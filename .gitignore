@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.npm-cache/
+.env
+.env.local
+.env.example.local
+.env.*.local
+coverage/
+*.log
+*.tsbuildinfo
+var/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

@@ -1,0 +1,23 @@
+{
+  "name": "autotrade-upbit",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Minimal TypeScript Node modular-monolith scaffold for AutoTrade Upbit.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/src/index.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "npm run build && node dist/tests/run-all.js",
+    "check": "npm run typecheck && npm run test"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}
