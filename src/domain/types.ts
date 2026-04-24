@@ -37,9 +37,24 @@ export type OrderLifecycleStatus =
 export type OrderOrigin = "STRATEGY" | "OPERATOR" | "RECOVERY";
 export type ReconciliationStatus = "SUCCESS" | "DRIFT_DETECTED" | "ERROR";
 export type RiskEventLevel = "INFO" | "WARN" | "BLOCK";
+export type OperatorNotificationChannel = "TELEGRAM";
+export type OperatorNotificationSeverity = "INFO" | "WARN" | "ERROR";
+export type OperatorNotificationStatus = "PENDING" | "SENT" | "FAILED";
+export type OperatorNotificationFailureClass = "RETRYABLE" | "PERMANENT";
+export type OperatorNotificationAttemptOutcome =
+  | "SENT"
+  | "RETRY_SCHEDULED"
+  | "FAILED"
+  | "STALE_LEASE";
+export type OperatorNotificationType =
+  | "ORDER_REJECTED"
+  | "ORDER_SUBMISSION_FAILED"
+  | "RECONCILIATION_DRIFT_DETECTED"
+  | "SYNC_FAILED";
 export type RiskRuleCode =
   | "GLOBAL_KILL_SWITCH"
   | "EXECUTION_PAUSED"
+  | "SYSTEM_DEGRADED"
   | "PER_ASSET_MAX_ALLOCATION"
   | "TOTAL_EXPOSURE_CAP"
   | "STALE_PRICE_GUARD"
@@ -47,7 +62,15 @@ export type RiskRuleCode =
   | "MINIMUM_ORDER_VALUE_GUARD"
   | "LIVE_EXECUTION_DISABLED"
   | "UNSUPPORTED_MARKET"
-  | "ORDER_RECOVERY_REQUIRED";
+  | "UNSUPPORTED_ORDER_TYPE"
+  | "EXCHANGE_MIN_TOTAL_GUARD"
+  | "EXCHANGE_MAX_TOTAL_GUARD"
+  | "MARKET_OFFLINE"
+  | "EXCHANGE_ORDER_CHANCE_FAILED"
+  | "EXCHANGE_ORDER_TEST_FAILED"
+  | "ORDER_RECOVERY_REQUIRED"
+  | "BALANCE_DRIFT_DETECTED"
+  | "POSITION_DRIFT_DETECTED";
 
 export interface UserRecord {
   id: string;
@@ -80,7 +103,41 @@ export interface ExecutionStateRecord {
   systemStatus: SystemStatus;
   killSwitchActive: boolean;
   pauseReason: string | null;
+  degradedReason: string | null;
+  degradedAt: string | null;
   updatedAt: string;
+}
+
+export interface ExecutionStateSeed {
+  executionMode: ExecutionMode;
+  liveExecutionGate: LiveExecutionGate;
+  killSwitchActive: boolean;
+}
+
+export type ExecutionStateTransitionCommand =
+  | "BOOTSTRAP"
+  | "/pause"
+  | "/resume"
+  | "/killswitch"
+  | "SET_EXECUTION_MODE"
+  | "SET_LIVE_EXECUTION_GATE"
+  | "MARK_DEGRADED"
+  | "CLEAR_DEGRADED";
+
+export interface ExecutionStateTransitionRecord {
+  id: string;
+  exchangeAccountId: string;
+  command: ExecutionStateTransitionCommand;
+  fromExecutionMode: ExecutionMode | null;
+  toExecutionMode: ExecutionMode;
+  fromLiveExecutionGate: LiveExecutionGate | null;
+  toLiveExecutionGate: LiveExecutionGate;
+  fromSystemStatus: SystemStatus | null;
+  toSystemStatus: SystemStatus;
+  fromKillSwitchActive: boolean | null;
+  toKillSwitchActive: boolean;
+  reason: string | null;
+  createdAt: string;
 }
 
 export interface ExchangeBalance {
@@ -194,6 +251,60 @@ export interface ReconciliationRunRecord {
   errorMessage: string | null;
 }
 
+export interface OperatorNotificationRecord {
+  id: string;
+  exchangeAccountId: string;
+  channel: OperatorNotificationChannel;
+  notificationType: OperatorNotificationType;
+  severity: OperatorNotificationSeverity;
+  title: string;
+  message: string;
+  payloadJson: string;
+  deliveryStatus: OperatorNotificationStatus;
+  attemptCount: number;
+  lastAttemptAt: string | null;
+  nextAttemptAt: string | null;
+  failureClass: OperatorNotificationFailureClass | null;
+  leaseToken: string | null;
+  leaseExpiresAt: string | null;
+  createdAt: string;
+  deliveredAt: string | null;
+  lastError: string | null;
+}
+
+export type ClaimedOperatorNotificationRecord = OperatorNotificationRecord & {
+  leaseToken: string;
+  leaseExpiresAt: string;
+  lastAttemptAt: string;
+};
+
+export interface OperatorNotificationDeliveryTransition {
+  id: string;
+  leaseToken: string;
+  deliveryStatus: OperatorNotificationStatus;
+  attemptCount: number;
+  lastAttemptAt: string;
+  nextAttemptAt: string | null;
+  failureClass: OperatorNotificationFailureClass | null;
+  deliveredAt: string | null;
+  lastError: string | null;
+}
+
+export interface OperatorNotificationDeliveryAttemptRecord {
+  id: string;
+  notificationId: string;
+  exchangeAccountId: string;
+  attemptCount: number;
+  leaseToken: string | null;
+  outcome: OperatorNotificationAttemptOutcome;
+  failureClass: OperatorNotificationFailureClass | null;
+  attemptedAt: string;
+  nextAttemptAt: string | null;
+  deliveredAt: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+}
+
 export interface RiskEventRecord {
   id: string;
   exchangeAccountId: string;
@@ -210,6 +321,13 @@ export interface ExecutionPolicy {
   executionMode: ExecutionMode;
   liveExecutionGate: LiveExecutionGate;
   globalKillSwitch: boolean;
+  maxAllocationByAsset: Record<SupportedAsset, number>;
+  totalExposureCap: number;
+  stalePriceThresholdMs: number;
+  minimumOrderValueKrw: number;
+}
+
+export interface ExecutionRiskLimits {
   maxAllocationByAsset: Record<SupportedAsset, number>;
   totalExposureCap: number;
   stalePriceThresholdMs: number;
@@ -267,6 +385,10 @@ export interface RiskEvaluationResult {
 export interface OperatorCommand {
   command:
     | "/status"
+    | "/statehistory"
+    | "/synchistory"
+    | "/alerts"
+    | "/risks"
     | "/balances"
     | "/positions"
     | "/orders"

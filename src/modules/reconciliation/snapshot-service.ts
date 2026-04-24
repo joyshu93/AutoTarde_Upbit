@@ -5,7 +5,43 @@ import type {
   PositionSnapshotRecord,
   SupportedAsset,
 } from "../../domain/types.js";
+import { getAssetForMarket, type SupportedMarket } from "../../domain/types.js";
 import { createId } from "../../shared/ids.js";
+import type { UpbitTickerSnapshot } from "../exchange/upbit/contracts.js";
+
+export function buildPriceByAssetFromExchangeBalances(
+  balances: ExchangeBalance[],
+): Partial<Record<SupportedAsset, number>> {
+  const priceByAsset: Partial<Record<SupportedAsset, number>> = {};
+
+  for (const balance of balances) {
+    if (balance.currency !== "BTC" && balance.currency !== "ETH") {
+      continue;
+    }
+
+    const avgBuyPrice = Number(balance.avgBuyPrice);
+    if (Number.isFinite(avgBuyPrice) && avgBuyPrice > 0) {
+      priceByAsset[balance.currency] = avgBuyPrice;
+    }
+  }
+
+  return priceByAsset;
+}
+
+export function buildPriceByAssetFromTickerSnapshots(
+  tickers: readonly Pick<UpbitTickerSnapshot, "market" | "trade_price">[],
+): Partial<Record<SupportedAsset, number>> {
+  const priceByAsset: Partial<Record<SupportedAsset, number>> = {};
+
+  for (const ticker of tickers) {
+    const asset = getAssetForMarket(ticker.market as SupportedMarket);
+    if (Number.isFinite(ticker.trade_price) && ticker.trade_price > 0) {
+      priceByAsset[asset] = ticker.trade_price;
+    }
+  }
+
+  return priceByAsset;
+}
 
 export function buildBalanceSnapshotRecord(input: {
   exchangeAccountId: string;

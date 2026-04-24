@@ -76,6 +76,12 @@ export interface UpbitBalance {
   readonly unit_currency: string;
 }
 
+export interface UpbitTickerSnapshot {
+  readonly market: UpbitSpotMarket;
+  readonly trade_price: number;
+  readonly trade_timestamp: number;
+}
+
 export interface UpbitOrderConstraint {
   readonly currency: string;
   readonly price_unit: DecimalString;
@@ -247,4 +253,8 @@ export interface UpbitPrivateExchangeClient {
   createOrder(request: UpbitCreateOrderRequest): Promise<UpbitCreatedOrderReceipt>;
   cancelOrder(request: UpbitCancelOrderRequest): Promise<UpbitOrderSnapshot>;
   getOrder(request: UpbitGetOrderRequest): Promise<UpbitOrderSnapshot>;
+}
+
+export interface UpbitPublicQuotationClient {
+  getTickers(markets: readonly UpbitSpotMarket[]): Promise<readonly UpbitTickerSnapshot[]>;
 }

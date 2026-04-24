@@ -1,4 +1,4 @@
-import type { OperatorCommand } from "../../domain/types.js";
+import type { ExecutionStateSeed, OperatorCommand } from "../../domain/types.js";
 import type { ExecutionRepository, OperatorStateStore } from "../db/interfaces.js";
 
 export interface TelegramResponse {
@@ -30,7 +30,7 @@ export interface TelegramSyncRequest {
 }
 
 export interface TelegramSyncResult {
-  readonly status: "REQUESTED" | "ALREADY_RUNNING" | "NOT_CONNECTED";
+  readonly status: "COMPLETED" | "ALREADY_RUNNING" | "NOT_CONNECTED" | "FAILED";
   readonly requestedAt: string;
   readonly detail: string;
 }
@@ -42,6 +42,8 @@ export interface TelegramSyncController {
 export interface TelegramRouterDependencies {
   readonly operatorState: OperatorStateStore;
   readonly repositories: ExecutionRepository;
+  readonly executionStateSeed?: ExecutionStateSeed;
+  readonly liveSendPath?: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
   readonly syncController?: TelegramSyncController;
   readonly now?: () => string;
 }

@@ -1,345 +1,227 @@
-export type TimestampMs = number;
-export type NumericString = string;
-
-export type JsonPrimitive = string | number | boolean | null;
-export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
-
-export interface JsonObject {
-  [key: string]: JsonValue;
-}
-
-export type UserStatus = 'active' | 'disabled';
-export type ExecutionMode = 'live' | 'paper';
-export type AccountStatus = 'active' | 'paused' | 'revoked' | 'paper';
-export type DecisionType = 'buy' | 'sell' | 'hold' | 'cancel' | 'reduce' | 'flatten';
-export type DecisionStatus =
-  | 'pending'
-  | 'approved'
-  | 'superseded'
-  | 'rejected'
-  | 'executed'
-  | 'expired';
-export type PositionEffect = 'open' | 'close' | 'increase' | 'decrease' | 'none';
-export type SnapshotSource = 'poll' | 'websocket' | 'reconciliation' | 'recovery' | 'operator';
-export type PositionSide = 'long' | 'short' | 'flat';
-export type PositionState = 'open' | 'closed' | 'liquidated';
-export type OrderType = 'market' | 'limit' | 'stop_market' | 'stop_limit';
-export type OrderSide = 'buy' | 'sell';
-export type OrderTimeInForce = 'gtc' | 'ioc' | 'fok' | 'post_only';
-export type OrderState =
-  | 'created'
-  | 'submission_pending'
-  | 'submitted'
-  | 'partially_filled'
-  | 'filled'
-  | 'cancel_pending'
-  | 'cancelled'
-  | 'rejected'
-  | 'expired'
-  | 'failed';
-export type OrderSource = 'strategy' | 'recovery' | 'operator' | 'reconciliation';
-export type OrderEventSource =
-  | 'local'
-  | 'exchange_poll'
-  | 'exchange_websocket'
-  | 'reconciliation'
-  | 'recovery'
-  | 'operator';
-export type OrderEventType =
-  | 'created'
-  | 'submission_requested'
-  | 'submission_accepted'
-  | 'submission_rejected'
-  | 'status_synced'
-  | 'fill_recorded'
-  | 'cancel_requested'
-  | 'cancel_accepted'
-  | 'cancel_rejected'
-  | 'completed'
-  | 'error'
-  | 'operator_note';
-export type LiquidityRole = 'maker' | 'taker' | 'unknown';
-export type ReconciliationRunType =
-  | 'startup_recovery'
-  | 'scheduled'
-  | 'manual'
-  | 'post_order'
-  | 'backfill';
-export type ReconciliationTrigger = 'system' | 'operator' | 'risk' | 'schedule';
-export type ReconciliationStatus =
-  | 'running'
-  | 'completed'
-  | 'completed_with_drift'
-  | 'failed'
-  | 'aborted';
-export type RiskSeverity = 'info' | 'warning' | 'critical';
-export type RiskStatus = 'open' | 'acknowledged' | 'suppressed' | 'resolved';
-export type ExecutionScopeType = 'system' | 'exchange_account' | 'market' | 'order' | 'strategy';
-export type IdempotencyStatus = 'in_progress' | 'completed' | 'failed' | 'expired';
-export type OperatorActionTargetType =
-  | 'system'
-  | 'exchange_account'
-  | 'market'
-  | 'order'
-  | 'strategy_decision'
-  | 'risk_event';
-export type OperatorActionType =
-  | 'pause_trading'
-  | 'resume_trading'
-  | 'cancel_order'
-  | 'retry_submission'
-  | 'flatten_position'
-  | 'ack_risk'
-  | 'resolve_risk'
-  | 'force_reconcile'
-  | 'set_state';
-export type OperatorActionStatus =
-  | 'requested'
-  | 'approved'
-  | 'applied'
-  | 'rejected'
-  | 'failed'
-  | 'cancelled';
-
-export interface UserRecord {
+export interface SqliteUserRow {
   id: string;
-  externalRef: string | null;
-  displayName: string;
-  status: UserStatus;
-  timezone: string;
-  createdAtMs: TimestampMs;
-  updatedAtMs: TimestampMs;
+  telegram_user_id: string;
+  telegram_chat_id: string | null;
+  display_name: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
-export interface ExchangeAccountRecord {
+export interface SqliteExchangeAccountRow {
   id: string;
-  userId: string;
-  venue: string;
-  accountLabel: string;
-  baseCurrency: string;
-  accessKeyRef: string;
-  secretKeyRef: string;
-  passphraseRef: string | null;
-  executionMode: ExecutionMode;
-  accountStatus: AccountStatus;
-  canTrade: boolean;
-  canWithdraw: boolean;
-  lastConnectedAtMs: TimestampMs | null;
-  lastReconciledAtMs: TimestampMs | null;
-  createdAtMs: TimestampMs;
-  updatedAtMs: TimestampMs;
+  user_id: string;
+  exchange: "UPBIT";
+  venue_type: "SPOT";
+  account_label: string;
+  access_key_ref: string;
+  secret_key_ref: string;
+  quote_currency: "KRW";
+  is_primary: number;
+  created_at: string;
+  updated_at: string;
 }
 
-export interface StrategyDecisionRecord {
+export interface SqliteExecutionStateRow {
   id: string;
-  exchangeAccountId: string;
-  strategyName: string;
-  strategyVersion: string;
-  marketSymbol: string;
-  timeframe: string | null;
-  decisionType: DecisionType;
-  side: OrderSide | null;
-  positionEffect: PositionEffect;
-  decisionStatus: DecisionStatus;
-  decisionKey: string;
-  requestedQuantity: NumericString | null;
-  requestedNotional: NumericString | null;
-  limitPrice: NumericString | null;
-  stopPrice: NumericString | null;
-  riskBudget: NumericString | null;
-  rationale: JsonValue | null;
-  marketSnapshot: JsonValue | null;
-  expiresAtMs: TimestampMs | null;
-  decidedAtMs: TimestampMs;
-  createdAtMs: TimestampMs;
-  updatedAtMs: TimestampMs;
+  exchange_account_id: string;
+  execution_mode: "DRY_RUN" | "LIVE";
+  live_execution_gate: "DISABLED" | "ENABLED";
+  system_status: "BOOTING" | "RUNNING" | "PAUSED" | "KILL_SWITCHED" | "DEGRADED";
+  kill_switch_active: number;
+  pause_reason: string | null;
+  degraded_reason: string | null;
+  degraded_at: string | null;
+  updated_at: string;
 }
 
-export interface BalanceSnapshotRecord {
+export interface SqliteExecutionStateTransitionRow {
   id: string;
-  exchangeAccountId: string;
-  captureId: string;
-  source: SnapshotSource;
-  assetSymbol: string;
-  availableAmount: NumericString;
-  lockedAmount: NumericString;
-  totalAmount: NumericString;
-  valueInBaseCurrency: NumericString | null;
-  capturedAtMs: TimestampMs;
-  createdAtMs: TimestampMs;
-}
-
-export interface PositionSnapshotRecord {
-  id: string;
-  exchangeAccountId: string;
-  captureId: string;
-  source: SnapshotSource;
-  marketSymbol: string;
-  side: PositionSide;
-  quantity: NumericString;
-  averageEntryPrice: NumericString | null;
-  markPrice: NumericString | null;
-  unrealizedPnl: NumericString | null;
-  realizedPnl: NumericString | null;
-  positionState: PositionState;
-  capturedAtMs: TimestampMs;
-  createdAtMs: TimestampMs;
-}
-
-export interface OrderRecord {
-  id: string;
-  exchangeAccountId: string;
-  strategyDecisionId: string | null;
-  operatorActionId: string | null;
-  clientOrderId: string;
-  venueOrderId: string | null;
-  idempotencyKey: string;
-  marketSymbol: string;
-  orderType: OrderType;
-  side: OrderSide;
-  timeInForce: OrderTimeInForce | null;
-  postOnly: boolean;
-  reduceOnly: boolean;
-  requestedQuantity: NumericString | null;
-  requestedNotional: NumericString | null;
-  limitPrice: NumericString | null;
-  stopPrice: NumericString | null;
-  executedQuantity: NumericString;
-  cumulativeQuoteAmount: NumericString;
-  averageFillPrice: NumericString | null;
-  state: OrderState;
-  stateReasonCode: string | null;
-  source: OrderSource;
-  submittedAtMs: TimestampMs | null;
-  lastEventAtMs: TimestampMs | null;
-  terminalAtMs: TimestampMs | null;
-  createdAtMs: TimestampMs;
-  updatedAtMs: TimestampMs;
-}
-
-export interface OrderEventRecord {
-  id: string;
-  orderId: string;
-  exchangeAccountId: string;
-  source: OrderEventSource;
-  eventType: OrderEventType;
-  sourceEventId: string | null;
-  idempotencyKey: string | null;
-  previousState: OrderState | null;
-  newState: OrderState | null;
-  eventPayload: JsonValue | null;
-  occurredAtMs: TimestampMs;
-  createdAtMs: TimestampMs;
-}
-
-export interface FillRecord {
-  id: string;
-  orderId: string;
-  orderEventId: string | null;
-  exchangeAccountId: string;
-  venueFillId: string;
-  venueTradeId: string | null;
-  side: OrderSide;
-  marketSymbol: string;
-  fillPrice: NumericString;
-  fillQuantity: NumericString;
-  quoteQuantity: NumericString | null;
-  feeAmount: NumericString | null;
-  feeAssetSymbol: string | null;
-  liquidityRole: LiquidityRole;
-  occurredAtMs: TimestampMs;
-  createdAtMs: TimestampMs;
-}
-
-export interface ReconciliationRunRecord {
-  id: string;
-  exchangeAccountId: string;
-  runType: ReconciliationRunType;
-  triggerSource: ReconciliationTrigger;
-  status: ReconciliationStatus;
-  startedAtMs: TimestampMs;
-  finishedAtMs: TimestampMs | null;
-  watermarkStartMs: TimestampMs | null;
-  watermarkEndMs: TimestampMs | null;
-  driftDetected: boolean;
-  actionsTaken: JsonValue | null;
-  summary: JsonValue | null;
-  errorCode: string | null;
-  errorMessage: string | null;
-  createdAtMs: TimestampMs;
-  updatedAtMs: TimestampMs;
-}
-
-export interface RiskEventRecord {
-  id: string;
-  exchangeAccountId: string;
-  orderId: string | null;
-  strategyDecisionId: string | null;
-  reconciliationRunId: string | null;
-  severity: RiskSeverity;
-  eventType: string;
-  dedupeKey: string;
-  status: RiskStatus;
-  message: string;
-  eventPayload: JsonValue | null;
-  detectedAtMs: TimestampMs;
-  acknowledgedAtMs: TimestampMs | null;
-  resolvedAtMs: TimestampMs | null;
-  createdAtMs: TimestampMs;
-  updatedAtMs: TimestampMs;
-}
-
-export interface ExecutionStateRecord {
-  scopeType: ExecutionScopeType;
-  scopeId: string;
-  stateKey: string;
-  version: number;
-  state: JsonValue;
-  leaseOwner: string | null;
-  leaseExpiresAtMs: TimestampMs | null;
-  lastHeartbeatAtMs: TimestampMs | null;
-  createdAtMs: TimestampMs;
-  updatedAtMs: TimestampMs;
-}
-
-export interface IdempotencyKeyRecord {
-  scope: string;
-  idempotencyKey: string;
-  requestHash: string;
-  status: IdempotencyStatus;
-  resourceType: string | null;
-  resourceId: string | null;
-  responsePayload: JsonValue | null;
-  firstSeenAtMs: TimestampMs;
-  lastTouchedAtMs: TimestampMs;
-  expiresAtMs: TimestampMs | null;
-}
-
-export interface OperatorActionRecord {
-  id: string;
-  exchangeAccountId: string | null;
-  targetType: OperatorActionTargetType;
-  targetId: string | null;
-  actionType: OperatorActionType;
-  requestedByUserId: string;
-  requestIdempotencyKey: string;
-  status: OperatorActionStatus;
+  exchange_account_id: string;
+  command:
+    | "BOOTSTRAP"
+    | "/pause"
+    | "/resume"
+    | "/killswitch"
+    | "SET_EXECUTION_MODE"
+    | "SET_LIVE_EXECUTION_GATE"
+    | "MARK_DEGRADED"
+    | "CLEAR_DEGRADED";
+  from_execution_mode: "DRY_RUN" | "LIVE" | null;
+  to_execution_mode: "DRY_RUN" | "LIVE";
+  from_live_execution_gate: "DISABLED" | "ENABLED" | null;
+  to_live_execution_gate: "DISABLED" | "ENABLED";
+  from_system_status: "BOOTING" | "RUNNING" | "PAUSED" | "KILL_SWITCHED" | "DEGRADED" | null;
+  to_system_status: "BOOTING" | "RUNNING" | "PAUSED" | "KILL_SWITCHED" | "DEGRADED";
+  from_kill_switch_active: number | null;
+  to_kill_switch_active: number;
   reason: string | null;
-  commandPayload: JsonValue | null;
-  resultPayload: JsonValue | null;
-  requestedAtMs: TimestampMs;
-  appliedAtMs: TimestampMs | null;
-  createdAtMs: TimestampMs;
-  updatedAtMs: TimestampMs;
+  created_at: string;
 }
 
-export interface ExecutionStateKey {
-  scopeType: ExecutionScopeType;
-  scopeId: string;
-  stateKey: string;
+export interface SqliteStrategyDecisionRow {
+  id: string;
+  exchange_account_id: string;
+  strategy_key: string;
+  market: "KRW-BTC" | "KRW-ETH";
+  action: "ENTER" | "ADD" | "REDUCE" | "EXIT" | "HOLD";
+  status: "READY" | "BLOCKED_BY_RISK" | "NO_ACTION" | "DATA_STALE";
+  decision_basis_json: string;
+  intended_notional_krw: string | null;
+  intended_quantity: string | null;
+  reference_price: string | null;
+  created_at: string;
 }
 
-export interface ResourcePointer {
-  resourceType: string;
-  resourceId: string;
+export interface SqliteBalanceSnapshotRow {
+  id: string;
+  exchange_account_id: string;
+  captured_at: string;
+  source: "EXCHANGE_POLL" | "RECONCILIATION";
+  total_krw_value: string | null;
+  balances_json: string;
+}
+
+export interface SqlitePositionSnapshotRow {
+  id: string;
+  exchange_account_id: string;
+  captured_at: string;
+  source: "EXCHANGE_POLL" | "RECONCILIATION";
+  positions_json: string;
+}
+
+export interface SqliteOrderRow {
+  id: string;
+  strategy_decision_id: string | null;
+  exchange_account_id: string;
+  market: "KRW-BTC" | "KRW-ETH";
+  side: "bid" | "ask";
+  ord_type: "limit" | "price" | "market" | "best";
+  volume: string | null;
+  price: string | null;
+  time_in_force: "ioc" | "fok" | "post_only" | null;
+  smp_type: "cancel_maker" | "cancel_taker" | "reduce" | null;
+  identifier: string;
+  idempotency_key: string;
+  origin: "STRATEGY" | "OPERATOR" | "RECOVERY";
+  requested_at: string;
+  upbit_uuid: string | null;
+  status:
+    | "INTENT_CREATED"
+    | "RISK_REJECTED"
+    | "PERSISTED"
+    | "SUBMITTING"
+    | "OPEN"
+    | "PARTIALLY_FILLED"
+    | "FILLED"
+    | "CANCEL_REQUESTED"
+    | "CANCELED"
+    | "REJECTED"
+    | "FAILED"
+    | "RECONCILIATION_REQUIRED";
+  execution_mode: "DRY_RUN" | "LIVE";
+  exchange_response_json: string | null;
+  failure_code: string | null;
+  failure_message: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SqliteOrderEventRow {
+  id: string;
+  order_id: string;
+  event_type: string;
+  event_source: "LOCAL" | "EXCHANGE" | "RECONCILIATION" | "TELEGRAM";
+  payload_json: string;
+  created_at: string;
+}
+
+export interface SqliteFillRow {
+  id: string;
+  order_id: string;
+  exchange_fill_id: string;
+  market: "KRW-BTC" | "KRW-ETH";
+  side: "bid" | "ask";
+  price: string;
+  volume: string;
+  fee_currency: string | null;
+  fee_amount: string | null;
+  filled_at: string;
+  raw_payload_json: string;
+}
+
+export interface SqliteReconciliationRunRow {
+  id: string;
+  exchange_account_id: string;
+  status: "SUCCESS" | "DRIFT_DETECTED" | "ERROR";
+  started_at: string;
+  completed_at: string | null;
+  summary_json: string;
+  error_message: string | null;
+}
+
+export interface SqliteOperatorNotificationRow {
+  id: string;
+  exchange_account_id: string;
+  channel: "TELEGRAM";
+  notification_type: "ORDER_REJECTED" | "ORDER_SUBMISSION_FAILED" | "RECONCILIATION_DRIFT_DETECTED" | "SYNC_FAILED";
+  severity: "INFO" | "WARN" | "ERROR";
+  title: string;
+  message: string;
+  payload_json: string;
+  delivery_status: "PENDING" | "SENT" | "FAILED";
+  attempt_count: number;
+  last_attempt_at: string | null;
+  next_attempt_at: string | null;
+  failure_class: "RETRYABLE" | "PERMANENT" | null;
+  lease_token: string | null;
+  lease_expires_at: string | null;
+  created_at: string;
+  delivered_at: string | null;
+  last_error: string | null;
+}
+
+export interface SqliteOperatorNotificationDeliveryAttemptRow {
+  id: string;
+  notification_id: string;
+  exchange_account_id: string;
+  attempt_count: number;
+  lease_token: string | null;
+  outcome: "SENT" | "RETRY_SCHEDULED" | "FAILED" | "STALE_LEASE";
+  failure_class: "RETRYABLE" | "PERMANENT" | null;
+  attempted_at: string;
+  next_attempt_at: string | null;
+  delivered_at: string | null;
+  error_message: string | null;
+  created_at: string;
+}
+
+export interface SqliteRiskEventRow {
+  id: string;
+  exchange_account_id: string;
+  strategy_decision_id: string | null;
+  order_id: string | null;
+  level: "INFO" | "WARN" | "BLOCK";
+  rule_code:
+    | "GLOBAL_KILL_SWITCH"
+    | "EXECUTION_PAUSED"
+    | "SYSTEM_DEGRADED"
+    | "PER_ASSET_MAX_ALLOCATION"
+    | "TOTAL_EXPOSURE_CAP"
+    | "STALE_PRICE_GUARD"
+    | "DUPLICATE_ORDER_GUARD"
+    | "MINIMUM_ORDER_VALUE_GUARD"
+    | "LIVE_EXECUTION_DISABLED"
+    | "UNSUPPORTED_MARKET"
+    | "UNSUPPORTED_ORDER_TYPE"
+    | "EXCHANGE_MIN_TOTAL_GUARD"
+    | "EXCHANGE_MAX_TOTAL_GUARD"
+    | "MARKET_OFFLINE"
+    | "EXCHANGE_ORDER_CHANCE_FAILED"
+    | "EXCHANGE_ORDER_TEST_FAILED"
+    | "ORDER_RECOVERY_REQUIRED"
+    | "BALANCE_DRIFT_DETECTED"
+    | "POSITION_DRIFT_DETECTED";
+  message: string;
+  payload_json: string;
+  created_at: string;
 }

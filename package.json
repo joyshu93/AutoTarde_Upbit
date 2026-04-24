@@ -5,7 +5,7 @@
   "description": "Minimal TypeScript Node modular-monolith scaffold for AutoTrade Upbit.",
   "type": "module",
   "engines": {
-    "node": ">=20.11.0"
+    "node": ">=22.13.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

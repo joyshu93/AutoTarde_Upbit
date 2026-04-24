@@ -28,6 +28,10 @@ export function evaluateRiskGuards(context: RiskEvaluationContext): RiskEvaluati
     triggeredRules.push(block("EXECUTION_PAUSED", "Execution is paused by operator state."));
   }
 
+  if (context.systemStatus === "DEGRADED") {
+    triggeredRules.push(block("SYSTEM_DEGRADED", "Execution is blocked while the system is DEGRADED pending operator review."));
+  }
+
   if (context.policy.executionMode === "LIVE" && context.policy.liveExecutionGate === "DISABLED") {
     triggeredRules.push(block("LIVE_EXECUTION_DISABLED", "LIVE mode is requested but live execution gate is disabled."));
   }

@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 
-import { buildBalanceSnapshotRecord, buildPositionSnapshotRecord } from "../src/modules/reconciliation/snapshot-service.js";
+import {
+  buildBalanceSnapshotRecord,
+  buildPositionSnapshotRecord,
+  buildPriceByAssetFromExchangeBalances,
+} from "../src/modules/reconciliation/snapshot-service.js";
 import { test } from "./harness.js";
 
 test("snapshot service builds KRW-valued balance and position snapshots", () => {
@@ -44,4 +48,18 @@ test("snapshot service builds KRW-valued balance and position snapshots", () => 
     positions.map((position) => position.marketValue),
     ["1000000", "2000000"],
   );
+});
+
+test("snapshot service derives explicit valuation prices from exchange avg_buy_price fields", () => {
+  const balances = [
+    { currency: "KRW", balance: "1000000", locked: "0", avgBuyPrice: "0", unitCurrency: "KRW" },
+    { currency: "BTC", balance: "0.01", locked: "0", avgBuyPrice: "90000000", unitCurrency: "KRW" },
+    { currency: "ETH", balance: "0.5", locked: "0", avgBuyPrice: "0", unitCurrency: "KRW" },
+  ];
+
+  const priceByAsset = buildPriceByAssetFromExchangeBalances(balances);
+
+  assert.deepEqual(priceByAsset, {
+    BTC: 90_000_000,
+  });
 });

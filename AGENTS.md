@@ -72,6 +72,7 @@ Telegram is an operator interface only. It may:
 - notify order acceptance, rejection, cancellation, and fills
 - expose inspection commands
 - expose operator control commands such as `/pause`, `/resume`, `/killswitch`, `/sync`
+- expose persisted operator-state inspection commands such as `/status`, `/statehistory`, and `/risks`
 
 Telegram must not:
 - accept manual cash inputs

@@ -7,8 +7,12 @@ import {
 import {
   formatBalanceMessage,
   formatControlCommandMessage,
+  formatOperatorNotificationsMessage,
   formatOrdersMessage,
   formatPositionMessage,
+  formatReconciliationRunsMessage,
+  formatRiskEventsMessage,
+  formatStateHistoryMessage,
   formatStatusMessage,
   formatSyncMessage,
 } from "./formatter.js";
@@ -19,6 +23,8 @@ import type {
   TelegramRouterDependencies,
   TelegramSyncResult,
 } from "./interfaces.js";
+import type { ReconciliationRunRecord } from "../../domain/types.js";
+import type { OperatorStateStore } from "../db/interfaces.js";
 
 export class TelegramCommandRouter {
   constructor(private readonly dependencies: TelegramRouterDependencies) {}
@@ -46,7 +52,15 @@ export class TelegramCommandRouter {
 
     switch (parsed.command) {
       case "/status":
-        return { text: formatStatusMessage(await this.dependencies.operatorState.getState()) };
+        return this.buildStatusResponse(exchangeAccountId);
+      case "/statehistory":
+        return this.buildStateHistoryResponse();
+      case "/synchistory":
+        return this.buildSyncHistoryResponse(exchangeAccountId);
+      case "/alerts":
+        return this.buildAlertsResponse(exchangeAccountId);
+      case "/risks":
+        return this.buildRiskEventsResponse(exchangeAccountId);
       case "/balances":
         return { text: formatBalanceMessage(await this.dependencies.repositories.getLatestBalanceSnapshot(exchangeAccountId)) };
       case "/positions":
@@ -54,30 +68,23 @@ export class TelegramCommandRouter {
       case "/orders":
         return { text: formatOrdersMessage(await this.dependencies.repositories.listOrders(exchangeAccountId)) };
       case "/pause":
-        return {
-          text: formatControlCommandMessage(
-            parsed.command,
-            await this.dependencies.operatorState.pause(
+        return this.applyControlCommand(
+          parsed.command,
+          () =>
+            this.dependencies.operatorState.pause(
               parsed.args.join(" ").trim() || "paused_by_operator",
             ),
-          ),
-        };
+        );
       case "/resume":
-        return {
-          text: formatControlCommandMessage(
-            parsed.command,
-            await this.dependencies.operatorState.resume(),
-          ),
-        };
+        return this.applyControlCommand(parsed.command, () => this.dependencies.operatorState.resume());
       case "/killswitch":
-        return {
-          text: formatControlCommandMessage(
-            parsed.command,
-            await this.dependencies.operatorState.activateKillSwitch(
+        return this.applyControlCommand(
+          parsed.command,
+          () =>
+            this.dependencies.operatorState.activateKillSwitch(
               parsed.args.join(" ").trim() || "killswitch_activated",
             ),
-          ),
-        };
+        );
       case "/sync":
         return {
           text: formatSyncMessage(await this.requestSync(exchangeAccountId)),
@@ -105,4 +112,107 @@ export class TelegramCommandRouter {
       requestedCommand: "/sync",
     });
   }
+
+  private async buildStatusResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+    const [state, transitions, runs] = await Promise.all([
+      this.dependencies.operatorState.getState(),
+      this.dependencies.operatorState.listTransitions(3),
+      this.dependencies.repositories.listReconciliationRuns(exchangeAccountId, 1),
+    ]);
+
+    return {
+      text: formatStatusMessage(
+        state,
+        buildStatusFormatOptions(this.dependencies, transitions, runs[0] ?? null),
+      ),
+    };
+  }
+
+  private async buildStateHistoryResponse(): Promise<TelegramResponse> {
+    const transitions = await this.dependencies.operatorState.listTransitions(10);
+
+    return {
+      text: formatStateHistoryMessage(transitions),
+    };
+  }
+
+  private async buildRiskEventsResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+    const events = await this.dependencies.repositories.listRiskEvents(exchangeAccountId, 10);
+
+    return {
+      text: formatRiskEventsMessage(events),
+    };
+  }
+
+  private async buildAlertsResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+    const [notifications, attempts] = await Promise.all([
+      this.dependencies.repositories.listOperatorNotifications(exchangeAccountId, 10),
+      this.dependencies.repositories.listOperatorNotificationDeliveryAttempts(exchangeAccountId, 5),
+    ]);
+
+    return {
+      text: formatOperatorNotificationsMessage(notifications, attempts),
+    };
+  }
+
+  private async buildSyncHistoryResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+    const runs = await this.dependencies.repositories.listReconciliationRuns(exchangeAccountId, 10);
+
+    return {
+      text: formatReconciliationRunsMessage(runs),
+    };
+  }
+
+  private async applyControlCommand(
+    command: SupportedTelegramCommand,
+    transition: () => Promise<import("../../domain/types.js").ExecutionStateRecord>,
+  ): Promise<TelegramResponse> {
+    const previousState = await this.dependencies.operatorState.getState();
+    const nextState = await transition();
+
+    return {
+      text: formatControlCommandMessage(
+        command,
+        previousState,
+        nextState,
+        this.dependencies.liveSendPath
+          ? { liveSendPath: this.dependencies.liveSendPath }
+          : undefined,
+      ),
+    };
+  }
+}
+
+function buildStatusFormatOptions(
+  dependencies: TelegramRouterDependencies,
+  transitions: Awaited<ReturnType<OperatorStateStore["listTransitions"]>>,
+  latestReconciliationRun: ReconciliationRunRecord | null,
+): {
+  executionStateSeed?: NonNullable<TelegramRouterDependencies["executionStateSeed"]>;
+  liveSendPath?: NonNullable<TelegramRouterDependencies["liveSendPath"]>;
+  transitions?: Awaited<ReturnType<OperatorStateStore["listTransitions"]>>;
+  latestReconciliationRun?: ReconciliationRunRecord | null;
+} | undefined {
+  const options: {
+    executionStateSeed?: NonNullable<TelegramRouterDependencies["executionStateSeed"]>;
+    liveSendPath?: NonNullable<TelegramRouterDependencies["liveSendPath"]>;
+    transitions?: Awaited<ReturnType<OperatorStateStore["listTransitions"]>>;
+    latestReconciliationRun?: ReconciliationRunRecord | null;
+  } = {};
+
+  if (dependencies.executionStateSeed) {
+    options.executionStateSeed = dependencies.executionStateSeed;
+  }
+
+  if (dependencies.liveSendPath) {
+    options.liveSendPath = dependencies.liveSendPath;
+  }
+
+  if (transitions.length > 0) {
+    options.transitions = transitions;
+  }
+
+  options.latestReconciliationRun = latestReconciliationRun;
+
+  return Object.keys(options).length === 0 ? undefined : options;
 }

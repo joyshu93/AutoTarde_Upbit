@@ -10,7 +10,9 @@ Build an Upbit-based BTC/ETH spot execution system that can progress from `DRY_R
 - order validation via exchange metadata and order-test path
 - order create, cancel, and status inquiry interfaces
 - balance and position snapshot persistence
+- balance and position drift detection against persisted local state and fill history
 - order, fill, reconciliation, and risk event persistence
+- startup recovery and operator-triggered reconciliation entry points
 - Telegram reporting and operator controls
 - execution recovery and reconciliation loops
 
@@ -45,6 +47,10 @@ Live mode requires both:
 ## Operator Interface
 Telegram may expose:
 - `/status`
+- `/statehistory`
+- `/synchistory`
+- `/alerts`
+- `/risks`
 - `/balances`
 - `/positions`
 - `/orders`
@@ -54,10 +60,15 @@ Telegram may expose:
 - `/sync`
 
 Telegram commands are operational controls and inspection requests, not portfolio data entry.
+`/alerts` may summarize both persisted operator notifications and recent delivery-attempt audit rows, but neither becomes a trading truth source.
+Startup recovery is read-only against exchange truth and must never create or cancel orders.
+When startup recovery confirms unresolved portfolio drift against persisted state, the operator state may move into `DEGRADED` without enabling any live path.
 
 ## Design Consequences
 - every order must have an explicit lifecycle record
 - every fill must be recoverable from reconciliation
 - every risk rejection must be persisted
+- every unexplained balance or position drift must be persisted as both reconciliation evidence and risk evidence
 - every transition into pause or kill-switch state must be explicit and inspectable
+- every transition into or out of `DEGRADED` must be explicit and inspectable
 - live-send capability must stay behind a separate safety gate even after implementation exists

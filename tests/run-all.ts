@@ -1,9 +1,15 @@
 await import("./env.test.js");
+await import("./db-sqlite-wiring.test.js");
 await import("./risk-guards.test.js");
 await import("./telegram-commands.test.js");
 await import("./snapshot-service.test.js");
+await import("./portfolio-drift.test.js");
+await import("./reconciliation-service.test.js");
+await import("./startup-recovery.test.js");
+await import("./sync-controller.test.js");
+await import("./upbit-public-client.test.js");
 await import("./execution-service.test.js");
-await import("./shared-config.test.js");
+await import("./telegram-delivery.test.js");
 await import("./telegram-operator-contracts.test.js");
 const { runRegisteredTests } = await import("./harness.js");
 await runRegisteredTests();

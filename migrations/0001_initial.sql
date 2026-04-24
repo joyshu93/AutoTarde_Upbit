@@ -1,323 +1,255 @@
 PRAGMA foreign_keys = ON;
 
-BEGIN TRANSACTION;
-
--- Numeric amounts/prices are stored as TEXT to avoid SQLite float drift.
-
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
-  external_ref TEXT,
-  display_name TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
-  timezone TEXT NOT NULL DEFAULT 'UTC',
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  UNIQUE (external_ref)
+  telegram_user_id TEXT NOT NULL UNIQUE,
+  telegram_chat_id TEXT,
+  display_name TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS exchange_accounts (
   id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-  venue TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  exchange TEXT NOT NULL CHECK (exchange = 'UPBIT'),
+  venue_type TEXT NOT NULL CHECK (venue_type = 'SPOT'),
   account_label TEXT NOT NULL,
-  base_currency TEXT NOT NULL,
   access_key_ref TEXT NOT NULL,
   secret_key_ref TEXT NOT NULL,
-  passphrase_ref TEXT,
-  execution_mode TEXT NOT NULL CHECK (execution_mode IN ('live', 'paper')),
-  account_status TEXT NOT NULL CHECK (account_status IN ('active', 'paused', 'revoked', 'paper')),
-  can_trade INTEGER NOT NULL CHECK (can_trade IN (0, 1)),
-  can_withdraw INTEGER NOT NULL CHECK (can_withdraw IN (0, 1)),
-  last_connected_at_ms INTEGER,
-  last_reconciled_at_ms INTEGER,
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  UNIQUE (user_id, venue, account_label)
-);
-
-CREATE TABLE IF NOT EXISTS idempotency_keys (
-  scope TEXT NOT NULL,
-  idempotency_key TEXT NOT NULL,
-  request_hash TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('in_progress', 'completed', 'failed', 'expired')),
-  resource_type TEXT,
-  resource_id TEXT,
-  response_payload_json TEXT,
-  first_seen_at_ms INTEGER NOT NULL,
-  last_touched_at_ms INTEGER NOT NULL,
-  expires_at_ms INTEGER,
-  PRIMARY KEY (scope, idempotency_key)
+  quote_currency TEXT NOT NULL CHECK (quote_currency = 'KRW'),
+  is_primary INTEGER NOT NULL CHECK (is_primary IN (0, 1)),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS execution_state (
-  scope_type TEXT NOT NULL CHECK (scope_type IN ('system', 'exchange_account', 'market', 'order', 'strategy')),
-  scope_id TEXT NOT NULL,
-  state_key TEXT NOT NULL,
-  version INTEGER NOT NULL,
-  state_json TEXT NOT NULL,
-  lease_owner TEXT,
-  lease_expires_at_ms INTEGER,
-  last_heartbeat_at_ms INTEGER,
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY (scope_type, scope_id, state_key)
+  id TEXT PRIMARY KEY,
+  exchange_account_id TEXT NOT NULL UNIQUE,
+  execution_mode TEXT NOT NULL CHECK (execution_mode IN ('DRY_RUN', 'LIVE')),
+  live_execution_gate TEXT NOT NULL CHECK (live_execution_gate IN ('DISABLED', 'ENABLED')),
+  system_status TEXT NOT NULL CHECK (system_status IN ('BOOTING', 'RUNNING', 'PAUSED', 'KILL_SWITCHED', 'DEGRADED')),
+  kill_switch_active INTEGER NOT NULL CHECK (kill_switch_active IN (0, 1)),
+  pause_reason TEXT,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS operator_actions (
+CREATE TABLE IF NOT EXISTS execution_state_transitions (
   id TEXT PRIMARY KEY,
-  exchange_account_id TEXT REFERENCES exchange_accounts(id) ON DELETE RESTRICT,
-  target_type TEXT NOT NULL CHECK (target_type IN ('system', 'exchange_account', 'market', 'order', 'strategy_decision', 'risk_event')),
-  target_id TEXT,
-  action_type TEXT NOT NULL CHECK (action_type IN ('pause_trading', 'resume_trading', 'cancel_order', 'retry_submission', 'flatten_position', 'ack_risk', 'resolve_risk', 'force_reconcile', 'set_state')),
-  requested_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-  request_idempotency_key TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('requested', 'approved', 'applied', 'rejected', 'failed', 'cancelled')),
+  exchange_account_id TEXT NOT NULL,
+  command TEXT NOT NULL CHECK (command IN ('BOOTSTRAP', '/pause', '/resume', '/killswitch', 'SET_EXECUTION_MODE', 'SET_LIVE_EXECUTION_GATE')),
+  from_execution_mode TEXT CHECK (from_execution_mode IN ('DRY_RUN', 'LIVE')),
+  to_execution_mode TEXT NOT NULL CHECK (to_execution_mode IN ('DRY_RUN', 'LIVE')),
+  from_live_execution_gate TEXT CHECK (from_live_execution_gate IN ('DISABLED', 'ENABLED')),
+  to_live_execution_gate TEXT NOT NULL CHECK (to_live_execution_gate IN ('DISABLED', 'ENABLED')),
+  from_system_status TEXT CHECK (from_system_status IN ('BOOTING', 'RUNNING', 'PAUSED', 'KILL_SWITCHED', 'DEGRADED')),
+  to_system_status TEXT NOT NULL CHECK (to_system_status IN ('BOOTING', 'RUNNING', 'PAUSED', 'KILL_SWITCHED', 'DEGRADED')),
+  from_kill_switch_active INTEGER CHECK (from_kill_switch_active IN (0, 1)),
+  to_kill_switch_active INTEGER NOT NULL CHECK (to_kill_switch_active IN (0, 1)),
   reason TEXT,
-  command_payload_json TEXT,
-  result_payload_json TEXT,
-  requested_at_ms INTEGER NOT NULL,
-  applied_at_ms INTEGER,
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  UNIQUE (requested_by_user_id, request_idempotency_key)
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS strategy_decisions (
   id TEXT PRIMARY KEY,
-  exchange_account_id TEXT NOT NULL REFERENCES exchange_accounts(id) ON DELETE RESTRICT,
-  strategy_name TEXT NOT NULL,
-  strategy_version TEXT NOT NULL,
-  market_symbol TEXT NOT NULL,
-  timeframe TEXT,
-  decision_type TEXT NOT NULL CHECK (decision_type IN ('buy', 'sell', 'hold', 'cancel', 'reduce', 'flatten')),
-  side TEXT CHECK (side IN ('buy', 'sell')),
-  position_effect TEXT NOT NULL CHECK (position_effect IN ('open', 'close', 'increase', 'decrease', 'none')),
-  decision_status TEXT NOT NULL CHECK (decision_status IN ('pending', 'approved', 'superseded', 'rejected', 'executed', 'expired')),
-  decision_key TEXT NOT NULL,
-  requested_quantity TEXT,
-  requested_notional TEXT,
-  limit_price TEXT,
-  stop_price TEXT,
-  risk_budget TEXT,
-  rationale_json TEXT,
-  market_snapshot_json TEXT,
-  expires_at_ms INTEGER,
-  decided_at_ms INTEGER NOT NULL,
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  CHECK (requested_quantity IS NOT NULL OR requested_notional IS NOT NULL OR decision_type IN ('hold', 'cancel', 'flatten')),
-  UNIQUE (exchange_account_id, decision_key)
+  exchange_account_id TEXT NOT NULL,
+  strategy_key TEXT NOT NULL,
+  market TEXT NOT NULL CHECK (market IN ('KRW-BTC', 'KRW-ETH')),
+  action TEXT NOT NULL CHECK (action IN ('ENTER', 'ADD', 'REDUCE', 'EXIT', 'HOLD')),
+  status TEXT NOT NULL CHECK (status IN ('READY', 'BLOCKED_BY_RISK', 'NO_ACTION', 'DATA_STALE')),
+  decision_basis_json TEXT NOT NULL,
+  intended_notional_krw TEXT,
+  intended_quantity TEXT,
+  reference_price TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS balance_snapshots (
+  id TEXT PRIMARY KEY,
+  exchange_account_id TEXT NOT NULL,
+  captured_at TEXT NOT NULL,
+  source TEXT NOT NULL CHECK (source IN ('EXCHANGE_POLL', 'RECONCILIATION')),
+  total_krw_value TEXT,
+  balances_json TEXT NOT NULL,
+  FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS position_snapshots (
+  id TEXT PRIMARY KEY,
+  exchange_account_id TEXT NOT NULL,
+  captured_at TEXT NOT NULL,
+  source TEXT NOT NULL CHECK (source IN ('EXCHANGE_POLL', 'RECONCILIATION')),
+  positions_json TEXT NOT NULL,
+  FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS orders (
   id TEXT PRIMARY KEY,
-  exchange_account_id TEXT NOT NULL REFERENCES exchange_accounts(id) ON DELETE RESTRICT,
-  strategy_decision_id TEXT REFERENCES strategy_decisions(id) ON DELETE SET NULL,
-  operator_action_id TEXT REFERENCES operator_actions(id) ON DELETE SET NULL,
-  client_order_id TEXT NOT NULL,
-  venue_order_id TEXT,
+  strategy_decision_id TEXT,
+  exchange_account_id TEXT NOT NULL,
+  market TEXT NOT NULL CHECK (market IN ('KRW-BTC', 'KRW-ETH')),
+  side TEXT NOT NULL CHECK (side IN ('bid', 'ask')),
+  ord_type TEXT NOT NULL CHECK (ord_type IN ('limit', 'price', 'market', 'best')),
+  volume TEXT,
+  price TEXT,
+  time_in_force TEXT CHECK (time_in_force IN ('ioc', 'fok', 'post_only')),
+  smp_type TEXT CHECK (smp_type IN ('cancel_maker', 'cancel_taker', 'reduce')),
+  identifier TEXT NOT NULL UNIQUE,
   idempotency_key TEXT NOT NULL,
-  market_symbol TEXT NOT NULL,
-  order_type TEXT NOT NULL CHECK (order_type IN ('market', 'limit', 'stop_market', 'stop_limit')),
-  side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
-  time_in_force TEXT CHECK (time_in_force IN ('gtc', 'ioc', 'fok', 'post_only')),
-  post_only INTEGER NOT NULL CHECK (post_only IN (0, 1)),
-  reduce_only INTEGER NOT NULL CHECK (reduce_only IN (0, 1)),
-  requested_quantity TEXT,
-  requested_notional TEXT,
-  limit_price TEXT,
-  stop_price TEXT,
-  executed_quantity TEXT NOT NULL DEFAULT '0',
-  cumulative_quote_amount TEXT NOT NULL DEFAULT '0',
-  average_fill_price TEXT,
-  state TEXT NOT NULL CHECK (state IN ('created', 'submission_pending', 'submitted', 'partially_filled', 'filled', 'cancel_pending', 'cancelled', 'rejected', 'expired', 'failed')),
-  state_reason_code TEXT,
-  source TEXT NOT NULL CHECK (source IN ('strategy', 'recovery', 'operator', 'reconciliation')),
-  submitted_at_ms INTEGER,
-  last_event_at_ms INTEGER,
-  terminal_at_ms INTEGER,
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  CHECK (requested_quantity IS NOT NULL OR requested_notional IS NOT NULL),
-  UNIQUE (exchange_account_id, client_order_id),
+  origin TEXT NOT NULL CHECK (origin IN ('STRATEGY', 'OPERATOR', 'RECOVERY')),
+  requested_at TEXT NOT NULL,
+  upbit_uuid TEXT,
+  status TEXT NOT NULL CHECK (status IN ('INTENT_CREATED', 'RISK_REJECTED', 'PERSISTED', 'SUBMITTING', 'OPEN', 'PARTIALLY_FILLED', 'FILLED', 'CANCEL_REQUESTED', 'CANCELED', 'REJECTED', 'FAILED', 'RECONCILIATION_REQUIRED')),
+  execution_mode TEXT NOT NULL CHECK (execution_mode IN ('DRY_RUN', 'LIVE')),
+  exchange_response_json TEXT,
+  failure_code TEXT,
+  failure_message TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (strategy_decision_id) REFERENCES strategy_decisions(id) ON DELETE SET NULL,
+  FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE,
   UNIQUE (exchange_account_id, idempotency_key)
 );
 
 CREATE TABLE IF NOT EXISTS order_events (
   id TEXT PRIMARY KEY,
-  order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
-  exchange_account_id TEXT NOT NULL REFERENCES exchange_accounts(id) ON DELETE RESTRICT,
-  source TEXT NOT NULL CHECK (source IN ('local', 'exchange_poll', 'exchange_websocket', 'reconciliation', 'recovery', 'operator')),
-  event_type TEXT NOT NULL CHECK (event_type IN ('created', 'submission_requested', 'submission_accepted', 'submission_rejected', 'status_synced', 'fill_recorded', 'cancel_requested', 'cancel_accepted', 'cancel_rejected', 'completed', 'error', 'operator_note')),
-  source_event_id TEXT,
-  idempotency_key TEXT,
-  previous_state TEXT,
-  new_state TEXT,
-  event_payload_json TEXT,
-  occurred_at_ms INTEGER NOT NULL,
-  created_at_ms INTEGER NOT NULL,
-  UNIQUE (order_id, source, source_event_id)
+  order_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  event_source TEXT NOT NULL CHECK (event_source IN ('LOCAL', 'EXCHANGE', 'RECONCILIATION', 'TELEGRAM')),
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS fills (
   id TEXT PRIMARY KEY,
-  order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
-  order_event_id TEXT REFERENCES order_events(id) ON DELETE SET NULL,
-  exchange_account_id TEXT NOT NULL REFERENCES exchange_accounts(id) ON DELETE RESTRICT,
-  venue_fill_id TEXT NOT NULL,
-  venue_trade_id TEXT,
-  side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
-  market_symbol TEXT NOT NULL,
-  fill_price TEXT NOT NULL,
-  fill_quantity TEXT NOT NULL,
-  quote_quantity TEXT,
+  order_id TEXT NOT NULL,
+  exchange_fill_id TEXT NOT NULL,
+  market TEXT NOT NULL CHECK (market IN ('KRW-BTC', 'KRW-ETH')),
+  side TEXT NOT NULL CHECK (side IN ('bid', 'ask')),
+  price TEXT NOT NULL,
+  volume TEXT NOT NULL,
+  fee_currency TEXT,
   fee_amount TEXT,
-  fee_asset_symbol TEXT,
-  liquidity_role TEXT NOT NULL CHECK (liquidity_role IN ('maker', 'taker', 'unknown')),
-  occurred_at_ms INTEGER NOT NULL,
-  created_at_ms INTEGER NOT NULL,
-  UNIQUE (exchange_account_id, venue_fill_id),
-  UNIQUE (order_id, venue_trade_id)
-);
-
-CREATE TABLE IF NOT EXISTS balance_snapshots (
-  id TEXT PRIMARY KEY,
-  exchange_account_id TEXT NOT NULL REFERENCES exchange_accounts(id) ON DELETE RESTRICT,
-  capture_id TEXT NOT NULL,
-  source TEXT NOT NULL CHECK (source IN ('poll', 'websocket', 'reconciliation', 'recovery', 'operator')),
-  asset_symbol TEXT NOT NULL,
-  available_amount TEXT NOT NULL,
-  locked_amount TEXT NOT NULL,
-  total_amount TEXT NOT NULL,
-  value_in_base_currency TEXT,
-  captured_at_ms INTEGER NOT NULL,
-  created_at_ms INTEGER NOT NULL,
-  UNIQUE (exchange_account_id, capture_id, asset_symbol)
-);
-
-CREATE TABLE IF NOT EXISTS position_snapshots (
-  id TEXT PRIMARY KEY,
-  exchange_account_id TEXT NOT NULL REFERENCES exchange_accounts(id) ON DELETE RESTRICT,
-  capture_id TEXT NOT NULL,
-  source TEXT NOT NULL CHECK (source IN ('poll', 'websocket', 'reconciliation', 'recovery', 'operator')),
-  market_symbol TEXT NOT NULL,
-  side TEXT NOT NULL CHECK (side IN ('long', 'short', 'flat')),
-  quantity TEXT NOT NULL,
-  average_entry_price TEXT,
-  mark_price TEXT,
-  unrealized_pnl TEXT,
-  realized_pnl TEXT,
-  position_state TEXT NOT NULL CHECK (position_state IN ('open', 'closed', 'liquidated')),
-  captured_at_ms INTEGER NOT NULL,
-  created_at_ms INTEGER NOT NULL,
-  UNIQUE (exchange_account_id, capture_id, market_symbol, side)
+  filled_at TEXT NOT NULL,
+  raw_payload_json TEXT NOT NULL,
+  FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
+  UNIQUE (order_id, exchange_fill_id)
 );
 
 CREATE TABLE IF NOT EXISTS reconciliation_runs (
   id TEXT PRIMARY KEY,
-  exchange_account_id TEXT NOT NULL REFERENCES exchange_accounts(id) ON DELETE RESTRICT,
-  run_type TEXT NOT NULL CHECK (run_type IN ('startup_recovery', 'scheduled', 'manual', 'post_order', 'backfill')),
-  trigger_source TEXT NOT NULL CHECK (trigger_source IN ('system', 'operator', 'risk', 'schedule')),
-  status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'completed_with_drift', 'failed', 'aborted')),
-  started_at_ms INTEGER NOT NULL,
-  finished_at_ms INTEGER,
-  watermark_start_ms INTEGER,
-  watermark_end_ms INTEGER,
-  drift_detected INTEGER NOT NULL CHECK (drift_detected IN (0, 1)),
-  actions_taken_json TEXT,
-  summary_json TEXT,
-  error_code TEXT,
+  exchange_account_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('SUCCESS', 'DRIFT_DETECTED', 'ERROR')),
+  started_at TEXT NOT NULL,
+  completed_at TEXT,
+  summary_json TEXT NOT NULL,
   error_message TEXT,
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL
+  FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS operator_notifications (
+  id TEXT PRIMARY KEY,
+  exchange_account_id TEXT NOT NULL,
+  channel TEXT NOT NULL CHECK (channel IN ('TELEGRAM')),
+  notification_type TEXT NOT NULL CHECK (notification_type IN ('ORDER_REJECTED', 'ORDER_SUBMISSION_FAILED', 'RECONCILIATION_DRIFT_DETECTED', 'SYNC_FAILED')),
+  severity TEXT NOT NULL CHECK (severity IN ('INFO', 'WARN', 'ERROR')),
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  delivery_status TEXT NOT NULL CHECK (delivery_status IN ('PENDING', 'SENT', 'FAILED')),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  last_attempt_at TEXT,
+  next_attempt_at TEXT,
+  failure_class TEXT CHECK (failure_class IN ('RETRYABLE', 'PERMANENT')),
+  lease_token TEXT,
+  lease_expires_at TEXT,
+  created_at TEXT NOT NULL,
+  delivered_at TEXT,
+  last_error TEXT,
+  FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS operator_notification_delivery_attempts (
+  id TEXT PRIMARY KEY,
+  notification_id TEXT NOT NULL,
+  exchange_account_id TEXT NOT NULL,
+  attempt_count INTEGER NOT NULL CHECK (attempt_count >= 1),
+  lease_token TEXT,
+  outcome TEXT NOT NULL CHECK (outcome IN ('SENT', 'RETRY_SCHEDULED', 'FAILED', 'STALE_LEASE')),
+  failure_class TEXT CHECK (failure_class IN ('RETRYABLE', 'PERMANENT')),
+  attempted_at TEXT NOT NULL,
+  next_attempt_at TEXT,
+  delivered_at TEXT,
+  error_message TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (notification_id) REFERENCES operator_notifications(id) ON DELETE CASCADE,
+  FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS risk_events (
   id TEXT PRIMARY KEY,
-  exchange_account_id TEXT NOT NULL REFERENCES exchange_accounts(id) ON DELETE RESTRICT,
-  order_id TEXT REFERENCES orders(id) ON DELETE SET NULL,
-  strategy_decision_id TEXT REFERENCES strategy_decisions(id) ON DELETE SET NULL,
-  reconciliation_run_id TEXT REFERENCES reconciliation_runs(id) ON DELETE SET NULL,
-  severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
-  event_type TEXT NOT NULL,
-  dedupe_key TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('open', 'acknowledged', 'suppressed', 'resolved')),
+  exchange_account_id TEXT NOT NULL,
+  strategy_decision_id TEXT,
+  order_id TEXT,
+  level TEXT NOT NULL CHECK (level IN ('INFO', 'WARN', 'BLOCK')),
+  rule_code TEXT NOT NULL CHECK (rule_code IN ('GLOBAL_KILL_SWITCH', 'EXECUTION_PAUSED', 'PER_ASSET_MAX_ALLOCATION', 'TOTAL_EXPOSURE_CAP', 'STALE_PRICE_GUARD', 'DUPLICATE_ORDER_GUARD', 'MINIMUM_ORDER_VALUE_GUARD', 'LIVE_EXECUTION_DISABLED', 'UNSUPPORTED_MARKET', 'UNSUPPORTED_ORDER_TYPE', 'EXCHANGE_MIN_TOTAL_GUARD', 'EXCHANGE_MAX_TOTAL_GUARD', 'MARKET_OFFLINE', 'EXCHANGE_ORDER_CHANCE_FAILED', 'EXCHANGE_ORDER_TEST_FAILED', 'ORDER_RECOVERY_REQUIRED')),
   message TEXT NOT NULL,
-  event_payload_json TEXT,
-  detected_at_ms INTEGER NOT NULL,
-  acknowledged_at_ms INTEGER,
-  resolved_at_ms INTEGER,
-  created_at_ms INTEGER NOT NULL,
-  updated_at_ms INTEGER NOT NULL
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE,
+  FOREIGN KEY (strategy_decision_id) REFERENCES strategy_decisions(id) ON DELETE SET NULL,
+  FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE SET NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_exchange_accounts_user_status
-  ON exchange_accounts (user_id, account_status, can_trade);
+CREATE INDEX IF NOT EXISTS idx_exchange_accounts_user_id
+  ON exchange_accounts(user_id, is_primary);
 
-CREATE INDEX IF NOT EXISTS idx_idempotency_status_expiry
-  ON idempotency_keys (status, expires_at_ms);
+CREATE INDEX IF NOT EXISTS idx_strategy_decisions_exchange_account_id
+  ON strategy_decisions(exchange_account_id, created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_execution_state_lease_expiry
-  ON execution_state (lease_expires_at_ms);
+CREATE INDEX IF NOT EXISTS idx_execution_state_transitions_exchange_account_id
+  ON execution_state_transitions(exchange_account_id, created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_operator_actions_account_status_requested
-  ON operator_actions (exchange_account_id, status, requested_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_balance_snapshots_exchange_account_id
+  ON balance_snapshots(exchange_account_id, captured_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_operator_actions_target_status
-  ON operator_actions (target_type, target_id, status);
+CREATE INDEX IF NOT EXISTS idx_position_snapshots_exchange_account_id
+  ON position_snapshots(exchange_account_id, captured_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_strategy_decisions_account_status_time
-  ON strategy_decisions (exchange_account_id, decision_status, decided_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_exchange_account_id
+  ON orders(exchange_account_id, updated_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_strategy_decisions_account_market_time
-  ON strategy_decisions (exchange_account_id, market_symbol, decided_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_status
+  ON orders(status, updated_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_orders_account_state_created
-  ON orders (exchange_account_id, state, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_order_events_order_id
+  ON order_events(order_id, created_at DESC);
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_account_venue_order_id
-  ON orders (exchange_account_id, venue_order_id)
-  WHERE venue_order_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_fills_order_id
+  ON fills(order_id, filled_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_orders_active_by_account
-  ON orders (exchange_account_id, updated_at_ms DESC)
-  WHERE state IN ('created', 'submission_pending', 'submitted', 'partially_filled', 'cancel_pending');
+CREATE INDEX IF NOT EXISTS idx_reconciliation_runs_exchange_account_id
+  ON reconciliation_runs(exchange_account_id, started_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_order_events_order_time
-  ON order_events (order_id, occurred_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_operator_notifications_exchange_account_id
+  ON operator_notifications(exchange_account_id, created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_order_events_account_source_time
-  ON order_events (exchange_account_id, source, occurred_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_operator_notifications_delivery_status
+  ON operator_notifications(exchange_account_id, delivery_status, created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_fills_order_time
-  ON fills (order_id, occurred_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_operator_notifications_delivery_due
+  ON operator_notifications(exchange_account_id, delivery_status, next_attempt_at, created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_fills_account_market_time
-  ON fills (exchange_account_id, market_symbol, occurred_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_operator_notification_delivery_attempts_exchange_account_id
+  ON operator_notification_delivery_attempts(exchange_account_id, attempted_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_balance_snapshots_account_asset_time
-  ON balance_snapshots (exchange_account_id, asset_symbol, captured_at_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_operator_notification_delivery_attempts_notification_id
+  ON operator_notification_delivery_attempts(notification_id, attempt_count DESC);
 
-CREATE INDEX IF NOT EXISTS idx_balance_snapshots_account_capture
-  ON balance_snapshots (exchange_account_id, capture_id);
-
-CREATE INDEX IF NOT EXISTS idx_position_snapshots_account_market_time
-  ON position_snapshots (exchange_account_id, market_symbol, captured_at_ms DESC);
-
-CREATE INDEX IF NOT EXISTS idx_position_snapshots_account_capture
-  ON position_snapshots (exchange_account_id, capture_id);
-
-CREATE INDEX IF NOT EXISTS idx_reconciliation_runs_account_status_started
-  ON reconciliation_runs (exchange_account_id, status, started_at_ms DESC);
-
-CREATE INDEX IF NOT EXISTS idx_risk_events_account_status_detected
-  ON risk_events (exchange_account_id, status, detected_at_ms DESC);
-
-CREATE INDEX IF NOT EXISTS idx_risk_events_event_type_detected
-  ON risk_events (event_type, detected_at_ms DESC);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_events_active_dedupe
-  ON risk_events (exchange_account_id, dedupe_key)
-  WHERE status IN ('open', 'acknowledged', 'suppressed');
-
-COMMIT;
+CREATE INDEX IF NOT EXISTS idx_risk_events_exchange_account_id
+  ON risk_events(exchange_account_id, created_at DESC);

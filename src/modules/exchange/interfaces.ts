@@ -24,6 +24,8 @@ export interface UpbitOrderChance {
   askTypes: string[];
   bidTypes: string[];
   maxTotal: string | null;
+  bidMinTotal: number | null;
+  askMinTotal: number | null;
   bidFee: string;
   askFee: string;
 }
@@ -93,6 +95,8 @@ export class DryRunExchangeAdapter implements ExchangeAdapter {
       askTypes: ["limit", "market", "best", "limit_ioc", "limit_fok", "best_ioc", "best_fok"],
       bidTypes: ["limit", "price", "best", "limit_ioc", "limit_fok", "best_ioc", "best_fok"],
       maxTotal: null,
+      bidMinTotal: 5000,
+      askMinTotal: 5000,
       bidFee: "0",
       askFee: "0",
     };

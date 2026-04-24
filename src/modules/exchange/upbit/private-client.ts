@@ -22,6 +22,12 @@ interface UpbitOrderChanceResponse {
     ask_types?: string[];
     bid_types?: string[];
     max_total?: string | null;
+    bid?: {
+      min_total?: string | number | null;
+    };
+    ask?: {
+      min_total?: string | number | null;
+    };
   };
 }
 
@@ -100,6 +106,8 @@ export class UpbitPrivateClient implements ExchangeAdapter {
       askTypes: response.market.ask_types ?? [],
       bidTypes: response.market.bid_types ?? [],
       maxTotal: response.market.max_total ?? null,
+      bidMinTotal: parseOptionalNumber(response.market.bid?.min_total),
+      askMinTotal: parseOptionalNumber(response.market.ask?.min_total),
       bidFee: response.bid_fee,
       askFee: response.ask_fee,
     };
@@ -183,8 +191,8 @@ export class UpbitPrivateClient implements ExchangeAdapter {
     const response = await this.fetchImpl(`${this.baseUrl}${options.path}${suffix}`, requestInit);
 
     if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      throw new Error(`Upbit private request failed (${response.status} ${response.statusText}): ${body}`);
+      await response.text().catch(() => "");
+      throw new Error(`Upbit private request failed (${response.status} ${response.statusText}).`);
     }
 
     return (await response.json()) as T;
@@ -230,4 +238,13 @@ function mapOrderResponse(response: UpbitOrderResponse): ExchangeOrderSnapshot {
     })),
     raw: response,
   };
+}
+
+function parseOptionalNumber(input: string | number | null | undefined): number | null {
+  if (typeof input === "number") {
+    return Number.isFinite(input) ? input : null;
+  }
+
+  const parsed = Number(input);
+  return Number.isFinite(parsed) ? parsed : null;
 }

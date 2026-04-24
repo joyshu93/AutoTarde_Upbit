@@ -119,6 +119,11 @@ Reconciliation should run when:
 - the process restarts with non-terminal orders
 - an operator runs `/sync`
 
+The current scaffold now uses both process startup recovery and operator-triggered `/sync` as explicit reconciliation entry points.
+
+Restart recovery currently prioritizes persisted non-terminal orders first, then limited terminal backfill candidates, and respects a per-run exchange lookup budget.
+When startup recovery also finds unexplained balance or position movement against the prior persisted snapshots and local fill ledger, that result is treated as operator-state health evidence rather than as an order state.
+
 ## Notification Expectations
 
 Telegram should report lifecycle outcomes, such as:
@@ -128,5 +133,11 @@ Telegram should report lifecycle outcomes, such as:
 - full fill
 - cancel acknowledgement
 - reconciliation required
+- unexplained portfolio drift detected during reconciliation
 
 Notifications are derived from lifecycle state, not treated as lifecycle state.
+They should be persisted first into `operator_notifications`, then delivered through a separate `PENDING -> SENT/FAILED` path.
+Notification delivery failure must never be treated as an order-lifecycle transition.
+Retryable Telegram failures may keep the notification in `PENDING` with a scheduled `next_attempt_at`, but that retry state is still separate from order lifecycle.
+Delivery workers may also claim a notification behind a lease token before transport, but that lease is still operator-notification state rather than order-lifecycle state.
+Recent delivery outcomes are now also kept in `operator_notification_delivery_attempts` so operator observability can grow without turning Telegram delivery into lifecycle truth.

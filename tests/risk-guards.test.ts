@@ -19,10 +19,10 @@ test("risk guards block LIVE execution when the live gate is disabled", () => {
         liveExecutionGate: "DISABLED",
         globalKillSwitch: false,
         maxAllocationByAsset: {
-          BTC: 0.7,
-          ETH: 0.4,
+          BTC: 0.6,
+          ETH: 0.6,
         },
-        totalExposureCap: 0.95,
+        totalExposureCap: 0.75,
         stalePriceThresholdMs: 30_000,
         minimumOrderValueKrw: 5_000,
       },
@@ -47,6 +47,20 @@ test("risk guards block stale or missing market references", () => {
   assert.deepEqual(
     result.triggeredRules.map((rule) => rule.code),
     ["STALE_PRICE_GUARD"],
+  );
+});
+
+test("risk guards block execution while operator state is DEGRADED", () => {
+  const result = evaluateRiskGuards(
+    createRiskContext({
+      systemStatus: "DEGRADED",
+    }),
+  );
+
+  assert.equal(result.accepted, false);
+  assert.deepEqual(
+    result.triggeredRules.map((rule) => rule.code),
+    ["SYSTEM_DEGRADED"],
   );
 });
 
@@ -102,10 +116,10 @@ function createRiskContext(
       liveExecutionGate: "DISABLED",
       globalKillSwitch: false,
       maxAllocationByAsset: {
-        BTC: 0.7,
-        ETH: 0.4,
+        BTC: 0.6,
+        ETH: 0.6,
       },
-      totalExposureCap: 0.95,
+      totalExposureCap: 0.75,
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
     },

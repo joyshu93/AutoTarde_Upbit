@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { buildExecutionPolicy, loadAppConfig } from "../src/app/env.js";
+import { buildExecutionRiskLimits, loadAppConfig } from "../src/app/env.js";
 import { test } from "./harness.js";
 
 test("loadAppConfig defaults to DRY_RUN with live gate disabled", () => {
@@ -8,19 +8,46 @@ test("loadAppConfig defaults to DRY_RUN with live gate disabled", () => {
 
   assert.equal(config.executionMode, "DRY_RUN");
   assert.equal(config.liveExecutionGate, "DISABLED");
+  assert.equal(config.telegramDeliveryEnabled, false);
+  assert.equal(config.telegramDeliveryMaxAttempts, 5);
+  assert.equal(config.telegramDeliveryBaseBackoffMs, 15_000);
+  assert.equal(config.telegramDeliveryMaxBackoffMs, 300_000);
+  assert.equal(config.telegramDeliveryLeaseMs, 30_000);
+  assert.equal(config.reconciliationMaxOrderLookupsPerRun, 10);
   assert.equal(config.globalKillSwitch, false);
+  assert.equal(config.databasePath, "./var/autotrade-upbit.sqlite");
 
-  const policy = buildExecutionPolicy(config);
-  assert.equal(policy.executionMode, "DRY_RUN");
-  assert.equal(policy.liveExecutionGate, "DISABLED");
+  const riskLimits = buildExecutionRiskLimits(config);
+  assert.equal(riskLimits.minimumOrderValueKrw, 5_000);
+  assert.equal(riskLimits.totalExposureCap, 0.75);
 });
 
 test("loadAppConfig allows LIVE only when explicitly requested", () => {
   const config = loadAppConfig({
     APP_EXECUTION_MODE: "LIVE",
     ENABLE_LIVE_ORDERS: "true",
+    ENABLE_TELEGRAM_DELIVERY: "true",
+    TELEGRAM_DELIVERY_MAX_ATTEMPTS: "7",
+    TELEGRAM_DELIVERY_BASE_BACKOFF_MS: "20000",
+    TELEGRAM_DELIVERY_MAX_BACKOFF_MS: "600000",
+    TELEGRAM_DELIVERY_LEASE_MS: "45000",
   });
 
   assert.equal(config.executionMode, "LIVE");
   assert.equal(config.liveExecutionGate, "ENABLED");
+  assert.equal(config.telegramDeliveryEnabled, true);
+  assert.equal(config.telegramDeliveryMaxAttempts, 7);
+  assert.equal(config.telegramDeliveryBaseBackoffMs, 20_000);
+  assert.equal(config.telegramDeliveryMaxBackoffMs, 600_000);
+  assert.equal(config.telegramDeliveryLeaseMs, 45_000);
+});
+
+test("loadAppConfig accepts an explicit sqlite database path override", () => {
+  const config = loadAppConfig({
+    DATABASE_PATH: "./var/test-wiring.sqlite",
+    RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN: "4",
+  });
+
+  assert.equal(config.databasePath, "./var/test-wiring.sqlite");
+  assert.equal(config.reconciliationMaxOrderLookupsPerRun, 4);
 });
