@@ -55,6 +55,7 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
     assert.ok(migrationRows.some((row) => row.filename === "0006_add_operator_notification_retry_metadata.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0007_add_operator_notification_delivery_leases.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0008_add_operator_notification_delivery_attempt_history.sql"));
+    assert.ok(migrationRows.some((row) => row.filename === "0009_add_history_recovery_checkpoints.sql"));
 
     for (const tableName of [
       "users",
@@ -67,6 +68,7 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
       "balance_snapshots",
       "position_snapshots",
       "reconciliation_runs",
+      "history_recovery_checkpoints",
       "operator_notifications",
       "operator_notification_delivery_attempts",
       "risk_events",
@@ -255,6 +257,22 @@ test("createSqlitePersistence bootstraps operator state and round-trips app-faci
     const latestRiskEvents = await bundle.repositories.listRiskEvents("primary", 1);
     assert.equal(latestRiskEvents.length, 1);
     assert.equal(latestRiskEvents[0]?.ruleCode, "DUPLICATE_ORDER_GUARD");
+
+    await bundle.repositories.saveHistoryRecoveryCheckpoint({
+      id: "history-checkpoint-1",
+      exchangeAccountId: "primary",
+      market: "KRW-BTC",
+      checkpointType: "CLOSED_ORDER_ARCHIVE",
+      nextWindowEndAt: "2026-04-01T00:00:00.000Z",
+      updatedAt: "2026-04-20T00:02:30.000Z",
+    });
+
+    const checkpoint = await bundle.repositories.getHistoryRecoveryCheckpoint(
+      "primary",
+      "KRW-BTC",
+      "CLOSED_ORDER_ARCHIVE",
+    );
+    assert.equal(checkpoint?.nextWindowEndAt, "2026-04-01T00:00:00.000Z");
 
     await bundle.repositories.saveOperatorNotification(createNotification({
       id: "operator-notification-1",

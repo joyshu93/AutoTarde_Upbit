@@ -1,11 +1,13 @@
 import type {
   BalanceSnapshotRecord,
+  ExecutionMode,
   OrderLifecycleStatus,
   OrderRecord,
   PositionSnapshotRecord,
   RiskEventRecord,
 } from "../../domain/types.js";
-import { createId } from "../../shared/ids.js";
+import { SUPPORTED_MARKETS } from "../../domain/types.js";
+import { createFingerprint, createId } from "../../shared/ids.js";
 import type { ExecutionRepository, OperatorStateStore } from "../db/interfaces.js";
 import type { ExchangeAdapter, ExchangeOrderSnapshot, ExchangeFillSnapshot } from "../exchange/interfaces.js";
 import type { OperatorNotificationReporter } from "../telegram/reporter.js";
@@ -18,6 +20,16 @@ const TERMINAL_RECONCILIATION_STATUSES = new Set<OrderLifecycleStatus>([
   "REJECTED",
   "FAILED",
 ]);
+const MANAGED_MARKETS = ["KRW-BTC", "KRW-ETH"] as const satisfies typeof SUPPORTED_MARKETS;
+const EXCHANGE_HISTORY_PAGE_LIMIT = 20;
+const DEFAULT_HISTORY_MAX_PAGES_PER_MARKET = 3;
+const DEFAULT_CLOSED_ORDER_LOOKBACK_DAYS = 7;
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
+
+interface ExchangeHistoryRecoveryResult {
+  snapshots: ExchangeOrderSnapshot[];
+  historyRecovery: NonNullable<ReconciliationSummary["historyRecovery"]> | null;
+}
 
 export class ReconciliationService {
   constructor(
@@ -25,8 +37,11 @@ export class ReconciliationService {
       repositories: ExecutionRepository;
       operatorState: OperatorStateStore;
       orderReader?: Pick<ExchangeAdapter, "getOrder">;
+      orderHistoryReader?: Pick<ExchangeAdapter, "listOpenOrders" | "listClosedOrders">;
       reporter?: OperatorNotificationReporter;
       maxOrderLookupsPerRun?: number;
+      historyMaxPagesPerMarket?: number;
+      closedOrderLookbackDays?: number;
     },
   ) {}
 
@@ -42,13 +57,25 @@ export class ReconciliationService {
       };
     },
   ): Promise<ReconciliationSummary> {
-    const openOrders = await this.dependencies.repositories.listActiveOrders(exchangeAccountId);
-    const terminalOrders = await this.listTerminalOrdersNeedingBackfill(exchangeAccountId);
-    const candidates = buildReconciliationCandidates(openOrders, terminalOrders);
     const maxOrderLookupsPerRun = this.dependencies.maxOrderLookupsPerRun ?? 10;
     const startedAt = new Date().toISOString();
+    const [openOrders, allOrders, state] = await Promise.all([
+      this.dependencies.repositories.listActiveOrders(exchangeAccountId),
+      this.dependencies.repositories.listOrders(exchangeAccountId),
+      this.dependencies.operatorState.getState(),
+    ]);
+    const terminalOrders = await this.listTerminalOrdersNeedingBackfill(allOrders);
+    const candidates = buildReconciliationCandidates(openOrders, terminalOrders);
     const issues: ReconciliationIssue[] = [];
     let processedCount = 0;
+
+    const historyRecovery = await this.recoverMissingExchangeOrders(
+      exchangeAccountId,
+      allOrders,
+      state.executionMode,
+      startedAt,
+    );
+    issues.push(...historyRecovery.issues);
 
     for (const candidate of candidates.slice(0, maxOrderLookupsPerRun)) {
       processedCount += 1;
@@ -77,6 +104,7 @@ export class ReconciliationService {
       processedCount,
       deferredCount,
       maxOrderLookupsPerRun,
+      ...(historyRecovery.historyRecovery ? { historyRecovery: historyRecovery.historyRecovery } : {}),
     };
 
     await this.dependencies.repositories.saveReconciliationRun({
@@ -155,8 +183,7 @@ export class ReconciliationService {
     }));
   }
 
-  private async listTerminalOrdersNeedingBackfill(exchangeAccountId: string): Promise<OrderRecord[]> {
-    const orders = await this.dependencies.repositories.listOrders(exchangeAccountId);
+  private async listTerminalOrdersNeedingBackfill(orders: OrderRecord[]): Promise<OrderRecord[]> {
     const candidates = orders.filter(
       (order) =>
         TERMINAL_RECONCILIATION_STATUSES.has(order.status) &&
@@ -172,6 +199,235 @@ export class ReconciliationService {
     return fillsByOrder
       .filter(({ order, fills }) => shouldReconcileTerminalOrder(order, fills.length))
       .map(({ order }) => order);
+  }
+
+  private async recoverMissingExchangeOrders(
+    exchangeAccountId: string,
+    localOrders: OrderRecord[],
+    executionMode: ExecutionMode,
+    reconciledAt: string,
+  ): Promise<{
+    issues: ReconciliationIssue[];
+    historyRecovery: ReconciliationSummary["historyRecovery"];
+  }> {
+    if (!this.dependencies.orderHistoryReader) {
+      return {
+        issues: [],
+        historyRecovery: undefined,
+      };
+    }
+
+    const knownUuids = new Set(
+      localOrders.map((order) => order.upbitUuid).filter((value): value is string => typeof value === "string"),
+    );
+    const knownIdentifiers = new Set(
+      localOrders.map((order) => order.identifier).filter((value): value is string => typeof value === "string"),
+    );
+
+    try {
+      const exchangeHistory = await this.listExchangeHistorySnapshots(exchangeAccountId, reconciledAt);
+      const issues: ReconciliationIssue[] = [];
+      let recoveredOrderCount = 0;
+
+      for (const snapshot of exchangeHistory.snapshots) {
+        if (knownUuids.has(snapshot.uuid)) {
+          continue;
+        }
+
+        if (snapshot.identifier && knownIdentifiers.has(snapshot.identifier)) {
+          continue;
+        }
+
+        const recoveredOrder = buildRecoveredOrderRecord({
+          exchangeAccountId,
+          executionMode,
+          snapshot,
+          recoveredAt: reconciledAt,
+        });
+
+        await this.dependencies.repositories.saveOrder(recoveredOrder);
+        await this.dependencies.repositories.appendOrderEvent({
+          id: createId("order_event"),
+          orderId: recoveredOrder.id,
+          eventType: "RECONCILIATION_HISTORY_RECOVERED",
+          eventSource: "RECONCILIATION",
+          payloadJson: JSON.stringify({
+            exchangeState: snapshot.state,
+            market: snapshot.market,
+            upbitUuid: snapshot.uuid,
+            identifier: snapshot.identifier,
+          }),
+          createdAt: reconciledAt,
+        });
+
+        knownUuids.add(snapshot.uuid);
+        knownIdentifiers.add(recoveredOrder.identifier);
+        recoveredOrderCount += 1;
+        issues.push({
+          code: "EXCHANGE_ORDER_RECOVERED",
+          message: `Recovered exchange order ${recoveredOrder.id} for ${snapshot.market} from exchange history state ${snapshot.state}.`,
+        });
+        issues.push(...await this.applyExchangeSnapshot(recoveredOrder, snapshot, reconciledAt));
+      }
+
+      return {
+        issues,
+        historyRecovery: exchangeHistory.historyRecovery
+          ? {
+              ...exchangeHistory.historyRecovery,
+              recoveredOrderCount,
+            }
+          : undefined,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown exchange history lookup failure.";
+      return {
+        issues: [
+          {
+            code: "ORDER_HISTORY_LOOKUP_FAILED",
+            message: `Exchange order history lookup failed. ${message}`,
+          },
+        ],
+        historyRecovery: undefined,
+      };
+    }
+  }
+
+  private async listExchangeHistorySnapshots(
+    exchangeAccountId: string,
+    reconciledAt: string,
+  ): Promise<ExchangeHistoryRecoveryResult> {
+    const orderHistoryReader = this.dependencies.orderHistoryReader;
+    if (!orderHistoryReader) {
+      return {
+        snapshots: [],
+        historyRecovery: null,
+      };
+    }
+
+    const historyMaxPagesPerMarket = Math.max(
+      1,
+      Math.trunc(this.dependencies.historyMaxPagesPerMarket ?? DEFAULT_HISTORY_MAX_PAGES_PER_MARKET),
+    );
+    const closedOrderLookbackDays = Math.max(
+      1,
+      Math.trunc(this.dependencies.closedOrderLookbackDays ?? DEFAULT_CLOSED_ORDER_LOOKBACK_DAYS),
+    );
+    const parsedReconciledAt = Date.parse(reconciledAt);
+    const closedOrderEndTimeMs = Number.isFinite(parsedReconciledAt) ? parsedReconciledAt : Date.now();
+    const closedOrderStartTimeMs =
+      closedOrderEndTimeMs - closedOrderLookbackDays * MILLISECONDS_PER_DAY;
+    const recentClosedWindowStartAt = new Date(closedOrderStartTimeMs).toISOString();
+    const recentClosedWindowEndAt = new Date(closedOrderEndTimeMs).toISOString();
+
+    const batches = await Promise.all(
+      MANAGED_MARKETS.map(async (market) => {
+        const checkpoint = await this.dependencies.repositories.getHistoryRecoveryCheckpoint(
+          exchangeAccountId,
+          market,
+          "CLOSED_ORDER_ARCHIVE",
+        );
+        const parsedCheckpointEndTimeMs = checkpoint ? Date.parse(checkpoint.nextWindowEndAt) : NaN;
+        const archivalWindowEndTimeMs =
+          Number.isFinite(parsedCheckpointEndTimeMs) ? parsedCheckpointEndTimeMs : closedOrderStartTimeMs;
+        const archivalWindowStartTimeMs = archivalWindowEndTimeMs - closedOrderLookbackDays * MILLISECONDS_PER_DAY;
+        const [openSnapshots, recentClosedSnapshots, archivalClosedSnapshots] = await Promise.all([
+          paginateExchangeOrderHistory({
+            maxPages: historyMaxPagesPerMarket,
+            fetchPage: (page) =>
+              orderHistoryReader.listOpenOrders({
+                market,
+                page,
+                limit: EXCHANGE_HISTORY_PAGE_LIMIT,
+                orderBy: "desc",
+              }),
+          }),
+          paginateExchangeOrderHistory({
+            maxPages: historyMaxPagesPerMarket,
+            fetchPage: (page) =>
+              orderHistoryReader.listClosedOrders({
+                market,
+                page,
+                limit: EXCHANGE_HISTORY_PAGE_LIMIT,
+                orderBy: "desc",
+                startTimeMs: closedOrderStartTimeMs,
+                endTimeMs: closedOrderEndTimeMs,
+              }),
+          }),
+          paginateExchangeOrderHistory({
+            maxPages: historyMaxPagesPerMarket,
+            fetchPage: (page) =>
+              orderHistoryReader.listClosedOrders({
+                market,
+                page,
+                limit: EXCHANGE_HISTORY_PAGE_LIMIT,
+                orderBy: "desc",
+                startTimeMs: archivalWindowStartTimeMs,
+                endTimeMs: archivalWindowEndTimeMs,
+              }),
+          }),
+        ]);
+        const nextWindowEndAt = new Date(archivalWindowStartTimeMs).toISOString();
+
+        await this.dependencies.repositories.saveHistoryRecoveryCheckpoint({
+          id: checkpoint?.id ?? createId("history_recovery_checkpoint"),
+          exchangeAccountId,
+          market,
+          checkpointType: "CLOSED_ORDER_ARCHIVE",
+          nextWindowEndAt,
+          updatedAt: reconciledAt,
+        });
+
+        const snapshots = [
+          ...openSnapshots.snapshots,
+          ...recentClosedSnapshots.snapshots,
+          ...archivalClosedSnapshots.snapshots,
+        ];
+
+        return {
+          market,
+          snapshots,
+          recentClosedWindowStartAt,
+          recentClosedWindowEndAt,
+          archivalWindowStartAt: new Date(archivalWindowStartTimeMs).toISOString(),
+          archivalWindowEndAt: new Date(archivalWindowEndTimeMs).toISOString(),
+          nextWindowEndAt,
+          openPagesScanned: openSnapshots.pagesScanned,
+          recentClosedPagesScanned: recentClosedSnapshots.pagesScanned,
+          archivalClosedPagesScanned: archivalClosedSnapshots.pagesScanned,
+          snapshotCount: snapshots.length,
+        };
+      }),
+    );
+
+    const deduped = new Map<string, ExchangeOrderSnapshot>();
+    for (const snapshot of batches.flatMap((batch) => batch.snapshots)) {
+      const key = snapshot.uuid || snapshot.identifier || JSON.stringify(snapshot.raw);
+      if (!deduped.has(key)) {
+        deduped.set(key, snapshot);
+      }
+    }
+
+    return {
+      snapshots: [...deduped.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
+      historyRecovery: {
+        closedOrderLookbackDays,
+        scannedSnapshotCount: deduped.size,
+        recoveredOrderCount: 0,
+        markets: batches.map((batch) => ({
+          market: batch.market,
+          recentClosedWindowStartAt: batch.recentClosedWindowStartAt,
+          recentClosedWindowEndAt: batch.recentClosedWindowEndAt,
+          archivalWindowStartAt: batch.archivalWindowStartAt,
+          archivalWindowEndAt: batch.archivalWindowEndAt,
+          nextWindowEndAt: batch.nextWindowEndAt,
+          openPagesScanned: batch.openPagesScanned,
+          recentClosedPagesScanned: batch.recentClosedPagesScanned,
+          archivalClosedPagesScanned: batch.archivalClosedPagesScanned,
+          snapshotCount: batch.snapshotCount,
+        })),
+      },
+    };
   }
 
   private async reconcileActiveOrder(
@@ -447,6 +703,68 @@ export class ReconciliationService {
       // Reporting is best-effort and must not change reconciliation outcomes.
     }
   }
+}
+
+async function paginateExchangeOrderHistory(input: {
+  maxPages: number;
+  fetchPage: (page: number) => Promise<ExchangeOrderSnapshot[]>;
+}): Promise<{ snapshots: ExchangeOrderSnapshot[]; pagesScanned: number }> {
+  const snapshots: ExchangeOrderSnapshot[] = [];
+  let pagesScanned = 0;
+
+  for (let page = 1; page <= input.maxPages; page += 1) {
+    const pageSnapshots = await input.fetchPage(page);
+    pagesScanned += 1;
+    if (pageSnapshots.length === 0) {
+      break;
+    }
+
+    snapshots.push(...pageSnapshots);
+    if (pageSnapshots.length < EXCHANGE_HISTORY_PAGE_LIMIT) {
+      break;
+    }
+  }
+
+  return {
+    snapshots,
+    pagesScanned,
+  };
+}
+
+function buildRecoveredOrderRecord(input: {
+  exchangeAccountId: string;
+  executionMode: ExecutionMode;
+  snapshot: ExchangeOrderSnapshot;
+  recoveredAt: string;
+}): OrderRecord {
+  const identifier = input.snapshot.identifier ?? `exchange_recovery:${input.snapshot.uuid}`;
+
+  return {
+    id: createId("order"),
+    strategyDecisionId: null,
+    exchangeAccountId: input.exchangeAccountId,
+    market: input.snapshot.market,
+    side: input.snapshot.side,
+    ordType: input.snapshot.ordType,
+    volume: input.snapshot.volume,
+    price: input.snapshot.price,
+    timeInForce: null,
+    smpType: null,
+    identifier,
+    idempotencyKey: createFingerprint(
+      `exchange_recovery:${input.exchangeAccountId}:${input.snapshot.uuid}:${identifier}`,
+    ),
+    origin: "RECOVERY",
+    requestedAt: input.snapshot.createdAt,
+    upbitUuid: input.snapshot.uuid,
+    status: mapExchangeOrderToLifecycleStatus(input.snapshot),
+    executionMode: input.executionMode,
+    exchangeResponseJson: JSON.stringify(input.snapshot.raw),
+    failureCode: null,
+    failureMessage: null,
+    createdAt: input.snapshot.createdAt,
+    updatedAt: input.recoveredAt,
+  };
 }
 
 function mapExchangeOrderToLifecycleStatus(snapshot: ExchangeOrderSnapshot): OrderRecord["status"] {

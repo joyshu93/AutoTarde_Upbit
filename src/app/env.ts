@@ -20,6 +20,8 @@ export interface AppConfig {
   telegramDeliveryMaxBackoffMs: number;
   telegramDeliveryLeaseMs: number;
   reconciliationMaxOrderLookupsPerRun: number;
+  reconciliationHistoryMaxPagesPerMarket: number;
+  reconciliationClosedOrderLookbackDays: number;
   stalePriceThresholdMs: number;
   minimumOrderValueKrw: number;
   maxAllocationByAsset: Record<SupportedAsset, number>;
@@ -34,6 +36,8 @@ const DEFAULT_TELEGRAM_DELIVERY_BASE_BACKOFF_MS = 15_000;
 const DEFAULT_TELEGRAM_DELIVERY_MAX_BACKOFF_MS = 300_000;
 const DEFAULT_TELEGRAM_DELIVERY_LEASE_MS = 30_000;
 const DEFAULT_RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN = 10;
+const DEFAULT_RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET = 3;
+const DEFAULT_RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS = 7;
 const DEFAULT_STALE_PRICE_THRESHOLD_MS = 30_000;
 const DEFAULT_MINIMUM_ORDER_VALUE_KRW = 5_000;
 const DEFAULT_TOTAL_EXPOSURE_CAP = 0.75;
@@ -75,6 +79,14 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     reconciliationMaxOrderLookupsPerRun: parseNumber(
       env.RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN,
       DEFAULT_RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN,
+    ),
+    reconciliationHistoryMaxPagesPerMarket: parseNumber(
+      env.RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET,
+      DEFAULT_RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET,
+    ),
+    reconciliationClosedOrderLookbackDays: parseNumber(
+      env.RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS,
+      DEFAULT_RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS,
     ),
     stalePriceThresholdMs: parseNumber(env.STALE_PRICE_THRESHOLD_MS, DEFAULT_STALE_PRICE_THRESHOLD_MS),
     minimumOrderValueKrw: parseNumber(env.MINIMUM_ORDER_VALUE_KRW, DEFAULT_MINIMUM_ORDER_VALUE_KRW),

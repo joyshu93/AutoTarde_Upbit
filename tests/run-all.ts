@@ -8,6 +8,7 @@ await import("./reconciliation-service.test.js");
 await import("./startup-recovery.test.js");
 await import("./sync-controller.test.js");
 await import("./upbit-public-client.test.js");
+await import("./upbit-private-client.test.js");
 await import("./execution-service.test.js");
 await import("./telegram-delivery.test.js");
 await import("./telegram-operator-contracts.test.js");

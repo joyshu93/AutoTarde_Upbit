@@ -120,7 +120,7 @@ export function formatReconciliationRunsMessage(
     "state_source: persisted reconciliation_runs",
     ...sortedRuns.map((run) => {
       const summaryMeta = tryParseReconciliationSummaryMeta(run.summaryJson);
-      return `- ${run.startedAt} | ${run.status} | source=${summaryMeta.source ?? "unknown"} | issues=${summaryMeta.issueCount ?? "unknown"} | codes=${summaryMeta.issueCodes.length === 0 ? "none" : summaryMeta.issueCodes.join(",")} | processed=${summaryMeta.processedCount ?? "unknown"} | deferred=${summaryMeta.deferredCount ?? "unknown"} | completed_at=${run.completedAt ?? "none"} | error=${run.errorMessage ?? "none"}`;
+      return `- ${run.startedAt} | ${run.status} | source=${summaryMeta.source ?? "unknown"} | issues=${summaryMeta.issueCount ?? "unknown"} | codes=${summaryMeta.issueCodes.length === 0 ? "none" : summaryMeta.issueCodes.join(",")} | processed=${summaryMeta.processedCount ?? "unknown"} | deferred=${summaryMeta.deferredCount ?? "unknown"} | history=${formatHistoryRecoveryInline(summaryMeta.historyRecovery)} | completed_at=${run.completedAt ?? "none"} | error=${run.errorMessage ?? "none"}`;
     }),
   ].join("\n");
 }
@@ -129,6 +129,8 @@ export function formatOperatorNotificationsMessage(
   notifications: OperatorNotificationRecord[],
   attempts: OperatorNotificationDeliveryAttemptRecord[] = [],
 ): string {
+  const metrics = summarizeNotificationDeliveryMetrics(notifications, attempts);
+
   if (notifications.length === 0) {
     return [
       "Operator Alerts",
@@ -136,6 +138,10 @@ export function formatOperatorNotificationsMessage(
       "state_source: persisted operator_notifications",
       "attempt_source: persisted operator_notification_delivery_attempts",
       "note: No operator notifications are stored yet.",
+      `pending_due_count: ${metrics.pendingDueCount}`,
+      `pending_scheduled_count: ${metrics.pendingScheduledCount}`,
+      `active_lease_count: ${metrics.activeLeaseCount}`,
+      `recent_stale_lease_count: ${metrics.recentStaleLeaseCount}`,
       `delivery_attempt_count: ${attempts.length}`,
       ...formatOperatorNotificationAttemptLines(attempts),
     ].join("\n");
@@ -148,6 +154,10 @@ export function formatOperatorNotificationsMessage(
     `count: ${sortedNotifications.length}`,
     "state_source: persisted operator_notifications",
     "attempt_source: persisted operator_notification_delivery_attempts",
+    `pending_due_count: ${metrics.pendingDueCount}`,
+    `pending_scheduled_count: ${metrics.pendingScheduledCount}`,
+    `active_lease_count: ${metrics.activeLeaseCount}`,
+    `recent_stale_lease_count: ${metrics.recentStaleLeaseCount}`,
     ...sortedNotifications.map(
       (notification) =>
         `- ${notification.createdAt} | ${notification.severity} | ${notification.notificationType} | ${notification.deliveryStatus} | attempts=${notification.attemptCount} | last_attempt_at=${notification.lastAttemptAt ?? "none"} | next_attempt_at=${notification.nextAttemptAt ?? "none"} | failure_class=${notification.failureClass ?? "none"} | delivered_at=${notification.deliveredAt ?? "none"} | error=${notification.lastError ?? "none"} | ${notification.title} | ${notification.message}`,
@@ -308,6 +318,52 @@ function formatOperatorNotificationAttemptLines(
   ];
 }
 
+function summarizeNotificationDeliveryMetrics(
+  notifications: OperatorNotificationRecord[],
+  attempts: OperatorNotificationDeliveryAttemptRecord[],
+): {
+  pendingDueCount: number;
+  pendingScheduledCount: number;
+  activeLeaseCount: number;
+  recentStaleLeaseCount: number;
+} {
+  let pendingDueCount = 0;
+  let pendingScheduledCount = 0;
+  let activeLeaseCount = 0;
+
+  for (const notification of notifications) {
+    if (notification.deliveryStatus !== "PENDING") {
+      continue;
+    }
+
+    const leaseActive =
+      notification.leaseToken !== null &&
+      notification.leaseExpiresAt !== null &&
+      notification.lastAttemptAt !== null;
+
+    if (leaseActive) {
+      activeLeaseCount += 1;
+      continue;
+    }
+
+    if (notification.nextAttemptAt === null) {
+      pendingDueCount += 1;
+      continue;
+    }
+
+    pendingScheduledCount += 1;
+  }
+
+  const recentStaleLeaseCount = attempts.filter((attempt) => attempt.outcome === "STALE_LEASE").length;
+
+  return {
+    pendingDueCount,
+    pendingScheduledCount,
+    activeLeaseCount,
+    recentStaleLeaseCount,
+  };
+}
+
 function tryParseJson<T>(rawJson: string): T | null {
   try {
     return JSON.parse(rawJson) as T;
@@ -331,13 +387,51 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
   issueCodes: string[];
   processedCount: number | null;
   deferredCount: number | null;
+  historyRecovery:
+    | {
+        closedOrderLookbackDays: number | null;
+        scannedSnapshotCount: number | null;
+        recoveredOrderCount: number | null;
+        markets: Array<{
+          market: string;
+          archivalWindowStartAt: string | null;
+          archivalWindowEndAt: string | null;
+          nextWindowEndAt: string | null;
+          openPagesScanned: number | null;
+          recentClosedPagesScanned: number | null;
+          archivalClosedPagesScanned: number | null;
+          snapshotCount: number | null;
+        }>;
+      }
+    | null;
 } {
+  type ParsedHistoryRecoveryMarketMeta = {
+    market: string;
+    archivalWindowStartAt: string | null;
+    archivalWindowEndAt: string | null;
+    nextWindowEndAt: string | null;
+    openPagesScanned: number | null;
+    recentClosedPagesScanned: number | null;
+    archivalClosedPagesScanned: number | null;
+    snapshotCount: number | null;
+  };
+
   const parsed = tryParseJson<{
     source?: unknown;
     issues?: unknown;
     processedCount?: unknown;
     deferredCount?: unknown;
+    historyRecovery?: unknown;
   }>(rawJson);
+  const historyRecoveryRaw =
+    parsed && parsed.historyRecovery && typeof parsed.historyRecovery === "object"
+      ? parsed.historyRecovery as {
+          closedOrderLookbackDays?: unknown;
+          scannedSnapshotCount?: unknown;
+          recoveredOrderCount?: unknown;
+          markets?: unknown;
+        }
+      : null;
 
   return {
     source: parsed && typeof parsed.source === "string" ? parsed.source : null,
@@ -356,6 +450,67 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
       parsed && typeof parsed.processedCount === "number" ? parsed.processedCount : null,
     deferredCount:
       parsed && typeof parsed.deferredCount === "number" ? parsed.deferredCount : null,
+    historyRecovery: historyRecoveryRaw
+      ? {
+          closedOrderLookbackDays:
+            typeof historyRecoveryRaw.closedOrderLookbackDays === "number"
+              ? historyRecoveryRaw.closedOrderLookbackDays
+              : null,
+          scannedSnapshotCount:
+            typeof historyRecoveryRaw.scannedSnapshotCount === "number"
+              ? historyRecoveryRaw.scannedSnapshotCount
+              : null,
+          recoveredOrderCount:
+            typeof historyRecoveryRaw.recoveredOrderCount === "number"
+              ? historyRecoveryRaw.recoveredOrderCount
+              : null,
+          markets:
+            Array.isArray(historyRecoveryRaw.markets)
+              ? historyRecoveryRaw.markets
+                  .map((market): ParsedHistoryRecoveryMarketMeta | null => {
+                    if (!market || typeof market !== "object") {
+                      return null;
+                    }
+
+                    return {
+                      market:
+                        "market" in market && typeof market.market === "string"
+                          ? market.market
+                          : "unknown",
+                      archivalWindowStartAt:
+                        "archivalWindowStartAt" in market && typeof market.archivalWindowStartAt === "string"
+                          ? market.archivalWindowStartAt
+                          : null,
+                      archivalWindowEndAt:
+                        "archivalWindowEndAt" in market && typeof market.archivalWindowEndAt === "string"
+                          ? market.archivalWindowEndAt
+                          : null,
+                      nextWindowEndAt:
+                        "nextWindowEndAt" in market && typeof market.nextWindowEndAt === "string"
+                          ? market.nextWindowEndAt
+                          : null,
+                      openPagesScanned:
+                        "openPagesScanned" in market && typeof market.openPagesScanned === "number"
+                          ? market.openPagesScanned
+                          : null,
+                      recentClosedPagesScanned:
+                        "recentClosedPagesScanned" in market && typeof market.recentClosedPagesScanned === "number"
+                          ? market.recentClosedPagesScanned
+                          : null,
+                      archivalClosedPagesScanned:
+                        "archivalClosedPagesScanned" in market && typeof market.archivalClosedPagesScanned === "number"
+                          ? market.archivalClosedPagesScanned
+                          : null,
+                      snapshotCount:
+                        "snapshotCount" in market && typeof market.snapshotCount === "number"
+                          ? market.snapshotCount
+                          : null,
+                    };
+                  })
+                  .filter((market): market is ParsedHistoryRecoveryMarketMeta => market !== null)
+              : [],
+        }
+      : null,
   };
 }
 
@@ -384,6 +539,9 @@ function formatLatestReconciliationLines(
       "recent_sync_status: none",
       "recent_sync_issues: none",
       "recent_sync_issue_codes: none",
+      "recent_sync_history_recovered_orders: none",
+      "recent_sync_history_scanned_snapshots: none",
+      "recent_sync_history_archive_progress: none",
       "recent_sync_completed_at: none",
       "recent_sync_error: none",
     ];
@@ -395,9 +553,48 @@ function formatLatestReconciliationLines(
     `recent_sync_status: ${run.status}`,
     `recent_sync_issues: ${meta.issueCount ?? "unknown"}`,
     `recent_sync_issue_codes: ${meta.issueCodes.length === 0 ? "none" : meta.issueCodes.join(",")}`,
+    `recent_sync_history_recovered_orders: ${meta.historyRecovery?.recoveredOrderCount ?? "none"}`,
+    `recent_sync_history_scanned_snapshots: ${meta.historyRecovery?.scannedSnapshotCount ?? "none"}`,
+    `recent_sync_history_archive_progress: ${formatHistoryRecoveryInline(meta.historyRecovery)}`,
     `recent_sync_completed_at: ${run.completedAt ?? "none"}`,
     `recent_sync_error: ${run.errorMessage ?? "none"}`,
   ];
+}
+
+function formatHistoryRecoveryInline(
+  historyRecovery:
+    | {
+        closedOrderLookbackDays: number | null;
+        scannedSnapshotCount: number | null;
+        recoveredOrderCount: number | null;
+        markets: Array<{
+          market: string;
+          archivalWindowStartAt: string | null;
+          archivalWindowEndAt: string | null;
+          nextWindowEndAt: string | null;
+          openPagesScanned: number | null;
+          recentClosedPagesScanned: number | null;
+          archivalClosedPagesScanned: number | null;
+          snapshotCount: number | null;
+        }>;
+      }
+    | null,
+): string {
+  if (!historyRecovery) {
+    return "none";
+  }
+
+  const marketSummaries = historyRecovery.markets.map(
+    (market) =>
+      `${market.market}[archive=${market.archivalWindowStartAt ?? "unknown"}..${market.archivalWindowEndAt ?? "unknown"} next<=${market.nextWindowEndAt ?? "unknown"} pages=${market.openPagesScanned ?? "?"}/${market.recentClosedPagesScanned ?? "?"}/${market.archivalClosedPagesScanned ?? "?"} snapshots=${market.snapshotCount ?? "?"}]`,
+  );
+
+  return [
+    `lookback_days=${historyRecovery.closedOrderLookbackDays ?? "unknown"}`,
+    `scanned=${historyRecovery.scannedSnapshotCount ?? "unknown"}`,
+    `recovered=${historyRecovery.recoveredOrderCount ?? "unknown"}`,
+    `markets=${marketSummaries.length === 0 ? "none" : marketSummaries.join(";")}`,
+  ].join(" ");
 }
 
 function describeLiveOrderBlockers(

@@ -92,7 +92,9 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
     operatorState,
     reporter,
     maxOrderLookupsPerRun: config.reconciliationMaxOrderLookupsPerRun,
-    ...(exchangeBackedReadEnabled ? { orderReader: liveExchangeClient } : {}),
+    historyMaxPagesPerMarket: config.reconciliationHistoryMaxPagesPerMarket,
+    closedOrderLookbackDays: config.reconciliationClosedOrderLookbackDays,
+    ...(exchangeBackedReadEnabled ? { orderReader: liveExchangeClient, orderHistoryReader: liveExchangeClient } : {}),
   };
   const reconciliationService = new ReconciliationService(reconciliationDependencies);
   const portfolioSyncService = new PortfolioSyncService({

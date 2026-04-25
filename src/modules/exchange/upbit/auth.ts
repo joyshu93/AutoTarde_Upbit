@@ -32,11 +32,20 @@ export function buildUpbitJwtToken(credentials: UpbitCredentials, queryString?: 
 }
 
 export function buildUpbitQueryString(
-  params: Record<string, string | number | boolean | null | undefined>,
+  params: Record<string, string | number | boolean | Array<string | number | boolean> | null | undefined>,
 ): string {
   return Object.entries(params)
-    .filter(([, value]) => value !== null && typeof value !== "undefined")
-    .map(([key, value]) => `${key}=${String(value)}`)
+    .flatMap(([key, value]) => {
+      if (value === null || typeof value === "undefined") {
+        return [];
+      }
+
+      if (Array.isArray(value)) {
+        return value.map((entry) => `${key}=${String(entry)}`);
+      }
+
+      return [`${key}=${String(value)}`];
+    })
     .join("&");
 }
 

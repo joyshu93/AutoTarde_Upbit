@@ -63,6 +63,8 @@ function applyMigrations(db: DatabaseSync, migrationsDir: string): void {
         repairMigration0007(db);
       } else if (filename === "0008_add_operator_notification_delivery_attempt_history.sql") {
         repairMigration0008(db);
+      } else if (filename === "0009_add_history_recovery_checkpoints.sql") {
+        repairMigration0009(db);
       } else {
         throw error;
       }
@@ -124,6 +126,25 @@ function repairMigration0008(db: DatabaseSync): void {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_operator_notification_delivery_attempts_notification_id
       ON operator_notification_delivery_attempts(notification_id, attempt_count DESC);
+  `);
+}
+
+function repairMigration0009(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS history_recovery_checkpoints (
+      id TEXT PRIMARY KEY,
+      exchange_account_id TEXT NOT NULL,
+      market TEXT NOT NULL CHECK (market IN ('KRW-BTC', 'KRW-ETH')),
+      checkpoint_type TEXT NOT NULL CHECK (checkpoint_type IN ('CLOSED_ORDER_ARCHIVE')),
+      next_window_end_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE,
+      UNIQUE (exchange_account_id, market, checkpoint_type)
+    );
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_history_recovery_checkpoints_exchange_account_id
+      ON history_recovery_checkpoints(exchange_account_id, checkpoint_type, market);
   `);
 }
 

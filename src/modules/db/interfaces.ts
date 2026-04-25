@@ -2,6 +2,8 @@ import type {
   BalanceSnapshotRecord,
   ClaimedOperatorNotificationRecord,
   ExecutionMode,
+  HistoryRecoveryCheckpointRecord,
+  HistoryRecoveryCheckpointType,
   OperatorNotificationDeliveryAttemptRecord,
   OperatorNotificationDeliveryTransition,
   OperatorNotificationRecord,
@@ -40,6 +42,12 @@ export interface ExecutionRepository {
   saveReconciliationRun(record: ReconciliationRunRecord): Promise<void>;
   updateReconciliationRun(record: ReconciliationRunRecord): Promise<void>;
   listReconciliationRuns(exchangeAccountId: string, limit?: number): Promise<ReconciliationRunRecord[]>;
+  saveHistoryRecoveryCheckpoint(record: HistoryRecoveryCheckpointRecord): Promise<void>;
+  getHistoryRecoveryCheckpoint(
+    exchangeAccountId: string,
+    market: SupportedMarket,
+    checkpointType: HistoryRecoveryCheckpointType,
+  ): Promise<HistoryRecoveryCheckpointRecord | null>;
   saveOperatorNotification(record: OperatorNotificationRecord): Promise<void>;
   saveOperatorNotificationDeliveryAttempt(record: OperatorNotificationDeliveryAttemptRecord): Promise<void>;
   claimPendingOperatorNotifications(

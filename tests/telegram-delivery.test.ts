@@ -83,6 +83,10 @@ test("delivery service marks pending notifications as sent after successful Tele
     sent: 2,
     retryScheduled: 0,
     failed: 0,
+    staleLease: 0,
+    pendingDue: 0,
+    pendingScheduled: 0,
+    activeLease: 0,
     skippedReason: null,
   });
   assert.equal(sentMessages.length, 2);
@@ -140,6 +144,10 @@ test("delivery service reschedules retryable Telegram delivery errors with expon
     sent: 0,
     retryScheduled: 1,
     failed: 0,
+    staleLease: 0,
+    pendingDue: 0,
+    pendingScheduled: 1,
+    activeLease: 0,
     skippedReason: null,
   });
   assert.equal(notifications[0]?.deliveryStatus, "PENDING");
@@ -188,6 +196,10 @@ test("delivery service marks permanent Telegram delivery errors as failed", asyn
     sent: 0,
     retryScheduled: 0,
     failed: 1,
+    staleLease: 0,
+    pendingDue: 0,
+    pendingScheduled: 0,
+    activeLease: 0,
     skippedReason: null,
   });
   assert.equal(notifications[0]?.deliveryStatus, "FAILED");
@@ -256,6 +268,10 @@ test("delivery service honors Telegram retry_after when rate limited", async () 
     sent: 0,
     retryScheduled: 1,
     failed: 0,
+    staleLease: 0,
+    pendingDue: 0,
+    pendingScheduled: 1,
+    activeLease: 0,
     skippedReason: null,
   });
   assert.equal(notifications[0]?.nextAttemptAt, "2026-04-20T00:24:25.000Z");
@@ -289,6 +305,10 @@ test("delivery service leaves notifications pending when Telegram delivery is no
     sent: 0,
     retryScheduled: 0,
     failed: 0,
+    staleLease: 0,
+    pendingDue: 0,
+    pendingScheduled: 0,
+    activeLease: 0,
     skippedReason: "telegram_delivery_not_configured",
   });
   assert.equal(notifications[0]?.deliveryStatus, "PENDING");
@@ -366,6 +386,8 @@ test("delivery service records stale lease outcomes in delivery attempt history"
     repositories: {
       claimPendingOperatorNotifications:
         baseRepository.claimPendingOperatorNotifications.bind(baseRepository),
+      listOperatorNotifications:
+        baseRepository.listOperatorNotifications.bind(baseRepository),
       listPendingOperatorNotifications:
         baseRepository.listPendingOperatorNotifications.bind(baseRepository),
       saveOperatorNotificationDeliveryAttempt:
@@ -390,6 +412,10 @@ test("delivery service records stale lease outcomes in delivery attempt history"
     sent: 0,
     retryScheduled: 0,
     failed: 0,
+    staleLease: 1,
+    pendingDue: 0,
+    pendingScheduled: 0,
+    activeLease: 1,
     skippedReason: null,
   });
   assert.equal(notifications[0]?.deliveryStatus, "PENDING");

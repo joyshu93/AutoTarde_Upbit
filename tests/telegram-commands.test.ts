@@ -60,6 +60,9 @@ test("telegram router exposes persisted execution status with explicit blockers"
   assert.match(status.text, /recent_sync_status: none/);
   assert.match(status.text, /recent_sync_issues: none/);
   assert.match(status.text, /recent_sync_issue_codes: none/);
+  assert.match(status.text, /recent_sync_history_recovered_orders: none/);
+  assert.match(status.text, /recent_sync_history_scanned_snapshots: none/);
+  assert.match(status.text, /recent_sync_history_archive_progress: none/);
   assert.match(status.text, /recent_transitions: 1/);
   assert.match(status.text, /\| BOOTSTRAP \| none -> RUNNING \| mode none -> DRY_RUN \| gate none -> DISABLED \|/);
 });
@@ -83,6 +86,25 @@ test("telegram router includes recent reconciliation summary in /status when ava
       ],
       processedCount: 1,
       deferredCount: 0,
+      historyRecovery: {
+        closedOrderLookbackDays: 7,
+        scannedSnapshotCount: 3,
+        recoveredOrderCount: 1,
+        markets: [
+          {
+            market: "KRW-BTC",
+            recentClosedWindowStartAt: "2026-04-13T00:30:00.000Z",
+            recentClosedWindowEndAt: "2026-04-20T00:30:00.000Z",
+            archivalWindowStartAt: "2026-04-06T00:30:00.000Z",
+            archivalWindowEndAt: "2026-04-13T00:30:00.000Z",
+            nextWindowEndAt: "2026-04-06T00:30:00.000Z",
+            openPagesScanned: 1,
+            recentClosedPagesScanned: 1,
+            archivalClosedPagesScanned: 1,
+            snapshotCount: 3,
+          },
+        ],
+      },
     }),
     errorMessage: null,
   });
@@ -109,6 +131,9 @@ test("telegram router includes recent reconciliation summary in /status when ava
   assert.match(status.text, /recent_sync_status: DRIFT_DETECTED/);
   assert.match(status.text, /recent_sync_issues: 1/);
   assert.match(status.text, /recent_sync_issue_codes: ORDER_FILLS_BACKFILLED/);
+  assert.match(status.text, /recent_sync_history_recovered_orders: 1/);
+  assert.match(status.text, /recent_sync_history_scanned_snapshots: 3/);
+  assert.match(status.text, /recent_sync_history_archive_progress: lookback_days=7 scanned=3 recovered=1 markets=KRW-BTC\[archive=2026-04-06T00:30:00.000Z\.\.2026-04-13T00:30:00.000Z next<=2026-04-06T00:30:00.000Z pages=1\/1\/1 snapshots=3\]/);
   assert.match(status.text, /recent_sync_completed_at: 2026-04-20T00:30:04.000Z/);
   assert.match(status.text, /recent_sync_error: none/);
 });
@@ -144,6 +169,25 @@ test("telegram router exposes dedicated reconciliation history inspection", asyn
       ],
       processedCount: 1,
       deferredCount: 0,
+      historyRecovery: {
+        closedOrderLookbackDays: 7,
+        scannedSnapshotCount: 3,
+        recoveredOrderCount: 1,
+        markets: [
+          {
+            market: "KRW-BTC",
+            recentClosedWindowStartAt: "2026-04-13T00:20:00.000Z",
+            recentClosedWindowEndAt: "2026-04-20T00:20:00.000Z",
+            archivalWindowStartAt: "2026-04-06T00:20:00.000Z",
+            archivalWindowEndAt: "2026-04-13T00:20:00.000Z",
+            nextWindowEndAt: "2026-04-06T00:20:00.000Z",
+            openPagesScanned: 1,
+            recentClosedPagesScanned: 1,
+            archivalClosedPagesScanned: 1,
+            snapshotCount: 3,
+          },
+        ],
+      },
     }),
     errorMessage: null,
   });
@@ -169,7 +213,7 @@ test("telegram router exposes dedicated reconciliation history inspection", asyn
   assert.match(history.text, /Reconciliation History/);
   assert.match(history.text, /count: 1/);
   assert.match(history.text, /state_source: persisted reconciliation_runs/);
-  assert.match(history.text, /\| DRIFT_DETECTED \| source=OPERATOR_SYNC \| issues=1 \| codes=ORDER_FILLS_BACKFILLED \| processed=1 \| deferred=0 \| completed_at=2026-04-20T00:20:05.000Z \| error=none/);
+  assert.match(history.text, /\| DRIFT_DETECTED \| source=OPERATOR_SYNC \| issues=1 \| codes=ORDER_FILLS_BACKFILLED \| processed=1 \| deferred=0 \| history=lookback_days=7 scanned=3 recovered=1 markets=KRW-BTC\[archive=2026-04-06T00:20:00.000Z\.\.2026-04-13T00:20:00.000Z next<=2026-04-06T00:20:00.000Z pages=1\/1\/1 snapshots=3\] \| completed_at=2026-04-20T00:20:05.000Z \| error=none/);
 });
 
 test("telegram router exposes durable operator alerts inspection", async () => {
@@ -218,6 +262,10 @@ test("telegram router exposes durable operator alerts inspection", async () => {
   assert.match(alerts.text, /count: 1/);
   assert.match(alerts.text, /state_source: persisted operator_notifications/);
   assert.match(alerts.text, /attempt_source: persisted operator_notification_delivery_attempts/);
+  assert.match(alerts.text, /pending_due_count: 1/);
+  assert.match(alerts.text, /pending_scheduled_count: 0/);
+  assert.match(alerts.text, /active_lease_count: 0/);
+  assert.match(alerts.text, /recent_stale_lease_count: 0/);
   assert.match(alerts.text, /\| WARN \| ORDER_REJECTED \| PENDING \| attempts=0 \| last_attempt_at=none \| next_attempt_at=none \| failure_class=none \| delivered_at=none \| error=none \| Order rejected before submission \| Exchange order chance does not allow price orders/);
   assert.match(alerts.text, /delivery_attempt_count: 1/);
   assert.match(alerts.text, /\| notification_id=operator-notification-1 \| attempt=1 \| outcome=RETRY_SCHEDULED \| failure_class=RETRYABLE \| next_attempt_at=2026-04-20T00:22:05.000Z \| delivered_at=none \| error=telegram_http_500/);

@@ -19,6 +19,10 @@ async function main(): Promise<void> {
         sent: number;
         retryScheduled: number;
         failed: number;
+        staleLease: number;
+        pendingDue: number;
+        pendingScheduled: number;
+        activeLease: number;
         skippedReason: string | null;
       }
     | {
@@ -26,6 +30,10 @@ async function main(): Promise<void> {
         sent: 0;
         retryScheduled: 0;
         failed: 0;
+        staleLease: 0;
+        pendingDue: 0;
+        pendingScheduled: 0;
+        activeLease: 0;
         skippedReason: string;
       };
 
@@ -37,6 +45,10 @@ async function main(): Promise<void> {
       sent: 0,
       retryScheduled: 0,
       failed: 0,
+      staleLease: 0,
+      pendingDue: 0,
+      pendingScheduled: 0,
+      activeLease: 0,
       skippedReason: error instanceof Error ? error.message : String(error),
     };
   }
@@ -61,6 +73,8 @@ async function main(): Promise<void> {
     databasePath: app.config.databasePath,
     recoveryReader: app.exchangeBackedReadEnabled ? "UPBIT_PRIVATE_READER" : "DISABLED",
     reconciliationMaxOrderLookupsPerRun: app.config.reconciliationMaxOrderLookupsPerRun,
+    reconciliationHistoryMaxPagesPerMarket: app.config.reconciliationHistoryMaxPagesPerMarket,
+    reconciliationClosedOrderLookbackDays: app.config.reconciliationClosedOrderLookbackDays,
     startupRecovery,
     startupRecoveryPolicy,
     telegramDeliveryEnabled: app.config.telegramDeliveryEnabled,

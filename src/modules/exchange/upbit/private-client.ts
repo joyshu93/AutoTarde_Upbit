@@ -2,6 +2,7 @@ import type { ExchangeBalance, SupportedMarket } from "../../../domain/types.js"
 import type {
   CancelOrderResult,
   ExchangeAdapter,
+  ExchangeOrderHistoryQuery,
   ExchangeOrderSnapshot,
   OrderValidationResult,
   UpbitOrderChance,
@@ -166,11 +167,31 @@ export class UpbitPrivateClient implements ExchangeAdapter {
     return mapOrderResponse(response);
   }
 
+  async listOpenOrders(query: ExchangeOrderHistoryQuery = {}): Promise<ExchangeOrderSnapshot[]> {
+    const response = await this.requestJson<UpbitOrderResponse[]>({
+      method: "GET",
+      path: "/v1/orders/open",
+      query: buildHistoryQuery(query, ["wait", "watch"]),
+    });
+
+    return response.map(mapOrderResponse);
+  }
+
+  async listClosedOrders(query: ExchangeOrderHistoryQuery = {}): Promise<ExchangeOrderSnapshot[]> {
+    const response = await this.requestJson<UpbitOrderResponse[]>({
+      method: "GET",
+      path: "/v1/orders/closed",
+      query: buildHistoryQuery(query, ["done", "cancel"]),
+    });
+
+    return response.map(mapOrderResponse);
+  }
+
   private async requestJson<T>(options: {
     method: "GET" | "POST" | "DELETE";
     path: string;
-    query?: Record<string, string | number | boolean | null | undefined>;
-    body?: Record<string, string | number | boolean | null | undefined>;
+    query?: Record<string, string | number | boolean | Array<string | number | boolean> | null | undefined>;
+    body?: Record<string, string | number | boolean | Array<string | number | boolean> | null | undefined>;
   }): Promise<T> {
     const queryString = options.query ? buildUpbitQueryString(options.query) : "";
     const bodyQueryString = options.body ? buildUpbitQueryString(options.body) : "";
@@ -197,6 +218,21 @@ export class UpbitPrivateClient implements ExchangeAdapter {
 
     return (await response.json()) as T;
   }
+}
+
+function buildHistoryQuery(
+  query: ExchangeOrderHistoryQuery,
+  defaultStates: string[],
+): Record<string, string | number | boolean | Array<string | number | boolean>> {
+  return {
+    ...(query.market ? { market: query.market } : {}),
+    "states[]": query.states && query.states.length > 0 ? query.states : defaultStates,
+    ...(typeof query.startTimeMs === "number" ? { start_time: Math.trunc(query.startTimeMs) } : {}),
+    ...(typeof query.endTimeMs === "number" ? { end_time: Math.trunc(query.endTimeMs) } : {}),
+    page: query.page ?? 1,
+    limit: query.limit ?? 20,
+    order_by: query.orderBy ?? "desc",
+  };
 }
 
 function mapOrderRequest(request: UpbitOrderRequest): Record<string, string> {

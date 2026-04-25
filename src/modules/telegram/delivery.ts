@@ -28,6 +28,10 @@ export interface OperatorNotificationDeliverySummary {
   sent: number;
   retryScheduled: number;
   failed: number;
+  staleLease: number;
+  pendingDue: number;
+  pendingScheduled: number;
+  activeLease: number;
   skippedReason: string | null;
 }
 
@@ -102,6 +106,7 @@ export class OperatorNotificationDeliveryService {
         ExecutionRepository,
         | "claimPendingOperatorNotifications"
         | "compareAndSetOperatorNotificationDeliveryStatus"
+        | "listOperatorNotifications"
         | "listPendingOperatorNotifications"
         | "saveOperatorNotificationDeliveryAttempt"
       >;
@@ -154,6 +159,10 @@ export class OperatorNotificationDeliveryService {
         sent: 0,
         retryScheduled: 0,
         failed: 0,
+        staleLease: 0,
+        pendingDue: 0,
+        pendingScheduled: 0,
+        activeLease: 0,
         skippedReason: "telegram_delivery_not_configured",
       };
     }
@@ -173,6 +182,7 @@ export class OperatorNotificationDeliveryService {
     let sent = 0;
     let retryScheduled = 0;
     let failed = 0;
+    let staleLease = 0;
 
     for (const notification of claimedNotifications) {
       const delivered = await this.deliverRecord(notification);
@@ -186,16 +196,34 @@ export class OperatorNotificationDeliveryService {
         continue;
       }
 
+      if (
+        delivered.id === notification.id &&
+        delivered.leaseToken === notification.leaseToken &&
+        delivered.deliveryStatus === "PENDING" &&
+        delivered.nextAttemptAt === notification.nextAttemptAt &&
+        delivered.lastError === notification.lastError &&
+        delivered.deliveredAt === notification.deliveredAt
+      ) {
+        staleLease += 1;
+        continue;
+      }
+
       if (delivered.deliveryStatus === "PENDING" && delivered.nextAttemptAt !== null) {
         retryScheduled += 1;
       }
     }
+
+    const queueState = await this.summarizeQueueState(exchangeAccountId, claimedAt);
 
     return {
       attempted: claimedNotifications.length,
       sent,
       retryScheduled,
       failed,
+      staleLease,
+      pendingDue: queueState.pendingDue,
+      pendingScheduled: queueState.pendingScheduled,
+      activeLease: queueState.activeLease,
       skippedReason: null,
     };
   }
@@ -401,6 +429,50 @@ export class OperatorNotificationDeliveryService {
     };
 
     await this.dependencies.repositories.saveOperatorNotificationDeliveryAttempt(record);
+  }
+
+  private async summarizeQueueState(
+    exchangeAccountId: string,
+    now: string,
+  ): Promise<{
+    pendingDue: number;
+    pendingScheduled: number;
+    activeLease: number;
+  }> {
+    const notifications = await this.dependencies.repositories.listOperatorNotifications(exchangeAccountId, 100);
+
+    let pendingDue = 0;
+    let pendingScheduled = 0;
+    let activeLease = 0;
+
+    for (const notification of notifications) {
+      if (notification.deliveryStatus !== "PENDING") {
+        continue;
+      }
+
+      const leaseActive =
+        notification.leaseToken !== null &&
+        notification.leaseExpiresAt !== null &&
+        notification.leaseExpiresAt.localeCompare(now) > 0;
+
+      if (leaseActive) {
+        activeLease += 1;
+        continue;
+      }
+
+      if (notification.nextAttemptAt === null || notification.nextAttemptAt.localeCompare(now) <= 0) {
+        pendingDue += 1;
+        continue;
+      }
+
+      pendingScheduled += 1;
+    }
+
+    return {
+      pendingDue,
+      pendingScheduled,
+      activeLease,
+    };
   }
 }
 

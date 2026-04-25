@@ -246,6 +246,26 @@ export interface UpbitGetOrderRequest {
   readonly target: UpbitOrderReference;
 }
 
+export interface UpbitListOpenOrdersRequest {
+  readonly permission: typeof UPBIT_EXCHANGE_PERMISSION_GROUPS.VIEW_ORDERS;
+  readonly market?: UpbitSpotMarket;
+  readonly states?: readonly Extract<UpbitOrderState, "wait" | "watch">[];
+  readonly page?: number;
+  readonly limit?: number;
+  readonly order_by?: "asc" | "desc";
+}
+
+export interface UpbitListClosedOrdersRequest {
+  readonly permission: typeof UPBIT_EXCHANGE_PERMISSION_GROUPS.VIEW_ORDERS;
+  readonly market?: UpbitSpotMarket;
+  readonly states?: readonly Extract<UpbitOrderState, "done" | "cancel">[];
+  readonly start_time?: number;
+  readonly end_time?: number;
+  readonly page?: number;
+  readonly limit?: number;
+  readonly order_by?: "asc" | "desc";
+}
+
 export interface UpbitPrivateExchangeClient {
   getBalances(request: UpbitGetBalancesRequest): Promise<readonly UpbitBalance[]>;
   getOrderChance(request: UpbitGetOrderChanceRequest): Promise<UpbitOrderChance>;
@@ -253,6 +273,8 @@ export interface UpbitPrivateExchangeClient {
   createOrder(request: UpbitCreateOrderRequest): Promise<UpbitCreatedOrderReceipt>;
   cancelOrder(request: UpbitCancelOrderRequest): Promise<UpbitOrderSnapshot>;
   getOrder(request: UpbitGetOrderRequest): Promise<UpbitOrderSnapshot>;
+  listOpenOrders(request: UpbitListOpenOrdersRequest): Promise<readonly UpbitOrderSnapshot[]>;
+  listClosedOrders(request: UpbitListClosedOrdersRequest): Promise<readonly UpbitOrderSnapshot[]>;
 }
 
 export interface UpbitPublicQuotationClient {

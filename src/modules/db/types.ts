@@ -159,6 +159,15 @@ export interface SqliteReconciliationRunRow {
   error_message: string | null;
 }
 
+export interface SqliteHistoryRecoveryCheckpointRow {
+  id: string;
+  exchange_account_id: string;
+  market: "KRW-BTC" | "KRW-ETH";
+  checkpoint_type: "CLOSED_ORDER_ARCHIVE";
+  next_window_end_at: string;
+  updated_at: string;
+}
+
 export interface SqliteOperatorNotificationRow {
   id: string;
   exchange_account_id: string;

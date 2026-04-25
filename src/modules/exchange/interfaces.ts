@@ -58,6 +58,16 @@ export interface ExchangeOrderSnapshot {
   raw: unknown;
 }
 
+export interface ExchangeOrderHistoryQuery {
+  market?: SupportedMarket;
+  states?: string[];
+  page?: number;
+  limit?: number;
+  orderBy?: "asc" | "desc";
+  startTimeMs?: number;
+  endTimeMs?: number;
+}
+
 export interface OrderValidationResult {
   accepted: boolean;
   marketOnline: boolean;
@@ -78,6 +88,8 @@ export interface ExchangeAdapter {
   createOrder(request: UpbitOrderRequest): Promise<ExchangeOrderSnapshot>;
   cancelOrder(query: { uuid?: string; identifier?: string }): Promise<CancelOrderResult>;
   getOrder(query: { uuid?: string; identifier?: string }): Promise<ExchangeOrderSnapshot | null>;
+  listOpenOrders(query?: ExchangeOrderHistoryQuery): Promise<ExchangeOrderSnapshot[]>;
+  listClosedOrders(query?: ExchangeOrderHistoryQuery): Promise<ExchangeOrderSnapshot[]>;
 }
 
 export class DryRunExchangeAdapter implements ExchangeAdapter {
@@ -167,6 +179,14 @@ export class DryRunExchangeAdapter implements ExchangeAdapter {
       fills: [],
       raw: { mode: "DRY_RUN" },
     };
+  }
+
+  async listOpenOrders(): Promise<ExchangeOrderSnapshot[]> {
+    return [];
+  }
+
+  async listClosedOrders(): Promise<ExchangeOrderSnapshot[]> {
+    return [];
   }
 }
 

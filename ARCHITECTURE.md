@@ -105,6 +105,7 @@ It provides:
 - reporting-friendly formatters
 - persisted-status inspection that can summarize recent operator-state transitions
 - `/status` summary that includes the latest persisted reconciliation run health
+- `/status` summary that now also includes checkpointed exchange-history recovery progress from the latest persisted reconciliation run
 - `/statehistory` for read-only execution_state transition history
 - `/synchistory` for read-only persisted reconciliation_runs inspection
 - `/alerts` for read-only persisted operator_notifications inspection, including `PENDING` / `SENT` / `FAILED` plus retry metadata such as `attempt_count`, `next_attempt_at`, and `failure_class`
@@ -112,6 +113,7 @@ It provides:
 - `/risks` for read-only persisted risk_events inspection
 - `/sync` for reconciliation-triggered snapshot and reconciliation record persistence with read-only public ticker valuation
 - future reconciliation inspection as a read-only operator view
+- `/synchistory` summaries that can expose bounded archival recovery progress such as checkpoint window movement and page counts
 - execution_state transition history inspection from persisted state
 - outbox-based Telegram delivery that persists first, then attempts best-effort send behind `ENABLE_TELEGRAM_DELIVERY`
 
@@ -208,7 +210,7 @@ Examples:
 
 ## Current Gaps
 
-- full exchange-history recovery beyond active orders, startup sweep, and terminal backfill is still incomplete
+- exchange-history recovery now includes bounded recent windows plus checkpointed archival closed-order sweeps, but stop conditions and richer progress views can still improve
 - reconciliation is still only partially exchange-backed today
 - delivery-attempt history exists, but richer worker metrics and claim/abandon visibility are still minimal
 - strategy logic is intentionally stubbed

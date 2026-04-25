@@ -186,6 +186,12 @@ test("execution service blocks order persistence when order chance rejects the r
     async getOrder() {
       return null;
     },
+    async listOpenOrders() {
+      return [];
+    },
+    async listClosedOrders() {
+      return [];
+    },
   };
   const { service, repositories } = createExecutionService({
     exchangeAdapter,
@@ -282,6 +288,12 @@ test("execution service queues an operator notification when an order is rejecte
     },
     async getOrder() {
       return null;
+    },
+    async listOpenOrders() {
+      return [];
+    },
+    async listClosedOrders() {
+      return [];
     },
   };
   const repositories = new InMemoryExecutionRepository();
@@ -399,6 +411,12 @@ test("execution service blocks order persistence when exchange order test report
     async getOrder() {
       return null;
     },
+    async listOpenOrders() {
+      return [];
+    },
+    async listClosedOrders() {
+      return [];
+    },
   };
   const { service, repositories } = createExecutionService({
     exchangeAdapter,
@@ -491,6 +509,12 @@ test("execution service blocks price orders below the exchange min total before 
     },
     async getOrder() {
       return null;
+    },
+    async listOpenOrders() {
+      return [];
+    },
+    async listClosedOrders() {
+      return [];
     },
   };
   const { service, repositories } = createExecutionService({

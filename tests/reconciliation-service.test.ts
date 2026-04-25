@@ -109,6 +109,179 @@ test("reconciliation service updates active orders from exchange state and captu
   assert.equal(fills[0]?.exchangeFillId, "trade-1");
 });
 
+test("reconciliation service recovers exchange-only orders from recent exchange history", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-history-recovery",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  });
+  const service = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderHistoryReader: {
+      async listOpenOrders() {
+        return [];
+      },
+      async listClosedOrders() {
+        return [
+          {
+            uuid: "uuid-history-1",
+            identifier: null,
+            market: "KRW-BTC",
+            side: "bid",
+            ordType: "limit",
+            state: "done",
+            price: "100000000",
+            volume: "0.01",
+            remainingVolume: "0",
+            executedVolume: "0.01",
+            paidFee: "500",
+            createdAt: "2026-04-20T00:05:00.000Z",
+            fills: [
+              {
+                tradeUuid: "trade-history-1",
+                side: "bid",
+                price: "100000000",
+                volume: "0.01",
+                funds: "1000000",
+                fee: "500",
+                createdAt: "2026-04-20T00:05:01.000Z",
+                raw: {
+                  tradeUuid: "trade-history-1",
+                },
+              },
+            ],
+            raw: {
+              state: "done",
+            },
+          },
+        ];
+      },
+    },
+  });
+
+  const summary = await service.run("primary");
+  const orders = await repositories.listOrders("primary");
+  const fills = await repositories.listFills();
+
+  assert.equal(summary.status, "DRIFT_DETECTED");
+  assert.equal(summary.candidateCount, 0);
+  assert.equal(summary.processedCount, 0);
+  assert.equal(summary.deferredCount, 0);
+  assert.equal(summary.historyRecovery?.closedOrderLookbackDays, 7);
+  assert.equal(summary.historyRecovery?.scannedSnapshotCount, 1);
+  assert.equal(summary.historyRecovery?.recoveredOrderCount, 1);
+  assert.equal(summary.historyRecovery?.markets.length, 2);
+  assert.equal(summary.historyRecovery?.markets[0]?.market, "KRW-BTC");
+  assert.equal(summary.historyRecovery?.markets[0]?.snapshotCount, 2);
+  assert.equal(summary.historyRecovery?.markets[0]?.recentClosedPagesScanned, 1);
+  assert.equal(summary.historyRecovery?.markets[0]?.archivalClosedPagesScanned, 1);
+  assert.equal(summary.historyRecovery?.markets[0]?.openPagesScanned, 1);
+  assert.equal(summary.historyRecovery?.markets[1]?.market, "KRW-ETH");
+  assert.equal(summary.historyRecovery?.markets[1]?.snapshotCount, 2);
+  assert.deepEqual(summary.issues, [
+    {
+      code: "EXCHANGE_ORDER_RECOVERED",
+      message: `Recovered exchange order ${orders[0]?.id} for KRW-BTC from exchange history state done.`,
+    },
+    {
+      code: "ORDER_FILLS_BACKFILLED",
+      message: `Backfilled 1 fill(s) for order ${orders[0]?.id} from exchange snapshot.`,
+    },
+  ]);
+  assert.equal(orders.length, 1);
+  assert.equal(orders[0]?.origin, "RECOVERY");
+  assert.equal(orders[0]?.status, "FILLED");
+  assert.equal(orders[0]?.identifier, "exchange_recovery:uuid-history-1");
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0]?.exchangeFillId, "trade-history-1");
+});
+
+test("reconciliation service paginates recent exchange history within the configured lookback window", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-history-pagination",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  });
+  const closedOrderRequests: Array<{ market: string; page: number | undefined; startTimeMs: number | undefined; endTimeMs: number | undefined }> = [];
+  const service = new ReconciliationService({
+    repositories,
+    operatorState,
+    historyMaxPagesPerMarket: 2,
+    closedOrderLookbackDays: 3,
+    orderHistoryReader: {
+      async listOpenOrders() {
+        return [];
+      },
+      async listClosedOrders(query = {}) {
+        closedOrderRequests.push({
+          market: query.market ?? "unknown",
+          page: query.page,
+          startTimeMs: query.startTimeMs,
+          endTimeMs: query.endTimeMs,
+        });
+
+        if (query.market !== "KRW-BTC") {
+          return [];
+        }
+
+        if (query.page === 1) {
+          return Array.from({ length: 20 }, (_, index) => buildHistorySnapshot(index + 1));
+        }
+
+        if (query.page === 2) {
+          return [buildHistorySnapshot(21)];
+        }
+
+        return [];
+      },
+    },
+  });
+
+  const summary = await service.run("primary");
+  const orders = await repositories.listOrders("primary");
+  const checkpoint = await repositories.getHistoryRecoveryCheckpoint(
+    "primary",
+    "KRW-BTC",
+    "CLOSED_ORDER_ARCHIVE",
+  );
+
+  assert.equal(orders.length, 21);
+  assert.equal(summary.historyRecovery?.closedOrderLookbackDays, 3);
+  assert.equal(summary.historyRecovery?.scannedSnapshotCount, 21);
+  assert.equal(summary.historyRecovery?.recoveredOrderCount, 21);
+  assert.equal(summary.historyRecovery?.markets[0]?.market, "KRW-BTC");
+  assert.equal(summary.historyRecovery?.markets[0]?.openPagesScanned, 1);
+  assert.equal(summary.historyRecovery?.markets[0]?.recentClosedPagesScanned, 2);
+  assert.equal(summary.historyRecovery?.markets[0]?.archivalClosedPagesScanned, 2);
+  assert.equal(summary.historyRecovery?.markets[0]?.snapshotCount, 42);
+  assert.deepEqual(
+    closedOrderRequests.filter((request) => request.market === "KRW-BTC").map((request) => request.page),
+    [1, 1, 2, 2],
+  );
+  assert.equal(
+    (closedOrderRequests[0]?.endTimeMs ?? 0) - (closedOrderRequests[0]?.startTimeMs ?? 0),
+    3 * 24 * 60 * 60 * 1000,
+  );
+  assert.ok(checkpoint);
+});
+
 test("reconciliation service backfills fills for terminal orders during sync", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = new InMemoryOperatorStateStore({
@@ -751,3 +924,25 @@ test("reconciliation service records portfolio drift as reconciliation issues an
     ["BALANCE_DRIFT_DETECTED", "POSITION_DRIFT_DETECTED"],
   );
 });
+
+function buildHistorySnapshot(index: number) {
+  return {
+    uuid: `uuid-history-page-${index}`,
+    identifier: null,
+    market: "KRW-BTC" as const,
+    side: "bid" as const,
+    ordType: "limit" as const,
+    state: "done",
+    price: "100000000",
+    volume: "0.01",
+    remainingVolume: "0",
+    executedVolume: "0.01",
+    paidFee: "500",
+    createdAt: `2026-04-20T00:${String(index).padStart(2, "0")}:00.000Z`,
+    fills: [],
+    raw: {
+      state: "done",
+      index,
+    },
+  };
+}

@@ -55,7 +55,7 @@ Current remaining gaps:
 - the strategy engine is a deterministic stub that returns `HOLD`
 - live exchange submission is implemented as an adapter contract, but the app still wires a dry-run adapter by default
 - `/sync` now persists read-only balance and position snapshots using Upbit public ticker prices when available, with explicit `avg_buy_price` fallback
-- exchange-backed reconciliation now covers active orders, startup recovery sweep, terminal-order fill/status backfill, balance/position drift detection against prior snapshots plus local fills, and per-run lookup budgeting, but full exchange-history recovery remains pending
+- exchange-backed reconciliation now covers active orders, startup recovery sweep, paginated recent open/closed exchange-order history recovery into local `RECOVERY` records, checkpointed archival closed-order recovery, terminal-order fill/status backfill, balance/position drift detection against prior snapshots plus local fills, and per-run lookup budgeting
 - execution pre-trade validation now checks Upbit `orders/chance` and `orders/test` before any order record is persisted for submission
 - automatic Telegram reporting now persists durable `operator_notifications`, attempts best-effort Telegram delivery when explicitly enabled, and records `PENDING` / `SENT` / `FAILED`
 - Telegram delivery now keeps durable retry metadata such as `attempt_count`, `last_attempt_at`, `next_attempt_at`, and `failure_class`
@@ -79,7 +79,7 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 7. In the current default path, a dry-run adapter simulates acceptance without sending a live order.
 8. The default local store is SQLite-backed persistence at `DATABASE_PATH`.
 9. `execution_state` and `execution_state_transitions` provide the operator control ledger.
-10. Telegram inspection currently includes `/status`, `/statehistory`, `/synchistory`, `/alerts`, `/risks`, `/balances`, `/positions`, `/orders`, and `/sync` for operator visibility, with `/status` also summarizing the latest persisted reconciliation run, recent issue codes, and persisted degraded metadata when present.
+10. Telegram inspection currently includes `/status`, `/statehistory`, `/synchistory`, `/alerts`, `/risks`, `/balances`, `/positions`, `/orders`, and `/sync` for operator visibility, with `/status` also summarizing the latest persisted reconciliation run, recent issue codes, checkpointed history-recovery progress, and persisted degraded metadata when present.
 11. `/sync` connects to reconciliation so snapshot and reconciliation records are persisted, using read-only public ticker valuation when available.
 12. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
 13. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
@@ -141,6 +141,8 @@ Environment variables currently recognized:
 - `TELEGRAM_DELIVERY_MAX_BACKOFF_MS`
 - `TELEGRAM_DELIVERY_LEASE_MS`
 - `RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN`
+- `RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET`
+- `RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS`
 - `STALE_PRICE_THRESHOLD_MS`
 - `MINIMUM_ORDER_VALUE_KRW`
 - `MAX_ALLOCATION_BTC`
@@ -157,9 +159,10 @@ When Telegram delivery is enabled, due notifications are claimed behind a lease,
 
 Exchange-backed startup recovery runs only when `UPBIT_ACCESS_KEY` and `UPBIT_SECRET_KEY` are configured. Without them, startup recovery is skipped and the app stays in local-inspection mode.
 Order reconciliation also respects `RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN` so `/sync` and startup recovery do not burst unbounded `getOrder` reads.
+Recent and archival exchange-history recovery also respect `RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET` and `RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS` so recovery sweeps can page through Upbit order history in bounded windows while checkpointing deeper archive progress per market.
 If startup recovery finds unresolved portfolio drift against the prior persisted snapshots and local fill history, bootstrap can mark the persisted operator state `DEGRADED` with explicit `degraded_reason` / `degraded_at`.
 
 ## Immediate Next Steps
 
-- extend exchange-backed reconciliation into richer exchange-history recovery beyond the current balance/position drift checks
+- expose checkpointed exchange-history recovery progress more explicitly in operator surfaces beyond the latest `/status` and `/synchistory` summary lines
 - extend delivery-attempt observability from outcome history into richer worker metrics and claim/abandon visibility

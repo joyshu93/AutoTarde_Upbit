@@ -5,6 +5,7 @@ import type {
   ExecutionStateTransitionRecord,
   ExchangeAccountRecord,
   FillRecord,
+  HistoryRecoveryCheckpointRecord,
   OperatorNotificationDeliveryAttemptRecord,
   OperatorNotificationDeliveryTransition,
   OperatorNotificationRecord,
@@ -26,6 +27,7 @@ import type {
   SqliteExecutionStateTransitionRow,
   SqliteExchangeAccountRow,
   SqliteFillRow,
+  SqliteHistoryRecoveryCheckpointRow,
   SqliteOperatorNotificationDeliveryAttemptRow,
   SqliteOperatorNotificationRow,
   SqliteOrderEventRow,
@@ -424,6 +426,39 @@ export class SqliteExecutionRepository implements ExecutionRepository {
         `).all(exchangeAccountId) as unknown as SqliteReconciliationRunRow[]);
 
     return rows.map(mapReconciliationRunRow);
+  }
+
+  async saveHistoryRecoveryCheckpoint(record: HistoryRecoveryCheckpointRecord): Promise<void> {
+    this.db.prepare(`
+      INSERT INTO history_recovery_checkpoints (
+        id, exchange_account_id, market, checkpoint_type, next_window_end_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(exchange_account_id, market, checkpoint_type) DO UPDATE SET
+        id = excluded.id,
+        next_window_end_at = excluded.next_window_end_at,
+        updated_at = excluded.updated_at
+    `).run(
+      record.id,
+      record.exchangeAccountId,
+      record.market,
+      record.checkpointType,
+      record.nextWindowEndAt,
+      record.updatedAt,
+    );
+  }
+
+  async getHistoryRecoveryCheckpoint(
+    exchangeAccountId: string,
+    market: SupportedMarket,
+    checkpointType: HistoryRecoveryCheckpointRecord["checkpointType"],
+  ): Promise<HistoryRecoveryCheckpointRecord | null> {
+    const row = this.db.prepare(`
+      SELECT * FROM history_recovery_checkpoints
+      WHERE exchange_account_id = ? AND market = ? AND checkpoint_type = ?
+      LIMIT 1
+    `).get(exchangeAccountId, market, checkpointType) as SqliteHistoryRecoveryCheckpointRow | undefined;
+
+    return row ? mapHistoryRecoveryCheckpointRow(row) : null;
   }
 
   async saveOperatorNotification(record: OperatorNotificationRecord): Promise<void> {
@@ -1143,6 +1178,19 @@ function mapReconciliationRunRow(row: SqliteReconciliationRunRow): Reconciliatio
     completedAt: row.completed_at,
     summaryJson: row.summary_json,
     errorMessage: row.error_message,
+  };
+}
+
+function mapHistoryRecoveryCheckpointRow(
+  row: SqliteHistoryRecoveryCheckpointRow,
+): HistoryRecoveryCheckpointRecord {
+  return {
+    id: row.id,
+    exchangeAccountId: row.exchange_account_id,
+    market: row.market,
+    checkpointType: row.checkpoint_type,
+    nextWindowEndAt: row.next_window_end_at,
+    updatedAt: row.updated_at,
   };
 }
 

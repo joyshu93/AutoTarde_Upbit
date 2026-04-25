@@ -6,6 +6,7 @@ import type {
   ExecutionStateRecord,
   ExecutionStateTransitionRecord,
   FillRecord,
+  HistoryRecoveryCheckpointRecord,
   OperatorNotificationRecord,
   OrderEventRecord,
   OrderLifecycleStatus,
@@ -40,6 +41,7 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   private readonly positionSnapshots: PositionSnapshotRecord[] = [];
   private readonly riskEvents: RiskEventRecord[] = [];
   private readonly reconciliationRuns: ReconciliationRunRecord[] = [];
+  private readonly historyRecoveryCheckpoints: HistoryRecoveryCheckpointRecord[] = [];
   private readonly operatorNotifications: OperatorNotificationRecord[] = [];
   private readonly operatorNotificationDeliveryAttempts: OperatorNotificationDeliveryAttemptRecord[] = [];
 
@@ -180,6 +182,34 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
 
     return typeof limit === "number" ? runs.slice(0, limit) : runs;
+  }
+
+  async saveHistoryRecoveryCheckpoint(record: HistoryRecoveryCheckpointRecord): Promise<void> {
+    const index = this.historyRecoveryCheckpoints.findIndex(
+      (candidate) =>
+        candidate.exchangeAccountId === record.exchangeAccountId &&
+        candidate.market === record.market &&
+        candidate.checkpointType === record.checkpointType,
+    );
+    if (index === -1) {
+      this.historyRecoveryCheckpoints.push(record);
+      return;
+    }
+
+    this.historyRecoveryCheckpoints[index] = record;
+  }
+
+  async getHistoryRecoveryCheckpoint(
+    exchangeAccountId: string,
+    market: SupportedMarket,
+    checkpointType: HistoryRecoveryCheckpointRecord["checkpointType"],
+  ): Promise<HistoryRecoveryCheckpointRecord | null> {
+    return this.historyRecoveryCheckpoints.find(
+      (candidate) =>
+        candidate.exchangeAccountId === exchangeAccountId &&
+        candidate.market === market &&
+        candidate.checkpointType === checkpointType,
+    ) ?? null;
   }
 
   async saveOperatorNotification(record: OperatorNotificationRecord): Promise<void> {

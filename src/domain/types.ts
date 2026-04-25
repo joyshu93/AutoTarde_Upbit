@@ -251,6 +251,17 @@ export interface ReconciliationRunRecord {
   errorMessage: string | null;
 }
 
+export type HistoryRecoveryCheckpointType = "CLOSED_ORDER_ARCHIVE";
+
+export interface HistoryRecoveryCheckpointRecord {
+  id: string;
+  exchangeAccountId: string;
+  market: SupportedMarket;
+  checkpointType: HistoryRecoveryCheckpointType;
+  nextWindowEndAt: string;
+  updatedAt: string;
+}
+
 export interface OperatorNotificationRecord {
   id: string;
   exchangeAccountId: string;

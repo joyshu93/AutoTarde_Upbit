@@ -211,7 +211,7 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
 
   assert.match(reconciliationRunsMessage, /Reconciliation History/);
   assert.match(reconciliationRunsMessage, /state_source: persisted reconciliation_runs/);
-  assert.match(reconciliationRunsMessage, /\| SUCCESS \| source=OPERATOR_SYNC \| issues=0 \| codes=none \| processed=1 \| deferred=0 \| completed_at=2026-04-20T00:07:02.000Z \| error=none/);
+  assert.match(reconciliationRunsMessage, /\| SUCCESS \| source=OPERATOR_SYNC \| issues=0 \| codes=none \| processed=1 \| deferred=0 \| history=none \| completed_at=2026-04-20T00:07:02.000Z \| error=none/);
 
   assert.match(risksMessage, /Risk Events/);
   assert.match(risksMessage, /count: 1/);
@@ -415,6 +415,9 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   assert.match(statusResponse.text, /recent_sync_status: SUCCESS/);
   assert.match(statusResponse.text, /recent_sync_issues: 0/);
   assert.match(statusResponse.text, /recent_sync_issue_codes: none/);
+  assert.match(statusResponse.text, /recent_sync_history_recovered_orders: none/);
+  assert.match(statusResponse.text, /recent_sync_history_scanned_snapshots: none/);
+  assert.match(statusResponse.text, /recent_sync_history_archive_progress: none/);
   assert.match(statusResponse.text, /recent_sync_completed_at: 2026-04-20T00:03:55.000Z/);
   assert.match(statusResponse.text, /recent_sync_error: none/);
   assert.match(statusResponse.text, /recent_transitions: 1/);
@@ -425,6 +428,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   assert.match(syncHistoryResponse.text, /Reconciliation History/);
   assert.match(syncHistoryResponse.text, /count: 1/);
   assert.match(syncHistoryResponse.text, /state_source: persisted reconciliation_runs/);
+  assert.match(syncHistoryResponse.text, /\| SUCCESS \| source=OPERATOR_SYNC \| issues=0 \| codes=none \| processed=1 \| deferred=0 \| history=none \| completed_at=2026-04-20T00:03:55.000Z \| error=none/);
   assert.match(alertsResponse.text, /Operator Alerts/);
   assert.match(alertsResponse.text, /count: 1/);
   assert.match(alertsResponse.text, /state_source: persisted operator_notifications/);
@@ -645,6 +649,10 @@ function createRepositoryStub(overrides: Partial<ExecutionRepository> = {}): Exe
     async updateReconciliationRun() {},
     async listReconciliationRuns() {
       return [];
+    },
+    async saveHistoryRecoveryCheckpoint() {},
+    async getHistoryRecoveryCheckpoint() {
+      return null;
     },
     async saveOperatorNotification() {},
     async saveOperatorNotificationDeliveryAttempt() {},

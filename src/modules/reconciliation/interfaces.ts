@@ -1,4 +1,4 @@
-import type { ReconciliationStatus } from "../../domain/types.js";
+import type { ReconciliationStatus, SupportedMarket } from "../../domain/types.js";
 
 export type ReconciliationTrigger = "DIRECT_RUN" | "OPERATOR_SYNC" | "STARTUP_RECOVERY";
 
@@ -14,8 +14,30 @@ export interface ReconciliationIssue {
     | "TERMINAL_ORDER_CONFIRMED_ABSENT"
     | "ORDER_REFERENCE_MISSING"
     | "ORDER_LOOKUP_TRANSIENT_FAILURE"
-    | "ORDER_LOOKUP_DEFERRED";
+    | "ORDER_LOOKUP_DEFERRED"
+    | "EXCHANGE_ORDER_RECOVERED"
+    | "ORDER_HISTORY_LOOKUP_FAILED";
   message: string;
+}
+
+export interface ReconciliationHistoryRecoveryMarketProgress {
+  market: SupportedMarket;
+  recentClosedWindowStartAt: string;
+  recentClosedWindowEndAt: string;
+  archivalWindowStartAt: string;
+  archivalWindowEndAt: string;
+  nextWindowEndAt: string;
+  openPagesScanned: number;
+  recentClosedPagesScanned: number;
+  archivalClosedPagesScanned: number;
+  snapshotCount: number;
+}
+
+export interface ReconciliationHistoryRecoverySummary {
+  closedOrderLookbackDays: number;
+  scannedSnapshotCount: number;
+  recoveredOrderCount: number;
+  markets: ReconciliationHistoryRecoveryMarketProgress[];
 }
 
 export interface ReconciliationSummary {
@@ -26,4 +48,5 @@ export interface ReconciliationSummary {
   processedCount: number;
   deferredCount: number;
   maxOrderLookupsPerRun: number;
+  historyRecovery?: ReconciliationHistoryRecoverySummary;
 }
