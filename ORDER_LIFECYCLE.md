@@ -122,6 +122,8 @@ Reconciliation should run when:
 The current scaffold now uses both process startup recovery and operator-triggered `/sync` as explicit reconciliation entry points.
 
 Restart recovery currently prioritizes persisted non-terminal orders first, then limited terminal backfill candidates, and respects a per-run exchange lookup budget.
+Exchange-history recovery advances per-market archive checkpoints only until the configured stop-before boundary, then reports that archive coverage as complete instead of continuing unbounded historical fetches.
+Its confidence metadata stays separate from coverage so page-limit truncation and exchange-history lookup failure remain explicit operator-visible evidence.
 When startup recovery also finds unexplained balance or position movement against the prior persisted snapshots and local fill ledger, that result is treated as operator-state health evidence rather than as an order state.
 
 ## Notification Expectations
@@ -141,3 +143,4 @@ Notification delivery failure must never be treated as an order-lifecycle transi
 Retryable Telegram failures may keep the notification in `PENDING` with a scheduled `next_attempt_at`, but that retry state is still separate from order lifecycle.
 Delivery workers may also claim a notification behind a lease token before transport, but that lease is still operator-notification state rather than order-lifecycle state.
 Recent delivery outcomes are now also kept in `operator_notification_delivery_attempts` so operator observability can grow without turning Telegram delivery into lifecycle truth.
+Derived `/alerts` queue metrics expose pending totals, active or expired leases, and abandoned-lease candidates without making Telegram delivery part of the order lifecycle.

@@ -75,6 +75,7 @@ async function main(): Promise<void> {
     reconciliationMaxOrderLookupsPerRun: app.config.reconciliationMaxOrderLookupsPerRun,
     reconciliationHistoryMaxPagesPerMarket: app.config.reconciliationHistoryMaxPagesPerMarket,
     reconciliationClosedOrderLookbackDays: app.config.reconciliationClosedOrderLookbackDays,
+    reconciliationHistoryStopBeforeDays: app.config.reconciliationHistoryStopBeforeDays,
     startupRecovery,
     startupRecoveryPolicy,
     telegramDeliveryEnabled: app.config.telegramDeliveryEnabled,

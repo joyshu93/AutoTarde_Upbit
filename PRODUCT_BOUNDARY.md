@@ -49,6 +49,7 @@ Telegram may expose:
 - `/status`
 - `/statehistory`
 - `/synchistory`
+- `/recovery`
 - `/alerts`
 - `/risks`
 - `/balances`
@@ -60,13 +61,14 @@ Telegram may expose:
 - `/sync`
 
 Telegram commands are operational controls and inspection requests, not portfolio data entry.
-`/alerts` may summarize both persisted operator notifications and recent delivery-attempt audit rows, but neither becomes a trading truth source.
+`/alerts` may summarize persisted operator notifications, recent delivery-attempt audit rows, and derived delivery-worker queue metrics, but none of them become trading truth sources.
 Startup recovery is read-only against exchange truth and must never create or cancel orders.
 When startup recovery confirms unresolved portfolio drift against persisted state, the operator state may move into `DEGRADED` without enabling any live path.
 
 ## Design Consequences
 - every order must have an explicit lifecycle record
 - every fill must be recoverable from reconciliation
+- every exchange-history recovery uncertainty must remain explicit through coverage and confidence metadata
 - every risk rejection must be persisted
 - every unexplained balance or position drift must be persisted as both reconciliation evidence and risk evidence
 - every transition into pause or kill-switch state must be explicit and inspectable

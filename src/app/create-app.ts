@@ -94,6 +94,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
     maxOrderLookupsPerRun: config.reconciliationMaxOrderLookupsPerRun,
     historyMaxPagesPerMarket: config.reconciliationHistoryMaxPagesPerMarket,
     closedOrderLookbackDays: config.reconciliationClosedOrderLookbackDays,
+    historyStopBeforeDays: config.reconciliationHistoryStopBeforeDays,
     ...(exchangeBackedReadEnabled ? { orderReader: liveExchangeClient, orderHistoryReader: liveExchangeClient } : {}),
   };
   const reconciliationService = new ReconciliationService(reconciliationDependencies);

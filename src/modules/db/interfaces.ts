@@ -43,6 +43,7 @@ export interface ExecutionRepository {
   updateReconciliationRun(record: ReconciliationRunRecord): Promise<void>;
   listReconciliationRuns(exchangeAccountId: string, limit?: number): Promise<ReconciliationRunRecord[]>;
   saveHistoryRecoveryCheckpoint(record: HistoryRecoveryCheckpointRecord): Promise<void>;
+  listHistoryRecoveryCheckpoints(exchangeAccountId: string): Promise<HistoryRecoveryCheckpointRecord[]>;
   getHistoryRecoveryCheckpoint(
     exchangeAccountId: string,
     market: SupportedMarket,

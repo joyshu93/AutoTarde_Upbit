@@ -24,6 +24,7 @@ const MANAGED_MARKETS = ["KRW-BTC", "KRW-ETH"] as const satisfies typeof SUPPORT
 const EXCHANGE_HISTORY_PAGE_LIMIT = 20;
 const DEFAULT_HISTORY_MAX_PAGES_PER_MARKET = 3;
 const DEFAULT_CLOSED_ORDER_LOOKBACK_DAYS = 7;
+const DEFAULT_HISTORY_STOP_BEFORE_DAYS = 365;
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 
 interface ExchangeHistoryRecoveryResult {
@@ -42,6 +43,7 @@ export class ReconciliationService {
       maxOrderLookupsPerRun?: number;
       historyMaxPagesPerMarket?: number;
       closedOrderLookbackDays?: number;
+      historyStopBeforeDays?: number;
     },
   ) {}
 
@@ -288,7 +290,12 @@ export class ReconciliationService {
             message: `Exchange order history lookup failed. ${message}`,
           },
         ],
-        historyRecovery: undefined,
+        historyRecovery: buildFailedHistoryRecoverySummary({
+          reconciledAt,
+          closedOrderLookbackDays: this.dependencies.closedOrderLookbackDays,
+          historyStopBeforeDays: this.dependencies.historyStopBeforeDays,
+          failureMessage: message,
+        }),
       };
     }
   }
@@ -313,10 +320,16 @@ export class ReconciliationService {
       1,
       Math.trunc(this.dependencies.closedOrderLookbackDays ?? DEFAULT_CLOSED_ORDER_LOOKBACK_DAYS),
     );
+    const historyStopBeforeDays = Math.max(
+      closedOrderLookbackDays,
+      Math.trunc(this.dependencies.historyStopBeforeDays ?? DEFAULT_HISTORY_STOP_BEFORE_DAYS),
+    );
     const parsedReconciledAt = Date.parse(reconciledAt);
     const closedOrderEndTimeMs = Number.isFinite(parsedReconciledAt) ? parsedReconciledAt : Date.now();
     const closedOrderStartTimeMs =
       closedOrderEndTimeMs - closedOrderLookbackDays * MILLISECONDS_PER_DAY;
+    const stopBeforeTimeMs = closedOrderEndTimeMs - historyStopBeforeDays * MILLISECONDS_PER_DAY;
+    const stopBeforeAt = new Date(stopBeforeTimeMs).toISOString();
     const recentClosedWindowStartAt = new Date(closedOrderStartTimeMs).toISOString();
     const recentClosedWindowEndAt = new Date(closedOrderEndTimeMs).toISOString();
 
@@ -330,7 +343,13 @@ export class ReconciliationService {
         const parsedCheckpointEndTimeMs = checkpoint ? Date.parse(checkpoint.nextWindowEndAt) : NaN;
         const archivalWindowEndTimeMs =
           Number.isFinite(parsedCheckpointEndTimeMs) ? parsedCheckpointEndTimeMs : closedOrderStartTimeMs;
-        const archivalWindowStartTimeMs = archivalWindowEndTimeMs - closedOrderLookbackDays * MILLISECONDS_PER_DAY;
+        const archiveAlreadyComplete = archivalWindowEndTimeMs <= stopBeforeTimeMs;
+        const archivalWindowStartTimeMs = archiveAlreadyComplete
+          ? archivalWindowEndTimeMs
+          : Math.max(
+              archivalWindowEndTimeMs - closedOrderLookbackDays * MILLISECONDS_PER_DAY,
+              stopBeforeTimeMs,
+            );
         const [openSnapshots, recentClosedSnapshots, archivalClosedSnapshots] = await Promise.all([
           paginateExchangeOrderHistory({
             maxPages: historyMaxPagesPerMarket,
@@ -354,20 +373,33 @@ export class ReconciliationService {
                 endTimeMs: closedOrderEndTimeMs,
               }),
           }),
-          paginateExchangeOrderHistory({
-            maxPages: historyMaxPagesPerMarket,
-            fetchPage: (page) =>
-              orderHistoryReader.listClosedOrders({
-                market,
-                page,
-                limit: EXCHANGE_HISTORY_PAGE_LIMIT,
-                orderBy: "desc",
-                startTimeMs: archivalWindowStartTimeMs,
-                endTimeMs: archivalWindowEndTimeMs,
+          archiveAlreadyComplete
+            ? Promise.resolve({ snapshots: [], pagesScanned: 0, pageLimitReached: false })
+            : paginateExchangeOrderHistory({
+                maxPages: historyMaxPagesPerMarket,
+                fetchPage: (page) =>
+                  orderHistoryReader.listClosedOrders({
+                    market,
+                    page,
+                    limit: EXCHANGE_HISTORY_PAGE_LIMIT,
+                    orderBy: "desc",
+                    startTimeMs: archivalWindowStartTimeMs,
+                    endTimeMs: archivalWindowEndTimeMs,
+                  }),
               }),
-          }),
         ]);
         const nextWindowEndAt = new Date(archivalWindowStartTimeMs).toISOString();
+        const archiveComplete = archivalWindowStartTimeMs <= stopBeforeTimeMs;
+        const pageLimitReached =
+          openSnapshots.pageLimitReached ||
+          recentClosedSnapshots.pageLimitReached ||
+          archivalClosedSnapshots.pageLimitReached;
+        const confidenceLevel: "HIGH" | "PARTIAL" = archiveComplete && !pageLimitReached ? "HIGH" : "PARTIAL";
+        const confidenceReason: "ARCHIVE_COMPLETE" | "ARCHIVE_IN_PROGRESS" | "PAGE_LIMIT_REACHED" = pageLimitReached
+          ? "PAGE_LIMIT_REACHED"
+          : archiveComplete
+            ? "ARCHIVE_COMPLETE"
+            : "ARCHIVE_IN_PROGRESS";
 
         await this.dependencies.repositories.saveHistoryRecoveryCheckpoint({
           id: checkpoint?.id ?? createId("history_recovery_checkpoint"),
@@ -395,6 +427,12 @@ export class ReconciliationService {
           openPagesScanned: openSnapshots.pagesScanned,
           recentClosedPagesScanned: recentClosedSnapshots.pagesScanned,
           archivalClosedPagesScanned: archivalClosedSnapshots.pagesScanned,
+          archiveComplete,
+          confidenceLevel,
+          confidenceReason,
+          openHistoryTruncated: openSnapshots.pageLimitReached,
+          recentClosedHistoryTruncated: recentClosedSnapshots.pageLimitReached,
+          archivalClosedHistoryTruncated: archivalClosedSnapshots.pageLimitReached,
           snapshotCount: snapshots.length,
         };
       }),
@@ -412,6 +450,12 @@ export class ReconciliationService {
       snapshots: [...deduped.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
       historyRecovery: {
         closedOrderLookbackDays,
+        stopBeforeDays: historyStopBeforeDays,
+        stopBeforeAt,
+        coverageStatus: batches.every((batch) => batch.archiveComplete) ? "COMPLETE" : "IN_PROGRESS",
+        confidenceLevel: summarizeHistoryRecoveryConfidence(batches),
+        confidenceReason: summarizeHistoryRecoveryConfidenceReason(batches),
+        failureMessage: null,
         scannedSnapshotCount: deduped.size,
         recoveredOrderCount: 0,
         markets: batches.map((batch) => ({
@@ -421,6 +465,12 @@ export class ReconciliationService {
           archivalWindowStartAt: batch.archivalWindowStartAt,
           archivalWindowEndAt: batch.archivalWindowEndAt,
           nextWindowEndAt: batch.nextWindowEndAt,
+          archiveComplete: batch.archiveComplete,
+          confidenceLevel: batch.confidenceLevel,
+          confidenceReason: batch.confidenceReason,
+          openHistoryTruncated: batch.openHistoryTruncated,
+          recentClosedHistoryTruncated: batch.recentClosedHistoryTruncated,
+          archivalClosedHistoryTruncated: batch.archivalClosedHistoryTruncated,
           openPagesScanned: batch.openPagesScanned,
           recentClosedPagesScanned: batch.recentClosedPagesScanned,
           archivalClosedPagesScanned: batch.archivalClosedPagesScanned,
@@ -705,12 +755,68 @@ export class ReconciliationService {
   }
 }
 
+function summarizeHistoryRecoveryConfidence(
+  batches: Array<{
+    confidenceLevel: "HIGH" | "PARTIAL";
+  }>,
+): NonNullable<ReconciliationSummary["historyRecovery"]>["confidenceLevel"] {
+  return batches.every((batch) => batch.confidenceLevel === "HIGH") ? "HIGH" : "PARTIAL";
+}
+
+function summarizeHistoryRecoveryConfidenceReason(
+  batches: Array<{
+    confidenceReason: "ARCHIVE_COMPLETE" | "ARCHIVE_IN_PROGRESS" | "PAGE_LIMIT_REACHED";
+  }>,
+): NonNullable<ReconciliationSummary["historyRecovery"]>["confidenceReason"] {
+  if (batches.some((batch) => batch.confidenceReason === "PAGE_LIMIT_REACHED")) {
+    return "PAGE_LIMIT_REACHED";
+  }
+
+  if (batches.some((batch) => batch.confidenceReason === "ARCHIVE_IN_PROGRESS")) {
+    return "ARCHIVE_IN_PROGRESS";
+  }
+
+  return "ARCHIVE_COMPLETE";
+}
+
+function buildFailedHistoryRecoverySummary(input: {
+  reconciledAt: string;
+  closedOrderLookbackDays: number | undefined;
+  historyStopBeforeDays: number | undefined;
+  failureMessage: string;
+}): NonNullable<ReconciliationSummary["historyRecovery"]> {
+  const closedOrderLookbackDays = Math.max(
+    1,
+    Math.trunc(input.closedOrderLookbackDays ?? DEFAULT_CLOSED_ORDER_LOOKBACK_DAYS),
+  );
+  const historyStopBeforeDays = Math.max(
+    closedOrderLookbackDays,
+    Math.trunc(input.historyStopBeforeDays ?? DEFAULT_HISTORY_STOP_BEFORE_DAYS),
+  );
+  const parsedReconciledAt = Date.parse(input.reconciledAt);
+  const closedOrderEndTimeMs = Number.isFinite(parsedReconciledAt) ? parsedReconciledAt : Date.now();
+
+  return {
+    closedOrderLookbackDays,
+    stopBeforeDays: historyStopBeforeDays,
+    stopBeforeAt: new Date(closedOrderEndTimeMs - historyStopBeforeDays * MILLISECONDS_PER_DAY).toISOString(),
+    coverageStatus: "IN_PROGRESS",
+    confidenceLevel: "FAILED",
+    confidenceReason: "LOOKUP_FAILED",
+    failureMessage: input.failureMessage,
+    scannedSnapshotCount: 0,
+    recoveredOrderCount: 0,
+    markets: [],
+  };
+}
+
 async function paginateExchangeOrderHistory(input: {
   maxPages: number;
   fetchPage: (page: number) => Promise<ExchangeOrderSnapshot[]>;
-}): Promise<{ snapshots: ExchangeOrderSnapshot[]; pagesScanned: number }> {
+}): Promise<{ snapshots: ExchangeOrderSnapshot[]; pagesScanned: number; pageLimitReached: boolean }> {
   const snapshots: ExchangeOrderSnapshot[] = [];
   let pagesScanned = 0;
+  let pageLimitReached = false;
 
   for (let page = 1; page <= input.maxPages; page += 1) {
     const pageSnapshots = await input.fetchPage(page);
@@ -723,11 +829,14 @@ async function paginateExchangeOrderHistory(input: {
     if (pageSnapshots.length < EXCHANGE_HISTORY_PAGE_LIMIT) {
       break;
     }
+
+    pageLimitReached = page === input.maxPages;
   }
 
   return {
     snapshots,
     pagesScanned,
+    pageLimitReached,
   };
 }
 

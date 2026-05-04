@@ -11,6 +11,7 @@ import {
   formatOrdersMessage,
   formatPositionMessage,
   formatReconciliationRunsMessage,
+  formatRecoveryProgressMessage,
   formatRiskEventsMessage,
   formatStateHistoryMessage,
   formatStatusMessage,
@@ -57,6 +58,8 @@ export class TelegramCommandRouter {
         return this.buildStateHistoryResponse();
       case "/synchistory":
         return this.buildSyncHistoryResponse(exchangeAccountId);
+      case "/recovery":
+        return this.buildRecoveryProgressResponse(exchangeAccountId);
       case "/alerts":
         return this.buildAlertsResponse(exchangeAccountId);
       case "/risks":
@@ -151,7 +154,20 @@ export class TelegramCommandRouter {
     ]);
 
     return {
-      text: formatOperatorNotificationsMessage(notifications, attempts),
+      text: formatOperatorNotificationsMessage(notifications, attempts, {
+        now: this.dependencies.now?.() ?? new Date().toISOString(),
+      }),
+    };
+  }
+
+  private async buildRecoveryProgressResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+    const [runs, checkpoints] = await Promise.all([
+      this.dependencies.repositories.listReconciliationRuns(exchangeAccountId, 1),
+      this.dependencies.repositories.listHistoryRecoveryCheckpoints(exchangeAccountId),
+    ]);
+
+    return {
+      text: formatRecoveryProgressMessage(runs[0] ?? null, checkpoints),
     };
   }
 

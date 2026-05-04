@@ -398,6 +398,7 @@ export interface OperatorCommand {
     | "/status"
     | "/statehistory"
     | "/synchistory"
+    | "/recovery"
     | "/alerts"
     | "/risks"
     | "/balances"

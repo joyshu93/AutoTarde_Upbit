@@ -86,6 +86,7 @@ Current slice:
 - balance and position drift detection by comparing new exchange-backed snapshots against the prior persisted snapshots plus local fill history
 - startup recovery sweep when exchange-backed Upbit reads are configured
 - per-run reconciliation lookup budgeting with oldest-first processing inside each priority tier
+- checkpointed exchange-history recovery with an explicit stop-before boundary, `IN_PROGRESS` / `COMPLETE` coverage status, and separate `HIGH` / `PARTIAL` / `FAILED` confidence classification
 - startup policy that can mark persisted operator state `DEGRADED` when unresolved portfolio drift remains after startup recovery
 
 It should eventually reconcile:
@@ -105,15 +106,17 @@ It provides:
 - reporting-friendly formatters
 - persisted-status inspection that can summarize recent operator-state transitions
 - `/status` summary that includes the latest persisted reconciliation run health
-- `/status` summary that now also includes checkpointed exchange-history recovery progress from the latest persisted reconciliation run
+- `/status` summary that now also includes checkpointed exchange-history recovery progress, coverage status, and confidence classification from the latest persisted reconciliation run
 - `/statehistory` for read-only execution_state transition history
 - `/synchistory` for read-only persisted reconciliation_runs inspection
+- `/recovery` for read-only checkpointed exchange-history recovery progress inspection
 - `/alerts` for read-only persisted operator_notifications inspection, including `PENDING` / `SENT` / `FAILED` plus retry metadata such as `attempt_count`, `next_attempt_at`, and `failure_class`
 - `/alerts` now also shows recent rows from the separate persisted `operator_notification_delivery_attempts` audit trail
+- `/alerts` now derives delivery-worker queue metrics including pending totals, due/scheduled counts, active/expired leases, abandoned-lease candidates, and recent attempt outcome counts
 - `/risks` for read-only persisted risk_events inspection
 - `/sync` for reconciliation-triggered snapshot and reconciliation record persistence with read-only public ticker valuation
 - future reconciliation inspection as a read-only operator view
-- `/synchistory` summaries that can expose bounded archival recovery progress such as checkpoint window movement and page counts
+- `/synchistory` summaries that expose bounded archival recovery progress such as checkpoint window movement, page counts, stop-before boundary, coverage status, truncation flags, and confidence classification
 - execution_state transition history inspection from persisted state
 - outbox-based Telegram delivery that persists first, then attempts best-effort send behind `ENABLE_TELEGRAM_DELIVERY`
 
@@ -160,6 +163,7 @@ The important design choice is that order lifecycle data is first-class. Balance
 Retry metadata is durable too, so delivery workers can reschedule without mutating execution or reconciliation records.
 Lease metadata is durable as well, so workers can claim rows and finalize only when the claimed `lease_token` still matches.
 `operator_notification_delivery_attempts` add append-oriented delivery observability without changing the current-summary semantics of `operator_notifications`.
+Delivery-worker queue metrics are currently derived from persisted notification and attempt rows rather than stored in a separate worker-run table.
 
 ## Execution Modes
 
@@ -210,7 +214,7 @@ Examples:
 
 ## Current Gaps
 
-- exchange-history recovery now includes bounded recent windows plus checkpointed archival closed-order sweeps, but stop conditions and richer progress views can still improve
+- exchange-history recovery now includes bounded recent windows, checkpointed archival closed-order sweeps, a configured stop-before boundary, page-limit truncation detection, lookup-failure confidence records, and a dedicated `/recovery` inspection view; remaining confidence work is richer classification of Upbit-side retention semantics
 - reconciliation is still only partially exchange-backed today
-- delivery-attempt history exists, but richer worker metrics and claim/abandon visibility are still minimal
+- delivery-attempt history and derived queue metrics exist, but there is not yet a durable delivery-worker run table for scheduled worker execution history
 - strategy logic is intentionally stubbed

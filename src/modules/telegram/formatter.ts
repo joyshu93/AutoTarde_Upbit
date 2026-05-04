@@ -4,6 +4,7 @@ import type {
   ExchangeBalance,
   ExecutionStateRecord,
   ExecutionStateTransitionRecord,
+  HistoryRecoveryCheckpointRecord,
   OperatorNotificationDeliveryAttemptRecord,
   OperatorNotificationRecord,
   OrderRecord,
@@ -125,11 +126,41 @@ export function formatReconciliationRunsMessage(
   ].join("\n");
 }
 
+export function formatRecoveryProgressMessage(
+  latestRun: ReconciliationRunRecord | null,
+  checkpoints: HistoryRecoveryCheckpointRecord[],
+): string {
+  const meta = latestRun ? tryParseReconciliationSummaryMeta(latestRun.summaryJson) : null;
+
+  return [
+    "Exchange History Recovery",
+    "state_source: persisted reconciliation_runs + history_recovery_checkpoints",
+    `latest_run_started_at: ${latestRun?.startedAt ?? "none"}`,
+    `latest_run_status: ${latestRun?.status ?? "none"}`,
+    `latest_run_source: ${meta?.source ?? "none"}`,
+    `latest_run_error: ${latestRun?.errorMessage ?? "none"}`,
+    `coverage_status: ${meta?.historyRecovery?.coverageStatus ?? "none"}`,
+    `confidence_level: ${meta?.historyRecovery?.confidenceLevel ?? "none"}`,
+    `confidence_reason: ${meta?.historyRecovery?.confidenceReason ?? "none"}`,
+    `failure_message: ${meta?.historyRecovery?.failureMessage ?? "none"}`,
+    `history_lookback_days: ${meta?.historyRecovery?.closedOrderLookbackDays ?? "none"}`,
+    `history_stop_before_days: ${meta?.historyRecovery?.stopBeforeDays ?? "none"}`,
+    `history_stop_before_at: ${meta?.historyRecovery?.stopBeforeAt ?? "none"}`,
+    `history_scanned_snapshots: ${meta?.historyRecovery?.scannedSnapshotCount ?? "none"}`,
+    `history_recovered_orders: ${meta?.historyRecovery?.recoveredOrderCount ?? "none"}`,
+    ...formatRecoveryMarketProgressLines(meta?.historyRecovery?.markets ?? []),
+    ...formatHistoryRecoveryCheckpointLines(checkpoints),
+  ].join("\n");
+}
+
 export function formatOperatorNotificationsMessage(
   notifications: OperatorNotificationRecord[],
   attempts: OperatorNotificationDeliveryAttemptRecord[] = [],
+  options?: {
+    now?: string;
+  },
 ): string {
-  const metrics = summarizeNotificationDeliveryMetrics(notifications, attempts);
+  const metrics = summarizeNotificationDeliveryMetrics(notifications, attempts, options?.now ?? null);
 
   if (notifications.length === 0) {
     return [
@@ -138,10 +169,20 @@ export function formatOperatorNotificationsMessage(
       "state_source: persisted operator_notifications",
       "attempt_source: persisted operator_notification_delivery_attempts",
       "note: No operator notifications are stored yet.",
+      `pending_total_count: ${metrics.pendingTotalCount}`,
       `pending_due_count: ${metrics.pendingDueCount}`,
       `pending_scheduled_count: ${metrics.pendingScheduledCount}`,
       `active_lease_count: ${metrics.activeLeaseCount}`,
+      `expired_lease_count: ${metrics.expiredLeaseCount}`,
+      `abandoned_lease_candidate_count: ${metrics.abandonedLeaseCandidateCount}`,
       `recent_stale_lease_count: ${metrics.recentStaleLeaseCount}`,
+      `recent_sent_attempt_count: ${metrics.recentSentAttemptCount}`,
+      `recent_retry_scheduled_attempt_count: ${metrics.recentRetryScheduledAttemptCount}`,
+      `recent_failed_attempt_count: ${metrics.recentFailedAttemptCount}`,
+      `oldest_pending_created_at: ${metrics.oldestPendingCreatedAt ?? "none"}`,
+      `next_scheduled_attempt_at: ${metrics.nextScheduledAttemptAt ?? "none"}`,
+      `oldest_active_lease_expires_at: ${metrics.oldestActiveLeaseExpiresAt ?? "none"}`,
+      `latest_delivery_attempt_at: ${metrics.latestDeliveryAttemptAt ?? "none"}`,
       `delivery_attempt_count: ${attempts.length}`,
       ...formatOperatorNotificationAttemptLines(attempts),
     ].join("\n");
@@ -154,10 +195,20 @@ export function formatOperatorNotificationsMessage(
     `count: ${sortedNotifications.length}`,
     "state_source: persisted operator_notifications",
     "attempt_source: persisted operator_notification_delivery_attempts",
+    `pending_total_count: ${metrics.pendingTotalCount}`,
     `pending_due_count: ${metrics.pendingDueCount}`,
     `pending_scheduled_count: ${metrics.pendingScheduledCount}`,
     `active_lease_count: ${metrics.activeLeaseCount}`,
+    `expired_lease_count: ${metrics.expiredLeaseCount}`,
+    `abandoned_lease_candidate_count: ${metrics.abandonedLeaseCandidateCount}`,
     `recent_stale_lease_count: ${metrics.recentStaleLeaseCount}`,
+    `recent_sent_attempt_count: ${metrics.recentSentAttemptCount}`,
+    `recent_retry_scheduled_attempt_count: ${metrics.recentRetryScheduledAttemptCount}`,
+    `recent_failed_attempt_count: ${metrics.recentFailedAttemptCount}`,
+    `oldest_pending_created_at: ${metrics.oldestPendingCreatedAt ?? "none"}`,
+    `next_scheduled_attempt_at: ${metrics.nextScheduledAttemptAt ?? "none"}`,
+    `oldest_active_lease_expires_at: ${metrics.oldestActiveLeaseExpiresAt ?? "none"}`,
+    `latest_delivery_attempt_at: ${metrics.latestDeliveryAttemptAt ?? "none"}`,
     ...sortedNotifications.map(
       (notification) =>
         `- ${notification.createdAt} | ${notification.severity} | ${notification.notificationType} | ${notification.deliveryStatus} | attempts=${notification.attemptCount} | last_attempt_at=${notification.lastAttemptAt ?? "none"} | next_attempt_at=${notification.nextAttemptAt ?? "none"} | failure_class=${notification.failureClass ?? "none"} | delivered_at=${notification.deliveredAt ?? "none"} | error=${notification.lastError ?? "none"} | ${notification.title} | ${notification.message}`,
@@ -318,50 +369,144 @@ function formatOperatorNotificationAttemptLines(
   ];
 }
 
+function formatRecoveryMarketProgressLines(
+  markets: NonNullable<ReturnType<typeof tryParseReconciliationSummaryMeta>["historyRecovery"]>["markets"],
+): string[] {
+  if (markets.length === 0) {
+    return ["latest_market_progress: none"];
+  }
+
+  return [
+    "latest_market_progress:",
+    ...markets.map(
+      (market) =>
+        `- ${market.market} | archive_window=${market.archivalWindowStartAt ?? "unknown"}..${market.archivalWindowEndAt ?? "unknown"} | next_window_end_at=${market.nextWindowEndAt ?? "unknown"} | archive_complete=${market.archiveComplete ?? "unknown"} | confidence=${market.confidenceLevel ?? "unknown"}:${market.confidenceReason ?? "unknown"} | truncated open/recent/archive=${market.openHistoryTruncated ?? "unknown"}/${market.recentClosedHistoryTruncated ?? "unknown"}/${market.archivalClosedHistoryTruncated ?? "unknown"} | pages open/recent/archive=${market.openPagesScanned ?? "?"}/${market.recentClosedPagesScanned ?? "?"}/${market.archivalClosedPagesScanned ?? "?"} | snapshots=${market.snapshotCount ?? "?"}`,
+    ),
+  ];
+}
+
+function formatHistoryRecoveryCheckpointLines(
+  checkpoints: HistoryRecoveryCheckpointRecord[],
+): string[] {
+  if (checkpoints.length === 0) {
+    return ["persisted_checkpoints: none"];
+  }
+
+  const sortedCheckpoints = [...checkpoints].sort(
+    (left, right) => left.market.localeCompare(right.market) || left.checkpointType.localeCompare(right.checkpointType),
+  );
+
+  return [
+    `persisted_checkpoints: ${sortedCheckpoints.length}`,
+    ...sortedCheckpoints.map(
+      (checkpoint) =>
+        `- ${checkpoint.market} | ${checkpoint.checkpointType} | next_window_end_at=${checkpoint.nextWindowEndAt} | updated_at=${checkpoint.updatedAt}`,
+    ),
+  ];
+}
+
 function summarizeNotificationDeliveryMetrics(
   notifications: OperatorNotificationRecord[],
   attempts: OperatorNotificationDeliveryAttemptRecord[],
+  now: string | null,
 ): {
+  pendingTotalCount: number;
   pendingDueCount: number;
   pendingScheduledCount: number;
   activeLeaseCount: number;
+  expiredLeaseCount: number;
+  abandonedLeaseCandidateCount: number;
   recentStaleLeaseCount: number;
+  recentSentAttemptCount: number;
+  recentRetryScheduledAttemptCount: number;
+  recentFailedAttemptCount: number;
+  oldestPendingCreatedAt: string | null;
+  nextScheduledAttemptAt: string | null;
+  oldestActiveLeaseExpiresAt: string | null;
+  latestDeliveryAttemptAt: string | null;
 } {
+  let pendingTotalCount = 0;
   let pendingDueCount = 0;
   let pendingScheduledCount = 0;
   let activeLeaseCount = 0;
+  let expiredLeaseCount = 0;
+  let abandonedLeaseCandidateCount = 0;
+  let oldestPendingCreatedAt: string | null = null;
+  let nextScheduledAttemptAt: string | null = null;
+  let oldestActiveLeaseExpiresAt: string | null = null;
 
   for (const notification of notifications) {
     if (notification.deliveryStatus !== "PENDING") {
       continue;
     }
 
+    pendingTotalCount += 1;
+    oldestPendingCreatedAt = minIso(oldestPendingCreatedAt, notification.createdAt);
+
     const leaseActive =
       notification.leaseToken !== null &&
       notification.leaseExpiresAt !== null &&
-      notification.lastAttemptAt !== null;
+      notification.lastAttemptAt !== null &&
+      (now === null || notification.leaseExpiresAt.localeCompare(now) > 0);
 
     if (leaseActive) {
       activeLeaseCount += 1;
+      if (notification.leaseExpiresAt !== null) {
+        oldestActiveLeaseExpiresAt = minIso(oldestActiveLeaseExpiresAt, notification.leaseExpiresAt);
+      }
       continue;
     }
 
-    if (notification.nextAttemptAt === null) {
+    const leaseExpired =
+      now !== null &&
+      notification.leaseToken !== null &&
+      notification.leaseExpiresAt !== null &&
+      notification.leaseExpiresAt.localeCompare(now) <= 0;
+
+    if (leaseExpired) {
+      expiredLeaseCount += 1;
+      if (notification.lastAttemptAt !== null) {
+        abandonedLeaseCandidateCount += 1;
+      }
+    }
+
+    if (notification.nextAttemptAt === null || (now !== null && notification.nextAttemptAt.localeCompare(now) <= 0)) {
       pendingDueCount += 1;
       continue;
     }
 
+    nextScheduledAttemptAt = minIso(nextScheduledAttemptAt, notification.nextAttemptAt);
     pendingScheduledCount += 1;
   }
 
   const recentStaleLeaseCount = attempts.filter((attempt) => attempt.outcome === "STALE_LEASE").length;
+  const recentSentAttemptCount = attempts.filter((attempt) => attempt.outcome === "SENT").length;
+  const recentRetryScheduledAttemptCount = attempts.filter((attempt) => attempt.outcome === "RETRY_SCHEDULED").length;
+  const recentFailedAttemptCount = attempts.filter((attempt) => attempt.outcome === "FAILED").length;
+  const latestDeliveryAttemptAt = attempts
+    .map((attempt) => attempt.attemptedAt)
+    .sort((left, right) => right.localeCompare(left))[0] ?? null;
 
   return {
+    pendingTotalCount,
     pendingDueCount,
     pendingScheduledCount,
     activeLeaseCount,
+    expiredLeaseCount,
+    abandonedLeaseCandidateCount,
     recentStaleLeaseCount,
+    recentSentAttemptCount,
+    recentRetryScheduledAttemptCount,
+    recentFailedAttemptCount,
+    oldestPendingCreatedAt,
+    nextScheduledAttemptAt,
+    oldestActiveLeaseExpiresAt,
+    latestDeliveryAttemptAt,
   };
+}
+
+function minIso(current: string | null, candidate: string): string {
+  return current === null || candidate.localeCompare(current) < 0 ? candidate : current;
 }
 
 function tryParseJson<T>(rawJson: string): T | null {
@@ -390,6 +535,12 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
   historyRecovery:
     | {
         closedOrderLookbackDays: number | null;
+        stopBeforeDays: number | null;
+        stopBeforeAt: string | null;
+        coverageStatus: string | null;
+        confidenceLevel: string | null;
+        confidenceReason: string | null;
+        failureMessage: string | null;
         scannedSnapshotCount: number | null;
         recoveredOrderCount: number | null;
         markets: Array<{
@@ -400,6 +551,12 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
           openPagesScanned: number | null;
           recentClosedPagesScanned: number | null;
           archivalClosedPagesScanned: number | null;
+          archiveComplete: boolean | null;
+          confidenceLevel: string | null;
+          confidenceReason: string | null;
+          openHistoryTruncated: boolean | null;
+          recentClosedHistoryTruncated: boolean | null;
+          archivalClosedHistoryTruncated: boolean | null;
           snapshotCount: number | null;
         }>;
       }
@@ -413,6 +570,12 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
     openPagesScanned: number | null;
     recentClosedPagesScanned: number | null;
     archivalClosedPagesScanned: number | null;
+    archiveComplete: boolean | null;
+    confidenceLevel: string | null;
+    confidenceReason: string | null;
+    openHistoryTruncated: boolean | null;
+    recentClosedHistoryTruncated: boolean | null;
+    archivalClosedHistoryTruncated: boolean | null;
     snapshotCount: number | null;
   };
 
@@ -427,6 +590,12 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
     parsed && parsed.historyRecovery && typeof parsed.historyRecovery === "object"
       ? parsed.historyRecovery as {
           closedOrderLookbackDays?: unknown;
+          stopBeforeDays?: unknown;
+          stopBeforeAt?: unknown;
+          coverageStatus?: unknown;
+          confidenceLevel?: unknown;
+          confidenceReason?: unknown;
+          failureMessage?: unknown;
           scannedSnapshotCount?: unknown;
           recoveredOrderCount?: unknown;
           markets?: unknown;
@@ -455,6 +624,30 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
           closedOrderLookbackDays:
             typeof historyRecoveryRaw.closedOrderLookbackDays === "number"
               ? historyRecoveryRaw.closedOrderLookbackDays
+              : null,
+          stopBeforeDays:
+            typeof historyRecoveryRaw.stopBeforeDays === "number"
+              ? historyRecoveryRaw.stopBeforeDays
+              : null,
+          stopBeforeAt:
+            typeof historyRecoveryRaw.stopBeforeAt === "string"
+              ? historyRecoveryRaw.stopBeforeAt
+              : null,
+          coverageStatus:
+            typeof historyRecoveryRaw.coverageStatus === "string"
+              ? historyRecoveryRaw.coverageStatus
+              : null,
+          confidenceLevel:
+            typeof historyRecoveryRaw.confidenceLevel === "string"
+              ? historyRecoveryRaw.confidenceLevel
+              : null,
+          confidenceReason:
+            typeof historyRecoveryRaw.confidenceReason === "string"
+              ? historyRecoveryRaw.confidenceReason
+              : null,
+          failureMessage:
+            typeof historyRecoveryRaw.failureMessage === "string"
+              ? historyRecoveryRaw.failureMessage
               : null,
           scannedSnapshotCount:
             typeof historyRecoveryRaw.scannedSnapshotCount === "number"
@@ -501,6 +694,30 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
                         "archivalClosedPagesScanned" in market && typeof market.archivalClosedPagesScanned === "number"
                           ? market.archivalClosedPagesScanned
                           : null,
+                      archiveComplete:
+                        "archiveComplete" in market && typeof market.archiveComplete === "boolean"
+                          ? market.archiveComplete
+                          : null,
+                      confidenceLevel:
+                        "confidenceLevel" in market && typeof market.confidenceLevel === "string"
+                          ? market.confidenceLevel
+                          : null,
+                      confidenceReason:
+                        "confidenceReason" in market && typeof market.confidenceReason === "string"
+                          ? market.confidenceReason
+                          : null,
+                      openHistoryTruncated:
+                        "openHistoryTruncated" in market && typeof market.openHistoryTruncated === "boolean"
+                          ? market.openHistoryTruncated
+                          : null,
+                      recentClosedHistoryTruncated:
+                        "recentClosedHistoryTruncated" in market && typeof market.recentClosedHistoryTruncated === "boolean"
+                          ? market.recentClosedHistoryTruncated
+                          : null,
+                      archivalClosedHistoryTruncated:
+                        "archivalClosedHistoryTruncated" in market && typeof market.archivalClosedHistoryTruncated === "boolean"
+                          ? market.archivalClosedHistoryTruncated
+                          : null,
                       snapshotCount:
                         "snapshotCount" in market && typeof market.snapshotCount === "number"
                           ? market.snapshotCount
@@ -539,6 +756,8 @@ function formatLatestReconciliationLines(
       "recent_sync_status: none",
       "recent_sync_issues: none",
       "recent_sync_issue_codes: none",
+      "recent_sync_history_coverage_status: none",
+      "recent_sync_history_confidence: none",
       "recent_sync_history_recovered_orders: none",
       "recent_sync_history_scanned_snapshots: none",
       "recent_sync_history_archive_progress: none",
@@ -553,6 +772,8 @@ function formatLatestReconciliationLines(
     `recent_sync_status: ${run.status}`,
     `recent_sync_issues: ${meta.issueCount ?? "unknown"}`,
     `recent_sync_issue_codes: ${meta.issueCodes.length === 0 ? "none" : meta.issueCodes.join(",")}`,
+    `recent_sync_history_coverage_status: ${meta.historyRecovery?.coverageStatus ?? "none"}`,
+    `recent_sync_history_confidence: ${formatHistoryRecoveryConfidence(meta.historyRecovery)}`,
     `recent_sync_history_recovered_orders: ${meta.historyRecovery?.recoveredOrderCount ?? "none"}`,
     `recent_sync_history_scanned_snapshots: ${meta.historyRecovery?.scannedSnapshotCount ?? "none"}`,
     `recent_sync_history_archive_progress: ${formatHistoryRecoveryInline(meta.historyRecovery)}`,
@@ -565,6 +786,12 @@ function formatHistoryRecoveryInline(
   historyRecovery:
     | {
         closedOrderLookbackDays: number | null;
+        stopBeforeDays: number | null;
+        stopBeforeAt: string | null;
+        coverageStatus: string | null;
+        confidenceLevel: string | null;
+        confidenceReason: string | null;
+        failureMessage: string | null;
         scannedSnapshotCount: number | null;
         recoveredOrderCount: number | null;
         markets: Array<{
@@ -575,6 +802,12 @@ function formatHistoryRecoveryInline(
           openPagesScanned: number | null;
           recentClosedPagesScanned: number | null;
           archivalClosedPagesScanned: number | null;
+          archiveComplete: boolean | null;
+          confidenceLevel: string | null;
+          confidenceReason: string | null;
+          openHistoryTruncated: boolean | null;
+          recentClosedHistoryTruncated: boolean | null;
+          archivalClosedHistoryTruncated: boolean | null;
           snapshotCount: number | null;
         }>;
       }
@@ -586,15 +819,36 @@ function formatHistoryRecoveryInline(
 
   const marketSummaries = historyRecovery.markets.map(
     (market) =>
-      `${market.market}[archive=${market.archivalWindowStartAt ?? "unknown"}..${market.archivalWindowEndAt ?? "unknown"} next<=${market.nextWindowEndAt ?? "unknown"} pages=${market.openPagesScanned ?? "?"}/${market.recentClosedPagesScanned ?? "?"}/${market.archivalClosedPagesScanned ?? "?"} snapshots=${market.snapshotCount ?? "?"}]`,
+      `${market.market}[archive=${market.archivalWindowStartAt ?? "unknown"}..${market.archivalWindowEndAt ?? "unknown"} next<=${market.nextWindowEndAt ?? "unknown"} complete=${market.archiveComplete ?? "unknown"} confidence=${market.confidenceLevel ?? "unknown"}:${market.confidenceReason ?? "unknown"} truncated=${market.openHistoryTruncated ?? "unknown"}/${market.recentClosedHistoryTruncated ?? "unknown"}/${market.archivalClosedHistoryTruncated ?? "unknown"} pages=${market.openPagesScanned ?? "?"}/${market.recentClosedPagesScanned ?? "?"}/${market.archivalClosedPagesScanned ?? "?"} snapshots=${market.snapshotCount ?? "?"}]`,
   );
 
   return [
     `lookback_days=${historyRecovery.closedOrderLookbackDays ?? "unknown"}`,
+    `stop_before_days=${historyRecovery.stopBeforeDays ?? "unknown"}`,
+    `stop_before_at=${historyRecovery.stopBeforeAt ?? "unknown"}`,
+    `coverage=${historyRecovery.coverageStatus ?? "unknown"}`,
+    `confidence=${historyRecovery.confidenceLevel ?? "unknown"}:${historyRecovery.confidenceReason ?? "unknown"}`,
+    `failure=${historyRecovery.failureMessage ?? "none"}`,
     `scanned=${historyRecovery.scannedSnapshotCount ?? "unknown"}`,
     `recovered=${historyRecovery.recoveredOrderCount ?? "unknown"}`,
     `markets=${marketSummaries.length === 0 ? "none" : marketSummaries.join(";")}`,
   ].join(" ");
+}
+
+function formatHistoryRecoveryConfidence(
+  historyRecovery:
+    | {
+        confidenceLevel: string | null;
+        confidenceReason: string | null;
+        failureMessage: string | null;
+      }
+    | null,
+): string {
+  if (!historyRecovery) {
+    return "none";
+  }
+
+  return `${historyRecovery.confidenceLevel ?? "unknown"}:${historyRecovery.confidenceReason ?? "unknown"} failure=${historyRecovery.failureMessage ?? "none"}`;
 }
 
 function describeLiveOrderBlockers(

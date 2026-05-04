@@ -16,6 +16,7 @@ test("loadAppConfig defaults to DRY_RUN with live gate disabled", () => {
   assert.equal(config.reconciliationMaxOrderLookupsPerRun, 10);
   assert.equal(config.reconciliationHistoryMaxPagesPerMarket, 3);
   assert.equal(config.reconciliationClosedOrderLookbackDays, 7);
+  assert.equal(config.reconciliationHistoryStopBeforeDays, 365);
   assert.equal(config.globalKillSwitch, false);
   assert.equal(config.databasePath, "./var/autotrade-upbit.sqlite");
 
@@ -35,6 +36,7 @@ test("loadAppConfig allows LIVE only when explicitly requested", () => {
     TELEGRAM_DELIVERY_LEASE_MS: "45000",
     RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET: "5",
     RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS: "2",
+    RECONCILIATION_HISTORY_STOP_BEFORE_DAYS: "30",
   });
 
   assert.equal(config.executionMode, "LIVE");
@@ -46,6 +48,7 @@ test("loadAppConfig allows LIVE only when explicitly requested", () => {
   assert.equal(config.telegramDeliveryLeaseMs, 45_000);
   assert.equal(config.reconciliationHistoryMaxPagesPerMarket, 5);
   assert.equal(config.reconciliationClosedOrderLookbackDays, 2);
+  assert.equal(config.reconciliationHistoryStopBeforeDays, 30);
 });
 
 test("loadAppConfig accepts an explicit sqlite database path override", () => {

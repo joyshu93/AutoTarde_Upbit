@@ -447,6 +447,16 @@ export class SqliteExecutionRepository implements ExecutionRepository {
     );
   }
 
+  async listHistoryRecoveryCheckpoints(exchangeAccountId: string): Promise<HistoryRecoveryCheckpointRecord[]> {
+    const rows = this.db.prepare(`
+      SELECT * FROM history_recovery_checkpoints
+      WHERE exchange_account_id = ?
+      ORDER BY market ASC, checkpoint_type ASC
+    `).all(exchangeAccountId) as unknown as SqliteHistoryRecoveryCheckpointRow[];
+
+    return rows.map(mapHistoryRecoveryCheckpointRow);
+  }
+
   async getHistoryRecoveryCheckpoint(
     exchangeAccountId: string,
     market: SupportedMarket,

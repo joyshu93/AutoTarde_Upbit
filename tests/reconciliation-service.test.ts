@@ -177,10 +177,21 @@ test("reconciliation service recovers exchange-only orders from recent exchange 
   assert.equal(summary.processedCount, 0);
   assert.equal(summary.deferredCount, 0);
   assert.equal(summary.historyRecovery?.closedOrderLookbackDays, 7);
+  assert.equal(summary.historyRecovery?.stopBeforeDays, 365);
+  assert.equal(summary.historyRecovery?.coverageStatus, "IN_PROGRESS");
+  assert.equal(summary.historyRecovery?.confidenceLevel, "PARTIAL");
+  assert.equal(summary.historyRecovery?.confidenceReason, "ARCHIVE_IN_PROGRESS");
+  assert.equal(summary.historyRecovery?.failureMessage, null);
   assert.equal(summary.historyRecovery?.scannedSnapshotCount, 1);
   assert.equal(summary.historyRecovery?.recoveredOrderCount, 1);
   assert.equal(summary.historyRecovery?.markets.length, 2);
   assert.equal(summary.historyRecovery?.markets[0]?.market, "KRW-BTC");
+  assert.equal(summary.historyRecovery?.markets[0]?.archiveComplete, false);
+  assert.equal(summary.historyRecovery?.markets[0]?.confidenceLevel, "PARTIAL");
+  assert.equal(summary.historyRecovery?.markets[0]?.confidenceReason, "ARCHIVE_IN_PROGRESS");
+  assert.equal(summary.historyRecovery?.markets[0]?.openHistoryTruncated, false);
+  assert.equal(summary.historyRecovery?.markets[0]?.recentClosedHistoryTruncated, false);
+  assert.equal(summary.historyRecovery?.markets[0]?.archivalClosedHistoryTruncated, false);
   assert.equal(summary.historyRecovery?.markets[0]?.snapshotCount, 2);
   assert.equal(summary.historyRecovery?.markets[0]?.recentClosedPagesScanned, 1);
   assert.equal(summary.historyRecovery?.markets[0]?.archivalClosedPagesScanned, 1);
@@ -264,12 +275,19 @@ test("reconciliation service paginates recent exchange history within the config
 
   assert.equal(orders.length, 21);
   assert.equal(summary.historyRecovery?.closedOrderLookbackDays, 3);
+  assert.equal(summary.historyRecovery?.stopBeforeDays, 365);
+  assert.equal(summary.historyRecovery?.coverageStatus, "IN_PROGRESS");
+  assert.equal(summary.historyRecovery?.confidenceLevel, "PARTIAL");
+  assert.equal(summary.historyRecovery?.confidenceReason, "ARCHIVE_IN_PROGRESS");
   assert.equal(summary.historyRecovery?.scannedSnapshotCount, 21);
   assert.equal(summary.historyRecovery?.recoveredOrderCount, 21);
   assert.equal(summary.historyRecovery?.markets[0]?.market, "KRW-BTC");
   assert.equal(summary.historyRecovery?.markets[0]?.openPagesScanned, 1);
   assert.equal(summary.historyRecovery?.markets[0]?.recentClosedPagesScanned, 2);
   assert.equal(summary.historyRecovery?.markets[0]?.archivalClosedPagesScanned, 2);
+  assert.equal(summary.historyRecovery?.markets[0]?.archiveComplete, false);
+  assert.equal(summary.historyRecovery?.markets[0]?.confidenceLevel, "PARTIAL");
+  assert.equal(summary.historyRecovery?.markets[0]?.confidenceReason, "ARCHIVE_IN_PROGRESS");
   assert.equal(summary.historyRecovery?.markets[0]?.snapshotCount, 42);
   assert.deepEqual(
     closedOrderRequests.filter((request) => request.market === "KRW-BTC").map((request) => request.page),
@@ -280,6 +298,163 @@ test("reconciliation service paginates recent exchange history within the config
     3 * 24 * 60 * 60 * 1000,
   );
   assert.ok(checkpoint);
+});
+
+test("reconciliation service stops archival exchange-history recovery at the configured boundary", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-history-stop",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  });
+  const completedArchiveEndAt = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  await repositories.saveHistoryRecoveryCheckpoint({
+    id: "checkpoint-stop-btc",
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    checkpointType: "CLOSED_ORDER_ARCHIVE",
+    nextWindowEndAt: completedArchiveEndAt,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  });
+  await repositories.saveHistoryRecoveryCheckpoint({
+    id: "checkpoint-stop-eth",
+    exchangeAccountId: "primary",
+    market: "KRW-ETH",
+    checkpointType: "CLOSED_ORDER_ARCHIVE",
+    nextWindowEndAt: completedArchiveEndAt,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  });
+
+  const closedOrderRequests: Array<{ market: string; page: number | undefined }> = [];
+  const service = new ReconciliationService({
+    repositories,
+    operatorState,
+    closedOrderLookbackDays: 7,
+    historyStopBeforeDays: 14,
+    orderHistoryReader: {
+      async listOpenOrders() {
+        return [];
+      },
+      async listClosedOrders(query = {}) {
+        closedOrderRequests.push({
+          market: query.market ?? "unknown",
+          page: query.page,
+        });
+        return [];
+      },
+    },
+  });
+
+  const summary = await service.run("primary");
+
+  assert.equal(summary.historyRecovery?.stopBeforeDays, 14);
+  assert.equal(summary.historyRecovery?.coverageStatus, "COMPLETE");
+  assert.equal(summary.historyRecovery?.confidenceLevel, "HIGH");
+  assert.equal(summary.historyRecovery?.confidenceReason, "ARCHIVE_COMPLETE");
+  assert.equal(summary.historyRecovery?.markets.length, 2);
+  assert.equal(summary.historyRecovery?.markets[0]?.archiveComplete, true);
+  assert.equal(summary.historyRecovery?.markets[0]?.confidenceLevel, "HIGH");
+  assert.equal(summary.historyRecovery?.markets[0]?.confidenceReason, "ARCHIVE_COMPLETE");
+  assert.equal(summary.historyRecovery?.markets[0]?.archivalClosedPagesScanned, 0);
+  assert.equal(summary.historyRecovery?.markets[1]?.archiveComplete, true);
+  assert.equal(summary.historyRecovery?.markets[1]?.archivalClosedPagesScanned, 0);
+  assert.deepEqual(
+    closedOrderRequests.map((request) => `${request.market}:${request.page}`),
+    ["KRW-BTC:1", "KRW-ETH:1"],
+  );
+});
+
+test("reconciliation service marks exchange-history confidence partial when page limits are reached", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-history-page-limit-confidence",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  });
+  const service = new ReconciliationService({
+    repositories,
+    operatorState,
+    historyMaxPagesPerMarket: 1,
+    orderHistoryReader: {
+      async listOpenOrders() {
+        return [];
+      },
+      async listClosedOrders(query = {}) {
+        if (query.market !== "KRW-BTC") {
+          return [];
+        }
+
+        return Array.from({ length: 20 }, (_, index) => buildHistorySnapshot(index + 1));
+      },
+    },
+  });
+
+  const summary = await service.run("primary");
+
+  assert.equal(summary.historyRecovery?.coverageStatus, "IN_PROGRESS");
+  assert.equal(summary.historyRecovery?.confidenceLevel, "PARTIAL");
+  assert.equal(summary.historyRecovery?.confidenceReason, "PAGE_LIMIT_REACHED");
+  assert.equal(summary.historyRecovery?.markets[0]?.market, "KRW-BTC");
+  assert.equal(summary.historyRecovery?.markets[0]?.confidenceLevel, "PARTIAL");
+  assert.equal(summary.historyRecovery?.markets[0]?.confidenceReason, "PAGE_LIMIT_REACHED");
+  assert.equal(summary.historyRecovery?.markets[0]?.openHistoryTruncated, false);
+  assert.equal(summary.historyRecovery?.markets[0]?.recentClosedHistoryTruncated, true);
+  assert.equal(summary.historyRecovery?.markets[0]?.archivalClosedHistoryTruncated, true);
+  assert.equal(summary.historyRecovery?.markets[1]?.market, "KRW-ETH");
+  assert.equal(summary.historyRecovery?.markets[1]?.confidenceReason, "ARCHIVE_IN_PROGRESS");
+});
+
+test("reconciliation service persists failed exchange-history confidence when history lookup fails", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-history-lookup-failed",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  });
+  const service = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderHistoryReader: {
+      async listOpenOrders() {
+        throw new Error("Upbit history temporarily unavailable");
+      },
+      async listClosedOrders() {
+        return [];
+      },
+    },
+  });
+
+  const summary = await service.run("primary");
+
+  assert.equal(summary.status, "DRIFT_DETECTED");
+  assert.equal(summary.issues[0]?.code, "ORDER_HISTORY_LOOKUP_FAILED");
+  assert.equal(summary.historyRecovery?.coverageStatus, "IN_PROGRESS");
+  assert.equal(summary.historyRecovery?.confidenceLevel, "FAILED");
+  assert.equal(summary.historyRecovery?.confidenceReason, "LOOKUP_FAILED");
+  assert.equal(summary.historyRecovery?.failureMessage, "Upbit history temporarily unavailable");
+  assert.equal(summary.historyRecovery?.scannedSnapshotCount, 0);
+  assert.equal(summary.historyRecovery?.markets.length, 0);
 });
 
 test("reconciliation service backfills fills for terminal orders during sync", async () => {

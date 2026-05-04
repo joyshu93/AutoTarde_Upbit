@@ -79,6 +79,7 @@ The execution path should validate orders through:
 - reconciliation runs must produce durable records
 - process startup should attempt a recovery sweep when exchange-backed reads are available
 - reconciliation should respect an explicit per-run lookup budget to avoid exchange read bursts
+- exchange-history recovery should stop at the configured historical boundary, report archive coverage as `IN_PROGRESS` or `COMPLETE`, and separately report confidence as `HIGH`, `PARTIAL`, or `FAILED`
 - reconciliation should compare new exchange-backed balance/position snapshots against the prior persisted snapshots plus local fill history to surface unexplained portfolio drift
 - partial fills, cancel requests, rejects, and unresolved states must remain queryable
 
@@ -88,6 +89,7 @@ The operator surface should expose:
 - `/status`
 - `/statehistory`
 - `/synchistory`
+- `/recovery`
 - `/alerts`
 - `/risks`
 - `/balances`
@@ -116,6 +118,7 @@ Every important transition should leave a durable trail:
 - operator notification delivery attempt history, including `RETRY_SCHEDULED` / `STALE_LEASE`, attempt timestamps, and follow-up retry timing
 - operator notification retry metadata, including `attemptCount`, `lastAttemptAt`, `nextAttemptAt`, and `failureClass`
 - operator notification lease metadata, so concurrent workers can only finalize rows they claimed
+- derived operator notification queue metrics, including active leases, expired leases, abandoned-lease candidates, and recent delivery-attempt outcomes
 
 Telegram delivery failure must not alter execution, reconciliation, or risk outcomes. It is an operator-reporting concern with its own durable state.
 Retryable delivery failures should remain explicit as `PENDING` plus future `nextAttemptAt`, not silently disappear.
@@ -123,4 +126,4 @@ Concurrent delivery workers should only finalize a notification when the persist
 
 ## Current Implementation Note
 
-This repository now enforces the policy through pure guard logic, durable SQLite persistence, persisted execution-state controls, startup recovery sweep plus `/sync` reconciliation, startup `DEGRADED` policy for unresolved portfolio drift, execution prechecks through Upbit `orders/chance` and `orders/test`, and durable `operator_notifications` with separately gated Telegram delivery retry/backoff, lease-based compare-and-set finalization, and separate delivery-attempt history. Remaining gaps are deeper exchange-history recovery, richer claim/abandon delivery observability, and keeping the live send path intentionally disabled until the user explicitly requests it.
+This repository now enforces the policy through pure guard logic, durable SQLite persistence, persisted execution-state controls, startup recovery sweep plus `/sync` reconciliation, checkpointed exchange-history recovery with bounded stop-before coverage reporting, page-limit truncation flags, and lookup-failure confidence records, startup `DEGRADED` policy for unresolved portfolio drift, execution prechecks through Upbit `orders/chance` and `orders/test`, and durable `operator_notifications` with separately gated Telegram delivery retry/backoff, lease-based compare-and-set finalization, separate delivery-attempt history, and derived claim/abandon queue metrics. Remaining gaps are richer Upbit-retention confidence semantics, durable delivery-worker run records for scheduled workers, and keeping the live send path intentionally disabled until the user explicitly requests it.

@@ -199,6 +199,12 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     this.historyRecoveryCheckpoints[index] = record;
   }
 
+  async listHistoryRecoveryCheckpoints(exchangeAccountId: string): Promise<HistoryRecoveryCheckpointRecord[]> {
+    return this.historyRecoveryCheckpoints
+      .filter((candidate) => candidate.exchangeAccountId === exchangeAccountId)
+      .sort((left, right) => left.market.localeCompare(right.market) || left.checkpointType.localeCompare(right.checkpointType));
+  }
+
   async getHistoryRecoveryCheckpoint(
     exchangeAccountId: string,
     market: SupportedMarket,

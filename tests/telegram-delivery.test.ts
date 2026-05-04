@@ -84,9 +84,12 @@ test("delivery service marks pending notifications as sent after successful Tele
     retryScheduled: 0,
     failed: 0,
     staleLease: 0,
+    pendingTotal: 0,
     pendingDue: 0,
     pendingScheduled: 0,
     activeLease: 0,
+    expiredLease: 0,
+    abandonedLeaseCandidate: 0,
     skippedReason: null,
   });
   assert.equal(sentMessages.length, 2);
@@ -145,9 +148,12 @@ test("delivery service reschedules retryable Telegram delivery errors with expon
     retryScheduled: 1,
     failed: 0,
     staleLease: 0,
+    pendingTotal: 1,
     pendingDue: 0,
     pendingScheduled: 1,
     activeLease: 0,
+    expiredLease: 0,
+    abandonedLeaseCandidate: 0,
     skippedReason: null,
   });
   assert.equal(notifications[0]?.deliveryStatus, "PENDING");
@@ -197,9 +203,12 @@ test("delivery service marks permanent Telegram delivery errors as failed", asyn
     retryScheduled: 0,
     failed: 1,
     staleLease: 0,
+    pendingTotal: 0,
     pendingDue: 0,
     pendingScheduled: 0,
     activeLease: 0,
+    expiredLease: 0,
+    abandonedLeaseCandidate: 0,
     skippedReason: null,
   });
   assert.equal(notifications[0]?.deliveryStatus, "FAILED");
@@ -269,9 +278,12 @@ test("delivery service honors Telegram retry_after when rate limited", async () 
     retryScheduled: 1,
     failed: 0,
     staleLease: 0,
+    pendingTotal: 1,
     pendingDue: 0,
     pendingScheduled: 1,
     activeLease: 0,
+    expiredLease: 0,
+    abandonedLeaseCandidate: 0,
     skippedReason: null,
   });
   assert.equal(notifications[0]?.nextAttemptAt, "2026-04-20T00:24:25.000Z");
@@ -306,9 +318,12 @@ test("delivery service leaves notifications pending when Telegram delivery is no
     retryScheduled: 0,
     failed: 0,
     staleLease: 0,
+    pendingTotal: 0,
     pendingDue: 0,
     pendingScheduled: 0,
     activeLease: 0,
+    expiredLease: 0,
+    abandonedLeaseCandidate: 0,
     skippedReason: "telegram_delivery_not_configured",
   });
   assert.equal(notifications[0]?.deliveryStatus, "PENDING");
@@ -413,15 +428,59 @@ test("delivery service records stale lease outcomes in delivery attempt history"
     retryScheduled: 0,
     failed: 0,
     staleLease: 1,
+    pendingTotal: 1,
     pendingDue: 0,
     pendingScheduled: 0,
     activeLease: 1,
+    expiredLease: 0,
+    abandonedLeaseCandidate: 0,
     skippedReason: null,
   });
   assert.equal(notifications[0]?.deliveryStatus, "PENDING");
   assert.equal(attempts.length, 1);
   assert.equal(attempts[0]?.outcome, "STALE_LEASE");
   assert.equal(attempts[0]?.errorMessage, "stale_lease_finalize");
+});
+
+test("delivery service reports expired abandoned lease candidates in queue metrics", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  await repositories.saveOperatorNotification(createNotification({
+    id: "operator-notification-abandoned-lease-1",
+    createdAt: "2026-04-20T00:25:00.000Z",
+    attemptCount: 1,
+    lastAttemptAt: "2026-04-20T00:25:05.000Z",
+    nextAttemptAt: "2026-04-20T00:30:00.000Z",
+    leaseToken: "lease-expired",
+    leaseExpiresAt: "2026-04-20T00:25:35.000Z",
+  }));
+
+  const deliveryService = new OperatorNotificationDeliveryService({
+    repositories,
+    client: {
+      async sendMessage() {
+        throw new Error("should not claim scheduled notification");
+      },
+    },
+    operatorChatId: "chat-1",
+    now: () => "2026-04-20T00:26:00.000Z",
+  });
+
+  const summary = await deliveryService.deliverPending("primary", 10);
+
+  assert.deepEqual(summary, {
+    attempted: 0,
+    sent: 0,
+    retryScheduled: 0,
+    failed: 0,
+    staleLease: 0,
+    pendingTotal: 1,
+    pendingDue: 0,
+    pendingScheduled: 1,
+    activeLease: 0,
+    expiredLease: 1,
+    abandonedLeaseCandidate: 1,
+    skippedReason: null,
+  });
 });
 
 test("durable reporter queues notifications and kicks the delivery service without awaiting transport", async () => {

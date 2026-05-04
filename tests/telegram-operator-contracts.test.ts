@@ -29,6 +29,7 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   const parsed = parseTelegramCommand("/STATUS@autotrade_upbit_bot");
   const historyParsed = parseTelegramCommand("/STATEHISTORY@autotrade_upbit_bot");
   const syncHistoryParsed = parseTelegramCommand("/SYNCHISTORY@autotrade_upbit_bot");
+  const recoveryParsed = parseTelegramCommand("/RECOVERY@autotrade_upbit_bot");
   const alertsParsed = parseTelegramCommand("/ALERTS@autotrade_upbit_bot");
   const risksParsed = parseTelegramCommand("/RISKS@autotrade_upbit_bot");
 
@@ -42,6 +43,9 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.ok(syncHistoryParsed);
   assert.equal(syncHistoryParsed.command, "/synchistory");
   assert.equal(syncHistoryParsed.contract.summary, "Show recent persisted reconciliation_runs for operator inspection.");
+  assert.ok(recoveryParsed);
+  assert.equal(recoveryParsed.command, "/recovery");
+  assert.equal(recoveryParsed.contract.summary, "Show checkpointed exchange-history recovery progress for operator inspection.");
   assert.ok(alertsParsed);
   assert.equal(alertsParsed.command, "/alerts");
   assert.equal(alertsParsed.contract.summary, "Show recent persisted operator_notifications, delivery attempts, retry schedule, and Telegram delivery states.");
@@ -54,13 +58,14 @@ test("manual input commands are rejected by the operator contract", () => {
   const message = buildUnsupportedCommandMessage("/setposition BTC 0.25 95000000");
 
   assert.match(message, /Manual cash and position input is not supported in Telegram\./);
-  assert.match(message, /\/status \/statehistory \/synchistory \/alerts \/risks \/balances \/positions \/orders \/pause \/resume \/killswitch \/sync/);
+  assert.match(message, /\/status \/statehistory \/synchistory \/recovery \/alerts \/risks \/balances \/positions \/orders \/pause \/resume \/killswitch \/sync/);
 });
 
 test("no-argument commands return usage guidance when extra arguments are supplied", () => {
   const parsed = parseTelegramCommand("/resume now");
   const historyParsed = parseTelegramCommand("/statehistory now");
   const syncHistoryParsed = parseTelegramCommand("/synchistory now");
+  const recoveryParsed = parseTelegramCommand("/recovery now");
   const alertsParsed = parseTelegramCommand("/alerts now");
   const risksParsed = parseTelegramCommand("/risks now");
 
@@ -78,6 +83,11 @@ test("no-argument commands return usage guidance when extra arguments are suppli
   assert.equal(
     validateTelegramCommand(syncHistoryParsed),
     buildUsageMessage("/synchistory"),
+  );
+  assert.ok(recoveryParsed);
+  assert.equal(
+    validateTelegramCommand(recoveryParsed),
+    buildUsageMessage("/recovery"),
   );
   assert.ok(alertsParsed);
   assert.equal(
@@ -224,6 +234,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   const historyRequests: number[] = [];
   const alertRequests: number[] = [];
   const reconciliationRequests: number[] = [];
+  const recoveryCheckpointRequests: string[] = [];
   let currentState = createExecutionState({
     systemStatus: "RUNNING",
     killSwitchActive: false,
@@ -382,6 +393,19 @@ test("router applies control commands, blocks invalid arguments, and advertises 
           },
         ];
       },
+      async listHistoryRecoveryCheckpoints(exchangeAccountId) {
+        recoveryCheckpointRequests.push(exchangeAccountId);
+        return [
+          {
+            id: "checkpoint-1",
+            exchangeAccountId,
+            market: "KRW-BTC",
+            checkpointType: "CLOSED_ORDER_ARCHIVE",
+            nextWindowEndAt: "2026-04-06T00:03:55.000Z",
+            updatedAt: "2026-04-20T00:03:55.000Z",
+          },
+        ];
+      },
     }),
     executionStateSeed: {
       executionMode: "DRY_RUN",
@@ -395,12 +419,14 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   const statusResponse = await router.route("/status");
   const historyResponse = await router.route("/statehistory");
   const syncHistoryResponse = await router.route("/synchistory");
+  const recoveryResponse = await router.route("/recovery");
   const alertsResponse = await router.route("/alerts");
   const risksResponse = await router.route("/risks");
   const pauseResponse = await router.route("/pause maintenance window");
   const invalidResumeResponse = await router.route("/resume now");
   const invalidHistoryResponse = await router.route("/statehistory now");
   const invalidSyncHistoryResponse = await router.route("/synchistory now");
+  const invalidRecoveryResponse = await router.route("/recovery now");
   const invalidAlertsResponse = await router.route("/alerts now");
   const invalidRisksResponse = await router.route("/risks now");
   const unsupportedInputResponse = await router.route("/setcash 100000");
@@ -415,6 +441,8 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   assert.match(statusResponse.text, /recent_sync_status: SUCCESS/);
   assert.match(statusResponse.text, /recent_sync_issues: 0/);
   assert.match(statusResponse.text, /recent_sync_issue_codes: none/);
+  assert.match(statusResponse.text, /recent_sync_history_coverage_status: none/);
+  assert.match(statusResponse.text, /recent_sync_history_confidence: none/);
   assert.match(statusResponse.text, /recent_sync_history_recovered_orders: none/);
   assert.match(statusResponse.text, /recent_sync_history_scanned_snapshots: none/);
   assert.match(statusResponse.text, /recent_sync_history_archive_progress: none/);
@@ -429,6 +457,9 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   assert.match(syncHistoryResponse.text, /count: 1/);
   assert.match(syncHistoryResponse.text, /state_source: persisted reconciliation_runs/);
   assert.match(syncHistoryResponse.text, /\| SUCCESS \| source=OPERATOR_SYNC \| issues=0 \| codes=none \| processed=1 \| deferred=0 \| history=none \| completed_at=2026-04-20T00:03:55.000Z \| error=none/);
+  assert.match(recoveryResponse.text, /Exchange History Recovery/);
+  assert.match(recoveryResponse.text, /latest_run_status: SUCCESS/);
+  assert.match(recoveryResponse.text, /persisted_checkpoints: 1/);
   assert.match(alertsResponse.text, /Operator Alerts/);
   assert.match(alertsResponse.text, /count: 1/);
   assert.match(alertsResponse.text, /state_source: persisted operator_notifications/);
@@ -440,7 +471,8 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   assert.match(risksResponse.text, /GLOBAL_KILL_SWITCH/);
   assert.deepEqual(historyRequests, [3, 10]);
   assert.deepEqual(alertRequests, [10, 500]);
-  assert.deepEqual(reconciliationRequests, [1, 10]);
+  assert.deepEqual(reconciliationRequests, [1, 10, 1]);
+  assert.deepEqual(recoveryCheckpointRequests, ["primary"]);
 
   assert.match(pauseResponse.text, /Execution Control/);
   assert.match(pauseResponse.text, /command: \/pause/);
@@ -459,6 +491,10 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   assert.equal(
     invalidSyncHistoryResponse.text,
     "Usage: /synchistory\nShow recent persisted reconciliation_runs for operator inspection.",
+  );
+  assert.equal(
+    invalidRecoveryResponse.text,
+    "Usage: /recovery\nShow checkpointed exchange-history recovery progress for operator inspection.",
   );
   assert.equal(
     invalidAlertsResponse.text,
@@ -651,6 +687,9 @@ function createRepositoryStub(overrides: Partial<ExecutionRepository> = {}): Exe
       return [];
     },
     async saveHistoryRecoveryCheckpoint() {},
+    async listHistoryRecoveryCheckpoints() {
+      return [];
+    },
     async getHistoryRecoveryCheckpoint() {
       return null;
     },

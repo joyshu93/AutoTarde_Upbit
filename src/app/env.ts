@@ -22,6 +22,7 @@ export interface AppConfig {
   reconciliationMaxOrderLookupsPerRun: number;
   reconciliationHistoryMaxPagesPerMarket: number;
   reconciliationClosedOrderLookbackDays: number;
+  reconciliationHistoryStopBeforeDays: number;
   stalePriceThresholdMs: number;
   minimumOrderValueKrw: number;
   maxAllocationByAsset: Record<SupportedAsset, number>;
@@ -38,6 +39,7 @@ const DEFAULT_TELEGRAM_DELIVERY_LEASE_MS = 30_000;
 const DEFAULT_RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN = 10;
 const DEFAULT_RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET = 3;
 const DEFAULT_RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS = 7;
+const DEFAULT_RECONCILIATION_HISTORY_STOP_BEFORE_DAYS = 365;
 const DEFAULT_STALE_PRICE_THRESHOLD_MS = 30_000;
 const DEFAULT_MINIMUM_ORDER_VALUE_KRW = 5_000;
 const DEFAULT_TOTAL_EXPOSURE_CAP = 0.75;
@@ -87,6 +89,10 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     reconciliationClosedOrderLookbackDays: parseNumber(
       env.RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS,
       DEFAULT_RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS,
+    ),
+    reconciliationHistoryStopBeforeDays: parseNumber(
+      env.RECONCILIATION_HISTORY_STOP_BEFORE_DAYS,
+      DEFAULT_RECONCILIATION_HISTORY_STOP_BEFORE_DAYS,
     ),
     stalePriceThresholdMs: parseNumber(env.STALE_PRICE_THRESHOLD_MS, DEFAULT_STALE_PRICE_THRESHOLD_MS),
     minimumOrderValueKrw: parseNumber(env.MINIMUM_ORDER_VALUE_KRW, DEFAULT_MINIMUM_ORDER_VALUE_KRW),

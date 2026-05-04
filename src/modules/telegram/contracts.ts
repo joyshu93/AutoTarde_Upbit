@@ -27,6 +27,13 @@ const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
     argumentPolicy: "none",
   },
   {
+    command: "/recovery",
+    category: "inspection",
+    usage: "/recovery",
+    summary: "Show checkpointed exchange-history recovery progress for operator inspection.",
+    argumentPolicy: "none",
+  },
+  {
     command: "/alerts",
     category: "inspection",
     usage: "/alerts",

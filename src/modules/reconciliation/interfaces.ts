@@ -27,6 +27,12 @@ export interface ReconciliationHistoryRecoveryMarketProgress {
   archivalWindowStartAt: string;
   archivalWindowEndAt: string;
   nextWindowEndAt: string;
+  archiveComplete: boolean;
+  confidenceLevel: "HIGH" | "PARTIAL";
+  confidenceReason: "ARCHIVE_COMPLETE" | "ARCHIVE_IN_PROGRESS" | "PAGE_LIMIT_REACHED";
+  openHistoryTruncated: boolean;
+  recentClosedHistoryTruncated: boolean;
+  archivalClosedHistoryTruncated: boolean;
   openPagesScanned: number;
   recentClosedPagesScanned: number;
   archivalClosedPagesScanned: number;
@@ -35,6 +41,12 @@ export interface ReconciliationHistoryRecoveryMarketProgress {
 
 export interface ReconciliationHistoryRecoverySummary {
   closedOrderLookbackDays: number;
+  stopBeforeDays: number;
+  stopBeforeAt: string;
+  coverageStatus: "IN_PROGRESS" | "COMPLETE";
+  confidenceLevel: "HIGH" | "PARTIAL" | "FAILED";
+  confidenceReason: "ARCHIVE_COMPLETE" | "ARCHIVE_IN_PROGRESS" | "PAGE_LIMIT_REACHED" | "LOOKUP_FAILED";
+  failureMessage: string | null;
   scannedSnapshotCount: number;
   recoveredOrderCount: number;
   markets: ReconciliationHistoryRecoveryMarketProgress[];

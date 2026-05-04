@@ -29,9 +29,12 @@ export interface OperatorNotificationDeliverySummary {
   retryScheduled: number;
   failed: number;
   staleLease: number;
+  pendingTotal: number;
   pendingDue: number;
   pendingScheduled: number;
   activeLease: number;
+  expiredLease: number;
+  abandonedLeaseCandidate: number;
   skippedReason: string | null;
 }
 
@@ -160,9 +163,12 @@ export class OperatorNotificationDeliveryService {
         retryScheduled: 0,
         failed: 0,
         staleLease: 0,
+        pendingTotal: 0,
         pendingDue: 0,
         pendingScheduled: 0,
         activeLease: 0,
+        expiredLease: 0,
+        abandonedLeaseCandidate: 0,
         skippedReason: "telegram_delivery_not_configured",
       };
     }
@@ -221,9 +227,12 @@ export class OperatorNotificationDeliveryService {
       retryScheduled,
       failed,
       staleLease,
+      pendingTotal: queueState.pendingTotal,
       pendingDue: queueState.pendingDue,
       pendingScheduled: queueState.pendingScheduled,
       activeLease: queueState.activeLease,
+      expiredLease: queueState.expiredLease,
+      abandonedLeaseCandidate: queueState.abandonedLeaseCandidate,
       skippedReason: null,
     };
   }
@@ -435,21 +444,28 @@ export class OperatorNotificationDeliveryService {
     exchangeAccountId: string,
     now: string,
   ): Promise<{
+    pendingTotal: number;
     pendingDue: number;
     pendingScheduled: number;
     activeLease: number;
+    expiredLease: number;
+    abandonedLeaseCandidate: number;
   }> {
     const notifications = await this.dependencies.repositories.listOperatorNotifications(exchangeAccountId, 100);
 
+    let pendingTotal = 0;
     let pendingDue = 0;
     let pendingScheduled = 0;
     let activeLease = 0;
+    let expiredLease = 0;
+    let abandonedLeaseCandidate = 0;
 
     for (const notification of notifications) {
       if (notification.deliveryStatus !== "PENDING") {
         continue;
       }
 
+      pendingTotal += 1;
       const leaseActive =
         notification.leaseToken !== null &&
         notification.leaseExpiresAt !== null &&
@@ -458,6 +474,18 @@ export class OperatorNotificationDeliveryService {
       if (leaseActive) {
         activeLease += 1;
         continue;
+      }
+
+      const leaseExpired =
+        notification.leaseToken !== null &&
+        notification.leaseExpiresAt !== null &&
+        notification.leaseExpiresAt.localeCompare(now) <= 0;
+
+      if (leaseExpired) {
+        expiredLease += 1;
+        if (notification.lastAttemptAt !== null) {
+          abandonedLeaseCandidate += 1;
+        }
       }
 
       if (notification.nextAttemptAt === null || notification.nextAttemptAt.localeCompare(now) <= 0) {
@@ -469,9 +497,12 @@ export class OperatorNotificationDeliveryService {
     }
 
     return {
+      pendingTotal,
       pendingDue,
       pendingScheduled,
       activeLease,
+      expiredLease,
+      abandonedLeaseCandidate,
     };
   }
 }
