@@ -5,6 +5,7 @@ import type {
   HistoryRecoveryCheckpointRecord,
   HistoryRecoveryCheckpointType,
   OperatorNotificationDeliveryAttemptRecord,
+  OperatorNotificationDeliveryRunRecord,
   OperatorNotificationDeliveryTransition,
   OperatorNotificationRecord,
   ExecutionStateSeed,
@@ -24,6 +25,11 @@ import type {
 
 export interface ExecutionRepository {
   saveStrategyDecision(record: StrategyDecisionRecord): Promise<void>;
+  getLatestStrategyDecision(
+    exchangeAccountId: string,
+    market: SupportedMarket,
+    strategyKey?: string,
+  ): Promise<StrategyDecisionRecord | null>;
   saveOrder(record: OrderRecord): Promise<void>;
   updateOrder(record: OrderRecord): Promise<void>;
   findOrderByIdempotencyKey(exchangeAccountId: string, idempotencyKey: string): Promise<OrderRecord | null>;
@@ -51,6 +57,7 @@ export interface ExecutionRepository {
   ): Promise<HistoryRecoveryCheckpointRecord | null>;
   saveOperatorNotification(record: OperatorNotificationRecord): Promise<void>;
   saveOperatorNotificationDeliveryAttempt(record: OperatorNotificationDeliveryAttemptRecord): Promise<void>;
+  saveOperatorNotificationDeliveryRun(record: OperatorNotificationDeliveryRunRecord): Promise<void>;
   claimPendingOperatorNotifications(
     exchangeAccountId: string,
     input: {
@@ -69,6 +76,10 @@ export interface ExecutionRepository {
     exchangeAccountId: string,
     limit?: number,
   ): Promise<OperatorNotificationDeliveryAttemptRecord[]>;
+  listOperatorNotificationDeliveryRuns(
+    exchangeAccountId: string,
+    limit?: number,
+  ): Promise<OperatorNotificationDeliveryRunRecord[]>;
   listPendingOperatorNotifications(
     exchangeAccountId: string,
     options?: {

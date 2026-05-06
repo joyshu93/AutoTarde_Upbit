@@ -32,6 +32,7 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   const recoveryParsed = parseTelegramCommand("/RECOVERY@autotrade_upbit_bot");
   const alertsParsed = parseTelegramCommand("/ALERTS@autotrade_upbit_bot");
   const risksParsed = parseTelegramCommand("/RISKS@autotrade_upbit_bot");
+  const runParsed = parseTelegramCommand("/RUN@autotrade_upbit_bot BTC");
 
   assert.ok(parsed);
   assert.equal(parsed.command, "/status");
@@ -52,13 +53,17 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.ok(risksParsed);
   assert.equal(risksParsed.command, "/risks");
   assert.equal(risksParsed.contract.summary, "Show recent persisted risk_events for operator inspection.");
+  assert.ok(runParsed);
+  assert.equal(runParsed.command, "/run");
+  assert.deepEqual(runParsed.args, ["BTC"]);
+  assert.equal(runParsed.contract.summary, "Run one deterministic PositionGuard strategy cycle for a supported asset through the safe execution path.");
 });
 
 test("manual input commands are rejected by the operator contract", () => {
   const message = buildUnsupportedCommandMessage("/setposition BTC 0.25 95000000");
 
   assert.match(message, /Manual cash and position input is not supported in Telegram\./);
-  assert.match(message, /\/status \/statehistory \/synchistory \/recovery \/alerts \/risks \/balances \/positions \/orders \/pause \/resume \/killswitch \/sync/);
+  assert.match(message, /\/status \/statehistory \/synchistory \/recovery \/alerts \/risks \/balances \/positions \/orders \/pause \/resume \/killswitch \/sync \/run/);
 });
 
 test("no-argument commands return usage guidance when extra arguments are supplied", () => {
@@ -68,6 +73,9 @@ test("no-argument commands return usage guidance when extra arguments are suppli
   const recoveryParsed = parseTelegramCommand("/recovery now");
   const alertsParsed = parseTelegramCommand("/alerts now");
   const risksParsed = parseTelegramCommand("/risks now");
+  const missingRunAssetParsed = parseTelegramCommand("/run");
+  const unsupportedRunAssetParsed = parseTelegramCommand("/run DOGE");
+  const extraRunArgParsed = parseTelegramCommand("/run BTC now");
 
   assert.ok(parsed);
   assert.equal(
@@ -98,6 +106,21 @@ test("no-argument commands return usage guidance when extra arguments are suppli
   assert.equal(
     validateTelegramCommand(risksParsed),
     buildUsageMessage("/risks"),
+  );
+  assert.ok(missingRunAssetParsed);
+  assert.equal(
+    validateTelegramCommand(missingRunAssetParsed),
+    buildUsageMessage("/run"),
+  );
+  assert.ok(unsupportedRunAssetParsed);
+  assert.equal(
+    validateTelegramCommand(unsupportedRunAssetParsed),
+    buildUsageMessage("/run"),
+  );
+  assert.ok(extraRunArgParsed);
+  assert.equal(
+    validateTelegramCommand(extraRunArgParsed),
+    buildUsageMessage("/run"),
   );
 });
 
@@ -406,6 +429,33 @@ test("router applies control commands, blocks invalid arguments, and advertises 
           },
         ];
       },
+      async listOperatorNotificationDeliveryRuns(_exchangeAccountId, limit) {
+        alertRequests.push((limit ?? -1) * 1000);
+        return [
+          {
+            id: "delivery-run-1",
+            exchangeAccountId: "primary",
+            workerName: "telegram_delivery_inline_worker",
+            status: "COMPLETED",
+            startedAt: "2026-04-20T00:03:41.000Z",
+            completedAt: "2026-04-20T00:03:42.000Z",
+            attemptedCount: 1,
+            sentCount: 0,
+            retryScheduledCount: 1,
+            failedCount: 0,
+            staleLeaseCount: 0,
+            pendingTotalCount: 1,
+            pendingDueCount: 0,
+            pendingScheduledCount: 1,
+            activeLeaseCount: 0,
+            expiredLeaseCount: 0,
+            abandonedLeaseCandidateCount: 0,
+            skippedReason: null,
+            errorMessage: null,
+            summaryJson: "{}",
+          },
+        ];
+      },
     }),
     executionStateSeed: {
       executionMode: "DRY_RUN",
@@ -431,6 +481,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   const invalidRisksResponse = await router.route("/risks now");
   const unsupportedInputResponse = await router.route("/setcash 100000");
   const syncResponse = await router.route("/sync");
+  const invalidRunResponse = await router.route("/run ETH now");
 
   assert.match(statusResponse.text, /exchange_account_id: primary/);
   assert.match(statusResponse.text, /state_source: persisted execution_state/);
@@ -470,7 +521,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   assert.match(risksResponse.text, /state_source: persisted risk_events/);
   assert.match(risksResponse.text, /GLOBAL_KILL_SWITCH/);
   assert.deepEqual(historyRequests, [3, 10]);
-  assert.deepEqual(alertRequests, [10, 500]);
+  assert.deepEqual(alertRequests, [10, 500, 5000]);
   assert.deepEqual(reconciliationRequests, [1, 10, 1]);
   assert.deepEqual(recoveryCheckpointRequests, ["primary"]);
 
@@ -509,6 +560,10 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   assert.match(unsupportedInputResponse.text, /Manual cash and position input is not supported in Telegram\./);
   assert.match(syncResponse.text, /status: NOT_CONNECTED/);
   assert.match(syncResponse.text, /requested_at: 2026-04-20T00:04:00.000Z/);
+  assert.equal(
+    invalidRunResponse.text,
+    "Usage: /run BTC|ETH\nRun one deterministic PositionGuard strategy cycle for a supported asset through the safe execution path.",
+  );
 });
 
 test("router surfaces a wired sync controller when available", async () => {
@@ -641,6 +696,9 @@ function createRepositoryStub(overrides: Partial<ExecutionRepository> = {}): Exe
 
   return {
     async saveStrategyDecision() {},
+    async getLatestStrategyDecision() {
+      return null;
+    },
     async saveOrder(record) {
       orders.push(record);
     },
@@ -695,6 +753,7 @@ function createRepositoryStub(overrides: Partial<ExecutionRepository> = {}): Exe
     },
     async saveOperatorNotification() {},
     async saveOperatorNotificationDeliveryAttempt() {},
+    async saveOperatorNotificationDeliveryRun() {},
     async claimPendingOperatorNotifications() {
       return [];
     },
@@ -705,6 +764,9 @@ function createRepositoryStub(overrides: Partial<ExecutionRepository> = {}): Exe
       return [];
     },
     async listOperatorNotificationDeliveryAttempts() {
+      return [];
+    },
+    async listOperatorNotificationDeliveryRuns() {
       return [];
     },
     async listPendingOperatorNotifications() {

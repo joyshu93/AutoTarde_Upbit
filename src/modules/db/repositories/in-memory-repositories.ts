@@ -2,6 +2,7 @@ import type {
   BalanceSnapshotRecord,
   ClaimedOperatorNotificationRecord,
   OperatorNotificationDeliveryAttemptRecord,
+  OperatorNotificationDeliveryRunRecord,
   OperatorNotificationDeliveryTransition,
   ExecutionStateRecord,
   ExecutionStateTransitionRecord,
@@ -44,9 +45,26 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   private readonly historyRecoveryCheckpoints: HistoryRecoveryCheckpointRecord[] = [];
   private readonly operatorNotifications: OperatorNotificationRecord[] = [];
   private readonly operatorNotificationDeliveryAttempts: OperatorNotificationDeliveryAttemptRecord[] = [];
+  private readonly operatorNotificationDeliveryRuns: OperatorNotificationDeliveryRunRecord[] = [];
 
   async saveStrategyDecision(record: StrategyDecisionRecord): Promise<void> {
     this.strategyDecisions.push(record);
+  }
+
+  async getLatestStrategyDecision(
+    exchangeAccountId: string,
+    market: SupportedMarket,
+    strategyKey?: string,
+  ): Promise<StrategyDecisionRecord | null> {
+    return (
+      [...this.strategyDecisions]
+        .filter((candidate) =>
+          candidate.exchangeAccountId === exchangeAccountId &&
+          candidate.market === market &&
+          (strategyKey === undefined || candidate.strategyKey === strategyKey),
+        )
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0] ?? null
+    );
   }
 
   async saveOrder(record: OrderRecord): Promise<void> {
@@ -240,6 +258,18 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     this.operatorNotificationDeliveryAttempts[index] = record;
   }
 
+  async saveOperatorNotificationDeliveryRun(
+    record: OperatorNotificationDeliveryRunRecord,
+  ): Promise<void> {
+    const index = this.operatorNotificationDeliveryRuns.findIndex((candidate) => candidate.id === record.id);
+    if (index === -1) {
+      this.operatorNotificationDeliveryRuns.push(record);
+      return;
+    }
+
+    this.operatorNotificationDeliveryRuns[index] = record;
+  }
+
   async claimPendingOperatorNotifications(
     exchangeAccountId: string,
     input: {
@@ -337,6 +367,17 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       .sort((left, right) => right.attemptedAt.localeCompare(left.attemptedAt));
 
     return typeof limit === "number" ? attempts.slice(0, limit) : attempts;
+  }
+
+  async listOperatorNotificationDeliveryRuns(
+    exchangeAccountId: string,
+    limit?: number,
+  ): Promise<OperatorNotificationDeliveryRunRecord[]> {
+    const runs = this.operatorNotificationDeliveryRuns
+      .filter((candidate) => candidate.exchangeAccountId === exchangeAccountId)
+      .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+
+    return typeof limit === "number" ? runs.slice(0, limit) : runs;
   }
 
   async listPendingOperatorNotifications(

@@ -75,6 +75,7 @@ test("delivery service marks pending notifications as sent after successful Tele
   const summary = await deliveryService.deliverPending("primary", 10);
   const notifications = await repositories.listOperatorNotifications("primary");
   const attempts = await repositories.listOperatorNotificationDeliveryAttempts("primary");
+  const runs = await repositories.listOperatorNotificationDeliveryRuns("primary");
   const pendingNotifications = await repositories.listPendingOperatorNotifications("primary");
   const firstAttempt = attempts.find((attempt) => attempt.notificationId === "operator-notification-1");
 
@@ -109,6 +110,11 @@ test("delivery service marks pending notifications as sent after successful Tele
   assert.equal(firstAttempt?.outcome, "SENT");
   assert.equal(firstAttempt?.attemptCount, 1);
   assert.equal(firstAttempt?.deliveredAt, "2026-04-20T00:21:05.000Z");
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0]?.status, "COMPLETED");
+  assert.equal(runs[0]?.attemptedCount, 2);
+  assert.equal(runs[0]?.sentCount, 2);
+  assert.equal(runs[0]?.skippedReason, null);
   assert.equal(pendingNotifications.length, 0);
 });
 
@@ -140,6 +146,7 @@ test("delivery service reschedules retryable Telegram delivery errors with expon
 
   const summary = await deliveryService.deliverPending("primary", 10);
   const notifications = await repositories.listOperatorNotifications("primary");
+  const runs = await repositories.listOperatorNotificationDeliveryRuns("primary");
   const attempts = await repositories.listOperatorNotificationDeliveryAttempts("primary");
 
   assert.deepEqual(summary, {
@@ -311,6 +318,7 @@ test("delivery service leaves notifications pending when Telegram delivery is no
 
   const summary = await deliveryService.deliverPending("primary", 10);
   const notifications = await repositories.listOperatorNotifications("primary");
+  const runs = await repositories.listOperatorNotificationDeliveryRuns("primary");
 
   assert.deepEqual(summary, {
     attempted: 0,
@@ -327,6 +335,9 @@ test("delivery service leaves notifications pending when Telegram delivery is no
     skippedReason: "telegram_delivery_not_configured",
   });
   assert.equal(notifications[0]?.deliveryStatus, "PENDING");
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0]?.status, "SKIPPED");
+  assert.equal(runs[0]?.skippedReason, "telegram_delivery_not_configured");
 });
 
 test("delivery service avoids double-claiming notifications while an active lease exists", async () => {
@@ -407,6 +418,8 @@ test("delivery service records stale lease outcomes in delivery attempt history"
         baseRepository.listPendingOperatorNotifications.bind(baseRepository),
       saveOperatorNotificationDeliveryAttempt:
         baseRepository.saveOperatorNotificationDeliveryAttempt.bind(baseRepository),
+      saveOperatorNotificationDeliveryRun:
+        baseRepository.saveOperatorNotificationDeliveryRun.bind(baseRepository),
       async compareAndSetOperatorNotificationDeliveryStatus() {
         return false;
       },
@@ -421,6 +434,7 @@ test("delivery service records stale lease outcomes in delivery attempt history"
   const summary = await deliveryService.deliverPending("primary", 10);
   const notifications = await baseRepository.listOperatorNotifications("primary");
   const attempts = await baseRepository.listOperatorNotificationDeliveryAttempts("primary");
+  const runs = await baseRepository.listOperatorNotificationDeliveryRuns("primary");
 
   assert.deepEqual(summary, {
     attempted: 1,
@@ -440,6 +454,9 @@ test("delivery service records stale lease outcomes in delivery attempt history"
   assert.equal(attempts.length, 1);
   assert.equal(attempts[0]?.outcome, "STALE_LEASE");
   assert.equal(attempts[0]?.errorMessage, "stale_lease_finalize");
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0]?.status, "COMPLETED");
+  assert.equal(runs[0]?.staleLeaseCount, 1);
 });
 
 test("delivery service reports expired abandoned lease candidates in queue metrics", async () => {

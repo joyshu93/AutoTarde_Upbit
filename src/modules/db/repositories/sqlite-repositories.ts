@@ -7,6 +7,7 @@ import type {
   FillRecord,
   HistoryRecoveryCheckpointRecord,
   OperatorNotificationDeliveryAttemptRecord,
+  OperatorNotificationDeliveryRunRecord,
   OperatorNotificationDeliveryTransition,
   OperatorNotificationRecord,
   OrderEventRecord,
@@ -29,6 +30,7 @@ import type {
   SqliteFillRow,
   SqliteHistoryRecoveryCheckpointRow,
   SqliteOperatorNotificationDeliveryAttemptRow,
+  SqliteOperatorNotificationDeliveryRunRow,
   SqliteOperatorNotificationRow,
   SqliteOrderEventRow,
   SqliteOrderRow,
@@ -156,6 +158,28 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       record.referencePrice,
       record.createdAt,
     );
+  }
+
+  async getLatestStrategyDecision(
+    exchangeAccountId: string,
+    market: SupportedMarket,
+    strategyKey?: string,
+  ): Promise<StrategyDecisionRecord | null> {
+    const row = strategyKey === undefined
+      ? (this.db.prepare(`
+          SELECT * FROM strategy_decisions
+          WHERE exchange_account_id = ? AND market = ?
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT 1
+        `).get(exchangeAccountId, market) as SqliteStrategyDecisionRow | undefined)
+      : (this.db.prepare(`
+          SELECT * FROM strategy_decisions
+          WHERE exchange_account_id = ? AND market = ? AND strategy_key = ?
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT 1
+        `).get(exchangeAccountId, market, strategyKey) as SqliteStrategyDecisionRow | undefined);
+
+    return row ? mapStrategyDecisionRow(row) : null;
   }
 
   async saveOrder(record: OrderRecord): Promise<void> {
@@ -556,6 +580,61 @@ export class SqliteExecutionRepository implements ExecutionRepository {
     );
   }
 
+  async saveOperatorNotificationDeliveryRun(
+    record: OperatorNotificationDeliveryRunRecord,
+  ): Promise<void> {
+    this.db.prepare(`
+      INSERT INTO operator_notification_delivery_runs (
+        id, exchange_account_id, worker_name, status, started_at, completed_at,
+        attempted_count, sent_count, retry_scheduled_count, failed_count,
+        stale_lease_count, pending_total_count, pending_due_count,
+        pending_scheduled_count, active_lease_count, expired_lease_count,
+        abandoned_lease_candidate_count, skipped_reason, error_message, summary_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        exchange_account_id = excluded.exchange_account_id,
+        worker_name = excluded.worker_name,
+        status = excluded.status,
+        started_at = excluded.started_at,
+        completed_at = excluded.completed_at,
+        attempted_count = excluded.attempted_count,
+        sent_count = excluded.sent_count,
+        retry_scheduled_count = excluded.retry_scheduled_count,
+        failed_count = excluded.failed_count,
+        stale_lease_count = excluded.stale_lease_count,
+        pending_total_count = excluded.pending_total_count,
+        pending_due_count = excluded.pending_due_count,
+        pending_scheduled_count = excluded.pending_scheduled_count,
+        active_lease_count = excluded.active_lease_count,
+        expired_lease_count = excluded.expired_lease_count,
+        abandoned_lease_candidate_count = excluded.abandoned_lease_candidate_count,
+        skipped_reason = excluded.skipped_reason,
+        error_message = excluded.error_message,
+        summary_json = excluded.summary_json
+    `).run(
+      record.id,
+      record.exchangeAccountId,
+      record.workerName,
+      record.status,
+      record.startedAt,
+      record.completedAt,
+      record.attemptedCount,
+      record.sentCount,
+      record.retryScheduledCount,
+      record.failedCount,
+      record.staleLeaseCount,
+      record.pendingTotalCount,
+      record.pendingDueCount,
+      record.pendingScheduledCount,
+      record.activeLeaseCount,
+      record.expiredLeaseCount,
+      record.abandonedLeaseCandidateCount,
+      record.skippedReason,
+      record.errorMessage,
+      record.summaryJson,
+    );
+  }
+
   async claimPendingOperatorNotifications(
     exchangeAccountId: string,
     input: {
@@ -712,6 +791,26 @@ export class SqliteExecutionRepository implements ExecutionRepository {
         `).all(exchangeAccountId) as unknown as SqliteOperatorNotificationDeliveryAttemptRow[]);
 
     return rows.map(mapOperatorNotificationDeliveryAttemptRow);
+  }
+
+  async listOperatorNotificationDeliveryRuns(
+    exchangeAccountId: string,
+    limit?: number,
+  ): Promise<OperatorNotificationDeliveryRunRecord[]> {
+    const rows = typeof limit === "number"
+      ? (this.db.prepare(`
+          SELECT * FROM operator_notification_delivery_runs
+          WHERE exchange_account_id = ?
+          ORDER BY started_at DESC, rowid DESC
+          LIMIT ?
+        `).all(exchangeAccountId, limit) as unknown as SqliteOperatorNotificationDeliveryRunRow[])
+      : (this.db.prepare(`
+          SELECT * FROM operator_notification_delivery_runs
+          WHERE exchange_account_id = ?
+          ORDER BY started_at DESC, rowid DESC
+        `).all(exchangeAccountId) as unknown as SqliteOperatorNotificationDeliveryRunRow[]);
+
+    return rows.map(mapOperatorNotificationDeliveryRunRow);
   }
 
   async listPendingOperatorNotifications(
@@ -1122,6 +1221,22 @@ function mapPositionSnapshotRow(row: SqlitePositionSnapshotRow): PositionSnapsho
   };
 }
 
+function mapStrategyDecisionRow(row: SqliteStrategyDecisionRow): StrategyDecisionRecord {
+  return {
+    id: row.id,
+    exchangeAccountId: row.exchange_account_id,
+    strategyKey: row.strategy_key,
+    market: row.market,
+    action: row.action,
+    status: row.status,
+    decisionBasisJson: row.decision_basis_json,
+    intendedNotionalKrw: row.intended_notional_krw,
+    intendedQuantity: row.intended_quantity,
+    referencePrice: row.reference_price,
+    createdAt: row.created_at,
+  };
+}
+
 function mapOrderRow(row: SqliteOrderRow): OrderRecord {
   return {
     id: row.id,
@@ -1243,6 +1358,33 @@ function mapOperatorNotificationDeliveryAttemptRow(
     deliveredAt: row.delivered_at,
     errorMessage: row.error_message,
     createdAt: row.created_at,
+  };
+}
+
+function mapOperatorNotificationDeliveryRunRow(
+  row: SqliteOperatorNotificationDeliveryRunRow,
+): OperatorNotificationDeliveryRunRecord {
+  return {
+    id: row.id,
+    exchangeAccountId: row.exchange_account_id,
+    workerName: row.worker_name,
+    status: row.status,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    attemptedCount: row.attempted_count,
+    sentCount: row.sent_count,
+    retryScheduledCount: row.retry_scheduled_count,
+    failedCount: row.failed_count,
+    staleLeaseCount: row.stale_lease_count,
+    pendingTotalCount: row.pending_total_count,
+    pendingDueCount: row.pending_due_count,
+    pendingScheduledCount: row.pending_scheduled_count,
+    activeLeaseCount: row.active_lease_count,
+    expiredLeaseCount: row.expired_lease_count,
+    abandonedLeaseCandidateCount: row.abandoned_lease_candidate_count,
+    skippedReason: row.skipped_reason,
+    errorMessage: row.error_message,
+    summaryJson: row.summary_json,
   };
 }
 

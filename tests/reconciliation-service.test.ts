@@ -178,6 +178,8 @@ test("reconciliation service recovers exchange-only orders from recent exchange 
   assert.equal(summary.deferredCount, 0);
   assert.equal(summary.historyRecovery?.closedOrderLookbackDays, 7);
   assert.equal(summary.historyRecovery?.stopBeforeDays, 365);
+  assert.equal(summary.historyRecovery?.retentionAssumptionDays, 365);
+  assert.equal(summary.historyRecovery?.retentionStatus, "WITHIN_ASSUMED_RETENTION");
   assert.equal(summary.historyRecovery?.coverageStatus, "IN_PROGRESS");
   assert.equal(summary.historyRecovery?.confidenceLevel, "PARTIAL");
   assert.equal(summary.historyRecovery?.confidenceReason, "ARCHIVE_IN_PROGRESS");
@@ -187,6 +189,7 @@ test("reconciliation service recovers exchange-only orders from recent exchange 
   assert.equal(summary.historyRecovery?.markets.length, 2);
   assert.equal(summary.historyRecovery?.markets[0]?.market, "KRW-BTC");
   assert.equal(summary.historyRecovery?.markets[0]?.archiveComplete, false);
+  assert.equal(summary.historyRecovery?.markets[0]?.retentionStatus, "WITHIN_ASSUMED_RETENTION");
   assert.equal(summary.historyRecovery?.markets[0]?.confidenceLevel, "PARTIAL");
   assert.equal(summary.historyRecovery?.markets[0]?.confidenceReason, "ARCHIVE_IN_PROGRESS");
   assert.equal(summary.historyRecovery?.markets[0]?.openHistoryTruncated, false);
@@ -276,6 +279,8 @@ test("reconciliation service paginates recent exchange history within the config
   assert.equal(orders.length, 21);
   assert.equal(summary.historyRecovery?.closedOrderLookbackDays, 3);
   assert.equal(summary.historyRecovery?.stopBeforeDays, 365);
+  assert.equal(summary.historyRecovery?.retentionAssumptionDays, 365);
+  assert.equal(summary.historyRecovery?.retentionStatus, "WITHIN_ASSUMED_RETENTION");
   assert.equal(summary.historyRecovery?.coverageStatus, "IN_PROGRESS");
   assert.equal(summary.historyRecovery?.confidenceLevel, "PARTIAL");
   assert.equal(summary.historyRecovery?.confidenceReason, "ARCHIVE_IN_PROGRESS");
@@ -355,6 +360,7 @@ test("reconciliation service stops archival exchange-history recovery at the con
   const summary = await service.run("primary");
 
   assert.equal(summary.historyRecovery?.stopBeforeDays, 14);
+  assert.equal(summary.historyRecovery?.retentionStatus, "WITHIN_ASSUMED_RETENTION");
   assert.equal(summary.historyRecovery?.coverageStatus, "COMPLETE");
   assert.equal(summary.historyRecovery?.confidenceLevel, "HIGH");
   assert.equal(summary.historyRecovery?.confidenceReason, "ARCHIVE_COMPLETE");
@@ -408,6 +414,7 @@ test("reconciliation service marks exchange-history confidence partial when page
   assert.equal(summary.historyRecovery?.coverageStatus, "IN_PROGRESS");
   assert.equal(summary.historyRecovery?.confidenceLevel, "PARTIAL");
   assert.equal(summary.historyRecovery?.confidenceReason, "PAGE_LIMIT_REACHED");
+  assert.equal(summary.historyRecovery?.retentionStatus, "WITHIN_ASSUMED_RETENTION");
   assert.equal(summary.historyRecovery?.markets[0]?.market, "KRW-BTC");
   assert.equal(summary.historyRecovery?.markets[0]?.confidenceLevel, "PARTIAL");
   assert.equal(summary.historyRecovery?.markets[0]?.confidenceReason, "PAGE_LIMIT_REACHED");
@@ -416,6 +423,50 @@ test("reconciliation service marks exchange-history confidence partial when page
   assert.equal(summary.historyRecovery?.markets[0]?.archivalClosedHistoryTruncated, true);
   assert.equal(summary.historyRecovery?.markets[1]?.market, "KRW-ETH");
   assert.equal(summary.historyRecovery?.markets[1]?.confidenceReason, "ARCHIVE_IN_PROGRESS");
+});
+
+test("reconciliation service marks history confidence partial when the scan crosses assumed exchange retention", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-history-retention-confidence",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  });
+  const service = new ReconciliationService({
+    repositories,
+    operatorState,
+    closedOrderLookbackDays: 7,
+    historyStopBeforeDays: 60,
+    historyRetentionAssumptionDays: 14,
+    orderHistoryReader: {
+      async listOpenOrders() {
+        return [];
+      },
+      async listClosedOrders() {
+        return [];
+      },
+    },
+  });
+
+  const summary = await service.run("primary");
+
+  assert.equal(summary.historyRecovery?.coverageStatus, "IN_PROGRESS");
+  assert.equal(summary.historyRecovery?.retentionAssumptionDays, 14);
+  assert.equal(summary.historyRecovery?.retentionStatus, "BEYOND_ASSUMED_RETENTION");
+  assert.equal(summary.historyRecovery?.confidenceLevel, "PARTIAL");
+  assert.equal(summary.historyRecovery?.confidenceReason, "BEYOND_ASSUMED_RETENTION");
+  assert.equal(summary.historyRecovery?.markets[0]?.market, "KRW-BTC");
+  assert.equal(summary.historyRecovery?.markets[0]?.retentionStatus, "BEYOND_ASSUMED_RETENTION");
+  assert.equal(summary.historyRecovery?.markets[0]?.confidenceReason, "BEYOND_ASSUMED_RETENTION");
+  assert.equal(summary.historyRecovery?.markets[1]?.market, "KRW-ETH");
+  assert.equal(summary.historyRecovery?.markets[1]?.retentionStatus, "BEYOND_ASSUMED_RETENTION");
 });
 
 test("reconciliation service persists failed exchange-history confidence when history lookup fails", async () => {
@@ -452,6 +503,8 @@ test("reconciliation service persists failed exchange-history confidence when hi
   assert.equal(summary.historyRecovery?.coverageStatus, "IN_PROGRESS");
   assert.equal(summary.historyRecovery?.confidenceLevel, "FAILED");
   assert.equal(summary.historyRecovery?.confidenceReason, "LOOKUP_FAILED");
+  assert.equal(summary.historyRecovery?.retentionAssumptionDays, 365);
+  assert.equal(summary.historyRecovery?.retentionStatus, "WITHIN_ASSUMED_RETENTION");
   assert.equal(summary.historyRecovery?.failureMessage, "Upbit history temporarily unavailable");
   assert.equal(summary.historyRecovery?.scannedSnapshotCount, 0);
   assert.equal(summary.historyRecovery?.markets.length, 0);

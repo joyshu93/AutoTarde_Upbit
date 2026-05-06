@@ -82,6 +82,35 @@ export interface UpbitTickerSnapshot {
   readonly trade_timestamp: number;
 }
 
+export type UpbitMinuteCandleUnit = 60 | 240;
+
+export interface UpbitCandleSnapshot {
+  readonly market: UpbitSpotMarket;
+  readonly candle_date_time_utc: string;
+  readonly candle_date_time_kst: string;
+  readonly opening_price: number;
+  readonly high_price: number;
+  readonly low_price: number;
+  readonly trade_price: number;
+  readonly timestamp: number;
+  readonly candle_acc_trade_price: number;
+  readonly candle_acc_trade_volume: number;
+  readonly unit?: UpbitMinuteCandleUnit;
+}
+
+export interface UpbitGetMinuteCandlesRequest {
+  readonly market: UpbitSpotMarket;
+  readonly unit: UpbitMinuteCandleUnit;
+  readonly count: number;
+  readonly to?: string;
+}
+
+export interface UpbitGetDayCandlesRequest {
+  readonly market: UpbitSpotMarket;
+  readonly count: number;
+  readonly to?: string;
+}
+
 export interface UpbitOrderConstraint {
   readonly currency: string;
   readonly price_unit: DecimalString;
@@ -279,4 +308,6 @@ export interface UpbitPrivateExchangeClient {
 
 export interface UpbitPublicQuotationClient {
   getTickers(markets: readonly UpbitSpotMarket[]): Promise<readonly UpbitTickerSnapshot[]>;
+  getMinuteCandles(request: UpbitGetMinuteCandlesRequest): Promise<readonly UpbitCandleSnapshot[]>;
+  getDayCandles(request: UpbitGetDayCandlesRequest): Promise<readonly UpbitCandleSnapshot[]>;
 }

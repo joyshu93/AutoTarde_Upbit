@@ -34,6 +34,17 @@ It must not:
 - submit orders
 - mutate persistence
 
+Current strategy direction:
+- the runtime app still wires a safe `HOLD` stub
+- the first pure `PositionGuard_PaperTrade` core port exists in `position-guard-core`
+- the first pure `PositionGuard_PaperTrade` market-structure analyzer port exists in `market-structure`
+- `position-guard-snapshot` now normalizes Upbit public ticker and 1h/4h/1d candle responses into the analyzer input shape
+- `position-guard-context` now assembles persisted balances, positions, latest compatible strategy decisions, and recent filled sell context into the core decision input shape
+- `position-guard-runner` now performs one explicit market cycle: public snapshot read, structure analysis, persisted context assembly, core decision, durable strategy-decision persistence, and optional `DRY_RUN` execution submission
+- the port preserves invalidation-first exits, no-chase entries, staged entry/add sizing, soft reduce logic, and borderline hourly confirmation semantics
+- Telegram `/run BTC|ETH` now exposes a controlled operator trigger for one runner cycle without enabling live order transmission
+- the next step is a scheduler trigger that uses the same runner/controller path and still inherits the default live-order blockers
+
 ### `risk`
 
 Applies hard guardrails before an order can proceed.
@@ -70,6 +81,7 @@ The execution layer is where `DRY_RUN` and `LIVE` diverge operationally, while s
 Owns exchange-specific behavior:
 - Upbit private authentication
 - request signing
+- public ticker and candle reads for deterministic strategy inputs
 - balance queries
 - order chance and order test paths
 - create, cancel, and get-order methods
@@ -86,7 +98,7 @@ Current slice:
 - balance and position drift detection by comparing new exchange-backed snapshots against the prior persisted snapshots plus local fill history
 - startup recovery sweep when exchange-backed Upbit reads are configured
 - per-run reconciliation lookup budgeting with oldest-first processing inside each priority tier
-- checkpointed exchange-history recovery with an explicit stop-before boundary, `IN_PROGRESS` / `COMPLETE` coverage status, and separate `HIGH` / `PARTIAL` / `FAILED` confidence classification
+- checkpointed exchange-history recovery with an explicit stop-before boundary, explicit exchange-retention assumption metadata, `IN_PROGRESS` / `COMPLETE` coverage status, and separate `HIGH` / `PARTIAL` / `FAILED` confidence classification
 - startup policy that can mark persisted operator state `DEGRADED` when unresolved portfolio drift remains after startup recovery
 
 It should eventually reconcile:
@@ -106,17 +118,18 @@ It provides:
 - reporting-friendly formatters
 - persisted-status inspection that can summarize recent operator-state transitions
 - `/status` summary that includes the latest persisted reconciliation run health
-- `/status` summary that now also includes checkpointed exchange-history recovery progress, coverage status, and confidence classification from the latest persisted reconciliation run
+- `/status` summary that now also includes checkpointed exchange-history recovery progress, retention-assumption status, coverage status, and confidence classification from the latest persisted reconciliation run
 - `/statehistory` for read-only execution_state transition history
 - `/synchistory` for read-only persisted reconciliation_runs inspection
 - `/recovery` for read-only checkpointed exchange-history recovery progress inspection
 - `/alerts` for read-only persisted operator_notifications inspection, including `PENDING` / `SENT` / `FAILED` plus retry metadata such as `attempt_count`, `next_attempt_at`, and `failure_class`
 - `/alerts` now also shows recent rows from the separate persisted `operator_notification_delivery_attempts` audit trail
-- `/alerts` now derives delivery-worker queue metrics including pending totals, due/scheduled counts, active/expired leases, abandoned-lease candidates, and recent attempt outcome counts
+- `/alerts` now derives delivery-worker queue metrics including pending totals, due/scheduled counts, active/expired leases, abandoned-lease candidates, recent delivery-run summaries, and recent attempt outcome counts
 - `/risks` for read-only persisted risk_events inspection
 - `/sync` for reconciliation-triggered snapshot and reconciliation record persistence with read-only public ticker valuation
+- `/run BTC|ETH` for one deterministic PositionGuard strategy runner cycle through the configured safe execution path
 - future reconciliation inspection as a read-only operator view
-- `/synchistory` summaries that expose bounded archival recovery progress such as checkpoint window movement, page counts, stop-before boundary, coverage status, truncation flags, and confidence classification
+- `/synchistory` summaries that expose bounded archival recovery progress such as checkpoint window movement, page counts, stop-before boundary, retention-assumption boundary, coverage status, truncation flags, and confidence classification
 - execution_state transition history inspection from persisted state
 - outbox-based Telegram delivery that persists first, then attempts best-effort send behind `ENABLE_TELEGRAM_DELIVERY`
 
@@ -156,6 +169,7 @@ The schema is centered on recovery and auditability:
 - `reconciliation_runs`
 - `operator_notifications`
 - `operator_notification_delivery_attempts`
+- `operator_notification_delivery_runs`
 - `risk_events`
 
 The important design choice is that order lifecycle data is first-class. Balance or position drift must be explainable through orders, fills, cancellations, failures, reconciliation runs, and explicit operator-state transitions.
@@ -163,7 +177,8 @@ The important design choice is that order lifecycle data is first-class. Balance
 Retry metadata is durable too, so delivery workers can reschedule without mutating execution or reconciliation records.
 Lease metadata is durable as well, so workers can claim rows and finalize only when the claimed `lease_token` still matches.
 `operator_notification_delivery_attempts` add append-oriented delivery observability without changing the current-summary semantics of `operator_notifications`.
-Delivery-worker queue metrics are currently derived from persisted notification and attempt rows rather than stored in a separate worker-run table.
+`operator_notification_delivery_runs` add one row per delivery-worker execution so scheduled or inline workers leave a durable summary even when no notification was sent.
+Delivery-worker queue metrics are currently derived from persisted notification, delivery-run, and attempt rows.
 
 ## Execution Modes
 
@@ -187,7 +202,7 @@ Delivery-worker queue metrics are currently derived from persisted notification 
 2. Optionally run an exchange-backed startup recovery sweep when Upbit read credentials are configured.
 3. During startup recovery, persist fresh balance and position snapshots, reconcile orders/fills, detect unexplained portfolio drift, then apply the bootstrap-only `DEGRADED` policy if needed.
 4. Load execution policy and operator state.
-5. Build a deterministic strategy decision.
+5. Build a deterministic strategy decision, either from an explicit operator `/run BTC|ETH` request or a future scheduler trigger.
 6. Convert the decision into an order intent with an idempotency key.
 7. Run risk guards.
 8. Run exchange pre-trade validation through `orders/chance` and `orders/test`.
@@ -198,8 +213,9 @@ Delivery-worker queue metrics are currently derived from persisted notification 
 13. Kick best-effort Telegram delivery without letting network delivery alter execution outcomes.
 14. Due notifications are claimed with a lease token so concurrent workers do not finalize the same row blindly.
 15. Delivery attempt outcomes are also written to `operator_notification_delivery_attempts` so operators can inspect recent send behavior separately from the summary row.
-16. Retryable Telegram delivery failures stay `PENDING` with future `next_attempt_at`, while permanent failures become `FAILED`.
-17. Expose inspection and reconciliation surfaces.
+16. Delivery worker executions are written to `operator_notification_delivery_runs` with completed, skipped, or failed status.
+17. Retryable Telegram delivery failures stay `PENDING` with future `next_attempt_at`, while permanent failures become `FAILED`.
+18. Expose inspection and reconciliation surfaces.
 
 ## Failure Posture
 
@@ -214,7 +230,6 @@ Examples:
 
 ## Current Gaps
 
-- exchange-history recovery now includes bounded recent windows, checkpointed archival closed-order sweeps, a configured stop-before boundary, page-limit truncation detection, lookup-failure confidence records, and a dedicated `/recovery` inspection view; remaining confidence work is richer classification of Upbit-side retention semantics
+- exchange-history recovery now includes bounded recent windows, checkpointed archival closed-order sweeps, a configured stop-before boundary, explicit retention-assumption confidence semantics, page-limit truncation detection, lookup-failure confidence records, and a dedicated `/recovery` inspection view
 - reconciliation is still only partially exchange-backed today
-- delivery-attempt history and derived queue metrics exist, but there is not yet a durable delivery-worker run table for scheduled worker execution history
-- strategy logic is intentionally stubbed
+- runtime startup still does not auto-run trading cycles, while `/run BTC|ETH` can now explicitly trigger the first `PositionGuard_PaperTrade` runner and submit eligible decisions into the default `DRY_RUN` execution lifecycle

@@ -13,6 +13,7 @@ const DEFAULT_PENDING_DELIVERY_LIMIT = 20;
 const DEFAULT_TELEGRAM_DELIVERY_MAX_ATTEMPTS = 5;
 const DEFAULT_TELEGRAM_DELIVERY_BASE_BACKOFF_MS = 15_000;
 const DEFAULT_TELEGRAM_DELIVERY_MAX_BACKOFF_MS = 300_000;
+const DEFAULT_TELEGRAM_DELIVERY_WORKER_NAME = "telegram_delivery_inline_worker";
 const MAX_DELIVERY_TEXT_LENGTH = 3_500;
 const MAX_DELIVERY_ERROR_LENGTH = 240;
 
@@ -112,6 +113,7 @@ export class OperatorNotificationDeliveryService {
         | "listOperatorNotifications"
         | "listPendingOperatorNotifications"
         | "saveOperatorNotificationDeliveryAttempt"
+        | "saveOperatorNotificationDeliveryRun"
       >;
       client: TelegramMessageClient | null;
       operatorChatId: string | null;
@@ -120,6 +122,7 @@ export class OperatorNotificationDeliveryService {
       baseBackoffMs?: number;
       maxBackoffMs?: number;
       leaseDurationMs?: number;
+      workerName?: string;
     },
   ) {}
 
@@ -156,8 +159,11 @@ export class OperatorNotificationDeliveryService {
     exchangeAccountId: string,
     limit: number,
   ): Promise<OperatorNotificationDeliverySummary> {
+    const runId = createId("operator_notification_delivery_run");
+    const startedAt = this.now();
+
     if (!this.isConfigured()) {
-      return {
+      const summary = {
         attempted: 0,
         sent: 0,
         retryScheduled: 0,
@@ -171,70 +177,117 @@ export class OperatorNotificationDeliveryService {
         abandonedLeaseCandidate: 0,
         skippedReason: "telegram_delivery_not_configured",
       };
+      await this.saveRunRecord({
+        runId,
+        exchangeAccountId,
+        startedAt,
+        completedAt: this.now(),
+        status: "SKIPPED",
+        summary,
+        errorMessage: null,
+      });
+      return summary;
     }
 
-    const claimedAt = this.now();
-    const claimedNotifications = await this.dependencies.repositories.claimPendingOperatorNotifications(
-      exchangeAccountId,
-      {
-        limit,
-        dueBefore: claimedAt,
-        claimedAt,
-        leaseToken: createId("telegram_delivery_lease"),
-        leaseExpiresAt: addMillisecondsToIso(claimedAt, this.leaseDurationMs()),
-      },
-    );
+    try {
+      const claimedAt = startedAt;
+      const claimedNotifications = await this.dependencies.repositories.claimPendingOperatorNotifications(
+        exchangeAccountId,
+        {
+          limit,
+          dueBefore: claimedAt,
+          claimedAt,
+          leaseToken: createId("telegram_delivery_lease"),
+          leaseExpiresAt: addMillisecondsToIso(claimedAt, this.leaseDurationMs()),
+        },
+      );
 
-    let sent = 0;
-    let retryScheduled = 0;
-    let failed = 0;
-    let staleLease = 0;
+      let sent = 0;
+      let retryScheduled = 0;
+      let failed = 0;
+      let staleLease = 0;
 
-    for (const notification of claimedNotifications) {
-      const delivered = await this.deliverRecord(notification);
-      if (delivered.deliveryStatus === "SENT") {
-        sent += 1;
-        continue;
+      for (const notification of claimedNotifications) {
+        const delivered = await this.deliverRecord(notification);
+        if (delivered.deliveryStatus === "SENT") {
+          sent += 1;
+          continue;
+        }
+
+        if (delivered.deliveryStatus === "FAILED") {
+          failed += 1;
+          continue;
+        }
+
+        if (
+          delivered.id === notification.id &&
+          delivered.leaseToken === notification.leaseToken &&
+          delivered.deliveryStatus === "PENDING" &&
+          delivered.nextAttemptAt === notification.nextAttemptAt &&
+          delivered.lastError === notification.lastError &&
+          delivered.deliveredAt === notification.deliveredAt
+        ) {
+          staleLease += 1;
+          continue;
+        }
+
+        if (delivered.deliveryStatus === "PENDING" && delivered.nextAttemptAt !== null) {
+          retryScheduled += 1;
+        }
       }
 
-      if (delivered.deliveryStatus === "FAILED") {
-        failed += 1;
-        continue;
-      }
-
-      if (
-        delivered.id === notification.id &&
-        delivered.leaseToken === notification.leaseToken &&
-        delivered.deliveryStatus === "PENDING" &&
-        delivered.nextAttemptAt === notification.nextAttemptAt &&
-        delivered.lastError === notification.lastError &&
-        delivered.deliveredAt === notification.deliveredAt
-      ) {
-        staleLease += 1;
-        continue;
-      }
-
-      if (delivered.deliveryStatus === "PENDING" && delivered.nextAttemptAt !== null) {
-        retryScheduled += 1;
-      }
+      const queueState = await this.summarizeQueueState(exchangeAccountId, claimedAt);
+      const summary = {
+        attempted: claimedNotifications.length,
+        sent,
+        retryScheduled,
+        failed,
+        staleLease,
+        pendingTotal: queueState.pendingTotal,
+        pendingDue: queueState.pendingDue,
+        pendingScheduled: queueState.pendingScheduled,
+        activeLease: queueState.activeLease,
+        expiredLease: queueState.expiredLease,
+        abandonedLeaseCandidate: queueState.abandonedLeaseCandidate,
+        skippedReason: null,
+      };
+      await this.saveRunRecord({
+        runId,
+        exchangeAccountId,
+        startedAt,
+        completedAt: this.now(),
+        status: "COMPLETED",
+        summary,
+        errorMessage: null,
+      });
+      return summary;
+    } catch (error) {
+      const errorMessage = sanitizeOperatorNotificationError(error);
+      const summary = {
+        attempted: 0,
+        sent: 0,
+        retryScheduled: 0,
+        failed: 0,
+        staleLease: 0,
+        pendingTotal: 0,
+        pendingDue: 0,
+        pendingScheduled: 0,
+        activeLease: 0,
+        expiredLease: 0,
+        abandonedLeaseCandidate: 0,
+        skippedReason: null,
+      };
+      await this.saveRunRecord({
+        runId,
+        exchangeAccountId,
+        startedAt,
+        completedAt: this.now(),
+        status: "FAILED",
+        summary,
+        errorMessage,
+      });
+      throw error;
     }
-
-    const queueState = await this.summarizeQueueState(exchangeAccountId, claimedAt);
-
-    return {
-      attempted: claimedNotifications.length,
-      sent,
-      retryScheduled,
-      failed,
-      staleLease,
-      pendingTotal: queueState.pendingTotal,
-      pendingDue: queueState.pendingDue,
-      pendingScheduled: queueState.pendingScheduled,
-      activeLease: queueState.activeLease,
-      expiredLease: queueState.expiredLease,
-      abandonedLeaseCandidate: queueState.abandonedLeaseCandidate,
-      skippedReason: null,
-    };
   }
 
   async deliverRecord(record: ClaimedOperatorNotificationRecord): Promise<OperatorNotificationRecord> {
@@ -394,6 +447,43 @@ export class OperatorNotificationDeliveryService {
       DEFAULT_TELEGRAM_DELIVERY_TIMEOUT_MS,
       Math.trunc(this.dependencies.leaseDurationMs ?? DEFAULT_TELEGRAM_DELIVERY_TIMEOUT_MS * 6),
     );
+  }
+
+  private workerName(): string {
+    return this.dependencies.workerName?.trim() || DEFAULT_TELEGRAM_DELIVERY_WORKER_NAME;
+  }
+
+  private async saveRunRecord(input: {
+    runId: string;
+    exchangeAccountId: string;
+    startedAt: string;
+    completedAt: string;
+    status: "COMPLETED" | "SKIPPED" | "FAILED";
+    summary: OperatorNotificationDeliverySummary;
+    errorMessage: string | null;
+  }): Promise<void> {
+    await this.dependencies.repositories.saveOperatorNotificationDeliveryRun({
+      id: input.runId,
+      exchangeAccountId: input.exchangeAccountId,
+      workerName: this.workerName(),
+      status: input.status,
+      startedAt: input.startedAt,
+      completedAt: input.completedAt,
+      attemptedCount: input.summary.attempted,
+      sentCount: input.summary.sent,
+      retryScheduledCount: input.summary.retryScheduled,
+      failedCount: input.summary.failed,
+      staleLeaseCount: input.summary.staleLease,
+      pendingTotalCount: input.summary.pendingTotal,
+      pendingDueCount: input.summary.pendingDue,
+      pendingScheduledCount: input.summary.pendingScheduled,
+      activeLeaseCount: input.summary.activeLease,
+      expiredLeaseCount: input.summary.expiredLease,
+      abandonedLeaseCandidateCount: input.summary.abandonedLeaseCandidate,
+      skippedReason: input.summary.skippedReason,
+      errorMessage: input.errorMessage,
+      summaryJson: JSON.stringify(input.summary),
+    });
   }
 
   private async finalizeTransition(transition: {

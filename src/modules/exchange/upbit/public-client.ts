@@ -1,4 +1,7 @@
 import type {
+  UpbitCandleSnapshot,
+  UpbitGetDayCandlesRequest,
+  UpbitGetMinuteCandlesRequest,
   UpbitPublicQuotationClient,
   UpbitTickerSnapshot,
 } from "./contracts.js";
@@ -50,4 +53,64 @@ export class UpbitPublicTickerClient implements UpbitPublicQuotationClient {
       trade_timestamp: ticker.trade_timestamp,
     }));
   }
+
+  async getMinuteCandles(request: UpbitGetMinuteCandlesRequest): Promise<readonly UpbitCandleSnapshot[]> {
+    assertCandleCount(request.count);
+    const query = buildQuery({
+      market: request.market,
+      count: String(request.count),
+      ...(request.to === undefined ? {} : { to: request.to }),
+    });
+    const payload = await this.getJson<UpbitCandleSnapshot[]>(
+      `/v1/candles/minutes/${request.unit}?${query}`,
+      "minute candle",
+    );
+
+    return payload.map((candle) => ({
+      ...candle,
+      market: candle.market as UpbitTickerSnapshot["market"],
+      unit: request.unit,
+    }));
+  }
+
+  async getDayCandles(request: UpbitGetDayCandlesRequest): Promise<readonly UpbitCandleSnapshot[]> {
+    assertCandleCount(request.count);
+    const query = buildQuery({
+      market: request.market,
+      count: String(request.count),
+      ...(request.to === undefined ? {} : { to: request.to }),
+    });
+    const payload = await this.getJson<UpbitCandleSnapshot[]>(`/v1/candles/days?${query}`, "day candle");
+
+    return payload.map((candle) => ({
+      ...candle,
+      market: candle.market as UpbitTickerSnapshot["market"],
+    }));
+  }
+
+  private async getJson<TPayload>(pathAndQuery: string, label: string): Promise<TPayload> {
+    const response = await this.fetchImpl(`${this.baseUrl}${pathAndQuery}`, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      await response.text().catch(() => "");
+      throw new Error(`Upbit public ${label} request failed (${response.status} ${response.statusText}).`);
+    }
+
+    return await response.json() as TPayload;
+  }
+}
+
+function assertCandleCount(count: number): void {
+  if (!Number.isInteger(count) || count < 1 || count > 200) {
+    throw new Error("Upbit candle count must be an integer between 1 and 200.");
+  }
+}
+
+function buildQuery(values: Record<string, string>): string {
+  return new URLSearchParams(values).toString();
 }

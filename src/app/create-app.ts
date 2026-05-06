@@ -1,4 +1,5 @@
 import { buildExecutionRiskLimits, loadAppConfig, type AppConfig } from "./env.js";
+import { InlineTelegramStrategyRunController } from "./strategy-run-controller.js";
 import { InlineTelegramSyncController } from "./sync-controller.js";
 import type { ExecutionRepository, OperatorStateStore } from "../modules/db/interfaces.js";
 import type { SqlitePersistenceBundle } from "../modules/db/repositories/contracts.js";
@@ -10,6 +11,10 @@ import { UpbitPrivateClient } from "../modules/exchange/upbit/private-client.js"
 import { PortfolioSyncService } from "../modules/reconciliation/portfolio-sync-service.js";
 import { ReconciliationService } from "../modules/reconciliation/reconciliation-service.js";
 import { DeterministicStubStrategy } from "../modules/strategy/deterministic-strategy.js";
+import {
+  createDefaultPositionGuardRunnerConfig,
+  PositionGuardStrategyRunner,
+} from "../modules/strategy/position-guard-runner.js";
 import { TelegramCommandRouter } from "../modules/telegram/commands.js";
 import {
   OperatorNotificationDeliveryService,
@@ -26,6 +31,7 @@ export interface AppServices {
   portfolioSyncService: PortfolioSyncService;
   telegramRouter: TelegramCommandRouter;
   strategy: DeterministicStubStrategy;
+  positionGuardRunner: PositionGuardStrategyRunner;
   liveExchangeClient: UpbitPrivateClient;
   exchangeBackedReadEnabled: boolean;
   notificationDelivery: OperatorNotificationDeliveryService;
@@ -86,6 +92,12 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
     operatorState,
     reporter,
   });
+  const positionGuardRunner = new PositionGuardStrategyRunner({
+    repositories,
+    executionService,
+    marketDataReader: publicTickerClient,
+    config: createDefaultPositionGuardRunnerConfig("primary"),
+  });
 
   const reconciliationDependencies = {
     repositories,
@@ -95,6 +107,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
     historyMaxPagesPerMarket: config.reconciliationHistoryMaxPagesPerMarket,
     closedOrderLookbackDays: config.reconciliationClosedOrderLookbackDays,
     historyStopBeforeDays: config.reconciliationHistoryStopBeforeDays,
+    historyRetentionAssumptionDays: config.reconciliationHistoryRetentionAssumptionDays,
     ...(exchangeBackedReadEnabled ? { orderReader: liveExchangeClient, orderHistoryReader: liveExchangeClient } : {}),
   };
   const reconciliationService = new ReconciliationService(reconciliationDependencies);
@@ -111,6 +124,9 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
     syncController: new InlineTelegramSyncController({
       portfolioSyncService,
       reporter,
+    }),
+    strategyRunController: new InlineTelegramStrategyRunController({
+      runner: positionGuardRunner,
     }),
     executionStateSeed: {
       executionMode: config.executionMode,
@@ -129,6 +145,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
     portfolioSyncService,
     telegramRouter,
     strategy,
+    positionGuardRunner,
     liveExchangeClient,
     exchangeBackedReadEnabled,
     notificationDelivery,

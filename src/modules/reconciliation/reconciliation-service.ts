@@ -25,6 +25,7 @@ const EXCHANGE_HISTORY_PAGE_LIMIT = 20;
 const DEFAULT_HISTORY_MAX_PAGES_PER_MARKET = 3;
 const DEFAULT_CLOSED_ORDER_LOOKBACK_DAYS = 7;
 const DEFAULT_HISTORY_STOP_BEFORE_DAYS = 365;
+const DEFAULT_HISTORY_RETENTION_ASSUMPTION_DAYS = 365;
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 
 interface ExchangeHistoryRecoveryResult {
@@ -44,6 +45,7 @@ export class ReconciliationService {
       historyMaxPagesPerMarket?: number;
       closedOrderLookbackDays?: number;
       historyStopBeforeDays?: number;
+      historyRetentionAssumptionDays?: number;
     },
   ) {}
 
@@ -294,6 +296,7 @@ export class ReconciliationService {
           reconciledAt,
           closedOrderLookbackDays: this.dependencies.closedOrderLookbackDays,
           historyStopBeforeDays: this.dependencies.historyStopBeforeDays,
+          historyRetentionAssumptionDays: this.dependencies.historyRetentionAssumptionDays,
           failureMessage: message,
         }),
       };
@@ -324,12 +327,19 @@ export class ReconciliationService {
       closedOrderLookbackDays,
       Math.trunc(this.dependencies.historyStopBeforeDays ?? DEFAULT_HISTORY_STOP_BEFORE_DAYS),
     );
+    const historyRetentionAssumptionDays = Math.max(
+      closedOrderLookbackDays,
+      Math.trunc(this.dependencies.historyRetentionAssumptionDays ?? DEFAULT_HISTORY_RETENTION_ASSUMPTION_DAYS),
+    );
     const parsedReconciledAt = Date.parse(reconciledAt);
     const closedOrderEndTimeMs = Number.isFinite(parsedReconciledAt) ? parsedReconciledAt : Date.now();
     const closedOrderStartTimeMs =
       closedOrderEndTimeMs - closedOrderLookbackDays * MILLISECONDS_PER_DAY;
     const stopBeforeTimeMs = closedOrderEndTimeMs - historyStopBeforeDays * MILLISECONDS_PER_DAY;
+    const retentionBoundaryTimeMs =
+      closedOrderEndTimeMs - historyRetentionAssumptionDays * MILLISECONDS_PER_DAY;
     const stopBeforeAt = new Date(stopBeforeTimeMs).toISOString();
+    const retentionBoundaryAt = new Date(retentionBoundaryTimeMs).toISOString();
     const recentClosedWindowStartAt = new Date(closedOrderStartTimeMs).toISOString();
     const recentClosedWindowEndAt = new Date(closedOrderEndTimeMs).toISOString();
 
@@ -394,12 +404,17 @@ export class ReconciliationService {
           openSnapshots.pageLimitReached ||
           recentClosedSnapshots.pageLimitReached ||
           archivalClosedSnapshots.pageLimitReached;
-        const confidenceLevel: "HIGH" | "PARTIAL" = archiveComplete && !pageLimitReached ? "HIGH" : "PARTIAL";
-        const confidenceReason: "ARCHIVE_COMPLETE" | "ARCHIVE_IN_PROGRESS" | "PAGE_LIMIT_REACHED" = pageLimitReached
-          ? "PAGE_LIMIT_REACHED"
-          : archiveComplete
-            ? "ARCHIVE_COMPLETE"
-            : "ARCHIVE_IN_PROGRESS";
+        const retentionStatus: "WITHIN_ASSUMED_RETENTION" | "BEYOND_ASSUMED_RETENTION" =
+          archivalWindowStartTimeMs <= retentionBoundaryTimeMs || stopBeforeTimeMs < retentionBoundaryTimeMs
+            ? "BEYOND_ASSUMED_RETENTION"
+            : "WITHIN_ASSUMED_RETENTION";
+        const confidenceLevel: "HIGH" | "PARTIAL" =
+          archiveComplete && !pageLimitReached && retentionStatus === "WITHIN_ASSUMED_RETENTION" ? "HIGH" : "PARTIAL";
+        const confidenceReason = resolveHistoryRecoveryConfidenceReason({
+          archiveComplete,
+          pageLimitReached,
+          retentionStatus,
+        });
 
         await this.dependencies.repositories.saveHistoryRecoveryCheckpoint({
           id: checkpoint?.id ?? createId("history_recovery_checkpoint"),
@@ -428,6 +443,7 @@ export class ReconciliationService {
           recentClosedPagesScanned: recentClosedSnapshots.pagesScanned,
           archivalClosedPagesScanned: archivalClosedSnapshots.pagesScanned,
           archiveComplete,
+          retentionStatus,
           confidenceLevel,
           confidenceReason,
           openHistoryTruncated: openSnapshots.pageLimitReached,
@@ -452,6 +468,9 @@ export class ReconciliationService {
         closedOrderLookbackDays,
         stopBeforeDays: historyStopBeforeDays,
         stopBeforeAt,
+        retentionAssumptionDays: historyRetentionAssumptionDays,
+        retentionBoundaryAt,
+        retentionStatus: summarizeHistoryRetentionStatus(batches),
         coverageStatus: batches.every((batch) => batch.archiveComplete) ? "COMPLETE" : "IN_PROGRESS",
         confidenceLevel: summarizeHistoryRecoveryConfidence(batches),
         confidenceReason: summarizeHistoryRecoveryConfidenceReason(batches),
@@ -466,6 +485,7 @@ export class ReconciliationService {
           archivalWindowEndAt: batch.archivalWindowEndAt,
           nextWindowEndAt: batch.nextWindowEndAt,
           archiveComplete: batch.archiveComplete,
+          retentionStatus: batch.retentionStatus,
           confidenceLevel: batch.confidenceLevel,
           confidenceReason: batch.confidenceReason,
           openHistoryTruncated: batch.openHistoryTruncated,
@@ -765,11 +785,19 @@ function summarizeHistoryRecoveryConfidence(
 
 function summarizeHistoryRecoveryConfidenceReason(
   batches: Array<{
-    confidenceReason: "ARCHIVE_COMPLETE" | "ARCHIVE_IN_PROGRESS" | "PAGE_LIMIT_REACHED";
+    confidenceReason:
+      | "ARCHIVE_COMPLETE"
+      | "ARCHIVE_IN_PROGRESS"
+      | "PAGE_LIMIT_REACHED"
+      | "BEYOND_ASSUMED_RETENTION";
   }>,
 ): NonNullable<ReconciliationSummary["historyRecovery"]>["confidenceReason"] {
   if (batches.some((batch) => batch.confidenceReason === "PAGE_LIMIT_REACHED")) {
     return "PAGE_LIMIT_REACHED";
+  }
+
+  if (batches.some((batch) => batch.confidenceReason === "BEYOND_ASSUMED_RETENTION")) {
+    return "BEYOND_ASSUMED_RETENTION";
   }
 
   if (batches.some((batch) => batch.confidenceReason === "ARCHIVE_IN_PROGRESS")) {
@@ -779,10 +807,37 @@ function summarizeHistoryRecoveryConfidenceReason(
   return "ARCHIVE_COMPLETE";
 }
 
+function summarizeHistoryRetentionStatus(
+  batches: Array<{
+    retentionStatus: "WITHIN_ASSUMED_RETENTION" | "BEYOND_ASSUMED_RETENTION";
+  }>,
+): NonNullable<ReconciliationSummary["historyRecovery"]>["retentionStatus"] {
+  return batches.some((batch) => batch.retentionStatus === "BEYOND_ASSUMED_RETENTION")
+    ? "BEYOND_ASSUMED_RETENTION"
+    : "WITHIN_ASSUMED_RETENTION";
+}
+
+function resolveHistoryRecoveryConfidenceReason(input: {
+  archiveComplete: boolean;
+  pageLimitReached: boolean;
+  retentionStatus: "WITHIN_ASSUMED_RETENTION" | "BEYOND_ASSUMED_RETENTION";
+}): NonNullable<ReconciliationSummary["historyRecovery"]>["markets"][number]["confidenceReason"] {
+  if (input.pageLimitReached) {
+    return "PAGE_LIMIT_REACHED";
+  }
+
+  if (input.retentionStatus === "BEYOND_ASSUMED_RETENTION") {
+    return "BEYOND_ASSUMED_RETENTION";
+  }
+
+  return input.archiveComplete ? "ARCHIVE_COMPLETE" : "ARCHIVE_IN_PROGRESS";
+}
+
 function buildFailedHistoryRecoverySummary(input: {
   reconciledAt: string;
   closedOrderLookbackDays: number | undefined;
   historyStopBeforeDays: number | undefined;
+  historyRetentionAssumptionDays: number | undefined;
   failureMessage: string;
 }): NonNullable<ReconciliationSummary["historyRecovery"]> {
   const closedOrderLookbackDays = Math.max(
@@ -793,13 +848,25 @@ function buildFailedHistoryRecoverySummary(input: {
     closedOrderLookbackDays,
     Math.trunc(input.historyStopBeforeDays ?? DEFAULT_HISTORY_STOP_BEFORE_DAYS),
   );
+  const historyRetentionAssumptionDays = Math.max(
+    closedOrderLookbackDays,
+    Math.trunc(input.historyRetentionAssumptionDays ?? DEFAULT_HISTORY_RETENTION_ASSUMPTION_DAYS),
+  );
   const parsedReconciledAt = Date.parse(input.reconciledAt);
   const closedOrderEndTimeMs = Number.isFinite(parsedReconciledAt) ? parsedReconciledAt : Date.now();
+  const retentionBoundaryTimeMs =
+    closedOrderEndTimeMs - historyRetentionAssumptionDays * MILLISECONDS_PER_DAY;
 
   return {
     closedOrderLookbackDays,
     stopBeforeDays: historyStopBeforeDays,
     stopBeforeAt: new Date(closedOrderEndTimeMs - historyStopBeforeDays * MILLISECONDS_PER_DAY).toISOString(),
+    retentionAssumptionDays: historyRetentionAssumptionDays,
+    retentionBoundaryAt: new Date(retentionBoundaryTimeMs).toISOString(),
+    retentionStatus:
+      closedOrderEndTimeMs - historyStopBeforeDays * MILLISECONDS_PER_DAY < retentionBoundaryTimeMs
+        ? "BEYOND_ASSUMED_RETENTION"
+        : "WITHIN_ASSUMED_RETENTION",
     coverageStatus: "IN_PROGRESS",
     confidenceLevel: "FAILED",
     confidenceReason: "LOOKUP_FAILED",

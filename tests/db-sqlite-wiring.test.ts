@@ -7,6 +7,7 @@ import type {
   BalanceSnapshotRecord,
   OperatorNotificationRecord,
   PositionSnapshotRecord,
+  StrategyDecisionRecord,
 } from "../src/domain/types.js";
 import { openSqliteDatabase } from "../src/modules/db/repositories/sqlite-database.js";
 import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
@@ -56,6 +57,7 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
     assert.ok(migrationRows.some((row) => row.filename === "0007_add_operator_notification_delivery_leases.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0008_add_operator_notification_delivery_attempt_history.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0009_add_history_recovery_checkpoints.sql"));
+    assert.ok(migrationRows.some((row) => row.filename === "0010_add_operator_notification_delivery_runs.sql"));
 
     for (const tableName of [
       "users",
@@ -71,6 +73,7 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
       "history_recovery_checkpoints",
       "operator_notifications",
       "operator_notification_delivery_attempts",
+      "operator_notification_delivery_runs",
       "risk_events",
     ]) {
       assert.ok(tableNames.has(tableName), `Expected migrated table ${tableName} to exist.`);
@@ -341,6 +344,34 @@ test("createSqlitePersistence bootstraps operator state and round-trips app-faci
     assert.equal(attemptRows[0]?.notificationId, "operator-notification-1");
     assert.equal(attemptRows[0]?.outcome, "SENT");
 
+    await bundle.repositories.saveOperatorNotificationDeliveryRun({
+      id: "delivery-run-1",
+      exchangeAccountId: "primary",
+      workerName: "telegram_delivery_inline_worker",
+      status: "COMPLETED",
+      startedAt: "2026-04-20T00:03:05.000Z",
+      completedAt: "2026-04-20T00:03:06.000Z",
+      attemptedCount: 1,
+      sentCount: 1,
+      retryScheduledCount: 0,
+      failedCount: 0,
+      staleLeaseCount: 0,
+      pendingTotalCount: 0,
+      pendingDueCount: 0,
+      pendingScheduledCount: 0,
+      activeLeaseCount: 0,
+      expiredLeaseCount: 0,
+      abandonedLeaseCandidateCount: 0,
+      skippedReason: null,
+      errorMessage: null,
+      summaryJson: JSON.stringify({ attempted: 1, sent: 1 }),
+    });
+
+    const runRows = await bundle.repositories.listOperatorNotificationDeliveryRuns("primary", 5);
+    assert.equal(runRows.length, 1);
+    assert.equal(runRows[0]?.status, "COMPLETED");
+    assert.equal(runRows[0]?.sentCount, 1);
+
     await bundle.repositories.saveOperatorNotification(createNotification({
       id: "operator-notification-2",
       notificationType: "SYNC_FAILED",
@@ -453,6 +484,54 @@ test("createSqlitePersistence bootstraps operator state and round-trips app-faci
     const finalizedNotification = finalizedNotifications.find((notification) => notification.id === "operator-notification-3");
     assert.equal(finalizedNotification?.leaseToken, null);
     assert.equal(finalizedNotification?.leaseExpiresAt, null);
+  } finally {
+    bundle.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("sqlite repository returns the latest strategy decision for a market and strategy", async () => {
+  const databasePath = await createTempDatabasePath("strategy-decisions");
+  const bundle = createSqlitePersistence({
+    databasePath,
+    exchangeAccountId: "primary",
+    userId: "operator",
+    userTelegramId: "telegram-user",
+    userDisplayName: "Operator",
+    accessKeyRef: "ENV:UPBIT_ACCESS_KEY",
+    secretKeyRef: "ENV:UPBIT_SECRET_KEY",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    killSwitchActive: false,
+  });
+
+  try {
+    const older = createStrategyDecisionRecord({
+      id: "decision-older",
+      createdAt: "2026-04-20T00:00:00.000Z",
+    });
+    const newer = createStrategyDecisionRecord({
+      id: "decision-newer",
+      createdAt: "2026-04-20T01:00:00.000Z",
+    });
+    const otherStrategy = createStrategyDecisionRecord({
+      id: "decision-other-strategy",
+      strategyKey: "other.strategy.v1",
+      createdAt: "2026-04-20T02:00:00.000Z",
+    });
+    await bundle.repositories.saveStrategyDecision(older);
+    await bundle.repositories.saveStrategyDecision(newer);
+    await bundle.repositories.saveStrategyDecision(otherStrategy);
+
+    const latestAny = await bundle.repositories.getLatestStrategyDecision("primary", "KRW-BTC");
+    const latestPositionGuard = await bundle.repositories.getLatestStrategyDecision(
+      "primary",
+      "KRW-BTC",
+      "position_guard.paper_core.v1",
+    );
+
+    assert.deepEqual(latestAny, otherStrategy);
+    assert.deepEqual(latestPositionGuard, newer);
   } finally {
     bundle.close();
     await cleanupTempDatabase(databasePath);
@@ -633,5 +712,28 @@ function createNotification(
     createdAt,
     deliveredAt: null,
     lastError: null,
+  };
+}
+
+function createStrategyDecisionRecord(overrides: Partial<StrategyDecisionRecord> = {}): StrategyDecisionRecord {
+  return {
+    id: "decision-1",
+    exchangeAccountId: "primary",
+    strategyKey: "position_guard.paper_core.v1",
+    market: "KRW-BTC",
+    action: "ENTER",
+    status: "READY",
+    decisionBasisJson: JSON.stringify({
+      metadata: {
+        executionDisposition: "IMMEDIATE",
+        signalQualityBucket: "HIGH",
+        diagnosticsJson: JSON.stringify({ entryPath: "RECLAIM" }),
+      },
+    }),
+    intendedNotionalKrw: "100000",
+    intendedQuantity: null,
+    referencePrice: "110000000",
+    createdAt: "2026-04-20T00:00:00.000Z",
+    ...overrides,
   };
 }

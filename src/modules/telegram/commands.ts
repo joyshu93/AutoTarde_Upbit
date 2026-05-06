@@ -2,6 +2,7 @@ import {
   buildUnsupportedCommandMessage,
   listSupportedTelegramCommands,
   parseTelegramCommand,
+  parseTelegramAssetArg,
   validateTelegramCommand,
 } from "./contracts.js";
 import {
@@ -14,6 +15,7 @@ import {
   formatRecoveryProgressMessage,
   formatRiskEventsMessage,
   formatStateHistoryMessage,
+  formatStrategyRunMessage,
   formatStatusMessage,
   formatSyncMessage,
 } from "./formatter.js";
@@ -22,8 +24,10 @@ import type {
   SupportedTelegramCommand,
   TelegramResponse,
   TelegramRouterDependencies,
+  TelegramStrategyRunResult,
   TelegramSyncResult,
 } from "./interfaces.js";
+import { getMarketForAsset } from "../../domain/types.js";
 import type { ReconciliationRunRecord } from "../../domain/types.js";
 import type { OperatorStateStore } from "../db/interfaces.js";
 
@@ -92,6 +96,10 @@ export class TelegramCommandRouter {
         return {
           text: formatSyncMessage(await this.requestSync(exchangeAccountId)),
         };
+      case "/run":
+        return {
+          text: formatStrategyRunMessage(await this.requestStrategyRun(parsed.args, exchangeAccountId)),
+        };
       default:
         return {
           text: buildUnsupportedCommandMessage(input),
@@ -113,6 +121,52 @@ export class TelegramCommandRouter {
       exchangeAccountId,
       requestedBy: "TELEGRAM",
       requestedCommand: "/sync",
+    });
+  }
+
+  private async requestStrategyRun(
+    args: readonly string[],
+    exchangeAccountId: string,
+  ): Promise<TelegramStrategyRunResult> {
+    const requestedAt = this.dependencies.now?.() ?? new Date().toISOString();
+    const asset = parseTelegramAssetArg(args);
+
+    if (!asset) {
+      return {
+        status: "FAILED",
+        requestedAt,
+        market: null,
+        strategyDecisionId: null,
+        action: null,
+        orderId: null,
+        orderStatus: null,
+        submissionAccepted: null,
+        detail: "Invalid strategy run request. Use /run BTC or /run ETH.",
+      };
+    }
+
+    const market = getMarketForAsset(asset);
+
+    if (!this.dependencies.strategyRunController) {
+      return {
+        status: "NOT_CONNECTED",
+        requestedAt,
+        market,
+        strategyDecisionId: null,
+        action: null,
+        orderId: null,
+        orderStatus: null,
+        submissionAccepted: null,
+        detail:
+          "PositionGuard strategy runner is not wired in this process yet. No trading cycle was started.",
+      };
+    }
+
+    return this.dependencies.strategyRunController.requestRun({
+      exchangeAccountId,
+      market,
+      requestedBy: "TELEGRAM",
+      requestedCommand: "/run",
     });
   }
 
@@ -148,13 +202,14 @@ export class TelegramCommandRouter {
   }
 
   private async buildAlertsResponse(exchangeAccountId: string): Promise<TelegramResponse> {
-    const [notifications, attempts] = await Promise.all([
+    const [notifications, attempts, runs] = await Promise.all([
       this.dependencies.repositories.listOperatorNotifications(exchangeAccountId, 10),
       this.dependencies.repositories.listOperatorNotificationDeliveryAttempts(exchangeAccountId, 5),
+      this.dependencies.repositories.listOperatorNotificationDeliveryRuns(exchangeAccountId, 5),
     ]);
 
     return {
-      text: formatOperatorNotificationsMessage(notifications, attempts, {
+      text: formatOperatorNotificationsMessage(notifications, attempts, runs, {
         now: this.dependencies.now?.() ?? new Date().toISOString(),
       }),
     };

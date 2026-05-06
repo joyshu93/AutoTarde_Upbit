@@ -6,6 +6,7 @@ import type {
   ExecutionStateTransitionRecord,
   HistoryRecoveryCheckpointRecord,
   OperatorNotificationDeliveryAttemptRecord,
+  OperatorNotificationDeliveryRunRecord,
   OperatorNotificationRecord,
   OrderRecord,
   PositionSnapshot,
@@ -14,7 +15,11 @@ import type {
   RiskEventRecord,
 } from "../../domain/types.js";
 import { detectExecutionStateSeedMismatches } from "../db/interfaces.js";
-import type { SupportedTelegramCommand, TelegramSyncResult } from "./interfaces.js";
+import type {
+  SupportedTelegramCommand,
+  TelegramStrategyRunResult,
+  TelegramSyncResult,
+} from "./interfaces.js";
 
 const MANUAL_INPUT_NOTE = "Telegram does not accept manual cash or position input.";
 
@@ -146,6 +151,9 @@ export function formatRecoveryProgressMessage(
     `history_lookback_days: ${meta?.historyRecovery?.closedOrderLookbackDays ?? "none"}`,
     `history_stop_before_days: ${meta?.historyRecovery?.stopBeforeDays ?? "none"}`,
     `history_stop_before_at: ${meta?.historyRecovery?.stopBeforeAt ?? "none"}`,
+    `history_retention_assumption_days: ${meta?.historyRecovery?.retentionAssumptionDays ?? "none"}`,
+    `history_retention_boundary_at: ${meta?.historyRecovery?.retentionBoundaryAt ?? "none"}`,
+    `history_retention_status: ${meta?.historyRecovery?.retentionStatus ?? "none"}`,
     `history_scanned_snapshots: ${meta?.historyRecovery?.scannedSnapshotCount ?? "none"}`,
     `history_recovered_orders: ${meta?.historyRecovery?.recoveredOrderCount ?? "none"}`,
     ...formatRecoveryMarketProgressLines(meta?.historyRecovery?.markets ?? []),
@@ -156,6 +164,7 @@ export function formatRecoveryProgressMessage(
 export function formatOperatorNotificationsMessage(
   notifications: OperatorNotificationRecord[],
   attempts: OperatorNotificationDeliveryAttemptRecord[] = [],
+  runs: OperatorNotificationDeliveryRunRecord[] = [],
   options?: {
     now?: string;
   },
@@ -183,6 +192,8 @@ export function formatOperatorNotificationsMessage(
       `next_scheduled_attempt_at: ${metrics.nextScheduledAttemptAt ?? "none"}`,
       `oldest_active_lease_expires_at: ${metrics.oldestActiveLeaseExpiresAt ?? "none"}`,
       `latest_delivery_attempt_at: ${metrics.latestDeliveryAttemptAt ?? "none"}`,
+      `delivery_run_count: ${runs.length}`,
+      ...formatOperatorNotificationDeliveryRunLines(runs),
       `delivery_attempt_count: ${attempts.length}`,
       ...formatOperatorNotificationAttemptLines(attempts),
     ].join("\n");
@@ -209,6 +220,8 @@ export function formatOperatorNotificationsMessage(
     `next_scheduled_attempt_at: ${metrics.nextScheduledAttemptAt ?? "none"}`,
     `oldest_active_lease_expires_at: ${metrics.oldestActiveLeaseExpiresAt ?? "none"}`,
     `latest_delivery_attempt_at: ${metrics.latestDeliveryAttemptAt ?? "none"}`,
+    `delivery_run_count: ${runs.length}`,
+    ...formatOperatorNotificationDeliveryRunLines(runs),
     ...sortedNotifications.map(
       (notification) =>
         `- ${notification.createdAt} | ${notification.severity} | ${notification.notificationType} | ${notification.deliveryStatus} | attempts=${notification.attemptCount} | last_attempt_at=${notification.lastAttemptAt ?? "none"} | next_attempt_at=${notification.nextAttemptAt ?? "none"} | failure_class=${notification.failureClass ?? "none"} | delivered_at=${notification.deliveredAt ?? "none"} | error=${notification.lastError ?? "none"} | ${notification.title} | ${notification.message}`,
@@ -318,6 +331,22 @@ export function formatSyncMessage(result: TelegramSyncResult): string {
   ].join("\n");
 }
 
+export function formatStrategyRunMessage(result: TelegramStrategyRunResult): string {
+  return [
+    "Strategy Run",
+    `status: ${result.status}`,
+    `requested_at: ${result.requestedAt}`,
+    `market: ${result.market ?? "none"}`,
+    `strategy_decision_id: ${result.strategyDecisionId ?? "none"}`,
+    `action: ${result.action ?? "none"}`,
+    `submission_accepted: ${result.submissionAccepted === null ? "none" : result.submissionAccepted}`,
+    `order_id: ${result.orderId ?? "none"}`,
+    `order_status: ${result.orderStatus ?? "none"}`,
+    `detail: ${result.detail}`,
+    `operator_boundary: ${MANUAL_INPUT_NOTE}`,
+  ].join("\n");
+}
+
 function formatBalanceLines(
   balances: ExchangeBalance[] | null,
   rawJson: string,
@@ -380,7 +409,7 @@ function formatRecoveryMarketProgressLines(
     "latest_market_progress:",
     ...markets.map(
       (market) =>
-        `- ${market.market} | archive_window=${market.archivalWindowStartAt ?? "unknown"}..${market.archivalWindowEndAt ?? "unknown"} | next_window_end_at=${market.nextWindowEndAt ?? "unknown"} | archive_complete=${market.archiveComplete ?? "unknown"} | confidence=${market.confidenceLevel ?? "unknown"}:${market.confidenceReason ?? "unknown"} | truncated open/recent/archive=${market.openHistoryTruncated ?? "unknown"}/${market.recentClosedHistoryTruncated ?? "unknown"}/${market.archivalClosedHistoryTruncated ?? "unknown"} | pages open/recent/archive=${market.openPagesScanned ?? "?"}/${market.recentClosedPagesScanned ?? "?"}/${market.archivalClosedPagesScanned ?? "?"} | snapshots=${market.snapshotCount ?? "?"}`,
+        `- ${market.market} | archive_window=${market.archivalWindowStartAt ?? "unknown"}..${market.archivalWindowEndAt ?? "unknown"} | next_window_end_at=${market.nextWindowEndAt ?? "unknown"} | archive_complete=${market.archiveComplete ?? "unknown"} | retention=${market.retentionStatus ?? "unknown"} | confidence=${market.confidenceLevel ?? "unknown"}:${market.confidenceReason ?? "unknown"} | truncated open/recent/archive=${market.openHistoryTruncated ?? "unknown"}/${market.recentClosedHistoryTruncated ?? "unknown"}/${market.archivalClosedHistoryTruncated ?? "unknown"} | pages open/recent/archive=${market.openPagesScanned ?? "?"}/${market.recentClosedPagesScanned ?? "?"}/${market.archivalClosedPagesScanned ?? "?"} | snapshots=${market.snapshotCount ?? "?"}`,
     ),
   ];
 }
@@ -401,6 +430,23 @@ function formatHistoryRecoveryCheckpointLines(
     ...sortedCheckpoints.map(
       (checkpoint) =>
         `- ${checkpoint.market} | ${checkpoint.checkpointType} | next_window_end_at=${checkpoint.nextWindowEndAt} | updated_at=${checkpoint.updatedAt}`,
+    ),
+  ];
+}
+
+function formatOperatorNotificationDeliveryRunLines(
+  runs: OperatorNotificationDeliveryRunRecord[],
+): string[] {
+  if (runs.length === 0) {
+    return ["recent_delivery_runs: none"];
+  }
+
+  const sortedRuns = [...runs].sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+  return [
+    "recent_delivery_runs:",
+    ...sortedRuns.map(
+      (run) =>
+        `- ${run.startedAt} | status=${run.status} | worker=${run.workerName} | attempted=${run.attemptedCount} | sent=${run.sentCount} | retry_scheduled=${run.retryScheduledCount} | failed=${run.failedCount} | stale_lease=${run.staleLeaseCount} | pending=${run.pendingTotalCount}/${run.pendingDueCount}/${run.pendingScheduledCount} | leases active/expired/abandoned=${run.activeLeaseCount}/${run.expiredLeaseCount}/${run.abandonedLeaseCandidateCount} | skipped=${run.skippedReason ?? "none"} | error=${run.errorMessage ?? "none"} | completed_at=${run.completedAt ?? "none"}`,
     ),
   ];
 }
@@ -537,6 +583,9 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
         closedOrderLookbackDays: number | null;
         stopBeforeDays: number | null;
         stopBeforeAt: string | null;
+        retentionAssumptionDays: number | null;
+        retentionBoundaryAt: string | null;
+        retentionStatus: string | null;
         coverageStatus: string | null;
         confidenceLevel: string | null;
         confidenceReason: string | null;
@@ -552,6 +601,7 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
           recentClosedPagesScanned: number | null;
           archivalClosedPagesScanned: number | null;
           archiveComplete: boolean | null;
+          retentionStatus: string | null;
           confidenceLevel: string | null;
           confidenceReason: string | null;
           openHistoryTruncated: boolean | null;
@@ -571,6 +621,7 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
     recentClosedPagesScanned: number | null;
     archivalClosedPagesScanned: number | null;
     archiveComplete: boolean | null;
+    retentionStatus: string | null;
     confidenceLevel: string | null;
     confidenceReason: string | null;
     openHistoryTruncated: boolean | null;
@@ -592,6 +643,9 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
           closedOrderLookbackDays?: unknown;
           stopBeforeDays?: unknown;
           stopBeforeAt?: unknown;
+          retentionAssumptionDays?: unknown;
+          retentionBoundaryAt?: unknown;
+          retentionStatus?: unknown;
           coverageStatus?: unknown;
           confidenceLevel?: unknown;
           confidenceReason?: unknown;
@@ -632,6 +686,18 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
           stopBeforeAt:
             typeof historyRecoveryRaw.stopBeforeAt === "string"
               ? historyRecoveryRaw.stopBeforeAt
+              : null,
+          retentionAssumptionDays:
+            typeof historyRecoveryRaw.retentionAssumptionDays === "number"
+              ? historyRecoveryRaw.retentionAssumptionDays
+              : null,
+          retentionBoundaryAt:
+            typeof historyRecoveryRaw.retentionBoundaryAt === "string"
+              ? historyRecoveryRaw.retentionBoundaryAt
+              : null,
+          retentionStatus:
+            typeof historyRecoveryRaw.retentionStatus === "string"
+              ? historyRecoveryRaw.retentionStatus
               : null,
           coverageStatus:
             typeof historyRecoveryRaw.coverageStatus === "string"
@@ -697,6 +763,10 @@ function tryParseReconciliationSummaryMeta(rawJson: string): {
                       archiveComplete:
                         "archiveComplete" in market && typeof market.archiveComplete === "boolean"
                           ? market.archiveComplete
+                          : null,
+                      retentionStatus:
+                        "retentionStatus" in market && typeof market.retentionStatus === "string"
+                          ? market.retentionStatus
                           : null,
                       confidenceLevel:
                         "confidenceLevel" in market && typeof market.confidenceLevel === "string"
@@ -788,6 +858,9 @@ function formatHistoryRecoveryInline(
         closedOrderLookbackDays: number | null;
         stopBeforeDays: number | null;
         stopBeforeAt: string | null;
+        retentionAssumptionDays: number | null;
+        retentionBoundaryAt: string | null;
+        retentionStatus: string | null;
         coverageStatus: string | null;
         confidenceLevel: string | null;
         confidenceReason: string | null;
@@ -803,6 +876,7 @@ function formatHistoryRecoveryInline(
           recentClosedPagesScanned: number | null;
           archivalClosedPagesScanned: number | null;
           archiveComplete: boolean | null;
+          retentionStatus: string | null;
           confidenceLevel: string | null;
           confidenceReason: string | null;
           openHistoryTruncated: boolean | null;
@@ -819,13 +893,16 @@ function formatHistoryRecoveryInline(
 
   const marketSummaries = historyRecovery.markets.map(
     (market) =>
-      `${market.market}[archive=${market.archivalWindowStartAt ?? "unknown"}..${market.archivalWindowEndAt ?? "unknown"} next<=${market.nextWindowEndAt ?? "unknown"} complete=${market.archiveComplete ?? "unknown"} confidence=${market.confidenceLevel ?? "unknown"}:${market.confidenceReason ?? "unknown"} truncated=${market.openHistoryTruncated ?? "unknown"}/${market.recentClosedHistoryTruncated ?? "unknown"}/${market.archivalClosedHistoryTruncated ?? "unknown"} pages=${market.openPagesScanned ?? "?"}/${market.recentClosedPagesScanned ?? "?"}/${market.archivalClosedPagesScanned ?? "?"} snapshots=${market.snapshotCount ?? "?"}]`,
+      `${market.market}[archive=${market.archivalWindowStartAt ?? "unknown"}..${market.archivalWindowEndAt ?? "unknown"} next<=${market.nextWindowEndAt ?? "unknown"} complete=${market.archiveComplete ?? "unknown"} retention=${market.retentionStatus ?? "unknown"} confidence=${market.confidenceLevel ?? "unknown"}:${market.confidenceReason ?? "unknown"} truncated=${market.openHistoryTruncated ?? "unknown"}/${market.recentClosedHistoryTruncated ?? "unknown"}/${market.archivalClosedHistoryTruncated ?? "unknown"} pages=${market.openPagesScanned ?? "?"}/${market.recentClosedPagesScanned ?? "?"}/${market.archivalClosedPagesScanned ?? "?"} snapshots=${market.snapshotCount ?? "?"}]`,
   );
 
   return [
     `lookback_days=${historyRecovery.closedOrderLookbackDays ?? "unknown"}`,
     `stop_before_days=${historyRecovery.stopBeforeDays ?? "unknown"}`,
     `stop_before_at=${historyRecovery.stopBeforeAt ?? "unknown"}`,
+    `retention_days=${historyRecovery.retentionAssumptionDays ?? "unknown"}`,
+    `retention_boundary_at=${historyRecovery.retentionBoundaryAt ?? "unknown"}`,
+    `retention=${historyRecovery.retentionStatus ?? "unknown"}`,
     `coverage=${historyRecovery.coverageStatus ?? "unknown"}`,
     `confidence=${historyRecovery.confidenceLevel ?? "unknown"}:${historyRecovery.confidenceReason ?? "unknown"}`,
     `failure=${historyRecovery.failureMessage ?? "none"}`,

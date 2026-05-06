@@ -46,6 +46,7 @@ export type OperatorNotificationAttemptOutcome =
   | "RETRY_SCHEDULED"
   | "FAILED"
   | "STALE_LEASE";
+export type OperatorNotificationDeliveryRunStatus = "COMPLETED" | "SKIPPED" | "FAILED";
 export type OperatorNotificationType =
   | "ORDER_REJECTED"
   | "ORDER_SUBMISSION_FAILED"
@@ -316,6 +317,29 @@ export interface OperatorNotificationDeliveryAttemptRecord {
   createdAt: string;
 }
 
+export interface OperatorNotificationDeliveryRunRecord {
+  id: string;
+  exchangeAccountId: string;
+  workerName: string;
+  status: OperatorNotificationDeliveryRunStatus;
+  startedAt: string;
+  completedAt: string | null;
+  attemptedCount: number;
+  sentCount: number;
+  retryScheduledCount: number;
+  failedCount: number;
+  staleLeaseCount: number;
+  pendingTotalCount: number;
+  pendingDueCount: number;
+  pendingScheduledCount: number;
+  activeLeaseCount: number;
+  expiredLeaseCount: number;
+  abandonedLeaseCandidateCount: number;
+  skippedReason: string | null;
+  errorMessage: string | null;
+  summaryJson: string;
+}
+
 export interface RiskEventRecord {
   id: string;
   exchangeAccountId: string;
@@ -407,7 +431,8 @@ export interface OperatorCommand {
     | "/pause"
     | "/resume"
     | "/killswitch"
-    | "/sync";
+    | "/sync"
+    | "/run";
   args: string[];
 }
 

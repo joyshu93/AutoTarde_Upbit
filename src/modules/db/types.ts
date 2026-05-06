@@ -204,6 +204,29 @@ export interface SqliteOperatorNotificationDeliveryAttemptRow {
   created_at: string;
 }
 
+export interface SqliteOperatorNotificationDeliveryRunRow {
+  id: string;
+  exchange_account_id: string;
+  worker_name: string;
+  status: "COMPLETED" | "SKIPPED" | "FAILED";
+  started_at: string;
+  completed_at: string | null;
+  attempted_count: number;
+  sent_count: number;
+  retry_scheduled_count: number;
+  failed_count: number;
+  stale_lease_count: number;
+  pending_total_count: number;
+  pending_due_count: number;
+  pending_scheduled_count: number;
+  active_lease_count: number;
+  expired_lease_count: number;
+  abandoned_lease_candidate_count: number;
+  skipped_reason: string | null;
+  error_message: string | null;
+  summary_json: string;
+}
+
 export interface SqliteRiskEventRow {
   id: string;
   exchange_account_id: string;

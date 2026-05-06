@@ -52,16 +52,17 @@ This first slice establishes:
 - pure-logic tests around risk, configuration, and Telegram command parsing
 
 Current remaining gaps:
-- the strategy engine is a deterministic stub that returns `HOLD`
+- runtime startup still does not auto-run trading cycles, but Telegram `/run BTC|ETH` now triggers the first `PositionGuard_PaperTrade` runner, which wires the market-structure analyzer, Upbit public snapshot normalizer, persisted context assembler, core strategy, durable strategy-decision persistence, and default `DRY_RUN` execution submission path
 - live exchange submission is implemented as an adapter contract, but the app still wires a dry-run adapter by default
 - `/sync` now persists read-only balance and position snapshots using Upbit public ticker prices when available, with explicit `avg_buy_price` fallback
-- exchange-backed reconciliation now covers active orders, startup recovery sweep, paginated recent open/closed exchange-order history recovery into local `RECOVERY` records, checkpointed archival closed-order recovery with an explicit stop-before boundary, coverage status, and confidence classification, terminal-order fill/status backfill, balance/position drift detection against prior snapshots plus local fills, and per-run lookup budgeting
+- exchange-backed reconciliation now covers active orders, startup recovery sweep, paginated recent open/closed exchange-order history recovery into local `RECOVERY` records, checkpointed archival closed-order recovery with an explicit stop-before boundary, coverage status, confidence classification, and explicit exchange-history retention-assumption metadata, terminal-order fill/status backfill, balance/position drift detection against prior snapshots plus local fills, and per-run lookup budgeting
 - execution pre-trade validation now checks Upbit `orders/chance` and `orders/test` before any order record is persisted for submission
 - automatic Telegram reporting now persists durable `operator_notifications`, attempts best-effort Telegram delivery when explicitly enabled, and records `PENDING` / `SENT` / `FAILED`
 - Telegram delivery now keeps durable retry metadata such as `attempt_count`, `last_attempt_at`, `next_attempt_at`, and `failure_class`
 - Telegram delivery now claims due notifications with a durable lease and finalizes delivery transitions by matching the claimed `lease_token`
 - Telegram delivery now also persists a separate `operator_notification_delivery_attempts` audit trail, and `/alerts` shows recent delivery attempt outcomes alongside the current notification rows
-- `/alerts` now exposes delivery-worker queue metrics such as pending totals, due/scheduled counts, active/expired leases, abandoned-lease candidates, recent attempt outcome counts, and latest/oldest timestamps
+- Telegram delivery now persists `operator_notification_delivery_runs` for each inline worker execution, including skipped/not-configured runs and failed worker runs
+- `/alerts` now exposes delivery-worker queue metrics such as pending totals, due/scheduled counts, active/expired leases, abandoned-lease candidates, recent worker-run summaries, recent attempt outcome counts, and latest/oldest timestamps
 - startup recovery can now mark persisted operator state `DEGRADED` when unresolved portfolio drift remains after exchange-backed bootstrap checks
 
 Current risk-policy framing is budget-first rather than asset-count-first:
@@ -82,12 +83,14 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 9. `execution_state` and `execution_state_transitions` provide the operator control ledger.
 10. Telegram inspection currently includes `/status`, `/statehistory`, `/synchistory`, `/recovery`, `/alerts`, `/risks`, `/balances`, `/positions`, `/orders`, and `/sync` for operator visibility, with `/status` also summarizing the latest persisted reconciliation run, recent issue codes, checkpointed history-recovery progress, and persisted degraded metadata when present.
 11. `/sync` connects to reconciliation so snapshot and reconciliation records are persisted, using read-only public ticker valuation when available.
-12. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
-13. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
-14. Telegram delivery claims due `PENDING` notifications with a lease token, then only finalizes rows that still match that lease.
-15. Each delivery attempt now also writes a durable `operator_notification_delivery_attempts` record so `/alerts` can show recent delivery outcomes separately from the summary row in `operator_notifications`.
-16. Retryable Telegram delivery failures stay `PENDING` with a later `next_attempt_at`, while permanent failures become `FAILED`.
-17. Reconciliation and Telegram inspection surfaces operate on persisted state.
+12. `/run BTC|ETH` requests one deterministic PositionGuard runner cycle for a supported asset and returns the persisted decision, action, and any DRY_RUN order lifecycle result.
+13. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
+14. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
+15. Telegram delivery claims due `PENDING` notifications with a lease token, then only finalizes rows that still match that lease.
+16. Each delivery attempt now also writes a durable `operator_notification_delivery_attempts` record so `/alerts` can show recent delivery outcomes separately from the summary row in `operator_notifications`.
+17. Each delivery worker kick also writes a durable `operator_notification_delivery_runs` record so operators can inspect skipped, completed, and failed delivery-worker executions.
+18. Retryable Telegram delivery failures stay `PENDING` with a later `next_attempt_at`, while permanent failures become `FAILED`.
+19. Reconciliation and Telegram inspection surfaces operate on persisted state.
 
 ## Folder Layout
 
@@ -145,6 +148,7 @@ Environment variables currently recognized:
 - `RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET`
 - `RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS`
 - `RECONCILIATION_HISTORY_STOP_BEFORE_DAYS`
+- `RECONCILIATION_HISTORY_RETENTION_ASSUMPTION_DAYS`
 - `STALE_PRICE_THRESHOLD_MS`
 - `MINIMUM_ORDER_VALUE_KRW`
 - `MAX_ALLOCATION_BTC`
@@ -158,15 +162,17 @@ Telegram delivery stays disabled unless all three conditions are true:
 
 If any of those are missing, notifications remain durable in `operator_notifications` as `PENDING` and `/alerts` remains the inspection surface.
 When Telegram delivery is enabled, due notifications are claimed behind a lease, retryable transport failures remain `PENDING` with a scheduled `next_attempt_at`, permanent errors become `FAILED`, and each outcome is appended to `operator_notification_delivery_attempts` for inspection.
-`/alerts` also derives delivery-worker queue metrics from persisted rows, including active leases, expired leases, abandoned-lease candidates, and recent attempt outcome counts.
+Each delivery kick is also appended to `operator_notification_delivery_runs` with worker name, status, counts, skipped reason, and error metadata.
+`/alerts` also derives delivery-worker queue metrics from persisted rows, including active leases, expired leases, abandoned-lease candidates, recent delivery-run summaries, and recent attempt outcome counts.
 
 Exchange-backed startup recovery runs only when `UPBIT_ACCESS_KEY` and `UPBIT_SECRET_KEY` are configured. Without them, startup recovery is skipped and the app stays in local-inspection mode.
 Order reconciliation also respects `RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN` so `/sync` and startup recovery do not burst unbounded `getOrder` reads.
-Recent and archival exchange-history recovery also respect `RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET`, `RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS`, and `RECONCILIATION_HISTORY_STOP_BEFORE_DAYS` so recovery sweeps page through Upbit order history in bounded windows, checkpoint deeper archive progress per market, and report whether archive coverage is still `IN_PROGRESS` or `COMPLETE`.
-History recovery summaries also separate coverage from confidence: `confidenceLevel` can be `HIGH`, `PARTIAL`, or `FAILED`, with reasons such as `ARCHIVE_COMPLETE`, `ARCHIVE_IN_PROGRESS`, `PAGE_LIMIT_REACHED`, or `LOOKUP_FAILED`.
+Recent and archival exchange-history recovery also respect `RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET`, `RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS`, `RECONCILIATION_HISTORY_STOP_BEFORE_DAYS`, and `RECONCILIATION_HISTORY_RETENTION_ASSUMPTION_DAYS` so recovery sweeps page through Upbit order history in bounded windows, checkpoint deeper archive progress per market, and report whether archive coverage is still `IN_PROGRESS` or `COMPLETE`.
+`RECONCILIATION_HISTORY_RETENTION_ASSUMPTION_DAYS` is an explicit operator assumption about how far back exchange history is expected to be reliably inspectable; it does not stop scanning by itself, but if the configured recovery range crosses that boundary, confidence becomes `PARTIAL` with reason `BEYOND_ASSUMED_RETENTION`.
+History recovery summaries also separate coverage from confidence: `confidenceLevel` can be `HIGH`, `PARTIAL`, or `FAILED`, with reasons such as `ARCHIVE_COMPLETE`, `ARCHIVE_IN_PROGRESS`, `PAGE_LIMIT_REACHED`, `BEYOND_ASSUMED_RETENTION`, or `LOOKUP_FAILED`.
 If startup recovery finds unresolved portfolio drift against the prior persisted snapshots and local fill history, bootstrap can mark the persisted operator state `DEGRADED` with explicit `degraded_reason` / `degraded_at`.
 
 ## Immediate Next Steps
 
-- extend exchange-history recovery confidence with richer exchange-side retention semantics beyond local page-limit and lookup-failure classification
-- add durable delivery-worker run records if Telegram delivery becomes a long-running scheduled worker instead of best-effort kicks
+- add a scheduler entry point for the `PositionGuard_PaperTrade` runner that reuses the same safe runner/controller path as `/run BTC|ETH`
+- keep live order transmission gated by `APP_EXECUTION_MODE=LIVE` plus `ENABLE_LIVE_ORDERS=true`

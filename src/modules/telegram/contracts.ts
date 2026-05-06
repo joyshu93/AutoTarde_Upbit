@@ -3,6 +3,7 @@ import type {
   SupportedTelegramCommand,
   TelegramCommandContract,
 } from "./interfaces.js";
+import type { SupportedAsset } from "../../domain/types.js";
 
 const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
   {
@@ -96,6 +97,13 @@ const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
     summary: "Request a reconciliation sync through the operator control plane.",
     argumentPolicy: "none",
   },
+  {
+    command: "/run",
+    category: "control",
+    usage: "/run BTC|ETH",
+    summary: "Run one deterministic PositionGuard strategy cycle for a supported asset through the safe execution path.",
+    argumentPolicy: "asset_required",
+  },
 ] as const;
 
 const TELEGRAM_COMMAND_CONTRACT_MAP = new Map<SupportedTelegramCommand, TelegramCommandContract>(
@@ -137,11 +145,24 @@ export function validateTelegramCommand(parsed: ParsedTelegramCommand): string |
     return null;
   }
 
+  if (parsed.contract.argumentPolicy === "asset_required") {
+    return parseTelegramAssetArg(parsed.args) === null ? buildUsageMessage(parsed.command) : null;
+  }
+
   if (parsed.args.length > 0) {
     return buildUsageMessage(parsed.command);
   }
 
   return null;
+}
+
+export function parseTelegramAssetArg(args: readonly string[]): SupportedAsset | null {
+  if (args.length !== 1) {
+    return null;
+  }
+
+  const normalizedAsset = args[0]?.toUpperCase();
+  return normalizedAsset === "BTC" || normalizedAsset === "ETH" ? normalizedAsset : null;
 }
 
 export function buildUnsupportedCommandMessage(input: string): string {

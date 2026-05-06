@@ -32,6 +32,7 @@ test("telegram router parses supported operator commands only", () => {
   const recoveryParsed = router.parse("/recovery");
   const alertsParsed = router.parse("/alerts");
   const risksParsed = router.parse("/risks");
+  const runParsed = router.parse("/run BTC");
   assert.equal(parsed?.command, "/status");
   assert.deepEqual(parsed?.args, []);
   assert.equal(parsed?.contract.command, "/status");
@@ -45,6 +46,9 @@ test("telegram router parses supported operator commands only", () => {
   assert.equal(alertsParsed?.contract.category, "inspection");
   assert.equal(risksParsed?.command, "/risks");
   assert.equal(risksParsed?.contract.category, "inspection");
+  assert.equal(runParsed?.command, "/run");
+  assert.deepEqual(runParsed?.args, ["BTC"]);
+  assert.equal(runParsed?.contract.category, "control");
   assert.equal(router.parse("/setcash 1000000"), null);
   assert.equal(router.parse("status"), null);
 });
@@ -95,6 +99,9 @@ test("telegram router includes recent reconciliation summary in /status when ava
         closedOrderLookbackDays: 7,
         stopBeforeDays: 365,
         stopBeforeAt: "2025-04-20T00:30:00.000Z",
+        retentionAssumptionDays: 365,
+        retentionBoundaryAt: "2025-04-20T00:30:00.000Z",
+        retentionStatus: "WITHIN_ASSUMED_RETENTION",
         coverageStatus: "IN_PROGRESS",
         confidenceLevel: "PARTIAL",
         confidenceReason: "ARCHIVE_IN_PROGRESS",
@@ -109,6 +116,7 @@ test("telegram router includes recent reconciliation summary in /status when ava
             archivalWindowStartAt: "2026-04-06T00:30:00.000Z",
             archivalWindowEndAt: "2026-04-13T00:30:00.000Z",
             nextWindowEndAt: "2026-04-06T00:30:00.000Z",
+            retentionStatus: "WITHIN_ASSUMED_RETENTION",
             openPagesScanned: 1,
             recentClosedPagesScanned: 1,
             archivalClosedPagesScanned: 1,
@@ -152,7 +160,7 @@ test("telegram router includes recent reconciliation summary in /status when ava
   assert.match(status.text, /recent_sync_history_confidence: PARTIAL:ARCHIVE_IN_PROGRESS failure=none/);
   assert.match(status.text, /recent_sync_history_recovered_orders: 1/);
   assert.match(status.text, /recent_sync_history_scanned_snapshots: 3/);
-  assert.match(status.text, /recent_sync_history_archive_progress: lookback_days=7 stop_before_days=365 stop_before_at=2025-04-20T00:30:00.000Z coverage=IN_PROGRESS confidence=PARTIAL:ARCHIVE_IN_PROGRESS failure=none scanned=3 recovered=1 markets=KRW-BTC\[archive=2026-04-06T00:30:00.000Z\.\.2026-04-13T00:30:00.000Z next<=2026-04-06T00:30:00.000Z complete=false confidence=PARTIAL:ARCHIVE_IN_PROGRESS truncated=false\/false\/false pages=1\/1\/1 snapshots=3\]/);
+  assert.match(status.text, /recent_sync_history_archive_progress: lookback_days=7 stop_before_days=365 stop_before_at=2025-04-20T00:30:00.000Z retention_days=365 retention_boundary_at=2025-04-20T00:30:00.000Z retention=WITHIN_ASSUMED_RETENTION coverage=IN_PROGRESS confidence=PARTIAL:ARCHIVE_IN_PROGRESS failure=none scanned=3 recovered=1 markets=KRW-BTC\[archive=2026-04-06T00:30:00.000Z\.\.2026-04-13T00:30:00.000Z next<=2026-04-06T00:30:00.000Z complete=false retention=WITHIN_ASSUMED_RETENTION confidence=PARTIAL:ARCHIVE_IN_PROGRESS truncated=false\/false\/false pages=1\/1\/1 snapshots=3\]/);
   assert.match(status.text, /recent_sync_completed_at: 2026-04-20T00:30:04.000Z/);
   assert.match(status.text, /recent_sync_error: none/);
 });
@@ -192,6 +200,9 @@ test("telegram router exposes dedicated reconciliation history inspection", asyn
         closedOrderLookbackDays: 7,
         stopBeforeDays: 365,
         stopBeforeAt: "2025-04-20T00:20:00.000Z",
+        retentionAssumptionDays: 365,
+        retentionBoundaryAt: "2025-04-20T00:20:00.000Z",
+        retentionStatus: "WITHIN_ASSUMED_RETENTION",
         coverageStatus: "IN_PROGRESS",
         confidenceLevel: "PARTIAL",
         confidenceReason: "ARCHIVE_IN_PROGRESS",
@@ -206,6 +217,7 @@ test("telegram router exposes dedicated reconciliation history inspection", asyn
             archivalWindowStartAt: "2026-04-06T00:20:00.000Z",
             archivalWindowEndAt: "2026-04-13T00:20:00.000Z",
             nextWindowEndAt: "2026-04-06T00:20:00.000Z",
+            retentionStatus: "WITHIN_ASSUMED_RETENTION",
             openPagesScanned: 1,
             recentClosedPagesScanned: 1,
             archivalClosedPagesScanned: 1,
@@ -244,7 +256,7 @@ test("telegram router exposes dedicated reconciliation history inspection", asyn
   assert.match(history.text, /Reconciliation History/);
   assert.match(history.text, /count: 1/);
   assert.match(history.text, /state_source: persisted reconciliation_runs/);
-  assert.match(history.text, /\| DRIFT_DETECTED \| source=OPERATOR_SYNC \| issues=1 \| codes=ORDER_FILLS_BACKFILLED \| processed=1 \| deferred=0 \| history=lookback_days=7 stop_before_days=365 stop_before_at=2025-04-20T00:20:00.000Z coverage=IN_PROGRESS confidence=PARTIAL:ARCHIVE_IN_PROGRESS failure=none scanned=3 recovered=1 markets=KRW-BTC\[archive=2026-04-06T00:20:00.000Z\.\.2026-04-13T00:20:00.000Z next<=2026-04-06T00:20:00.000Z complete=false confidence=PARTIAL:ARCHIVE_IN_PROGRESS truncated=false\/false\/false pages=1\/1\/1 snapshots=3\] \| completed_at=2026-04-20T00:20:05.000Z \| error=none/);
+  assert.match(history.text, /\| DRIFT_DETECTED \| source=OPERATOR_SYNC \| issues=1 \| codes=ORDER_FILLS_BACKFILLED \| processed=1 \| deferred=0 \| history=lookback_days=7 stop_before_days=365 stop_before_at=2025-04-20T00:20:00.000Z retention_days=365 retention_boundary_at=2025-04-20T00:20:00.000Z retention=WITHIN_ASSUMED_RETENTION coverage=IN_PROGRESS confidence=PARTIAL:ARCHIVE_IN_PROGRESS failure=none scanned=3 recovered=1 markets=KRW-BTC\[archive=2026-04-06T00:20:00.000Z\.\.2026-04-13T00:20:00.000Z next<=2026-04-06T00:20:00.000Z complete=false retention=WITHIN_ASSUMED_RETENTION confidence=PARTIAL:ARCHIVE_IN_PROGRESS truncated=false\/false\/false pages=1\/1\/1 snapshots=3\] \| completed_at=2026-04-20T00:20:05.000Z \| error=none/);
 });
 
 test("telegram router exposes dedicated exchange-history recovery inspection", async () => {
@@ -270,6 +282,9 @@ test("telegram router exposes dedicated exchange-history recovery inspection", a
         closedOrderLookbackDays: 7,
         stopBeforeDays: 365,
         stopBeforeAt: "2025-04-20T00:25:00.000Z",
+        retentionAssumptionDays: 365,
+        retentionBoundaryAt: "2025-04-20T00:25:00.000Z",
+        retentionStatus: "WITHIN_ASSUMED_RETENTION",
         coverageStatus: "IN_PROGRESS",
         confidenceLevel: "PARTIAL",
         confidenceReason: "ARCHIVE_IN_PROGRESS",
@@ -284,6 +299,7 @@ test("telegram router exposes dedicated exchange-history recovery inspection", a
             archivalWindowStartAt: "2026-04-06T00:25:00.000Z",
             archivalWindowEndAt: "2026-04-13T00:25:00.000Z",
             nextWindowEndAt: "2026-04-06T00:25:00.000Z",
+            retentionStatus: "WITHIN_ASSUMED_RETENTION",
             openPagesScanned: 1,
             recentClosedPagesScanned: 2,
             archivalClosedPagesScanned: 1,
@@ -338,9 +354,12 @@ test("telegram router exposes dedicated exchange-history recovery inspection", a
   assert.match(recovery.text, /history_lookback_days: 7/);
   assert.match(recovery.text, /history_stop_before_days: 365/);
   assert.match(recovery.text, /history_stop_before_at: 2025-04-20T00:25:00.000Z/);
+  assert.match(recovery.text, /history_retention_assumption_days: 365/);
+  assert.match(recovery.text, /history_retention_boundary_at: 2025-04-20T00:25:00.000Z/);
+  assert.match(recovery.text, /history_retention_status: WITHIN_ASSUMED_RETENTION/);
   assert.match(recovery.text, /history_scanned_snapshots: 4/);
   assert.match(recovery.text, /history_recovered_orders: 1/);
-  assert.match(recovery.text, /- KRW-BTC \| archive_window=2026-04-06T00:25:00.000Z\.\.2026-04-13T00:25:00.000Z \| next_window_end_at=2026-04-06T00:25:00.000Z \| archive_complete=false \| confidence=PARTIAL:ARCHIVE_IN_PROGRESS \| truncated open\/recent\/archive=false\/false\/false \| pages open\/recent\/archive=1\/2\/1 \| snapshots=4/);
+  assert.match(recovery.text, /- KRW-BTC \| archive_window=2026-04-06T00:25:00.000Z\.\.2026-04-13T00:25:00.000Z \| next_window_end_at=2026-04-06T00:25:00.000Z \| archive_complete=false \| retention=WITHIN_ASSUMED_RETENTION \| confidence=PARTIAL:ARCHIVE_IN_PROGRESS \| truncated open\/recent\/archive=false\/false\/false \| pages open\/recent\/archive=1\/2\/1 \| snapshots=4/);
   assert.match(recovery.text, /persisted_checkpoints: 1/);
   assert.match(recovery.text, /- KRW-BTC \| CLOSED_ORDER_ARCHIVE \| next_window_end_at=2026-04-06T00:25:00.000Z \| updated_at=2026-04-20T00:25:03.000Z/);
 });
@@ -368,6 +387,28 @@ test("telegram router exposes durable operator alerts inspection", async () => {
     errorMessage: "telegram_http_500",
     createdAt: "2026-04-20T00:21:05.000Z",
   });
+  await repository.saveOperatorNotificationDeliveryRun({
+    id: "delivery-run-1",
+    exchangeAccountId: "primary",
+    workerName: "telegram_delivery_inline_worker",
+    status: "COMPLETED",
+    startedAt: "2026-04-20T00:21:05.000Z",
+    completedAt: "2026-04-20T00:21:06.000Z",
+    attemptedCount: 1,
+    sentCount: 0,
+    retryScheduledCount: 1,
+    failedCount: 0,
+    staleLeaseCount: 0,
+    pendingTotalCount: 1,
+    pendingDueCount: 0,
+    pendingScheduledCount: 1,
+    activeLeaseCount: 0,
+    expiredLeaseCount: 0,
+    abandonedLeaseCandidateCount: 0,
+    skippedReason: null,
+    errorMessage: null,
+    summaryJson: "{}",
+  });
 
   const router = new TelegramCommandRouter({
     repositories: repository,
@@ -394,6 +435,9 @@ test("telegram router exposes durable operator alerts inspection", async () => {
   assert.match(alerts.text, /pending_due_count: 1/);
   assert.match(alerts.text, /pending_scheduled_count: 0/);
   assert.match(alerts.text, /active_lease_count: 0/);
+  assert.match(alerts.text, /delivery_run_count: 1/);
+  assert.match(alerts.text, /recent_delivery_runs:/);
+  assert.match(alerts.text, /status=COMPLETED \| worker=telegram_delivery_inline_worker \| attempted=1 \| sent=0 \| retry_scheduled=1/);
   assert.match(alerts.text, /recent_stale_lease_count: 0/);
   assert.match(alerts.text, /\| WARN \| ORDER_REJECTED \| PENDING \| attempts=0 \| last_attempt_at=none \| next_attempt_at=none \| failure_class=none \| delivered_at=none \| error=none \| Order rejected before submission \| Exchange order chance does not allow price orders/);
   assert.match(alerts.text, /delivery_attempt_count: 1/);
@@ -560,6 +604,67 @@ test("telegram router activates kill switch", async () => {
   const response = await router.route("/killswitch operator_stop");
   assert.match(response.text, /system_status: KILL_SWITCHED/);
   assert.match(response.text, /kill_switch: on/);
+});
+
+test("telegram router exposes strategy run trigger without manual portfolio input", async () => {
+  const router = createRouter();
+
+  const missingController = await router.route("/run BTC");
+  const invalidAsset = await router.route("/run DOGE");
+
+  assert.match(missingController.text, /Strategy Run/);
+  assert.match(missingController.text, /status: NOT_CONNECTED/);
+  assert.match(missingController.text, /market: KRW-BTC/);
+  assert.match(missingController.text, /PositionGuard strategy runner is not wired/);
+  assert.match(missingController.text, /operator_boundary: Telegram does not accept manual cash or position input\./);
+  assert.equal(
+    invalidAsset.text,
+    "Usage: /run BTC|ETH\nRun one deterministic PositionGuard strategy cycle for a supported asset through the safe execution path.",
+  );
+});
+
+test("telegram router calls a wired strategy run controller for supported assets", async () => {
+  const runRequests: string[] = [];
+  const router = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    strategyRunController: {
+      async requestRun(request) {
+        runRequests.push(`${request.exchangeAccountId}:${request.market}:${request.requestedCommand}`);
+        return {
+          status: "COMPLETED",
+          requestedAt: "2026-04-20T00:15:00.000Z",
+          market: request.market,
+          strategyDecisionId: "strategy-decision-1",
+          action: "HOLD",
+          orderId: null,
+          orderStatus: null,
+          submissionAccepted: null,
+          detail: "Decision HOLD persisted; no order submission was requested.",
+        };
+      },
+    },
+  });
+
+  const response = await router.route("/run ETH");
+
+  assert.deepEqual(runRequests, ["primary:KRW-ETH:/run"]);
+  assert.match(response.text, /status: COMPLETED/);
+  assert.match(response.text, /market: KRW-ETH/);
+  assert.match(response.text, /strategy_decision_id: strategy-decision-1/);
+  assert.match(response.text, /action: HOLD/);
+  assert.match(response.text, /submission_accepted: none/);
 });
 
 function createNotification(
