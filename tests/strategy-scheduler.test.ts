@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 
 import { StrategyScheduler } from "../src/app/strategy-scheduler.js";
+import { InMemoryExecutionRepository } from "../src/modules/db/repositories/in-memory-repositories.js";
 import type {
   TelegramStrategyRunController,
   TelegramStrategyRunRequest,
@@ -81,6 +82,7 @@ test("strategy scheduler schedules configured markets without immediate run by d
 
 test("strategy scheduler records completed run outcomes through the shared run controller", async () => {
   const requests: TelegramStrategyRunRequest[] = [];
+  const repository = new InMemoryExecutionRepository();
   const scheduler = new StrategyScheduler({
     config: {
       enabled: true,
@@ -110,6 +112,7 @@ test("strategy scheduler records completed run outcomes through the shared run c
         };
       },
     }),
+    repositories: repository,
     now: createNowSequence([
       "2026-04-20T00:00:00.000Z",
       "2026-04-20T00:00:02.000Z",
@@ -118,6 +121,7 @@ test("strategy scheduler records completed run outcomes through the shared run c
 
   const result = await scheduler.runMarketNow("KRW-BTC");
   const status = scheduler.getStatus();
+  const persistedRuns = await repository.listStrategySchedulerRuns("primary", 5);
 
   assert.equal(result.status, "COMPLETED");
   assert.deepEqual(requests.map((request) => `${request.requestedBy}:${request.requestedCommand}:${request.market}`), [
@@ -129,10 +133,15 @@ test("strategy scheduler records completed run outcomes through the shared run c
   assert.equal(status.markets[0]?.lastStrategyDecisionId, "strategy-decision-1");
   assert.equal(status.markets[0]?.lastAction, "HOLD");
   assert.equal(status.markets[0]?.lastStatus, "COMPLETED");
+  assert.equal(persistedRuns.length, 1);
+  assert.equal(persistedRuns[0]?.status, "COMPLETED");
+  assert.equal(persistedRuns[0]?.strategyDecisionId, "strategy-decision-1");
+  assert.equal(persistedRuns[0]?.action, "HOLD");
 });
 
 test("strategy scheduler prevents same-market overlapping runs", async () => {
   let releaseRun: (() => void) | undefined;
+  const repository = new InMemoryExecutionRepository();
   const scheduler = new StrategyScheduler({
     config: {
       enabled: true,
@@ -164,6 +173,7 @@ test("strategy scheduler prevents same-market overlapping runs", async () => {
         };
       },
     }),
+    repositories: repository,
     now: createNowSequence([
       "2026-04-20T00:00:00.000Z",
       "2026-04-20T00:00:01.000Z",
@@ -179,6 +189,7 @@ test("strategy scheduler prevents same-market overlapping runs", async () => {
   release();
   await firstRun;
   const finalStatus = scheduler.getStatus();
+  const persistedRuns = await repository.listStrategySchedulerRuns("primary", 5);
 
   assert.equal(skipped.status, "ALREADY_RUNNING");
   assert.equal(skippedStatus.markets[0]?.running, true);
@@ -187,6 +198,10 @@ test("strategy scheduler prevents same-market overlapping runs", async () => {
   assert.equal(finalStatus.markets[0]?.runCount, 1);
   assert.equal(finalStatus.markets[0]?.successCount, 1);
   assert.equal(finalStatus.markets[0]?.skippedCount, 1);
+  assert.deepEqual(
+    persistedRuns.map((run) => run.status).sort(),
+    ["COMPLETED", "SKIPPED"],
+  );
 });
 
 function createController(

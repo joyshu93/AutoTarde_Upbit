@@ -42,6 +42,7 @@ export type StrategySchedulerLastStatus =
   | "FAILED"
   | "NOT_CONNECTED"
   | "ALREADY_RUNNING";
+export type StrategySchedulerRunStatus = "STARTED" | "COMPLETED" | "FAILED" | "SKIPPED";
 export type RiskEventLevel = "INFO" | "WARN" | "BLOCK";
 export type OperatorNotificationChannel = "TELEGRAM";
 export type OperatorNotificationSeverity = "INFO" | "WARN" | "ERROR";
@@ -283,6 +284,26 @@ export interface StrategySchedulerStatus {
   exchangeAccountId: string;
   liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
   markets: StrategySchedulerMarketStatus[];
+}
+
+export interface StrategySchedulerRunRecord {
+  id: string;
+  exchangeAccountId: string;
+  market: SupportedMarket;
+  triggerSource: "SCHEDULER";
+  status: StrategySchedulerRunStatus;
+  startedAt: string;
+  completedAt: string | null;
+  intervalMs: number;
+  runOnStart: boolean;
+  strategyDecisionId: string | null;
+  action: StrategyDecisionAction | null;
+  orderId: string | null;
+  orderStatus: OrderLifecycleStatus | null;
+  submissionAccepted: boolean | null;
+  detail: string | null;
+  errorMessage: string | null;
+  summaryJson: string;
 }
 
 export type HistoryRecoveryCheckpointType = "CLOSED_ORDER_ARCHIVE";

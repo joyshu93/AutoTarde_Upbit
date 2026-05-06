@@ -18,6 +18,7 @@ import type {
   ReconciliationRunRecord,
   RiskEventRecord,
   StrategyDecisionRecord,
+  StrategySchedulerRunRecord,
   SupportedAsset,
   SupportedMarket,
   UserRecord,
@@ -38,6 +39,7 @@ import type {
   SqliteReconciliationRunRow,
   SqliteRiskEventRow,
   SqliteStrategyDecisionRow,
+  SqliteStrategySchedulerRunRow,
   SqliteUserRow,
 } from "../types.js";
 import type { ExecutionRepository, OperatorStateStore } from "../interfaces.js";
@@ -450,6 +452,75 @@ export class SqliteExecutionRepository implements ExecutionRepository {
         `).all(exchangeAccountId) as unknown as SqliteReconciliationRunRow[]);
 
     return rows.map(mapReconciliationRunRow);
+  }
+
+  async saveStrategySchedulerRun(record: StrategySchedulerRunRecord): Promise<void> {
+    this.db.prepare(`
+      INSERT INTO strategy_scheduler_runs (
+        id, exchange_account_id, market, trigger_source, status, started_at, completed_at,
+        interval_ms, run_on_start, strategy_decision_id, action, order_id, order_status,
+        submission_accepted, detail, error_message, summary_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        exchange_account_id = excluded.exchange_account_id,
+        market = excluded.market,
+        trigger_source = excluded.trigger_source,
+        status = excluded.status,
+        started_at = excluded.started_at,
+        completed_at = excluded.completed_at,
+        interval_ms = excluded.interval_ms,
+        run_on_start = excluded.run_on_start,
+        strategy_decision_id = excluded.strategy_decision_id,
+        action = excluded.action,
+        order_id = excluded.order_id,
+        order_status = excluded.order_status,
+        submission_accepted = excluded.submission_accepted,
+        detail = excluded.detail,
+        error_message = excluded.error_message,
+        summary_json = excluded.summary_json
+    `).run(
+      record.id,
+      record.exchangeAccountId,
+      record.market,
+      record.triggerSource,
+      record.status,
+      record.startedAt,
+      record.completedAt,
+      record.intervalMs,
+      toSqliteBoolean(record.runOnStart),
+      record.strategyDecisionId,
+      record.action,
+      record.orderId,
+      record.orderStatus,
+      record.submissionAccepted === null ? null : toSqliteBoolean(record.submissionAccepted),
+      record.detail,
+      record.errorMessage,
+      record.summaryJson,
+    );
+  }
+
+  async updateStrategySchedulerRun(record: StrategySchedulerRunRecord): Promise<void> {
+    await this.saveStrategySchedulerRun(record);
+  }
+
+  async listStrategySchedulerRuns(
+    exchangeAccountId: string,
+    limit?: number,
+  ): Promise<StrategySchedulerRunRecord[]> {
+    const rows = typeof limit === "number"
+      ? (this.db.prepare(`
+          SELECT * FROM strategy_scheduler_runs
+          WHERE exchange_account_id = ?
+          ORDER BY started_at DESC, rowid DESC
+          LIMIT ?
+        `).all(exchangeAccountId, limit) as unknown as SqliteStrategySchedulerRunRow[])
+      : (this.db.prepare(`
+          SELECT * FROM strategy_scheduler_runs
+          WHERE exchange_account_id = ?
+          ORDER BY started_at DESC, rowid DESC
+        `).all(exchangeAccountId) as unknown as SqliteStrategySchedulerRunRow[]);
+
+    return rows.map(mapStrategySchedulerRunRow);
   }
 
   async saveHistoryRecoveryCheckpoint(record: HistoryRecoveryCheckpointRecord): Promise<void> {
@@ -1383,6 +1454,30 @@ function mapOperatorNotificationDeliveryRunRow(
     expiredLeaseCount: row.expired_lease_count,
     abandonedLeaseCandidateCount: row.abandoned_lease_candidate_count,
     skippedReason: row.skipped_reason,
+    errorMessage: row.error_message,
+    summaryJson: row.summary_json,
+  };
+}
+
+function mapStrategySchedulerRunRow(
+  row: SqliteStrategySchedulerRunRow,
+): StrategySchedulerRunRecord {
+  return {
+    id: row.id,
+    exchangeAccountId: row.exchange_account_id,
+    market: row.market,
+    triggerSource: row.trigger_source,
+    status: row.status,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    intervalMs: row.interval_ms,
+    runOnStart: fromSqliteBoolean(row.run_on_start),
+    strategyDecisionId: row.strategy_decision_id,
+    action: row.action,
+    orderId: row.order_id,
+    orderStatus: row.order_status,
+    submissionAccepted: row.submission_accepted === null ? null : fromSqliteBoolean(row.submission_accepted),
+    detail: row.detail,
     errorMessage: row.error_message,
     summaryJson: row.summary_json,
   };

@@ -168,6 +168,39 @@ export interface SqliteHistoryRecoveryCheckpointRow {
   updated_at: string;
 }
 
+export interface SqliteStrategySchedulerRunRow {
+  id: string;
+  exchange_account_id: string;
+  market: "KRW-BTC" | "KRW-ETH";
+  trigger_source: "SCHEDULER";
+  status: "STARTED" | "COMPLETED" | "FAILED" | "SKIPPED";
+  started_at: string;
+  completed_at: string | null;
+  interval_ms: number;
+  run_on_start: number;
+  strategy_decision_id: string | null;
+  action: "ENTER" | "ADD" | "REDUCE" | "EXIT" | "HOLD" | null;
+  order_id: string | null;
+  order_status:
+    | "INTENT_CREATED"
+    | "RISK_REJECTED"
+    | "PERSISTED"
+    | "SUBMITTING"
+    | "OPEN"
+    | "PARTIALLY_FILLED"
+    | "FILLED"
+    | "CANCEL_REQUESTED"
+    | "CANCELED"
+    | "REJECTED"
+    | "FAILED"
+    | "RECONCILIATION_REQUIRED"
+    | null;
+  submission_accepted: number | null;
+  detail: string | null;
+  error_message: string | null;
+  summary_json: string;
+}
+
 export interface SqliteOperatorNotificationRow {
   id: string;
   exchange_account_id: string;

@@ -76,4 +76,5 @@ When startup recovery confirms unresolved portfolio drift against persisted stat
 - every unexplained balance or position drift must be persisted as both reconciliation evidence and risk evidence
 - every transition into pause or kill-switch state must be explicit and inspectable
 - every transition into or out of `DEGRADED` must be explicit and inspectable
+- every scheduler-triggered cycle must leave inspectable run history without becoming portfolio truth
 - live-send capability must stay behind a separate safety gate even after implementation exists

@@ -115,6 +115,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
       ethIntervalMs: config.strategySchedulerEthIntervalMs,
     }),
     controller: strategyRunController,
+    repositories,
   });
 
   const reconciliationDependencies = {

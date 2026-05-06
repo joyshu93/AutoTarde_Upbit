@@ -28,7 +28,7 @@ import type {
   TelegramSyncResult,
 } from "./interfaces.js";
 import { getMarketForAsset } from "../../domain/types.js";
-import type { ReconciliationRunRecord } from "../../domain/types.js";
+import type { ReconciliationRunRecord, StrategySchedulerRunRecord } from "../../domain/types.js";
 import type { OperatorStateStore } from "../db/interfaces.js";
 
 export class TelegramCommandRouter {
@@ -171,16 +171,17 @@ export class TelegramCommandRouter {
   }
 
   private async buildStatusResponse(exchangeAccountId: string): Promise<TelegramResponse> {
-    const [state, transitions, runs] = await Promise.all([
+    const [state, transitions, runs, schedulerRuns] = await Promise.all([
       this.dependencies.operatorState.getState(),
       this.dependencies.operatorState.listTransitions(3),
       this.dependencies.repositories.listReconciliationRuns(exchangeAccountId, 1),
+      this.dependencies.repositories.listStrategySchedulerRuns(exchangeAccountId, 5),
     ]);
 
     return {
       text: formatStatusMessage(
         state,
-        buildStatusFormatOptions(this.dependencies, transitions, runs[0] ?? null),
+        buildStatusFormatOptions(this.dependencies, transitions, runs[0] ?? null, schedulerRuns),
       ),
     };
   }
@@ -258,12 +259,14 @@ function buildStatusFormatOptions(
   dependencies: TelegramRouterDependencies,
   transitions: Awaited<ReturnType<OperatorStateStore["listTransitions"]>>,
   latestReconciliationRun: ReconciliationRunRecord | null,
+  schedulerRuns: StrategySchedulerRunRecord[],
 ): {
   executionStateSeed?: NonNullable<TelegramRouterDependencies["executionStateSeed"]>;
   liveSendPath?: NonNullable<TelegramRouterDependencies["liveSendPath"]>;
   transitions?: Awaited<ReturnType<OperatorStateStore["listTransitions"]>>;
   latestReconciliationRun?: ReconciliationRunRecord | null;
   schedulerStatus?: ReturnType<NonNullable<TelegramRouterDependencies["schedulerStatus"]>>;
+  schedulerRuns?: StrategySchedulerRunRecord[];
 } | undefined {
   const options: {
     executionStateSeed?: NonNullable<TelegramRouterDependencies["executionStateSeed"]>;
@@ -271,6 +274,7 @@ function buildStatusFormatOptions(
     transitions?: Awaited<ReturnType<OperatorStateStore["listTransitions"]>>;
     latestReconciliationRun?: ReconciliationRunRecord | null;
     schedulerStatus?: ReturnType<NonNullable<TelegramRouterDependencies["schedulerStatus"]>>;
+    schedulerRuns?: StrategySchedulerRunRecord[];
   } = {};
 
   if (dependencies.executionStateSeed) {
@@ -289,6 +293,10 @@ function buildStatusFormatOptions(
 
   if (dependencies.schedulerStatus) {
     options.schedulerStatus = dependencies.schedulerStatus();
+  }
+
+  if (schedulerRuns.length > 0) {
+    options.schedulerRuns = schedulerRuns;
   }
 
   return Object.keys(options).length === 0 ? undefined : options;

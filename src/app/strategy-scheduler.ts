@@ -1,12 +1,15 @@
 import type {
   StrategySchedulerMarketStatus,
+  StrategySchedulerRunRecord,
   StrategySchedulerStatus,
   SupportedMarket,
 } from "../domain/types.js";
+import type { ExecutionRepository } from "../modules/db/interfaces.js";
 import type {
   TelegramStrategyRunController,
   TelegramStrategyRunResult,
 } from "../modules/telegram/interfaces.js";
+import { createId } from "../shared/ids.js";
 
 export interface StrategySchedulerMarketConfig {
   market: SupportedMarket;
@@ -32,6 +35,7 @@ export class StrategyScheduler {
     private readonly dependencies: {
       config: StrategySchedulerConfig;
       controller: TelegramStrategyRunController;
+      repositories?: Pick<ExecutionRepository, "saveStrategySchedulerRun" | "updateStrategySchedulerRun">;
       now?: () => string;
       setTimer?: (callback: () => void, delayMs: number) => SchedulerTimer;
       clearTimer?: (timer: SchedulerTimer) => void;
@@ -117,6 +121,19 @@ export class StrategyScheduler {
         lastStatus: "ALREADY_RUNNING",
         lastError: null,
       });
+      await this.persistSchedulerRun({
+        run: createSchedulerRunRecord({
+          exchangeAccountId: this.dependencies.config.exchangeAccountId,
+          market,
+          intervalMs: config.intervalMs,
+          runOnStart: this.dependencies.config.runOnStart,
+          status: "SKIPPED",
+          startedAt: requestedAt,
+          completedAt: requestedAt,
+          result: skipped,
+        }),
+        update: false,
+      });
       return skipped;
     }
 
@@ -127,6 +144,36 @@ export class StrategyScheduler {
       lastCompletedAt: null,
       lastError: null,
     });
+    const runRecord = createSchedulerRunRecord({
+      exchangeAccountId: this.dependencies.config.exchangeAccountId,
+      market,
+      intervalMs: config.intervalMs,
+      runOnStart: this.dependencies.config.runOnStart,
+      status: "STARTED",
+      startedAt,
+      completedAt: null,
+      result: null,
+    });
+    const startPersisted = await this.persistSchedulerRun({
+      run: runRecord,
+      update: false,
+    });
+    if (!startPersisted) {
+      const failedAt = this.now();
+      const failed: TelegramStrategyRunResult = {
+        status: "FAILED",
+        requestedAt: startedAt,
+        market,
+        strategyDecisionId: null,
+        action: null,
+        orderId: null,
+        orderStatus: null,
+        submissionAccepted: null,
+        detail: "Strategy scheduler did not run because scheduler history could not be persisted.",
+      };
+      this.applyRunResult(market, failed, startedAt, failedAt);
+      return failed;
+    }
 
     const result = await this.dependencies.controller.requestRun({
       exchangeAccountId: this.dependencies.config.exchangeAccountId,
@@ -136,6 +183,10 @@ export class StrategyScheduler {
     });
     const completedAt = this.now();
     this.applyRunResult(market, result, startedAt, completedAt);
+    await this.persistSchedulerRun({
+      run: completeSchedulerRunRecord(runRecord, result, completedAt),
+      update: true,
+    });
     return result;
   }
 
@@ -168,6 +219,28 @@ export class StrategyScheduler {
     }, delayMs);
 
     this.timers.set(config.market, timer);
+  }
+
+  private async persistSchedulerRun(input: {
+    run: StrategySchedulerRunRecord;
+    update: boolean;
+  }): Promise<boolean> {
+    const repositories = this.dependencies.repositories;
+    if (!repositories) {
+      return true;
+    }
+
+    try {
+      if (input.update) {
+        await repositories.updateStrategySchedulerRun(input.run);
+        return true;
+      }
+
+      await repositories.saveStrategySchedulerRun(input.run);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private applyRunResult(
@@ -219,6 +292,86 @@ export class StrategyScheduler {
   private now(): string {
     return this.dependencies.now?.() ?? new Date().toISOString();
   }
+}
+
+function createSchedulerRunRecord(input: {
+  exchangeAccountId: string;
+  market: SupportedMarket;
+  intervalMs: number;
+  runOnStart: boolean;
+  status: StrategySchedulerRunRecord["status"];
+  startedAt: string;
+  completedAt: string | null;
+  result: TelegramStrategyRunResult | null;
+}): StrategySchedulerRunRecord {
+  return {
+    id: createId("strategy_scheduler_run"),
+    exchangeAccountId: input.exchangeAccountId,
+    market: input.market,
+    triggerSource: "SCHEDULER",
+    status: input.status,
+    startedAt: input.startedAt,
+    completedAt: input.completedAt,
+    intervalMs: input.intervalMs,
+    runOnStart: input.runOnStart,
+    strategyDecisionId: input.result?.strategyDecisionId ?? null,
+    action: input.result?.action ?? null,
+    orderId: input.result?.orderId ?? null,
+    orderStatus: input.result?.orderStatus ?? null,
+    submissionAccepted: input.result?.submissionAccepted ?? null,
+    detail: input.result?.detail ?? null,
+    errorMessage: input.result && input.result.status !== "COMPLETED" && input.result.status !== "ALREADY_RUNNING"
+      ? input.result.detail
+      : null,
+    summaryJson: JSON.stringify({
+      status: input.status,
+      market: input.market,
+      intervalMs: input.intervalMs,
+      runOnStart: input.runOnStart,
+      result: input.result,
+    }),
+  };
+}
+
+function completeSchedulerRunRecord(
+  started: StrategySchedulerRunRecord,
+  result: TelegramStrategyRunResult,
+  completedAt: string,
+): StrategySchedulerRunRecord {
+  const status = mapSchedulerRunStatus(result.status);
+  return {
+    ...started,
+    status,
+    completedAt,
+    strategyDecisionId: result.strategyDecisionId,
+    action: result.action,
+    orderId: result.orderId,
+    orderStatus: result.orderStatus,
+    submissionAccepted: result.submissionAccepted,
+    detail: result.detail,
+    errorMessage: status === "FAILED" ? result.detail : null,
+    summaryJson: JSON.stringify({
+      status,
+      market: started.market,
+      intervalMs: started.intervalMs,
+      runOnStart: started.runOnStart,
+      result,
+    }),
+  };
+}
+
+function mapSchedulerRunStatus(
+  status: TelegramStrategyRunResult["status"],
+): StrategySchedulerRunRecord["status"] {
+  if (status === "COMPLETED") {
+    return "COMPLETED";
+  }
+
+  if (status === "ALREADY_RUNNING") {
+    return "SKIPPED";
+  }
+
+  return "FAILED";
 }
 
 export function createDefaultStrategySchedulerConfig(input: {

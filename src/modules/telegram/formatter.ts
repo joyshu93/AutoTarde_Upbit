@@ -13,6 +13,7 @@ import type {
   PositionSnapshotRecord,
   ReconciliationRunRecord,
   RiskEventRecord,
+  StrategySchedulerRunRecord,
   StrategySchedulerStatus,
 } from "../../domain/types.js";
 import { detectExecutionStateSeedMismatches } from "../db/interfaces.js";
@@ -32,6 +33,7 @@ export function formatStatusMessage(
     transitions?: ExecutionStateTransitionRecord[];
     latestReconciliationRun?: ReconciliationRunRecord | null;
     schedulerStatus?: StrategySchedulerStatus;
+    schedulerRuns?: StrategySchedulerRunRecord[];
   },
 ): string {
   const liveSendPath = options?.liveSendPath ?? "DRY_RUN_ADAPTER";
@@ -58,6 +60,7 @@ export function formatStatusMessage(
     `blocked_by: ${blockers.length === 0 ? "none" : blockers.join(",")}`,
     `seed_mismatches: ${seedMismatches.length === 0 ? "none" : seedMismatches.join(",")}`,
     ...formatStrategySchedulerStatusLines(options?.schedulerStatus ?? null),
+    ...formatStrategySchedulerRunLines(options?.schedulerRuns ?? []),
     ...formatLatestReconciliationLines(latestReconciliationRun),
     ...formatTransitionLines(transitions),
     `updated_at: ${state.updatedAt}`,
@@ -368,6 +371,23 @@ function formatStrategySchedulerStatusLines(status: StrategySchedulerStatus | nu
     ...status.markets.map(
       (market) =>
         `- ${market.market} interval_ms=${market.intervalMs} running=${market.running} next_run_at=${market.nextRunAt ?? "none"} last_status=${market.lastStatus} run_count=${market.runCount} success=${market.successCount} failure=${market.failureCount} skipped=${market.skippedCount} last_started_at=${market.lastStartedAt ?? "none"} last_completed_at=${market.lastCompletedAt ?? "none"} last_decision=${market.lastStrategyDecisionId ?? "none"} last_action=${market.lastAction ?? "none"} last_order=${market.lastOrderId ?? "none"} last_order_status=${market.lastOrderStatus ?? "none"} last_error=${market.lastError ?? "none"}`,
+    ),
+  ];
+}
+
+function formatStrategySchedulerRunLines(runs: StrategySchedulerRunRecord[]): string[] {
+  if (runs.length === 0) {
+    return [
+      "strategy_scheduler_recent_runs: none",
+    ];
+  }
+
+  const sortedRuns = [...runs].sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+  return [
+    `strategy_scheduler_recent_runs: ${sortedRuns.length}`,
+    ...sortedRuns.map(
+      (run) =>
+        `- ${run.startedAt} | ${run.market} | ${run.status} | completed_at=${run.completedAt ?? "none"} | interval_ms=${run.intervalMs} | run_on_start=${run.runOnStart} | decision=${run.strategyDecisionId ?? "none"} | action=${run.action ?? "none"} | order=${run.orderId ?? "none"} | order_status=${run.orderStatus ?? "none"} | accepted=${run.submissionAccepted === null ? "none" : run.submissionAccepted} | error=${run.errorMessage ?? "none"} | detail=${run.detail ?? "none"}`,
     ),
   ];
 }

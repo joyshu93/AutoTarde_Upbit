@@ -7,6 +7,7 @@ import type {
   BalanceSnapshotRecord,
   OperatorNotificationRecord,
   PositionSnapshotRecord,
+  StrategySchedulerRunRecord,
   StrategyDecisionRecord,
 } from "../src/domain/types.js";
 import { openSqliteDatabase } from "../src/modules/db/repositories/sqlite-database.js";
@@ -58,6 +59,7 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
     assert.ok(migrationRows.some((row) => row.filename === "0008_add_operator_notification_delivery_attempt_history.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0009_add_history_recovery_checkpoints.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0010_add_operator_notification_delivery_runs.sql"));
+    assert.ok(migrationRows.some((row) => row.filename === "0011_add_strategy_scheduler_runs.sql"));
 
     for (const tableName of [
       "users",
@@ -74,6 +76,7 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
       "operator_notifications",
       "operator_notification_delivery_attempts",
       "operator_notification_delivery_runs",
+      "strategy_scheduler_runs",
       "risk_events",
     ]) {
       assert.ok(tableNames.has(tableName), `Expected migrated table ${tableName} to exist.`);
@@ -371,6 +374,37 @@ test("createSqlitePersistence bootstraps operator state and round-trips app-faci
     assert.equal(runRows.length, 1);
     assert.equal(runRows[0]?.status, "COMPLETED");
     assert.equal(runRows[0]?.sentCount, 1);
+
+    const schedulerRun = createStrategySchedulerRun({
+      id: "scheduler-run-1",
+      status: "STARTED",
+      startedAt: "2026-04-20T00:03:07.000Z",
+      completedAt: null,
+      strategyDecisionId: null,
+      action: null,
+      orderId: null,
+      orderStatus: null,
+      submissionAccepted: null,
+      detail: null,
+      errorMessage: null,
+    });
+    await bundle.repositories.saveStrategySchedulerRun(schedulerRun);
+    await bundle.repositories.updateStrategySchedulerRun({
+      ...schedulerRun,
+      status: "COMPLETED",
+      completedAt: "2026-04-20T00:03:08.000Z",
+      strategyDecisionId: "strategy-decision-1",
+      action: "HOLD",
+      detail: "Decision HOLD persisted; no order submission was requested.",
+      summaryJson: JSON.stringify({ status: "COMPLETED" }),
+    });
+
+    const schedulerRuns = await bundle.repositories.listStrategySchedulerRuns("primary", 5);
+    assert.equal(schedulerRuns.length, 1);
+    assert.equal(schedulerRuns[0]?.status, "COMPLETED");
+    assert.equal(schedulerRuns[0]?.strategyDecisionId, "strategy-decision-1");
+    assert.equal(schedulerRuns[0]?.action, "HOLD");
+    assert.equal(schedulerRuns[0]?.runOnStart, false);
 
     await bundle.repositories.saveOperatorNotification(createNotification({
       id: "operator-notification-2",
@@ -734,6 +768,28 @@ function createStrategyDecisionRecord(overrides: Partial<StrategyDecisionRecord>
     intendedQuantity: null,
     referencePrice: "110000000",
     createdAt: "2026-04-20T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function createStrategySchedulerRun(
+  overrides: Partial<StrategySchedulerRunRecord> & Pick<StrategySchedulerRunRecord, "id" | "status" | "startedAt">,
+): StrategySchedulerRunRecord {
+  return {
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    triggerSource: "SCHEDULER",
+    completedAt: null,
+    intervalMs: 3_600_000,
+    runOnStart: false,
+    strategyDecisionId: null,
+    action: null,
+    orderId: null,
+    orderStatus: null,
+    submissionAccepted: null,
+    detail: null,
+    errorMessage: null,
+    summaryJson: "{}",
     ...overrides,
   };
 }

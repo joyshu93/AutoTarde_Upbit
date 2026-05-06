@@ -64,6 +64,7 @@ Current remaining gaps:
 - Telegram delivery now persists `operator_notification_delivery_runs` for each inline worker execution, including skipped/not-configured runs and failed worker runs
 - `/alerts` now exposes delivery-worker queue metrics such as pending totals, due/scheduled counts, active/expired leases, abandoned-lease candidates, recent worker-run summaries, recent attempt outcome counts, and latest/oldest timestamps
 - startup recovery can now mark persisted operator state `DEGRADED` when unresolved portfolio drift remains after exchange-backed bootstrap checks
+- scheduler-triggered strategy cycles now persist `strategy_scheduler_runs` so scheduled run starts, completions, failures, and skips remain inspectable after process restart
 
 Current risk-policy framing is budget-first rather than asset-count-first:
 - total exposure cap is the main reserve control
@@ -85,13 +86,14 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 11. `/sync` connects to reconciliation so snapshot and reconciliation records are persisted, using read-only public ticker valuation when available.
 12. `/run BTC|ETH` requests one deterministic PositionGuard runner cycle for a supported asset and returns the persisted decision, action, and any DRY_RUN order lifecycle result.
 13. When `STRATEGY_SCHEDULER_ENABLED=true`, the scheduler uses the same safe runner/controller path as `/run BTC|ETH`; it is disabled by default.
-14. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
-15. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
-16. Telegram delivery claims due `PENDING` notifications with a lease token, then only finalizes rows that still match that lease.
-17. Each delivery attempt now also writes a durable `operator_notification_delivery_attempts` record so `/alerts` can show recent delivery outcomes separately from the summary row in `operator_notifications`.
-18. Each delivery worker kick also writes a durable `operator_notification_delivery_runs` record so operators can inspect skipped, completed, and failed delivery-worker executions.
-19. Retryable Telegram delivery failures stay `PENDING` with a later `next_attempt_at`, while permanent failures become `FAILED`.
-20. Reconciliation and Telegram inspection surfaces operate on persisted state.
+14. Scheduler-triggered cycles are persisted in `strategy_scheduler_runs` before runner execution and updated on completion, failure, or skip.
+15. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
+16. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
+17. Telegram delivery claims due `PENDING` notifications with a lease token, then only finalizes rows that still match that lease.
+18. Each delivery attempt now also writes a durable `operator_notification_delivery_attempts` record so `/alerts` can show recent delivery outcomes separately from the summary row in `operator_notifications`.
+19. Each delivery worker kick also writes a durable `operator_notification_delivery_runs` record so operators can inspect skipped, completed, and failed delivery-worker executions.
+20. Retryable Telegram delivery failures stay `PENDING` with a later `next_attempt_at`, while permanent failures become `FAILED`.
+21. Reconciliation and Telegram inspection surfaces operate on persisted state.
 
 ## Folder Layout
 
@@ -183,5 +185,5 @@ The scheduler still uses the same runner/controller path as `/run BTC|ETH`, so i
 
 ## Immediate Next Steps
 
-- add persisted scheduler run history so scheduler failures survive process restarts, rather than only appearing in in-memory `/status` lines
+- add a dedicated `/scheduler` inspection command for fuller persisted scheduler run history beyond the compact `/status` summary
 - keep live order transmission gated by `APP_EXECUTION_MODE=LIVE` plus `ENABLE_LIVE_ORDERS=true`

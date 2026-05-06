@@ -78,8 +78,28 @@ test("telegram router exposes persisted execution status with explicit blockers"
 });
 
 test("telegram router includes strategy scheduler state in /status when wired", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveStrategySchedulerRun({
+    id: "strategy-scheduler-run-1",
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    triggerSource: "SCHEDULER",
+    status: "COMPLETED",
+    startedAt: "2026-04-20T00:00:00.000Z",
+    completedAt: "2026-04-20T00:00:02.000Z",
+    intervalMs: 1_800_000,
+    runOnStart: false,
+    strategyDecisionId: "strategy-decision-1",
+    action: "HOLD",
+    orderId: null,
+    orderStatus: null,
+    submissionAccepted: null,
+    detail: "Decision HOLD persisted; no order submission was requested.",
+    errorMessage: null,
+    summaryJson: JSON.stringify({ status: "COMPLETED" }),
+  });
   const router = new TelegramCommandRouter({
-    repositories: new InMemoryExecutionRepository(),
+    repositories: repository,
     operatorState: new InMemoryOperatorStateStore({
       id: "state-1",
       exchangeAccountId: "primary",
@@ -127,6 +147,8 @@ test("telegram router includes strategy scheduler state in /status when wired", 
   assert.match(status.text, /strategy_scheduler_live_send_path: DRY_RUN_ADAPTER/);
   assert.match(status.text, /- KRW-BTC interval_ms=1800000 running=false next_run_at=2026-04-20T00:30:00.000Z last_status=COMPLETED run_count=1 success=1 failure=0 skipped=0/);
   assert.match(status.text, /last_decision=strategy-decision-1 last_action=HOLD/);
+  assert.match(status.text, /strategy_scheduler_recent_runs: 1/);
+  assert.match(status.text, /\| KRW-BTC \| COMPLETED \| completed_at=2026-04-20T00:00:02.000Z \| interval_ms=1800000/);
 });
 
 test("telegram router includes recent reconciliation summary in /status when available", async () => {

@@ -744,6 +744,11 @@ function createRepositoryStub(overrides: Partial<ExecutionRepository> = {}): Exe
     async listReconciliationRuns() {
       return [];
     },
+    async saveStrategySchedulerRun() {},
+    async updateStrategySchedulerRun() {},
+    async listStrategySchedulerRuns() {
+      return [];
+    },
     async saveHistoryRecoveryCheckpoint() {},
     async listHistoryRecoveryCheckpoints() {
       return [];

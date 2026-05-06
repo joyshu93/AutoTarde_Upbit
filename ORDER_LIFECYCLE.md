@@ -142,6 +142,7 @@ Telegram should report lifecycle outcomes, such as:
 - scheduled strategy runner outcomes when `STRATEGY_SCHEDULER_ENABLED=true`
 
 Notifications are derived from lifecycle state, not treated as lifecycle state.
+Scheduler run history is likewise operational audit state, not order lifecycle truth; orders and fills remain the durable lifecycle records.
 They should be persisted first into `operator_notifications`, then delivered through a separate `PENDING -> SENT/FAILED` path.
 Notification delivery failure must never be treated as an order-lifecycle transition.
 Retryable Telegram failures may keep the notification in `PENDING` with a scheduled `next_attempt_at`, but that retry state is still separate from order lifecycle.

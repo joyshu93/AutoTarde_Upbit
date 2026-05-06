@@ -128,7 +128,7 @@ It provides:
 - `/risks` for read-only persisted risk_events inspection
 - `/sync` for reconciliation-triggered snapshot and reconciliation record persistence with read-only public ticker valuation
 - `/run BTC|ETH` for one deterministic PositionGuard strategy runner cycle through the configured safe execution path
-- `/status` strategy-scheduler lines for disabled/enabled state, configured intervals, next run timestamps, and recent in-memory scheduler outcomes
+- `/status` strategy-scheduler lines for disabled/enabled state, configured intervals, next run timestamps, recent in-memory scheduler outcomes, and persisted recent scheduler run history
 - future reconciliation inspection as a read-only operator view
 - `/synchistory` summaries that expose bounded archival recovery progress such as checkpoint window movement, page counts, stop-before boundary, retention-assumption boundary, coverage status, truncation flags, and confidence classification
 - execution_state transition history inspection from persisted state
@@ -168,6 +168,7 @@ The schema is centered on recovery and auditability:
 - `order_events`
 - `fills`
 - `reconciliation_runs`
+- `strategy_scheduler_runs`
 - `operator_notifications`
 - `operator_notification_delivery_attempts`
 - `operator_notification_delivery_runs`
@@ -180,6 +181,7 @@ Lease metadata is durable as well, so workers can claim rows and finalize only w
 `operator_notification_delivery_attempts` add append-oriented delivery observability without changing the current-summary semantics of `operator_notifications`.
 `operator_notification_delivery_runs` add one row per delivery-worker execution so scheduled or inline workers leave a durable summary even when no notification was sent.
 Delivery-worker queue metrics are currently derived from persisted notification, delivery-run, and attempt rows.
+`strategy_scheduler_runs` records scheduler-triggered strategy cycles separately from strategy decisions and orders so operators can inspect scheduler health without treating scheduler state as trading truth.
 
 ## Execution Modes
 

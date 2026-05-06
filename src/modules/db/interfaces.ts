@@ -20,6 +20,7 @@ import type {
   ReconciliationRunRecord,
   RiskEventRecord,
   StrategyDecisionRecord,
+  StrategySchedulerRunRecord,
   SupportedMarket,
 } from "../../domain/types.js";
 
@@ -48,6 +49,9 @@ export interface ExecutionRepository {
   saveReconciliationRun(record: ReconciliationRunRecord): Promise<void>;
   updateReconciliationRun(record: ReconciliationRunRecord): Promise<void>;
   listReconciliationRuns(exchangeAccountId: string, limit?: number): Promise<ReconciliationRunRecord[]>;
+  saveStrategySchedulerRun(record: StrategySchedulerRunRecord): Promise<void>;
+  updateStrategySchedulerRun(record: StrategySchedulerRunRecord): Promise<void>;
+  listStrategySchedulerRuns(exchangeAccountId: string, limit?: number): Promise<StrategySchedulerRunRecord[]>;
   saveHistoryRecoveryCheckpoint(record: HistoryRecoveryCheckpointRecord): Promise<void>;
   listHistoryRecoveryCheckpoints(exchangeAccountId: string): Promise<HistoryRecoveryCheckpointRecord[]>;
   getHistoryRecoveryCheckpoint(

@@ -18,6 +18,7 @@ import type {
   ReconciliationRunRecord,
   RiskEventRecord,
   StrategyDecisionRecord,
+  StrategySchedulerRunRecord,
   SupportedAsset,
   SupportedMarket,
 } from "../../../domain/types.js";
@@ -42,6 +43,7 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   private readonly positionSnapshots: PositionSnapshotRecord[] = [];
   private readonly riskEvents: RiskEventRecord[] = [];
   private readonly reconciliationRuns: ReconciliationRunRecord[] = [];
+  private readonly strategySchedulerRuns: StrategySchedulerRunRecord[] = [];
   private readonly historyRecoveryCheckpoints: HistoryRecoveryCheckpointRecord[] = [];
   private readonly operatorNotifications: OperatorNotificationRecord[] = [];
   private readonly operatorNotificationDeliveryAttempts: OperatorNotificationDeliveryAttemptRecord[] = [];
@@ -196,6 +198,28 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
 
   async listReconciliationRuns(exchangeAccountId: string, limit?: number): Promise<ReconciliationRunRecord[]> {
     const runs = this.reconciliationRuns
+      .filter((candidate) => candidate.exchangeAccountId === exchangeAccountId)
+      .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+
+    return typeof limit === "number" ? runs.slice(0, limit) : runs;
+  }
+
+  async saveStrategySchedulerRun(record: StrategySchedulerRunRecord): Promise<void> {
+    const index = this.strategySchedulerRuns.findIndex((candidate) => candidate.id === record.id);
+    if (index === -1) {
+      this.strategySchedulerRuns.push(record);
+      return;
+    }
+
+    this.strategySchedulerRuns[index] = record;
+  }
+
+  async updateStrategySchedulerRun(record: StrategySchedulerRunRecord): Promise<void> {
+    await this.saveStrategySchedulerRun(record);
+  }
+
+  async listStrategySchedulerRuns(exchangeAccountId: string, limit?: number): Promise<StrategySchedulerRunRecord[]> {
+    const runs = this.strategySchedulerRuns
       .filter((candidate) => candidate.exchangeAccountId === exchangeAccountId)
       .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
 
