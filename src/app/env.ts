@@ -19,6 +19,10 @@ export interface AppConfig {
   telegramDeliveryBaseBackoffMs: number;
   telegramDeliveryMaxBackoffMs: number;
   telegramDeliveryLeaseMs: number;
+  strategySchedulerEnabled: boolean;
+  strategySchedulerRunOnStart: boolean;
+  strategySchedulerBtcIntervalMs: number;
+  strategySchedulerEthIntervalMs: number;
   reconciliationMaxOrderLookupsPerRun: number;
   reconciliationHistoryMaxPagesPerMarket: number;
   reconciliationClosedOrderLookbackDays: number;
@@ -37,6 +41,7 @@ const DEFAULT_TELEGRAM_DELIVERY_MAX_ATTEMPTS = 5;
 const DEFAULT_TELEGRAM_DELIVERY_BASE_BACKOFF_MS = 15_000;
 const DEFAULT_TELEGRAM_DELIVERY_MAX_BACKOFF_MS = 300_000;
 const DEFAULT_TELEGRAM_DELIVERY_LEASE_MS = 30_000;
+const DEFAULT_STRATEGY_SCHEDULER_INTERVAL_MS = 3_600_000;
 const DEFAULT_RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN = 10;
 const DEFAULT_RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET = 3;
 const DEFAULT_RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS = 7;
@@ -79,6 +84,16 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     telegramDeliveryLeaseMs: parseNumber(
       env.TELEGRAM_DELIVERY_LEASE_MS,
       DEFAULT_TELEGRAM_DELIVERY_LEASE_MS,
+    ),
+    strategySchedulerEnabled: parseBoolean(env.STRATEGY_SCHEDULER_ENABLED),
+    strategySchedulerRunOnStart: parseBoolean(env.STRATEGY_SCHEDULER_RUN_ON_START),
+    strategySchedulerBtcIntervalMs: parsePositiveNumber(
+      env.STRATEGY_SCHEDULER_BTC_INTERVAL_MS,
+      DEFAULT_STRATEGY_SCHEDULER_INTERVAL_MS,
+    ),
+    strategySchedulerEthIntervalMs: parsePositiveNumber(
+      env.STRATEGY_SCHEDULER_ETH_INTERVAL_MS,
+      DEFAULT_STRATEGY_SCHEDULER_INTERVAL_MS,
     ),
     reconciliationMaxOrderLookupsPerRun: parseNumber(
       env.RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN,
@@ -134,4 +149,9 @@ function parseBoolean(input: string | undefined): boolean {
 function parseNumber(input: string | undefined, fallback: number): number {
   const parsed = Number(input);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parsePositiveNumber(input: string | undefined, fallback: number): number {
+  const parsed = Number(input);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }

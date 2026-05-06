@@ -1,4 +1,8 @@
 import { buildExecutionRiskLimits, loadAppConfig, type AppConfig } from "./env.js";
+import {
+  createDefaultStrategySchedulerConfig,
+  StrategyScheduler,
+} from "./strategy-scheduler.js";
 import { InlineTelegramStrategyRunController } from "./strategy-run-controller.js";
 import { InlineTelegramSyncController } from "./sync-controller.js";
 import type { ExecutionRepository, OperatorStateStore } from "../modules/db/interfaces.js";
@@ -30,6 +34,7 @@ export interface AppServices {
   reconciliationService: ReconciliationService;
   portfolioSyncService: PortfolioSyncService;
   telegramRouter: TelegramCommandRouter;
+  strategyScheduler: StrategyScheduler;
   strategy: DeterministicStubStrategy;
   positionGuardRunner: PositionGuardStrategyRunner;
   liveExchangeClient: UpbitPrivateClient;
@@ -98,6 +103,19 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
     marketDataReader: publicTickerClient,
     config: createDefaultPositionGuardRunnerConfig("primary"),
   });
+  const strategyRunController = new InlineTelegramStrategyRunController({
+    runner: positionGuardRunner,
+  });
+  const strategyScheduler = new StrategyScheduler({
+    config: createDefaultStrategySchedulerConfig({
+      enabled: config.strategySchedulerEnabled,
+      runOnStart: config.strategySchedulerRunOnStart,
+      exchangeAccountId: "primary",
+      btcIntervalMs: config.strategySchedulerBtcIntervalMs,
+      ethIntervalMs: config.strategySchedulerEthIntervalMs,
+    }),
+    controller: strategyRunController,
+  });
 
   const reconciliationDependencies = {
     repositories,
@@ -125,9 +143,8 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
       portfolioSyncService,
       reporter,
     }),
-    strategyRunController: new InlineTelegramStrategyRunController({
-      runner: positionGuardRunner,
-    }),
+    strategyRunController,
+    schedulerStatus: () => strategyScheduler.getStatus(),
     executionStateSeed: {
       executionMode: config.executionMode,
       liveExecutionGate: config.liveExecutionGate,
@@ -144,6 +161,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
     reconciliationService,
     portfolioSyncService,
     telegramRouter,
+    strategyScheduler,
     strategy,
     positionGuardRunner,
     liveExchangeClient,

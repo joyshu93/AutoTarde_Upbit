@@ -36,6 +36,12 @@ export type OrderLifecycleStatus =
 
 export type OrderOrigin = "STRATEGY" | "OPERATOR" | "RECOVERY";
 export type ReconciliationStatus = "SUCCESS" | "DRIFT_DETECTED" | "ERROR";
+export type StrategySchedulerLastStatus =
+  | "NEVER_RUN"
+  | "COMPLETED"
+  | "FAILED"
+  | "NOT_CONNECTED"
+  | "ALREADY_RUNNING";
 export type RiskEventLevel = "INFO" | "WARN" | "BLOCK";
 export type OperatorNotificationChannel = "TELEGRAM";
 export type OperatorNotificationSeverity = "INFO" | "WARN" | "ERROR";
@@ -250,6 +256,33 @@ export interface ReconciliationRunRecord {
   completedAt: string | null;
   summaryJson: string;
   errorMessage: string | null;
+}
+
+export interface StrategySchedulerMarketStatus {
+  market: SupportedMarket;
+  intervalMs: number;
+  running: boolean;
+  runCount: number;
+  successCount: number;
+  failureCount: number;
+  skippedCount: number;
+  lastStartedAt: string | null;
+  lastCompletedAt: string | null;
+  lastStatus: StrategySchedulerLastStatus;
+  lastStrategyDecisionId: string | null;
+  lastAction: StrategyDecisionAction | null;
+  lastOrderId: string | null;
+  lastOrderStatus: OrderLifecycleStatus | null;
+  lastError: string | null;
+  nextRunAt: string | null;
+}
+
+export interface StrategySchedulerStatus {
+  enabled: boolean;
+  started: boolean;
+  exchangeAccountId: string;
+  liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
+  markets: StrategySchedulerMarketStatus[];
 }
 
 export type HistoryRecoveryCheckpointType = "CLOSED_ORDER_ARCHIVE";

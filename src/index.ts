@@ -54,6 +54,7 @@ async function main(): Promise<void> {
   }
 
   const state = await app.operatorState.getState();
+  const strategySchedulerStatus = app.strategyScheduler.start();
   const seedMismatches = detectExecutionStateSeedMismatches(state, {
     executionMode: app.config.executionMode,
     liveExecutionGate: app.config.liveExecutionGate,
@@ -86,6 +87,7 @@ async function main(): Promise<void> {
     telegramDeliveryMaxBackoffMs: app.config.telegramDeliveryMaxBackoffMs,
     telegramDeliveryLeaseMs: app.config.telegramDeliveryLeaseMs,
     notificationDeliverySummary,
+    strategyScheduler: strategySchedulerStatus,
     supportedCommands: app.telegramRouter.getSupportedCommands(),
   };
 

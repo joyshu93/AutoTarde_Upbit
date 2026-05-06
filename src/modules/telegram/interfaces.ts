@@ -2,6 +2,7 @@ import type {
   ExecutionStateSeed,
   OperatorCommand,
   OrderLifecycleStatus,
+  StrategySchedulerStatus,
   StrategyDecisionAction,
   SupportedMarket,
 } from "../../domain/types.js";
@@ -48,8 +49,8 @@ export interface TelegramSyncController {
 export interface TelegramStrategyRunRequest {
   readonly exchangeAccountId: string;
   readonly market: SupportedMarket;
-  readonly requestedBy: "TELEGRAM";
-  readonly requestedCommand: "/run";
+  readonly requestedBy: "TELEGRAM" | "SCHEDULER";
+  readonly requestedCommand: "/run" | "SCHEDULER_TICK";
 }
 
 export interface TelegramStrategyRunResult {
@@ -75,5 +76,6 @@ export interface TelegramRouterDependencies {
   readonly liveSendPath?: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
   readonly syncController?: TelegramSyncController;
   readonly strategyRunController?: TelegramStrategyRunController;
+  readonly schedulerStatus?: () => StrategySchedulerStatus;
   readonly now?: () => string;
 }

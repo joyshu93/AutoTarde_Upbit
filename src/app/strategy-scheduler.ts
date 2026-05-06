@@ -1,0 +1,270 @@
+import type {
+  StrategySchedulerMarketStatus,
+  StrategySchedulerStatus,
+  SupportedMarket,
+} from "../domain/types.js";
+import type {
+  TelegramStrategyRunController,
+  TelegramStrategyRunResult,
+} from "../modules/telegram/interfaces.js";
+
+export interface StrategySchedulerMarketConfig {
+  market: SupportedMarket;
+  intervalMs: number;
+}
+
+export interface StrategySchedulerConfig {
+  enabled: boolean;
+  runOnStart: boolean;
+  exchangeAccountId: string;
+  liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
+  markets: StrategySchedulerMarketConfig[];
+}
+
+type SchedulerTimer = ReturnType<typeof setTimeout>;
+
+export class StrategyScheduler {
+  private started = false;
+  private readonly timers = new Map<SupportedMarket, SchedulerTimer>();
+  private readonly statusByMarket = new Map<SupportedMarket, StrategySchedulerMarketStatus>();
+
+  constructor(
+    private readonly dependencies: {
+      config: StrategySchedulerConfig;
+      controller: TelegramStrategyRunController;
+      now?: () => string;
+      setTimer?: (callback: () => void, delayMs: number) => SchedulerTimer;
+      clearTimer?: (timer: SchedulerTimer) => void;
+    },
+  ) {
+    for (const market of dependencies.config.markets) {
+      this.statusByMarket.set(market.market, createInitialMarketStatus(market));
+    }
+  }
+
+  start(): StrategySchedulerStatus {
+    if (!this.dependencies.config.enabled || this.started) {
+      return this.getStatus();
+    }
+
+    this.started = true;
+    for (const market of this.dependencies.config.markets) {
+      if (this.dependencies.config.runOnStart) {
+        this.scheduleMarket(market, 0);
+        continue;
+      }
+
+      this.scheduleMarket(market, market.intervalMs);
+    }
+
+    return this.getStatus();
+  }
+
+  stop(): StrategySchedulerStatus {
+    for (const timer of this.timers.values()) {
+      (this.dependencies.clearTimer ?? clearTimeout)(timer);
+    }
+
+    this.timers.clear();
+    this.started = false;
+    for (const market of this.dependencies.config.markets) {
+      this.updateMarketStatus(market.market, {
+        running: false,
+        nextRunAt: null,
+      });
+    }
+
+    return this.getStatus();
+  }
+
+  getStatus(): StrategySchedulerStatus {
+    return {
+      enabled: this.dependencies.config.enabled,
+      started: this.started,
+      exchangeAccountId: this.dependencies.config.exchangeAccountId,
+      liveSendPath: this.dependencies.config.liveSendPath,
+      markets: this.dependencies.config.markets.map((market) => {
+        const status = this.statusByMarket.get(market.market);
+        return status ? { ...status } : createInitialMarketStatus(market);
+      }),
+    };
+  }
+
+  async runMarketNow(market: SupportedMarket): Promise<TelegramStrategyRunResult> {
+    const config = this.dependencies.config.markets.find((candidate) => candidate.market === market);
+    if (!config) {
+      throw new Error(`Unsupported scheduled market: ${market}`);
+    }
+
+    const current = this.statusByMarket.get(market) ?? createInitialMarketStatus(config);
+    if (current.running) {
+      const requestedAt = this.now();
+      const skipped: TelegramStrategyRunResult = {
+        status: "ALREADY_RUNNING",
+        requestedAt,
+        market,
+        strategyDecisionId: null,
+        action: null,
+        orderId: null,
+        orderStatus: null,
+        submissionAccepted: null,
+        detail: `A scheduled strategy run is already running for ${market}.`,
+      };
+      this.statusByMarket.set(market, {
+        ...current,
+        skippedCount: current.skippedCount + 1,
+        lastCompletedAt: requestedAt,
+        lastStatus: "ALREADY_RUNNING",
+        lastError: null,
+      });
+      return skipped;
+    }
+
+    const startedAt = this.now();
+    this.updateMarketStatus(market, {
+      running: true,
+      lastStartedAt: startedAt,
+      lastCompletedAt: null,
+      lastError: null,
+    });
+
+    const result = await this.dependencies.controller.requestRun({
+      exchangeAccountId: this.dependencies.config.exchangeAccountId,
+      market,
+      requestedBy: "SCHEDULER",
+      requestedCommand: "SCHEDULER_TICK",
+    });
+    const completedAt = this.now();
+    this.applyRunResult(market, result, startedAt, completedAt);
+    return result;
+  }
+
+  private scheduleMarket(config: StrategySchedulerMarketConfig, delayMs: number): void {
+    if (!this.started || !this.dependencies.config.enabled) {
+      return;
+    }
+
+    const nextRunAt = new Date(Date.parse(this.now()) + delayMs).toISOString();
+    this.updateMarketStatus(config.market, { nextRunAt });
+    const timer = (this.dependencies.setTimer ?? setTimeout)(() => {
+      this.timers.delete(config.market);
+      void this.runMarketNow(config.market)
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          const completedAt = this.now();
+          this.applyRunResult(config.market, {
+            status: "FAILED",
+            requestedAt: completedAt,
+            market: config.market,
+            strategyDecisionId: null,
+            action: null,
+            orderId: null,
+            orderStatus: null,
+            submissionAccepted: null,
+            detail: `Strategy scheduler failed: ${message}`,
+          }, completedAt, completedAt);
+        })
+        .finally(() => this.scheduleMarket(config, config.intervalMs));
+    }, delayMs);
+
+    this.timers.set(config.market, timer);
+  }
+
+  private applyRunResult(
+    market: SupportedMarket,
+    result: TelegramStrategyRunResult,
+    startedAt: string,
+    completedAt: string,
+  ): void {
+    const current = this.statusByMarket.get(market);
+    if (!current) {
+      return;
+    }
+
+    const success = result.status === "COMPLETED";
+    const skipped = result.status === "ALREADY_RUNNING";
+    this.statusByMarket.set(market, {
+      ...current,
+      running: false,
+      runCount: current.runCount + (skipped ? 0 : 1),
+      successCount: current.successCount + (success ? 1 : 0),
+      failureCount: current.failureCount + (!success && !skipped ? 1 : 0),
+      skippedCount: current.skippedCount + (skipped ? 1 : 0),
+      lastStartedAt: startedAt,
+      lastCompletedAt: completedAt,
+      lastStatus: result.status,
+      lastStrategyDecisionId: result.strategyDecisionId,
+      lastAction: result.action,
+      lastOrderId: result.orderId,
+      lastOrderStatus: result.orderStatus,
+      lastError: success || skipped ? null : result.detail,
+    });
+  }
+
+  private updateMarketStatus(
+    market: SupportedMarket,
+    patch: Partial<StrategySchedulerMarketStatus>,
+  ): void {
+    const current = this.statusByMarket.get(market);
+    if (!current) {
+      return;
+    }
+
+    this.statusByMarket.set(market, {
+      ...current,
+      ...patch,
+    });
+  }
+
+  private now(): string {
+    return this.dependencies.now?.() ?? new Date().toISOString();
+  }
+}
+
+export function createDefaultStrategySchedulerConfig(input: {
+  enabled: boolean;
+  runOnStart: boolean;
+  exchangeAccountId: string;
+  btcIntervalMs: number;
+  ethIntervalMs: number;
+}): StrategySchedulerConfig {
+  return {
+    enabled: input.enabled,
+    runOnStart: input.runOnStart,
+    exchangeAccountId: input.exchangeAccountId,
+    liveSendPath: "DRY_RUN_ADAPTER",
+    markets: [
+      {
+        market: "KRW-BTC",
+        intervalMs: input.btcIntervalMs,
+      },
+      {
+        market: "KRW-ETH",
+        intervalMs: input.ethIntervalMs,
+      },
+    ],
+  };
+}
+
+function createInitialMarketStatus(
+  config: StrategySchedulerMarketConfig,
+): StrategySchedulerMarketStatus {
+  return {
+    market: config.market,
+    intervalMs: config.intervalMs,
+    running: false,
+    runCount: 0,
+    successCount: 0,
+    failureCount: 0,
+    skippedCount: 0,
+    lastStartedAt: null,
+    lastCompletedAt: null,
+    lastStatus: "NEVER_RUN",
+    lastStrategyDecisionId: null,
+    lastAction: null,
+    lastOrderId: null,
+    lastOrderStatus: null,
+    lastError: null,
+    nextRunAt: null,
+  };
+}

@@ -52,7 +52,7 @@ This first slice establishes:
 - pure-logic tests around risk, configuration, and Telegram command parsing
 
 Current remaining gaps:
-- runtime startup still does not auto-run trading cycles, but Telegram `/run BTC|ETH` now triggers the first `PositionGuard_PaperTrade` runner, which wires the market-structure analyzer, Upbit public snapshot normalizer, persisted context assembler, core strategy, durable strategy-decision persistence, and default `DRY_RUN` execution submission path
+- runtime startup still does not auto-run trading cycles by default, but Telegram `/run BTC|ETH` and the disabled-by-default scheduler can trigger the first `PositionGuard_PaperTrade` runner, which wires the market-structure analyzer, Upbit public snapshot normalizer, persisted context assembler, core strategy, durable strategy-decision persistence, and default `DRY_RUN` execution submission path
 - live exchange submission is implemented as an adapter contract, but the app still wires a dry-run adapter by default
 - `/sync` now persists read-only balance and position snapshots using Upbit public ticker prices when available, with explicit `avg_buy_price` fallback
 - exchange-backed reconciliation now covers active orders, startup recovery sweep, paginated recent open/closed exchange-order history recovery into local `RECOVERY` records, checkpointed archival closed-order recovery with an explicit stop-before boundary, coverage status, confidence classification, and explicit exchange-history retention-assumption metadata, terminal-order fill/status backfill, balance/position drift detection against prior snapshots plus local fills, and per-run lookup budgeting
@@ -84,13 +84,14 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 10. Telegram inspection currently includes `/status`, `/statehistory`, `/synchistory`, `/recovery`, `/alerts`, `/risks`, `/balances`, `/positions`, `/orders`, and `/sync` for operator visibility, with `/status` also summarizing the latest persisted reconciliation run, recent issue codes, checkpointed history-recovery progress, and persisted degraded metadata when present.
 11. `/sync` connects to reconciliation so snapshot and reconciliation records are persisted, using read-only public ticker valuation when available.
 12. `/run BTC|ETH` requests one deterministic PositionGuard runner cycle for a supported asset and returns the persisted decision, action, and any DRY_RUN order lifecycle result.
-13. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
-14. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
-15. Telegram delivery claims due `PENDING` notifications with a lease token, then only finalizes rows that still match that lease.
-16. Each delivery attempt now also writes a durable `operator_notification_delivery_attempts` record so `/alerts` can show recent delivery outcomes separately from the summary row in `operator_notifications`.
-17. Each delivery worker kick also writes a durable `operator_notification_delivery_runs` record so operators can inspect skipped, completed, and failed delivery-worker executions.
-18. Retryable Telegram delivery failures stay `PENDING` with a later `next_attempt_at`, while permanent failures become `FAILED`.
-19. Reconciliation and Telegram inspection surfaces operate on persisted state.
+13. When `STRATEGY_SCHEDULER_ENABLED=true`, the scheduler uses the same safe runner/controller path as `/run BTC|ETH`; it is disabled by default.
+14. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
+15. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
+16. Telegram delivery claims due `PENDING` notifications with a lease token, then only finalizes rows that still match that lease.
+17. Each delivery attempt now also writes a durable `operator_notification_delivery_attempts` record so `/alerts` can show recent delivery outcomes separately from the summary row in `operator_notifications`.
+18. Each delivery worker kick also writes a durable `operator_notification_delivery_runs` record so operators can inspect skipped, completed, and failed delivery-worker executions.
+19. Retryable Telegram delivery failures stay `PENDING` with a later `next_attempt_at`, while permanent failures become `FAILED`.
+20. Reconciliation and Telegram inspection surfaces operate on persisted state.
 
 ## Folder Layout
 
@@ -138,6 +139,10 @@ Environment variables currently recognized:
 - `UPBIT_SECRET_KEY`
 - `DATABASE_PATH`
 - `ENABLE_TELEGRAM_DELIVERY`
+- `STRATEGY_SCHEDULER_ENABLED`
+- `STRATEGY_SCHEDULER_RUN_ON_START`
+- `STRATEGY_SCHEDULER_BTC_INTERVAL_MS`
+- `STRATEGY_SCHEDULER_ETH_INTERVAL_MS`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_OPERATOR_CHAT_ID`
 - `TELEGRAM_DELIVERY_MAX_ATTEMPTS`
@@ -172,7 +177,11 @@ Recent and archival exchange-history recovery also respect `RECONCILIATION_HISTO
 History recovery summaries also separate coverage from confidence: `confidenceLevel` can be `HIGH`, `PARTIAL`, or `FAILED`, with reasons such as `ARCHIVE_COMPLETE`, `ARCHIVE_IN_PROGRESS`, `PAGE_LIMIT_REACHED`, `BEYOND_ASSUMED_RETENTION`, or `LOOKUP_FAILED`.
 If startup recovery finds unresolved portfolio drift against the prior persisted snapshots and local fill history, bootstrap can mark the persisted operator state `DEGRADED` with explicit `degraded_reason` / `degraded_at`.
 
+The strategy scheduler is disabled unless `STRATEGY_SCHEDULER_ENABLED=true`.
+When enabled, `STRATEGY_SCHEDULER_BTC_INTERVAL_MS` and `STRATEGY_SCHEDULER_ETH_INTERVAL_MS` control the BTC/ETH cadence, and `STRATEGY_SCHEDULER_RUN_ON_START=true` requests an immediate first tick after startup recovery policy has completed.
+The scheduler still uses the same runner/controller path as `/run BTC|ETH`, so it does not enable live order transmission by itself.
+
 ## Immediate Next Steps
 
-- add a scheduler entry point for the `PositionGuard_PaperTrade` runner that reuses the same safe runner/controller path as `/run BTC|ETH`
+- add persisted scheduler run history so scheduler failures survive process restarts, rather than only appearing in in-memory `/status` lines
 - keep live order transmission gated by `APP_EXECUTION_MODE=LIVE` plus `ENABLE_LIVE_ORDERS=true`

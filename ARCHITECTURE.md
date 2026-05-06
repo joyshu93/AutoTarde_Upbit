@@ -43,7 +43,7 @@ Current strategy direction:
 - `position-guard-runner` now performs one explicit market cycle: public snapshot read, structure analysis, persisted context assembly, core decision, durable strategy-decision persistence, and optional `DRY_RUN` execution submission
 - the port preserves invalidation-first exits, no-chase entries, staged entry/add sizing, soft reduce logic, and borderline hourly confirmation semantics
 - Telegram `/run BTC|ETH` now exposes a controlled operator trigger for one runner cycle without enabling live order transmission
-- the next step is a scheduler trigger that uses the same runner/controller path and still inherits the default live-order blockers
+- the disabled-by-default strategy scheduler now uses the same runner/controller path and still inherits the default live-order blockers
 
 ### `risk`
 
@@ -128,6 +128,7 @@ It provides:
 - `/risks` for read-only persisted risk_events inspection
 - `/sync` for reconciliation-triggered snapshot and reconciliation record persistence with read-only public ticker valuation
 - `/run BTC|ETH` for one deterministic PositionGuard strategy runner cycle through the configured safe execution path
+- `/status` strategy-scheduler lines for disabled/enabled state, configured intervals, next run timestamps, and recent in-memory scheduler outcomes
 - future reconciliation inspection as a read-only operator view
 - `/synchistory` summaries that expose bounded archival recovery progress such as checkpoint window movement, page counts, stop-before boundary, retention-assumption boundary, coverage status, truncation flags, and confidence classification
 - execution_state transition history inspection from persisted state
@@ -202,7 +203,7 @@ Delivery-worker queue metrics are currently derived from persisted notification,
 2. Optionally run an exchange-backed startup recovery sweep when Upbit read credentials are configured.
 3. During startup recovery, persist fresh balance and position snapshots, reconcile orders/fills, detect unexplained portfolio drift, then apply the bootstrap-only `DEGRADED` policy if needed.
 4. Load execution policy and operator state.
-5. Build a deterministic strategy decision, either from an explicit operator `/run BTC|ETH` request or a future scheduler trigger.
+5. Build a deterministic strategy decision, either from an explicit operator `/run BTC|ETH` request or the disabled-by-default scheduler.
 6. Convert the decision into an order intent with an idempotency key.
 7. Run risk guards.
 8. Run exchange pre-trade validation through `orders/chance` and `orders/test`.
@@ -232,4 +233,4 @@ Examples:
 
 - exchange-history recovery now includes bounded recent windows, checkpointed archival closed-order sweeps, a configured stop-before boundary, explicit retention-assumption confidence semantics, page-limit truncation detection, lookup-failure confidence records, and a dedicated `/recovery` inspection view
 - reconciliation is still only partially exchange-backed today
-- runtime startup still does not auto-run trading cycles, while `/run BTC|ETH` can now explicitly trigger the first `PositionGuard_PaperTrade` runner and submit eligible decisions into the default `DRY_RUN` execution lifecycle
+- runtime startup does not auto-run trading cycles unless `STRATEGY_SCHEDULER_ENABLED=true`; `/run BTC|ETH` and the scheduler both trigger the first `PositionGuard_PaperTrade` runner and submit eligible decisions into the default `DRY_RUN` execution lifecycle

@@ -119,6 +119,7 @@ Reconciliation should run when:
 - the process restarts with non-terminal orders
 - an operator runs `/sync`
 - an operator runs `/run BTC|ETH` and the resulting strategy decision creates or updates an order lifecycle record
+- the disabled-by-default scheduler runs a deterministic cycle and the resulting strategy decision creates or updates an order lifecycle record
 
 The current scaffold now uses both process startup recovery and operator-triggered `/sync` as explicit reconciliation entry points.
 
@@ -138,6 +139,7 @@ Telegram should report lifecycle outcomes, such as:
 - reconciliation required
 - unexplained portfolio drift detected during reconciliation
 - one-shot strategy runner outcomes from `/run BTC|ETH`, including HOLD/no-order decisions and risk-blocked submissions
+- scheduled strategy runner outcomes when `STRATEGY_SCHEDULER_ENABLED=true`
 
 Notifications are derived from lifecycle state, not treated as lifecycle state.
 They should be persisted first into `operator_notifications`, then delivered through a separate `PENDING -> SENT/FAILED` path.

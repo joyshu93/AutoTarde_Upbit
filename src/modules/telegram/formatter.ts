@@ -13,6 +13,7 @@ import type {
   PositionSnapshotRecord,
   ReconciliationRunRecord,
   RiskEventRecord,
+  StrategySchedulerStatus,
 } from "../../domain/types.js";
 import { detectExecutionStateSeedMismatches } from "../db/interfaces.js";
 import type {
@@ -30,6 +31,7 @@ export function formatStatusMessage(
     liveSendPath?: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
     transitions?: ExecutionStateTransitionRecord[];
     latestReconciliationRun?: ReconciliationRunRecord | null;
+    schedulerStatus?: StrategySchedulerStatus;
   },
 ): string {
   const liveSendPath = options?.liveSendPath ?? "DRY_RUN_ADAPTER";
@@ -55,6 +57,7 @@ export function formatStatusMessage(
     `live_orders_allowed: ${blockers.length === 0 ? "true" : "false"}`,
     `blocked_by: ${blockers.length === 0 ? "none" : blockers.join(",")}`,
     `seed_mismatches: ${seedMismatches.length === 0 ? "none" : seedMismatches.join(",")}`,
+    ...formatStrategySchedulerStatusLines(options?.schedulerStatus ?? null),
     ...formatLatestReconciliationLines(latestReconciliationRun),
     ...formatTransitionLines(transitions),
     `updated_at: ${state.updatedAt}`,
@@ -345,6 +348,28 @@ export function formatStrategyRunMessage(result: TelegramStrategyRunResult): str
     `detail: ${result.detail}`,
     `operator_boundary: ${MANUAL_INPUT_NOTE}`,
   ].join("\n");
+}
+
+function formatStrategySchedulerStatusLines(status: StrategySchedulerStatus | null): string[] {
+  if (!status) {
+    return [
+      "strategy_scheduler_enabled: unknown",
+      "strategy_scheduler_started: unknown",
+      "strategy_scheduler_markets: none",
+    ];
+  }
+
+  return [
+    `strategy_scheduler_enabled: ${status.enabled}`,
+    `strategy_scheduler_started: ${status.started}`,
+    `strategy_scheduler_exchange_account_id: ${status.exchangeAccountId}`,
+    `strategy_scheduler_live_send_path: ${status.liveSendPath}`,
+    `strategy_scheduler_markets: ${status.markets.length}`,
+    ...status.markets.map(
+      (market) =>
+        `- ${market.market} interval_ms=${market.intervalMs} running=${market.running} next_run_at=${market.nextRunAt ?? "none"} last_status=${market.lastStatus} run_count=${market.runCount} success=${market.successCount} failure=${market.failureCount} skipped=${market.skippedCount} last_started_at=${market.lastStartedAt ?? "none"} last_completed_at=${market.lastCompletedAt ?? "none"} last_decision=${market.lastStrategyDecisionId ?? "none"} last_action=${market.lastAction ?? "none"} last_order=${market.lastOrderId ?? "none"} last_order_status=${market.lastOrderStatus ?? "none"} last_error=${market.lastError ?? "none"}`,
+    ),
+  ];
 }
 
 function formatBalanceLines(

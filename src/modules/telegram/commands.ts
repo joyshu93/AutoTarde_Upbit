@@ -263,12 +263,14 @@ function buildStatusFormatOptions(
   liveSendPath?: NonNullable<TelegramRouterDependencies["liveSendPath"]>;
   transitions?: Awaited<ReturnType<OperatorStateStore["listTransitions"]>>;
   latestReconciliationRun?: ReconciliationRunRecord | null;
+  schedulerStatus?: ReturnType<NonNullable<TelegramRouterDependencies["schedulerStatus"]>>;
 } | undefined {
   const options: {
     executionStateSeed?: NonNullable<TelegramRouterDependencies["executionStateSeed"]>;
     liveSendPath?: NonNullable<TelegramRouterDependencies["liveSendPath"]>;
     transitions?: Awaited<ReturnType<OperatorStateStore["listTransitions"]>>;
     latestReconciliationRun?: ReconciliationRunRecord | null;
+    schedulerStatus?: ReturnType<NonNullable<TelegramRouterDependencies["schedulerStatus"]>>;
   } = {};
 
   if (dependencies.executionStateSeed) {
@@ -284,6 +286,10 @@ function buildStatusFormatOptions(
   }
 
   options.latestReconciliationRun = latestReconciliationRun;
+
+  if (dependencies.schedulerStatus) {
+    options.schedulerStatus = dependencies.schedulerStatus();
+  }
 
   return Object.keys(options).length === 0 ? undefined : options;
 }

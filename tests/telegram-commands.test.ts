@@ -61,6 +61,7 @@ test("telegram router exposes persisted execution status with explicit blockers"
   assert.match(status.text, /state_source: persisted execution_state/);
   assert.match(status.text, /live_orders_allowed: false/);
   assert.match(status.text, /blocked_by: DRY_RUN,LIVE_GATE_DISABLED,DRY_RUN_ADAPTER/);
+  assert.match(status.text, /strategy_scheduler_enabled: unknown/);
   assert.match(status.text, /degraded_reason: none/);
   assert.match(status.text, /degraded_since: none/);
   assert.match(status.text, /recent_sync_source: none/);
@@ -74,6 +75,58 @@ test("telegram router exposes persisted execution status with explicit blockers"
   assert.match(status.text, /recent_sync_history_archive_progress: none/);
   assert.match(status.text, /recent_transitions: 1/);
   assert.match(status.text, /\| BOOTSTRAP \| none -> RUNNING \| mode none -> DRY_RUN \| gate none -> DISABLED \|/);
+});
+
+test("telegram router includes strategy scheduler state in /status when wired", async () => {
+  const router = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    schedulerStatus: () => ({
+      enabled: true,
+      started: true,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [
+        {
+          market: "KRW-BTC",
+          intervalMs: 1_800_000,
+          running: false,
+          runCount: 1,
+          successCount: 1,
+          failureCount: 0,
+          skippedCount: 0,
+          lastStartedAt: "2026-04-20T00:00:00.000Z",
+          lastCompletedAt: "2026-04-20T00:00:02.000Z",
+          lastStatus: "COMPLETED",
+          lastStrategyDecisionId: "strategy-decision-1",
+          lastAction: "HOLD",
+          lastOrderId: null,
+          lastOrderStatus: null,
+          lastError: null,
+          nextRunAt: "2026-04-20T00:30:00.000Z",
+        },
+      ],
+    }),
+  });
+
+  const status = await router.route("/status");
+
+  assert.match(status.text, /strategy_scheduler_enabled: true/);
+  assert.match(status.text, /strategy_scheduler_started: true/);
+  assert.match(status.text, /strategy_scheduler_live_send_path: DRY_RUN_ADAPTER/);
+  assert.match(status.text, /- KRW-BTC interval_ms=1800000 running=false next_run_at=2026-04-20T00:30:00.000Z last_status=COMPLETED run_count=1 success=1 failure=0 skipped=0/);
+  assert.match(status.text, /last_decision=strategy-decision-1 last_action=HOLD/);
 });
 
 test("telegram router includes recent reconciliation summary in /status when available", async () => {

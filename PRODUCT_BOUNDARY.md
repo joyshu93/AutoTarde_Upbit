@@ -64,6 +64,7 @@ Telegram may expose:
 Telegram commands are operational controls and inspection requests, not portfolio data entry.
 `/alerts` may summarize persisted operator notifications, recent delivery-run rows, recent delivery-attempt audit rows, and derived delivery-worker queue metrics, but none of them become trading truth sources.
 `/run BTC|ETH` may request one deterministic PositionGuard strategy cycle for a supported asset, but it must route through the configured execution path and inherits the default `DRY_RUN` live-send blockers.
+The strategy scheduler may run the same deterministic cycle automatically only when `STRATEGY_SCHEDULER_ENABLED=true`; it is disabled by default and does not bypass execution-state, risk, or live-send gates.
 Startup recovery is read-only against exchange truth and must never create or cancel orders.
 When startup recovery confirms unresolved portfolio drift against persisted state, the operator state may move into `DEGRADED` without enabling any live path.
 

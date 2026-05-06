@@ -13,6 +13,10 @@ test("loadAppConfig defaults to DRY_RUN with live gate disabled", () => {
   assert.equal(config.telegramDeliveryBaseBackoffMs, 15_000);
   assert.equal(config.telegramDeliveryMaxBackoffMs, 300_000);
   assert.equal(config.telegramDeliveryLeaseMs, 30_000);
+  assert.equal(config.strategySchedulerEnabled, false);
+  assert.equal(config.strategySchedulerRunOnStart, false);
+  assert.equal(config.strategySchedulerBtcIntervalMs, 3_600_000);
+  assert.equal(config.strategySchedulerEthIntervalMs, 3_600_000);
   assert.equal(config.reconciliationMaxOrderLookupsPerRun, 10);
   assert.equal(config.reconciliationHistoryMaxPagesPerMarket, 3);
   assert.equal(config.reconciliationClosedOrderLookbackDays, 7);
@@ -35,6 +39,10 @@ test("loadAppConfig allows LIVE only when explicitly requested", () => {
     TELEGRAM_DELIVERY_BASE_BACKOFF_MS: "20000",
     TELEGRAM_DELIVERY_MAX_BACKOFF_MS: "600000",
     TELEGRAM_DELIVERY_LEASE_MS: "45000",
+    STRATEGY_SCHEDULER_ENABLED: "true",
+    STRATEGY_SCHEDULER_RUN_ON_START: "true",
+    STRATEGY_SCHEDULER_BTC_INTERVAL_MS: "1800000",
+    STRATEGY_SCHEDULER_ETH_INTERVAL_MS: "2700000",
     RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET: "5",
     RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS: "2",
     RECONCILIATION_HISTORY_STOP_BEFORE_DAYS: "30",
@@ -48,6 +56,10 @@ test("loadAppConfig allows LIVE only when explicitly requested", () => {
   assert.equal(config.telegramDeliveryBaseBackoffMs, 20_000);
   assert.equal(config.telegramDeliveryMaxBackoffMs, 600_000);
   assert.equal(config.telegramDeliveryLeaseMs, 45_000);
+  assert.equal(config.strategySchedulerEnabled, true);
+  assert.equal(config.strategySchedulerRunOnStart, true);
+  assert.equal(config.strategySchedulerBtcIntervalMs, 1_800_000);
+  assert.equal(config.strategySchedulerEthIntervalMs, 2_700_000);
   assert.equal(config.reconciliationHistoryMaxPagesPerMarket, 5);
   assert.equal(config.reconciliationClosedOrderLookbackDays, 2);
   assert.equal(config.reconciliationHistoryStopBeforeDays, 30);
