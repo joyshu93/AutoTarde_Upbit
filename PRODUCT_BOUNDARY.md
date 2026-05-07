@@ -46,6 +46,8 @@ Live mode requires both:
 
 ## Operator Interface
 Telegram may expose:
+- `/help`
+- `/config`
 - `/status`
 - `/statehistory`
 - `/synchistory`
@@ -55,6 +57,9 @@ Telegram may expose:
 - `/balances`
 - `/positions`
 - `/orders`
+- `/order <order-id|identifier>`
+- `/scheduler`
+- `/inbound`
 - `/pause`
 - `/resume`
 - `/killswitch`
@@ -62,8 +67,15 @@ Telegram may expose:
 - `/run BTC|ETH`
 
 Telegram commands are operational controls and inspection requests, not portfolio data entry.
+`/help` may list supported Telegram commands from static command contracts and safety boundaries, but it must not trigger exchange reads, sync, strategy runs, scheduler ticks, order mutation, or live order transmission.
+`/config` may inspect non-secret runtime configuration, explicit risk limits, and live-send blockers, but it must render only configured/not-configured booleans for secrets and must not mutate runtime or exchange state.
+Telegram inbound polling is a transport for those commands only; it is disabled by default, accepts only the configured operator chat, and persists only update-offset transport progress.
+`/inbound` may inspect runtime inbound polling status and persisted offset progress, but it must not poll Telegram or route commands by itself.
+`npm run smoke:telegram:inbound` may perform one bounded Telegram `getUpdates` poll for operator validation, but it forcibly uses `DRY_RUN`, disables live-send and scheduler paths, and never starts the long-running polling loop.
 `/alerts` may summarize persisted operator notifications, recent delivery-run rows, recent delivery-attempt audit rows, and derived delivery-worker queue metrics, but none of them become trading truth sources.
+`/order <order-id|identifier>` may inspect one persisted order, its local lifecycle events, and its fills, but it must not query Telegram as truth or trigger exchange-side mutation.
 `/run BTC|ETH` may request one deterministic PositionGuard strategy cycle for a supported asset, but it must route through the configured execution path and inherits the default `DRY_RUN` live-send blockers.
+`/scheduler` may inspect persisted `strategy_scheduler_runs`, but it must not trigger execution or mutate portfolio truth.
 The strategy scheduler may run the same deterministic cycle automatically only when `STRATEGY_SCHEDULER_ENABLED=true`; it is disabled by default and does not bypass execution-state, risk, or live-send gates.
 Startup recovery is read-only against exchange truth and must never create or cancel orders.
 When startup recovery confirms unresolved portfolio drift against persisted state, the operator state may move into `DEGRADED` without enabling any live path.

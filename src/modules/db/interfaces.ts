@@ -22,6 +22,7 @@ import type {
   StrategyDecisionRecord,
   StrategySchedulerRunRecord,
   SupportedMarket,
+  TelegramInboundOffsetRecord,
 } from "../../domain/types.js";
 
 export interface ExecutionRepository {
@@ -34,9 +35,11 @@ export interface ExecutionRepository {
   saveOrder(record: OrderRecord): Promise<void>;
   updateOrder(record: OrderRecord): Promise<void>;
   findOrderByIdempotencyKey(exchangeAccountId: string, idempotencyKey: string): Promise<OrderRecord | null>;
+  findOrderByReference(exchangeAccountId: string, reference: string): Promise<OrderRecord | null>;
   listActiveOrders(exchangeAccountId: string, market?: SupportedMarket): Promise<OrderRecord[]>;
   listOrders(exchangeAccountId: string): Promise<OrderRecord[]>;
   appendOrderEvent(record: OrderEventRecord): Promise<void>;
+  listOrderEvents(orderId: string): Promise<OrderEventRecord[]>;
   saveFill(record: FillRecord): Promise<void>;
   listFills(orderId?: string): Promise<FillRecord[]>;
   saveBalanceSnapshot(record: BalanceSnapshotRecord): Promise<void>;
@@ -103,6 +106,15 @@ export interface OperatorStateStore {
   setLiveExecutionGate(gate: LiveExecutionGate): Promise<ExecutionStateRecord>;
   markDegraded(reason?: string): Promise<ExecutionStateRecord>;
   clearDegraded(reason?: string): Promise<ExecutionStateRecord>;
+}
+
+export interface TelegramInboundOffsetStore {
+  getTelegramInboundOffset(input: {
+    exchangeAccountId: string;
+    updateSource: TelegramInboundOffsetRecord["updateSource"];
+    botTokenRef: string;
+  }): Promise<TelegramInboundOffsetRecord | null>;
+  saveTelegramInboundOffset(record: TelegramInboundOffsetRecord): Promise<void>;
 }
 
 export function detectExecutionStateSeedMismatches(

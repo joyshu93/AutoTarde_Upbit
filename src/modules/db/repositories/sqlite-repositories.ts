@@ -21,6 +21,7 @@ import type {
   StrategySchedulerRunRecord,
   SupportedAsset,
   SupportedMarket,
+  TelegramInboundOffsetRecord,
   UserRecord,
 } from "../../../domain/types.js";
 import type {
@@ -40,9 +41,10 @@ import type {
   SqliteRiskEventRow,
   SqliteStrategyDecisionRow,
   SqliteStrategySchedulerRunRow,
+  SqliteTelegramInboundOffsetRow,
   SqliteUserRow,
 } from "../types.js";
-import type { ExecutionRepository, OperatorStateStore } from "../interfaces.js";
+import type { ExecutionRepository, OperatorStateStore, TelegramInboundOffsetStore } from "../interfaces.js";
 import type { SqliteBootstrapOptions, SqlitePersistenceBundle } from "./contracts.js";
 import { fromSqliteBoolean, parseJson, stringifyJson, toSqliteBoolean } from "./sqlite-shapes.js";
 import { openSqliteDatabase } from "./sqlite-database.js";
@@ -61,6 +63,7 @@ const ACTIVE_ORDER_STATUSES = new Set<OrderRecord["status"]>([
 export function createSqlitePersistence(options: SqliteBootstrapOptions): SqlitePersistenceBundle {
   const handle = openSqliteDatabase(options.databasePath);
   const repositories = new SqliteExecutionRepository(handle.db);
+  const telegramInboundOffsets = new SqliteTelegramInboundOffsetStore(handle.db);
 
   const now = new Date().toISOString();
   const bootstrapStateInserted = ensureBootstrapRecords(handle.db, {
@@ -120,6 +123,7 @@ export function createSqlitePersistence(options: SqliteBootstrapOptions): Sqlite
   return {
     repositories,
     operatorState: new SqliteOperatorStateStore(handle.db, options.exchangeAccountId),
+    telegramInboundOffsets,
     close() {
       handle.close();
     },
@@ -198,6 +202,25 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       WHERE exchange_account_id = ? AND idempotency_key = ?
       LIMIT 1
     `).get(exchangeAccountId, idempotencyKey) as SqliteOrderRow | undefined;
+
+    return row ? mapOrderRow(row) : null;
+  }
+
+  async findOrderByReference(exchangeAccountId: string, reference: string): Promise<OrderRecord | null> {
+    const row = this.db.prepare(`
+      SELECT * FROM orders
+      WHERE exchange_account_id = ?
+        AND (id = ? OR identifier = ? OR upbit_uuid = ?)
+      ORDER BY CASE WHEN id = ? THEN 0 WHEN identifier = ? THEN 1 ELSE 2 END, updated_at DESC
+      LIMIT 1
+    `).get(
+      exchangeAccountId,
+      reference,
+      reference,
+      reference,
+      reference,
+      reference,
+    ) as SqliteOrderRow | undefined;
 
     return row ? mapOrderRow(row) : null;
   }
@@ -497,6 +520,16 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       record.errorMessage,
       record.summaryJson,
     );
+  }
+
+  async listOrderEvents(orderId: string): Promise<OrderEventRecord[]> {
+    const rows = this.db.prepare(`
+      SELECT * FROM order_events
+      WHERE order_id = ?
+      ORDER BY created_at ASC
+    `).all(orderId) as unknown as SqliteOrderEventRow[];
+
+    return rows.map(mapOrderEventRow);
   }
 
   async updateStrategySchedulerRun(record: StrategySchedulerRunRecord): Promise<void> {
@@ -1148,6 +1181,49 @@ export class SqliteOperatorStateStore implements OperatorStateStore {
   }
 }
 
+export class SqliteTelegramInboundOffsetStore implements TelegramInboundOffsetStore {
+  constructor(private readonly db: import("node:sqlite").DatabaseSync) {}
+
+  async getTelegramInboundOffset(input: {
+    exchangeAccountId: string;
+    updateSource: TelegramInboundOffsetRecord["updateSource"];
+    botTokenRef: string;
+  }): Promise<TelegramInboundOffsetRecord | null> {
+    const row = this.db.prepare(`
+      SELECT * FROM telegram_inbound_offsets
+      WHERE exchange_account_id = ? AND update_source = ? AND bot_token_ref = ?
+      LIMIT 1
+    `).get(
+      input.exchangeAccountId,
+      input.updateSource,
+      input.botTokenRef,
+    ) as SqliteTelegramInboundOffsetRow | undefined;
+
+    return row ? mapTelegramInboundOffsetRow(row) : null;
+  }
+
+  async saveTelegramInboundOffset(record: TelegramInboundOffsetRecord): Promise<void> {
+    this.db.prepare(`
+      INSERT INTO telegram_inbound_offsets (
+        id, exchange_account_id, update_source, bot_token_ref, next_offset, last_update_id, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(exchange_account_id, update_source, bot_token_ref) DO UPDATE SET
+        id = excluded.id,
+        next_offset = excluded.next_offset,
+        last_update_id = excluded.last_update_id,
+        updated_at = excluded.updated_at
+    `).run(
+      record.id,
+      record.exchangeAccountId,
+      record.updateSource,
+      record.botTokenRef,
+      record.nextOffset,
+      record.lastUpdateId,
+      record.updatedAt,
+    );
+  }
+}
+
 function resolveResumedSystemStatus(current: ExecutionStateRecord): ExecutionStateRecord["systemStatus"] {
   if (current.killSwitchActive) {
     return "KILL_SWITCHED";
@@ -1351,6 +1427,17 @@ function mapFillRow(row: SqliteFillRow): FillRecord {
   };
 }
 
+function mapOrderEventRow(row: SqliteOrderEventRow): OrderEventRecord {
+  return {
+    id: row.id,
+    orderId: row.order_id,
+    eventType: row.event_type,
+    eventSource: row.event_source,
+    payloadJson: row.payload_json,
+    createdAt: row.created_at,
+  };
+}
+
 function mapRiskEventRow(row: SqliteRiskEventRow): RiskEventRecord {
   return {
     id: row.id,
@@ -1480,6 +1567,20 @@ function mapStrategySchedulerRunRow(
     detail: row.detail,
     errorMessage: row.error_message,
     summaryJson: row.summary_json,
+  };
+}
+
+function mapTelegramInboundOffsetRow(
+  row: SqliteTelegramInboundOffsetRow,
+): TelegramInboundOffsetRecord {
+  return {
+    id: row.id,
+    exchangeAccountId: row.exchange_account_id,
+    updateSource: row.update_source,
+    botTokenRef: row.bot_token_ref,
+    nextOffset: row.next_offset,
+    lastUpdateId: row.last_update_id,
+    updatedAt: row.updated_at,
   };
 }
 

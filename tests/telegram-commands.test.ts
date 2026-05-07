@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 
-import type { OperatorNotificationRecord } from "../src/domain/types.js";
-import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
+import type { OperatorNotificationRecord, OrderRecord } from "../src/domain/types.js";
+import {
+  InMemoryExecutionRepository,
+  InMemoryOperatorStateStore,
+  InMemoryTelegramInboundOffsetStore,
+} from "../src/modules/db/repositories/in-memory-repositories.js";
 import { TelegramCommandRouter } from "../src/modules/telegram/commands.js";
 import { test } from "./harness.js";
 
@@ -26,13 +30,24 @@ function createRouter(): TelegramCommandRouter {
 test("telegram router parses supported operator commands only", () => {
   const router = createRouter();
 
+  const helpParsed = router.parse("/help");
+  const configParsed = router.parse("/config");
   const parsed = router.parse("/status");
   const historyParsed = router.parse("/statehistory");
   const syncHistoryParsed = router.parse("/synchistory");
   const recoveryParsed = router.parse("/recovery");
   const alertsParsed = router.parse("/alerts");
   const risksParsed = router.parse("/risks");
+  const schedulerParsed = router.parse("/scheduler");
+  const inboundParsed = router.parse("/inbound");
+  const orderParsed = router.parse("/order order-1");
   const runParsed = router.parse("/run BTC");
+  assert.equal(helpParsed?.command, "/help");
+  assert.deepEqual(helpParsed?.args, []);
+  assert.equal(helpParsed?.contract.category, "inspection");
+  assert.equal(configParsed?.command, "/config");
+  assert.deepEqual(configParsed?.args, []);
+  assert.equal(configParsed?.contract.category, "inspection");
   assert.equal(parsed?.command, "/status");
   assert.deepEqual(parsed?.args, []);
   assert.equal(parsed?.contract.command, "/status");
@@ -46,11 +61,277 @@ test("telegram router parses supported operator commands only", () => {
   assert.equal(alertsParsed?.contract.category, "inspection");
   assert.equal(risksParsed?.command, "/risks");
   assert.equal(risksParsed?.contract.category, "inspection");
+  assert.equal(schedulerParsed?.command, "/scheduler");
+  assert.equal(schedulerParsed?.contract.category, "inspection");
+  assert.equal(inboundParsed?.command, "/inbound");
+  assert.equal(inboundParsed?.contract.category, "inspection");
+  assert.equal(orderParsed?.command, "/order");
+  assert.deepEqual(orderParsed?.args, ["order-1"]);
+  assert.equal(orderParsed?.contract.category, "inspection");
   assert.equal(runParsed?.command, "/run");
   assert.deepEqual(runParsed?.args, ["BTC"]);
   assert.equal(runParsed?.contract.category, "control");
   assert.equal(router.parse("/setcash 1000000"), null);
   assert.equal(router.parse("status"), null);
+});
+
+test("telegram router exposes non-secret runtime config inspection", async () => {
+  const router = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    runtimeConfig: {
+      serviceName: "AutoTrade_Upbit",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      upbitBaseUrl: "https://api.upbit.com",
+      databasePath: "./var/autotrade-upbit.sqlite",
+      exchangeBackedReadEnabled: true,
+      telegramDeliveryEnabled: true,
+      telegramBotTokenConfigured: true,
+      telegramOperatorChatIdConfigured: true,
+      telegramDeliveryMaxAttempts: 5,
+      telegramDeliveryBaseBackoffMs: 15_000,
+      telegramDeliveryMaxBackoffMs: 300_000,
+      telegramDeliveryLeaseMs: 30_000,
+      telegramInboundPollingEnabled: true,
+      telegramInboundPollIntervalMs: 2_000,
+      telegramInboundPollTimeoutSeconds: 25,
+      telegramInboundPollLimit: 10,
+      strategySchedulerEnabled: false,
+      strategySchedulerRunOnStart: false,
+      strategySchedulerBtcIntervalMs: 3_600_000,
+      strategySchedulerEthIntervalMs: 3_600_000,
+      reconciliationMaxOrderLookupsPerRun: 10,
+      reconciliationHistoryMaxPagesPerMarket: 3,
+      reconciliationClosedOrderLookbackDays: 7,
+      reconciliationHistoryStopBeforeDays: 365,
+      reconciliationHistoryRetentionAssumptionDays: 365,
+      stalePriceThresholdMs: 30_000,
+      minimumOrderValueKrw: 5_000,
+      maxAllocationByAsset: {
+        BTC: 0.6,
+        ETH: 0.6,
+      },
+      totalExposureCap: 0.75,
+    },
+  });
+
+  const response = await router.route("/config");
+
+  assert.match(response.text, /Runtime Config/);
+  assert.match(response.text, /state_source: runtime app configuration/);
+  assert.match(response.text, /execution_mode: DRY_RUN/);
+  assert.match(response.text, /live_gate: DISABLED/);
+  assert.match(response.text, /live_send_path: DRY_RUN_ADAPTER/);
+  assert.match(response.text, /live_orders_allowed_by_config: false/);
+  assert.match(response.text, /config_live_blockers: DRY_RUN,LIVE_GATE_DISABLED,DRY_RUN_ADAPTER/);
+  assert.match(response.text, /exchange_backed_read_enabled: true/);
+  assert.match(response.text, /telegram_bot_token_configured: true/);
+  assert.match(response.text, /telegram_operator_chat_id_configured: true/);
+  assert.match(response.text, /telegram_inbound_polling_enabled: true/);
+  assert.match(response.text, /strategy_scheduler_enabled: false/);
+  assert.match(response.text, /minimum_order_value_krw: 5000/);
+  assert.match(response.text, /max_allocation_btc: 0\.6/);
+  assert.match(response.text, /total_exposure_cap: 0\.75/);
+  assert.match(response.text, /secret_boundary: secret values are never rendered/);
+  assert.doesNotMatch(response.text, /123456:real-bot-token|real-upbit-secret|UPBIT_SECRET_KEY=/);
+});
+
+test("telegram router exposes static operator help without touching runtime state", async () => {
+  const throwingRepositories = new Proxy(new InMemoryExecutionRepository(), {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (typeof value === "function") {
+        return () => {
+          throw new Error(`/help must not call repository method ${String(property)}`);
+        };
+      }
+
+      return value;
+    },
+  });
+  const throwingOperatorState = new Proxy(new InMemoryOperatorStateStore({
+    id: "state-1",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  }), {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (typeof value === "function") {
+        return () => {
+          throw new Error(`/help must not call operator-state method ${String(property)}`);
+        };
+      }
+
+      return value;
+    },
+  });
+  const router = new TelegramCommandRouter({
+    repositories: throwingRepositories,
+    operatorState: throwingOperatorState,
+    syncController: {
+      async requestSync() {
+        throw new Error("/help must not call syncController");
+      },
+    },
+    strategyRunController: {
+      async requestRun() {
+        throw new Error("/help must not call strategyRunController");
+      },
+    },
+    schedulerStatus: () => {
+      throw new Error("/help must not read scheduler runtime status");
+    },
+    telegramInboundStatus: () => {
+      throw new Error("/help must not read inbound runtime status");
+    },
+  });
+
+  const response = await router.route("/help");
+
+  assert.match(response.text, /Operator Help/);
+  assert.match(response.text, /state_source: static telegram command contracts/);
+  assert.match(response.text, /command_count: 19/);
+  assert.match(response.text, /inspection_commands:/);
+  assert.match(response.text, /- \/help \| \/help \| Show supported Telegram operator commands and safety boundaries\./);
+  assert.match(response.text, /- \/order \| \/order <order-id\|identifier> \| Show one persisted order with lifecycle events and fills\./);
+  assert.match(response.text, /control_commands:/);
+  assert.match(response.text, /- \/run \| \/run BTC\|ETH \| Run one deterministic PositionGuard strategy cycle for a supported asset through the safe execution path\./);
+  assert.match(response.text, /read_only_boundary: \/help never triggers sync, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission\./);
+  assert.match(response.text, /live_boundary: Live order transmission requires APP_EXECUTION_MODE=LIVE and ENABLE_LIVE_ORDERS=true; the default path remains DRY_RUN\./);
+  assert.match(response.text, /operator_boundary: Telegram does not accept manual cash or position input\./);
+});
+
+test("telegram router exposes a read-only order lifecycle detail", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveOrder(createOrder({
+    id: "order-1",
+    identifier: "order-identifier-1",
+    upbitUuid: "upbit-uuid-1",
+    status: "PARTIALLY_FILLED",
+    exchangeResponseJson: JSON.stringify({ uuid: "upbit-uuid-1" }),
+    updatedAt: "2026-04-20T00:02:00.000Z",
+  }));
+  await repository.appendOrderEvent({
+    id: "order-event-1",
+    orderId: "order-1",
+    eventType: "ORDER_PERSISTED",
+    eventSource: "LOCAL",
+    payloadJson: JSON.stringify({ status: "PERSISTED" }),
+    createdAt: "2026-04-20T00:00:01.000Z",
+  });
+  await repository.appendOrderEvent({
+    id: "order-event-2",
+    orderId: "order-1",
+    eventType: "RECONCILIATION_STATUS_UPDATED",
+    eventSource: "RECONCILIATION",
+    payloadJson: JSON.stringify({ status: "PARTIALLY_FILLED" }),
+    createdAt: "2026-04-20T00:02:00.000Z",
+  });
+  await repository.saveFill({
+    id: "fill-1",
+    orderId: "order-1",
+    exchangeFillId: "exchange-fill-1",
+    market: "KRW-BTC",
+    side: "bid",
+    price: "500000",
+    volume: "0.005",
+    feeCurrency: "KRW",
+    feeAmount: "250",
+    filledAt: "2026-04-20T00:01:00.000Z",
+    rawPayloadJson: JSON.stringify({ fill: 1 }),
+  });
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+  });
+
+  const response = await router.route("/order order-identifier-1");
+
+  assert.match(response.text, /Order Detail/);
+  assert.match(response.text, /query: order-identifier-1/);
+  assert.match(response.text, /state_source: persisted orders \+ order_events \+ fills/);
+  assert.match(response.text, /id: order-1/);
+  assert.match(response.text, /identifier: order-identifier-1/);
+  assert.match(response.text, /upbit_uuid: upbit-uuid-1/);
+  assert.match(response.text, /status: PARTIALLY_FILLED/);
+  assert.match(response.text, /idempotency_key: idempotency-1/);
+  assert.match(response.text, /exchange_response_available: true/);
+  assert.match(response.text, /event_count: 2/);
+  assert.match(response.text, /\| LOCAL \| ORDER_PERSISTED \| payload=\{"status":"PERSISTED"\}/);
+  assert.match(response.text, /\| RECONCILIATION \| RECONCILIATION_STATUS_UPDATED \| payload=\{"status":"PARTIALLY_FILLED"\}/);
+  assert.match(response.text, /fill_count: 1/);
+  assert.match(response.text, /\| KRW-BTC \| bid \| price=500000 \| volume=0\.005 \| fee=250 KRW \| exchange_fill_id=exchange-fill-1/);
+  assert.match(response.text, /operator_boundary: Telegram does not accept manual cash or position input\./);
+});
+
+test("telegram router reports missing order detail without reading events or fills", async () => {
+  let eventLookupCount = 0;
+  let fillLookupCount = 0;
+  const repository = new InMemoryExecutionRepository();
+  const listOrderEvents = repository.listOrderEvents.bind(repository);
+  const listFills = repository.listFills.bind(repository);
+  repository.listOrderEvents = async (orderId) => {
+    eventLookupCount += 1;
+    return listOrderEvents(orderId);
+  };
+  repository.listFills = async (orderId) => {
+    fillLookupCount += 1;
+    return listFills(orderId);
+  };
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+  });
+
+  const response = await router.route("/order unknown-order");
+
+  assert.match(response.text, /Order Detail/);
+  assert.match(response.text, /status: not_found/);
+  assert.match(response.text, /query: unknown-order/);
+  assert.equal(eventLookupCount, 0);
+  assert.equal(fillLookupCount, 0);
 });
 
 test("telegram router exposes persisted execution status with explicit blockers", async () => {
@@ -149,6 +430,151 @@ test("telegram router includes strategy scheduler state in /status when wired", 
   assert.match(status.text, /last_decision=strategy-decision-1 last_action=HOLD/);
   assert.match(status.text, /strategy_scheduler_recent_runs: 1/);
   assert.match(status.text, /\| KRW-BTC \| COMPLETED \| completed_at=2026-04-20T00:00:02.000Z \| interval_ms=1800000/);
+});
+
+test("telegram router exposes dedicated strategy scheduler inspection", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveStrategySchedulerRun({
+    id: "strategy-scheduler-run-1",
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    triggerSource: "SCHEDULER",
+    status: "COMPLETED",
+    startedAt: "2026-04-20T00:00:00.000Z",
+    completedAt: "2026-04-20T00:00:02.000Z",
+    intervalMs: 1_800_000,
+    runOnStart: false,
+    strategyDecisionId: "strategy-decision-1",
+    action: "HOLD",
+    orderId: null,
+    orderStatus: null,
+    submissionAccepted: null,
+    detail: "Decision HOLD persisted; no order submission was requested.",
+    errorMessage: null,
+    summaryJson: JSON.stringify({ status: "COMPLETED" }),
+  });
+  await repository.saveStrategySchedulerRun({
+    id: "strategy-scheduler-run-2",
+    exchangeAccountId: "primary",
+    market: "KRW-ETH",
+    triggerSource: "SCHEDULER",
+    status: "FAILED",
+    startedAt: "2026-04-20T00:10:00.000Z",
+    completedAt: "2026-04-20T00:10:01.000Z",
+    intervalMs: 1_800_000,
+    runOnStart: false,
+    strategyDecisionId: null,
+    action: null,
+    orderId: null,
+    orderStatus: null,
+    submissionAccepted: null,
+    detail: null,
+    errorMessage: "upbit_timeout",
+    summaryJson: JSON.stringify({ status: "FAILED" }),
+  });
+
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+  });
+
+  const scheduler = await router.route("/scheduler");
+
+  assert.match(scheduler.text, /Strategy Scheduler History/);
+  assert.match(scheduler.text, /count: 2/);
+  assert.match(scheduler.text, /state_source: persisted strategy_scheduler_runs/);
+  assert.match(scheduler.text, /2026-04-20T00:10:00.000Z \| KRW-ETH \| FAILED \| trigger=SCHEDULER/);
+  assert.match(scheduler.text, /interval_ms=1800000 \| run_on_start=false/);
+  assert.match(scheduler.text, /error=upbit_timeout/);
+  assert.match(scheduler.text, /2026-04-20T00:00:00.000Z \| KRW-BTC \| COMPLETED \| trigger=SCHEDULER/);
+  assert.match(scheduler.text, /decision=strategy-decision-1 \| action=HOLD/);
+  assert.match(scheduler.text, /operator_boundary: Telegram does not accept manual cash or position input\./);
+});
+
+test("telegram router exposes empty strategy scheduler history", async () => {
+  const router = createRouter();
+
+  const scheduler = await router.route("/scheduler");
+
+  assert.match(scheduler.text, /Strategy Scheduler History/);
+  assert.match(scheduler.text, /count: 0/);
+  assert.match(scheduler.text, /state_source: persisted strategy_scheduler_runs/);
+  assert.match(scheduler.text, /note: No strategy scheduler runs are stored yet\./);
+});
+
+test("telegram router exposes dedicated telegram inbound inspection", async () => {
+  const offsetStore = new InMemoryTelegramInboundOffsetStore();
+  await offsetStore.saveTelegramInboundOffset({
+    id: "telegram-inbound-offset-1",
+    exchangeAccountId: "primary",
+    updateSource: "GET_UPDATES",
+    botTokenRef: "sha256:bot-a",
+    nextOffset: 42,
+    lastUpdateId: 41,
+    updatedAt: "2026-04-20T00:11:00.000Z",
+  });
+  const router = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    telegramInboundOffsetStore: offsetStore,
+    telegramInboundBotTokenRef: "sha256:bot-a",
+    telegramInboundStatus: () => ({
+      enabled: true,
+      configured: true,
+      running: true,
+      nextOffset: 42,
+      pollIntervalMs: 2_000,
+      longPollTimeoutSeconds: 25,
+      limit: 10,
+      lastPollAt: "2026-04-20T00:12:00.000Z",
+      lastUpdateId: 41,
+      offsetLoaded: true,
+      offsetStorage: "DURABLE",
+      processedCount: 3,
+      ignoredCount: 1,
+      failedCount: 0,
+      lastError: null,
+    }),
+  });
+
+  const inbound = await router.route("/inbound");
+
+  assert.match(inbound.text, /Telegram Inbound/);
+  assert.match(inbound.text, /state_source: runtime polling status \+ persisted telegram_inbound_offsets/);
+  assert.match(inbound.text, /enabled: true/);
+  assert.match(inbound.text, /configured: true/);
+  assert.match(inbound.text, /running: true/);
+  assert.match(inbound.text, /offset_storage: DURABLE/);
+  assert.match(inbound.text, /runtime_next_offset: 42/);
+  assert.match(inbound.text, /processed_count: 3/);
+  assert.match(inbound.text, /ignored_count: 1/);
+  assert.match(inbound.text, /persisted_offset_available: true/);
+  assert.match(inbound.text, /persisted_bot_token_ref: sha256:bot-a/);
+  assert.match(inbound.text, /persisted_next_offset: 42/);
+  assert.match(inbound.text, /persisted_last_update_id: 41/);
+  assert.match(inbound.text, /operator_boundary: Telegram does not accept manual cash or position input\./);
 });
 
 test("telegram router includes recent reconciliation summary in /status when available", async () => {
@@ -766,5 +1192,32 @@ function createNotification(
     createdAt,
     deliveredAt: null,
     lastError: null,
+  };
+}
+
+function createOrder(overrides: Partial<OrderRecord> & Pick<OrderRecord, "id">): OrderRecord {
+  return {
+    strategyDecisionId: "strategy-decision-1",
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    side: "bid",
+    ordType: "price",
+    volume: null,
+    price: "500000",
+    timeInForce: null,
+    smpType: null,
+    identifier: "order-identifier",
+    idempotencyKey: "idempotency-1",
+    origin: "STRATEGY",
+    requestedAt: "2026-04-20T00:00:00.000Z",
+    upbitUuid: null,
+    status: "PERSISTED",
+    executionMode: "DRY_RUN",
+    exchangeResponseJson: null,
+    failureCode: null,
+    failureMessage: null,
+    createdAt: "2026-04-20T00:00:00.000Z",
+    updatedAt: "2026-04-20T00:00:00.000Z",
+    ...overrides,
   };
 }

@@ -1,8 +1,9 @@
-import type { ExecutionRepository, OperatorStateStore } from "../interfaces.js";
+import type { ExecutionRepository, OperatorStateStore, TelegramInboundOffsetStore } from "../interfaces.js";
 
 export interface SqlitePersistenceBundle {
   repositories: ExecutionRepository;
   operatorState: OperatorStateStore;
+  telegramInboundOffsets: TelegramInboundOffsetStore;
   close(): void;
 }
 

@@ -21,8 +21,9 @@ import type {
   StrategySchedulerRunRecord,
   SupportedAsset,
   SupportedMarket,
+  TelegramInboundOffsetRecord,
 } from "../../../domain/types.js";
-import type { ExecutionRepository, OperatorStateStore } from "../interfaces.js";
+import type { ExecutionRepository, OperatorStateStore, TelegramInboundOffsetStore } from "../interfaces.js";
 
 const ACTIVE_ORDER_STATUSES: ReadonlySet<OrderLifecycleStatus> = new Set([
   "INTENT_CREATED",
@@ -90,6 +91,14 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     ) ?? null;
   }
 
+  async findOrderByReference(exchangeAccountId: string, reference: string): Promise<OrderRecord | null> {
+    return this.orders.find(
+      (candidate) =>
+        candidate.exchangeAccountId === exchangeAccountId &&
+        (candidate.id === reference || candidate.identifier === reference || candidate.upbitUuid === reference),
+    ) ?? null;
+  }
+
   async listActiveOrders(exchangeAccountId: string, market?: SupportedMarket): Promise<OrderRecord[]> {
     return this.orders.filter((candidate) => {
       if (candidate.exchangeAccountId !== exchangeAccountId) {
@@ -108,6 +117,12 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
 
   async appendOrderEvent(record: OrderEventRecord): Promise<void> {
     this.orderEvents.push(record);
+  }
+
+  async listOrderEvents(orderId: string): Promise<OrderEventRecord[]> {
+    return this.orderEvents
+      .filter((candidate) => candidate.orderId === orderId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
   async saveFill(record: FillRecord): Promise<void> {
@@ -428,6 +443,37 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       });
 
     return typeof options?.limit === "number" ? notifications.slice(0, options.limit) : notifications;
+  }
+}
+
+export class InMemoryTelegramInboundOffsetStore implements TelegramInboundOffsetStore {
+  private readonly offsets: TelegramInboundOffsetRecord[] = [];
+
+  async getTelegramInboundOffset(input: {
+    exchangeAccountId: string;
+    updateSource: TelegramInboundOffsetRecord["updateSource"];
+    botTokenRef: string;
+  }): Promise<TelegramInboundOffsetRecord | null> {
+    return this.offsets.find((candidate) =>
+      candidate.exchangeAccountId === input.exchangeAccountId &&
+      candidate.updateSource === input.updateSource &&
+      candidate.botTokenRef === input.botTokenRef,
+    ) ?? null;
+  }
+
+  async saveTelegramInboundOffset(record: TelegramInboundOffsetRecord): Promise<void> {
+    const index = this.offsets.findIndex((candidate) =>
+      candidate.exchangeAccountId === record.exchangeAccountId &&
+      candidate.updateSource === record.updateSource &&
+      candidate.botTokenRef === record.botTokenRef,
+    );
+
+    if (index === -1) {
+      this.offsets.push(record);
+      return;
+    }
+
+    this.offsets[index] = record;
   }
 }
 

@@ -1,5 +1,6 @@
 import {
   buildUnsupportedCommandMessage,
+  listTelegramCommandContracts,
   listSupportedTelegramCommands,
   parseTelegramCommand,
   parseTelegramAssetArg,
@@ -8,16 +9,21 @@ import {
 import {
   formatBalanceMessage,
   formatControlCommandMessage,
+  formatHelpMessage,
   formatOperatorNotificationsMessage,
+  formatOrderDetailMessage,
   formatOrdersMessage,
   formatPositionMessage,
   formatReconciliationRunsMessage,
   formatRecoveryProgressMessage,
   formatRiskEventsMessage,
+  formatRuntimeConfigMessage,
   formatStateHistoryMessage,
+  formatStrategySchedulerRunsMessage,
   formatStrategyRunMessage,
   formatStatusMessage,
   formatSyncMessage,
+  formatTelegramInboundMessage,
 } from "./formatter.js";
 import type {
   ParsedTelegramCommand,
@@ -56,6 +62,14 @@ export class TelegramCommandRouter {
     }
 
     switch (parsed.command) {
+      case "/help":
+        return {
+          text: formatHelpMessage(listTelegramCommandContracts()),
+        };
+      case "/config":
+        return {
+          text: formatRuntimeConfigMessage(this.dependencies.runtimeConfig ?? null),
+        };
       case "/status":
         return this.buildStatusResponse(exchangeAccountId);
       case "/statehistory":
@@ -74,6 +88,12 @@ export class TelegramCommandRouter {
         return { text: formatPositionMessage(await this.dependencies.repositories.getLatestPositionSnapshot(exchangeAccountId)) };
       case "/orders":
         return { text: formatOrdersMessage(await this.dependencies.repositories.listOrders(exchangeAccountId)) };
+      case "/order":
+        return this.buildOrderDetailResponse(exchangeAccountId, parsed.args[0] ?? "");
+      case "/scheduler":
+        return this.buildSchedulerResponse(exchangeAccountId);
+      case "/inbound":
+        return this.buildInboundResponse(exchangeAccountId);
       case "/pause":
         return this.applyControlCommand(
           parsed.command,
@@ -199,6 +219,49 @@ export class TelegramCommandRouter {
 
     return {
       text: formatRiskEventsMessage(events),
+    };
+  }
+
+  private async buildSchedulerResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+    const runs = await this.dependencies.repositories.listStrategySchedulerRuns(exchangeAccountId, 20);
+
+    return {
+      text: formatStrategySchedulerRunsMessage(runs),
+    };
+  }
+
+  private async buildOrderDetailResponse(
+    exchangeAccountId: string,
+    reference: string,
+  ): Promise<TelegramResponse> {
+    const order = await this.dependencies.repositories.findOrderByReference(exchangeAccountId, reference);
+    if (!order) {
+      return {
+        text: formatOrderDetailMessage(null, [], [], reference),
+      };
+    }
+
+    const [events, fills] = await Promise.all([
+      this.dependencies.repositories.listOrderEvents(order.id),
+      this.dependencies.repositories.listFills(order.id),
+    ]);
+
+    return {
+      text: formatOrderDetailMessage(order, events, fills, reference),
+    };
+  }
+
+  private async buildInboundResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+    const offset = this.dependencies.telegramInboundOffsetStore && this.dependencies.telegramInboundBotTokenRef
+      ? await this.dependencies.telegramInboundOffsetStore.getTelegramInboundOffset({
+          exchangeAccountId,
+          updateSource: "GET_UPDATES",
+          botTokenRef: this.dependencies.telegramInboundBotTokenRef,
+        })
+      : null;
+
+    return {
+      text: formatTelegramInboundMessage(this.dependencies.telegramInboundStatus?.() ?? null, offset),
     };
   }
 

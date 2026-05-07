@@ -60,6 +60,7 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
     assert.ok(migrationRows.some((row) => row.filename === "0009_add_history_recovery_checkpoints.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0010_add_operator_notification_delivery_runs.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0011_add_strategy_scheduler_runs.sql"));
+    assert.ok(migrationRows.some((row) => row.filename === "0012_add_telegram_inbound_offsets.sql"));
 
     for (const tableName of [
       "users",
@@ -77,6 +78,7 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
       "operator_notification_delivery_attempts",
       "operator_notification_delivery_runs",
       "strategy_scheduler_runs",
+      "telegram_inbound_offsets",
       "risk_events",
     ]) {
       assert.ok(tableNames.has(tableName), `Expected migrated table ${tableName} to exist.`);
@@ -524,6 +526,80 @@ test("createSqlitePersistence bootstraps operator state and round-trips app-faci
   }
 });
 
+test("sqlite repository round-trips durable telegram inbound offsets by bot token ref", async () => {
+  const databasePath = await createTempDatabasePath("telegram-inbound-offset");
+  const bundle = createSqlitePersistence({
+    databasePath,
+    exchangeAccountId: "primary",
+    userId: "operator",
+    userTelegramId: "telegram-user",
+    userDisplayName: "Operator",
+    accessKeyRef: "ENV:UPBIT_ACCESS_KEY",
+    secretKeyRef: "ENV:UPBIT_SECRET_KEY",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    killSwitchActive: false,
+  });
+
+  try {
+    await bundle.telegramInboundOffsets.saveTelegramInboundOffset({
+      id: "telegram-inbound-offset-1",
+      exchangeAccountId: "primary",
+      updateSource: "GET_UPDATES",
+      botTokenRef: "sha256:bot-a",
+      nextOffset: 101,
+      lastUpdateId: 100,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    });
+    await bundle.telegramInboundOffsets.saveTelegramInboundOffset({
+      id: "telegram-inbound-offset-2",
+      exchangeAccountId: "primary",
+      updateSource: "GET_UPDATES",
+      botTokenRef: "sha256:bot-a",
+      nextOffset: 102,
+      lastUpdateId: 101,
+      updatedAt: "2026-04-20T00:01:00.000Z",
+    });
+    await bundle.telegramInboundOffsets.saveTelegramInboundOffset({
+      id: "telegram-inbound-offset-other-bot",
+      exchangeAccountId: "primary",
+      updateSource: "GET_UPDATES",
+      botTokenRef: "sha256:bot-b",
+      nextOffset: 5,
+      lastUpdateId: 4,
+      updatedAt: "2026-04-20T00:02:00.000Z",
+    });
+
+    assert.deepEqual(
+      await bundle.telegramInboundOffsets.getTelegramInboundOffset({
+        exchangeAccountId: "primary",
+        updateSource: "GET_UPDATES",
+        botTokenRef: "sha256:bot-a",
+      }),
+      {
+        id: "telegram-inbound-offset-2",
+        exchangeAccountId: "primary",
+        updateSource: "GET_UPDATES",
+        botTokenRef: "sha256:bot-a",
+        nextOffset: 102,
+        lastUpdateId: 101,
+        updatedAt: "2026-04-20T00:01:00.000Z",
+      },
+    );
+    assert.equal(
+      (await bundle.telegramInboundOffsets.getTelegramInboundOffset({
+        exchangeAccountId: "primary",
+        updateSource: "GET_UPDATES",
+        botTokenRef: "sha256:bot-b",
+      }))?.nextOffset,
+      5,
+    );
+  } finally {
+    bundle.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
 test("sqlite repository returns the latest strategy decision for a market and strategy", async () => {
   const databasePath = await createTempDatabasePath("strategy-decisions");
   const bundle = createSqlitePersistence({
@@ -660,6 +736,18 @@ test("sqlite order updates preserve existing order events and fills", async () =
       createdAt: "2026-04-20T00:00:00.000Z",
       updatedAt: "2026-04-20T00:00:03.000Z",
     });
+
+    const byId = await bundle.repositories.findOrderByReference("primary", "order-1");
+    const byIdentifier = await bundle.repositories.findOrderByReference("primary", "identifier-1");
+    const byUuid = await bundle.repositories.findOrderByReference("primary", "uuid-1");
+    const events = await bundle.repositories.listOrderEvents("order-1");
+    const fills = await bundle.repositories.listFills("order-1");
+
+    assert.equal(byId?.id, "order-1");
+    assert.equal(byIdentifier?.id, "order-1");
+    assert.equal(byUuid?.id, "order-1");
+    assert.equal(events[0]?.eventType, "ORDER_PERSISTED");
+    assert.equal(fills[0]?.exchangeFillId, "exchange-fill-1");
   } finally {
     bundle.close();
   }

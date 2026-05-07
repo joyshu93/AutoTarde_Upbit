@@ -260,6 +260,16 @@ export interface SqliteOperatorNotificationDeliveryRunRow {
   summary_json: string;
 }
 
+export interface SqliteTelegramInboundOffsetRow {
+  id: string;
+  exchange_account_id: string;
+  update_source: "GET_UPDATES";
+  bot_token_ref: string;
+  next_offset: number;
+  last_update_id: number | null;
+  updated_at: string;
+}
+
 export interface SqliteRiskEventRow {
   id: string;
   exchange_account_id: string;

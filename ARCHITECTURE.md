@@ -113,6 +113,8 @@ It should eventually reconcile:
 Telegram is an operator surface only.
 
 It provides:
+- `/help` for static command-contract inspection and operator safety boundaries
+- `/config` for non-secret runtime configuration, live blockers, and explicit risk-limit inspection
 - inspection commands
 - pause/resume/killswitch controls
 - reporting-friendly formatters
@@ -129,10 +131,18 @@ It provides:
 - `/sync` for reconciliation-triggered snapshot and reconciliation record persistence with read-only public ticker valuation
 - `/run BTC|ETH` for one deterministic PositionGuard strategy runner cycle through the configured safe execution path
 - `/status` strategy-scheduler lines for disabled/enabled state, configured intervals, next run timestamps, recent in-memory scheduler outcomes, and persisted recent scheduler run history
+- `/order <order-id|identifier>` for one persisted order plus order-event and fill detail without exchange mutation
+- `/scheduler` for fuller read-only persisted `strategy_scheduler_runs` history without triggering scheduler execution
+- `/inbound` for read-only runtime inbound polling status and persisted `telegram_inbound_offsets` inspection
 - future reconciliation inspection as a read-only operator view
 - `/synchistory` summaries that expose bounded archival recovery progress such as checkpoint window movement, page counts, stop-before boundary, retention-assumption boundary, coverage status, truncation flags, and confidence classification
 - execution_state transition history inspection from persisted state
 - outbox-based Telegram delivery that persists first, then attempts best-effort send behind `ENABLE_TELEGRAM_DELIVERY`
+- disabled-by-default inbound polling that accepts only `TELEGRAM_OPERATOR_CHAT_ID` messages and routes them through the existing command router
+- a bounded `smoke:telegram:inbound` operator validation script that forces `DRY_RUN`, disables live orders and scheduler ticks, and calls only one inbound `pollOnce()` without starting the runtime loop
+
+`/help` is intentionally contract-derived and does not read repositories, poll Telegram, inspect exchange state, start sync, start strategy runs, start scheduler ticks, mutate orders, or enable live order transmission.
+`/config` is intentionally non-secret and runtime-derived; it renders configured/not-configured booleans for secrets and never prints raw credentials, tokens, or chat identifiers.
 
 It does not provide:
 - portfolio truth entry
@@ -172,9 +182,11 @@ The schema is centered on recovery and auditability:
 - `operator_notifications`
 - `operator_notification_delivery_attempts`
 - `operator_notification_delivery_runs`
+- `telegram_inbound_offsets`
 - `risk_events`
 
 The important design choice is that order lifecycle data is first-class. Balance or position drift must be explainable through orders, fills, cancellations, failures, reconciliation runs, and explicit operator-state transitions.
+Single-order inspection reads only persisted `orders`, `order_events`, and `fills`, so it improves recoverability without becoming an execution trigger.
 `operator_notifications` follow the same philosophy: delivery status is durable and separate from execution or reconciliation state.
 Retry metadata is durable too, so delivery workers can reschedule without mutating execution or reconciliation records.
 Lease metadata is durable as well, so workers can claim rows and finalize only when the claimed `lease_token` still matches.
@@ -182,6 +194,7 @@ Lease metadata is durable as well, so workers can claim rows and finalize only w
 `operator_notification_delivery_runs` add one row per delivery-worker execution so scheduled or inline workers leave a durable summary even when no notification was sent.
 Delivery-worker queue metrics are currently derived from persisted notification, delivery-run, and attempt rows.
 `strategy_scheduler_runs` records scheduler-triggered strategy cycles separately from strategy decisions and orders so operators can inspect scheduler health without treating scheduler state as trading truth.
+`telegram_inbound_offsets` records `getUpdates` transport progress, scoped by exchange account and non-secret bot-token fingerprint. It is durable transport state, not portfolio truth.
 
 ## Execution Modes
 
@@ -219,6 +232,8 @@ Delivery-worker queue metrics are currently derived from persisted notification,
 16. Delivery worker executions are written to `operator_notification_delivery_runs` with completed, skipped, or failed status.
 17. Retryable Telegram delivery failures stay `PENDING` with future `next_attempt_at`, while permanent failures become `FAILED`.
 18. Expose inspection and reconciliation surfaces.
+19. If scheduler or inbound polling background timers are started, install signal handlers that stop Telegram inbound polling, stop scheduler timers, and close SQLite persistence on `SIGINT` / `SIGTERM`.
+20. If no background runtime is started, close SQLite persistence immediately after the startup banner is printed.
 
 ## Failure Posture
 
@@ -230,6 +245,9 @@ Examples:
 - if order state cannot be reconciled, mark it for recovery rather than pretending success
 - if exchange-backed snapshots move in a way the local fill ledger cannot explain, persist both reconciliation issues and `risk_events`, then consider `DEGRADED` during startup bootstrap
 - if Telegram delivery fails, keep the notification and mark it `FAILED` rather than mutating execution or reconciliation outcomes
+- if Telegram inbound reply delivery fails, surface that failure in polling status rather than mutating execution, reconciliation, or order state
+- if the Telegram inbound smoke script detects non-smoke safety settings after its forced environment patch, block polling and report the blocker explicitly
+- if runtime shutdown cleanup fails, report a partial shutdown failure instead of silently skipping resource cleanup
 
 ## Current Gaps
 

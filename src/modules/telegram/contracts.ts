@@ -7,6 +7,20 @@ import type { SupportedAsset } from "../../domain/types.js";
 
 const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
   {
+    command: "/help",
+    category: "inspection",
+    usage: "/help",
+    summary: "Show supported Telegram operator commands and safety boundaries.",
+    argumentPolicy: "none",
+  },
+  {
+    command: "/config",
+    category: "inspection",
+    usage: "/config",
+    summary: "Show non-secret runtime configuration, safety gates, and explicit risk limits.",
+    argumentPolicy: "none",
+  },
+  {
     command: "/status",
     category: "inspection",
     usage: "/status",
@@ -70,6 +84,27 @@ const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
     argumentPolicy: "none",
   },
   {
+    command: "/order",
+    category: "inspection",
+    usage: "/order <order-id|identifier>",
+    summary: "Show one persisted order with lifecycle events and fills.",
+    argumentPolicy: "order_reference_required",
+  },
+  {
+    command: "/scheduler",
+    category: "inspection",
+    usage: "/scheduler",
+    summary: "Show recent persisted strategy_scheduler_runs for operator inspection.",
+    argumentPolicy: "none",
+  },
+  {
+    command: "/inbound",
+    category: "inspection",
+    usage: "/inbound",
+    summary: "Show Telegram inbound polling status and persisted update offset.",
+    argumentPolicy: "none",
+  },
+  {
     command: "/pause",
     category: "control",
     usage: "/pause [reason]",
@@ -116,6 +151,10 @@ export function listSupportedTelegramCommands(): SupportedTelegramCommand[] {
   return TELEGRAM_COMMAND_CONTRACTS.map((contract) => contract.command);
 }
 
+export function listTelegramCommandContracts(): readonly TelegramCommandContract[] {
+  return TELEGRAM_COMMAND_CONTRACTS;
+}
+
 export function parseTelegramCommand(input: string): ParsedTelegramCommand | null {
   const trimmed = input.trim();
   if (!trimmed.startsWith("/")) {
@@ -147,6 +186,10 @@ export function validateTelegramCommand(parsed: ParsedTelegramCommand): string |
 
   if (parsed.contract.argumentPolicy === "asset_required") {
     return parseTelegramAssetArg(parsed.args) === null ? buildUsageMessage(parsed.command) : null;
+  }
+
+  if (parsed.contract.argumentPolicy === "order_reference_required") {
+    return parsed.args.length === 1 && parsed.args[0]?.trim() ? null : buildUsageMessage(parsed.command);
   }
 
   if (parsed.args.length > 0) {

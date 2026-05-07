@@ -8,6 +8,8 @@ import type {
   OperatorNotificationDeliveryAttemptRecord,
   OperatorNotificationDeliveryRunRecord,
   OperatorNotificationRecord,
+  FillRecord,
+  OrderEventRecord,
   OrderRecord,
   PositionSnapshot,
   PositionSnapshotRecord,
@@ -15,15 +17,91 @@ import type {
   RiskEventRecord,
   StrategySchedulerRunRecord,
   StrategySchedulerStatus,
+  TelegramInboundOffsetRecord,
 } from "../../domain/types.js";
 import { detectExecutionStateSeedMismatches } from "../db/interfaces.js";
+import type { TelegramInboundPollingStatus } from "./inbound.js";
 import type {
   SupportedTelegramCommand,
+  TelegramCommandContract,
+  TelegramRuntimeConfigSnapshot,
   TelegramStrategyRunResult,
   TelegramSyncResult,
 } from "./interfaces.js";
 
 const MANUAL_INPUT_NOTE = "Telegram does not accept manual cash or position input.";
+
+export function formatHelpMessage(contracts: readonly TelegramCommandContract[]): string {
+  const inspectionContracts = contracts.filter((contract) => contract.category === "inspection");
+  const controlContracts = contracts.filter((contract) => contract.category === "control");
+
+  return [
+    "Operator Help",
+    "state_source: static telegram command contracts",
+    `command_count: ${contracts.length}`,
+    ...formatHelpCommandGroup("inspection_commands", inspectionContracts),
+    ...formatHelpCommandGroup("control_commands", controlContracts),
+    "read_only_boundary: /help never triggers sync, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission.",
+    "execution_boundary: /run BTC|ETH is a deterministic strategy trigger and still inherits execution-state, risk, DRY_RUN, and live-send gates.",
+    "live_boundary: Live order transmission requires APP_EXECUTION_MODE=LIVE and ENABLE_LIVE_ORDERS=true; the default path remains DRY_RUN.",
+    `operator_boundary: ${MANUAL_INPUT_NOTE}`,
+  ].join("\n");
+}
+
+export function formatRuntimeConfigMessage(config: TelegramRuntimeConfigSnapshot | null): string {
+  if (!config) {
+    return [
+      "Runtime Config",
+      "state_source: runtime app configuration",
+      "status: unavailable",
+      "note: Runtime configuration was not supplied to the Telegram router.",
+      `operator_boundary: ${MANUAL_INPUT_NOTE}`,
+    ].join("\n");
+  }
+
+  const liveBlockers = describeRuntimeConfigLiveBlockers(config);
+
+  return [
+    "Runtime Config",
+    "state_source: runtime app configuration",
+    `service_name: ${config.serviceName}`,
+    `execution_mode: ${config.executionMode}`,
+    `live_gate: ${config.liveExecutionGate}`,
+    `live_send_path: ${config.liveSendPath}`,
+    `live_orders_allowed_by_config: ${liveBlockers.length === 0 ? "true" : "false"}`,
+    `config_live_blockers: ${liveBlockers.length === 0 ? "none" : liveBlockers.join(",")}`,
+    `exchange_backed_read_enabled: ${config.exchangeBackedReadEnabled}`,
+    `upbit_base_url: ${config.upbitBaseUrl}`,
+    `database_path: ${config.databasePath}`,
+    `telegram_delivery_enabled: ${config.telegramDeliveryEnabled}`,
+    `telegram_bot_token_configured: ${config.telegramBotTokenConfigured}`,
+    `telegram_operator_chat_id_configured: ${config.telegramOperatorChatIdConfigured}`,
+    `telegram_delivery_max_attempts: ${config.telegramDeliveryMaxAttempts}`,
+    `telegram_delivery_base_backoff_ms: ${config.telegramDeliveryBaseBackoffMs}`,
+    `telegram_delivery_max_backoff_ms: ${config.telegramDeliveryMaxBackoffMs}`,
+    `telegram_delivery_lease_ms: ${config.telegramDeliveryLeaseMs}`,
+    `telegram_inbound_polling_enabled: ${config.telegramInboundPollingEnabled}`,
+    `telegram_inbound_poll_interval_ms: ${config.telegramInboundPollIntervalMs}`,
+    `telegram_inbound_poll_timeout_seconds: ${config.telegramInboundPollTimeoutSeconds}`,
+    `telegram_inbound_poll_limit: ${config.telegramInboundPollLimit}`,
+    `strategy_scheduler_enabled: ${config.strategySchedulerEnabled}`,
+    `strategy_scheduler_run_on_start: ${config.strategySchedulerRunOnStart}`,
+    `strategy_scheduler_btc_interval_ms: ${config.strategySchedulerBtcIntervalMs}`,
+    `strategy_scheduler_eth_interval_ms: ${config.strategySchedulerEthIntervalMs}`,
+    `reconciliation_max_order_lookups_per_run: ${config.reconciliationMaxOrderLookupsPerRun}`,
+    `reconciliation_history_max_pages_per_market: ${config.reconciliationHistoryMaxPagesPerMarket}`,
+    `reconciliation_closed_order_lookback_days: ${config.reconciliationClosedOrderLookbackDays}`,
+    `reconciliation_history_stop_before_days: ${config.reconciliationHistoryStopBeforeDays}`,
+    `reconciliation_history_retention_assumption_days: ${config.reconciliationHistoryRetentionAssumptionDays}`,
+    `stale_price_threshold_ms: ${config.stalePriceThresholdMs}`,
+    `minimum_order_value_krw: ${config.minimumOrderValueKrw}`,
+    `max_allocation_btc: ${config.maxAllocationByAsset.BTC}`,
+    `max_allocation_eth: ${config.maxAllocationByAsset.ETH}`,
+    `total_exposure_cap: ${config.totalExposureCap}`,
+    "secret_boundary: secret values are never rendered; only configured/not_configured booleans are shown.",
+    `operator_boundary: ${MANUAL_INPUT_NOTE}`,
+  ].join("\n");
+}
 
 export function formatStatusMessage(
   state: ExecutionStateRecord,
@@ -279,6 +357,131 @@ export function formatOrdersMessage(orders: OrderRecord[]): string {
   ].join("\n");
 }
 
+export function formatOrderDetailMessage(
+  order: OrderRecord | null,
+  events: OrderEventRecord[],
+  fills: FillRecord[],
+  reference: string,
+): string {
+  if (!order) {
+    return [
+      "Order Detail",
+      `query: ${reference}`,
+      "status: not_found",
+      "state_source: persisted orders + order_events + fills",
+      "note: No order matched the provided id, identifier, or Upbit UUID for this exchange account.",
+      `operator_boundary: ${MANUAL_INPUT_NOTE}`,
+    ].join("\n");
+  }
+
+  const sortedEvents = [...events].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  const sortedFills = [...fills].sort((left, right) => left.filledAt.localeCompare(right.filledAt));
+
+  return [
+    "Order Detail",
+    `query: ${reference}`,
+    "state_source: persisted orders + order_events + fills",
+    `id: ${order.id}`,
+    `identifier: ${order.identifier}`,
+    `exchange_account_id: ${order.exchangeAccountId}`,
+    `market: ${order.market}`,
+    `side: ${order.side}`,
+    `ord_type: ${order.ordType}`,
+    `status: ${order.status}`,
+    `execution_mode: ${order.executionMode}`,
+    `origin: ${order.origin}`,
+    `strategy_decision_id: ${order.strategyDecisionId ?? "none"}`,
+    `idempotency_key: ${order.idempotencyKey}`,
+    `upbit_uuid: ${order.upbitUuid ?? "none"}`,
+    `price: ${order.price ?? "none"}`,
+    `volume: ${order.volume ?? "none"}`,
+    `time_in_force: ${order.timeInForce ?? "none"}`,
+    `smp_type: ${order.smpType ?? "none"}`,
+    `requested_at: ${order.requestedAt}`,
+    `created_at: ${order.createdAt}`,
+    `updated_at: ${order.updatedAt}`,
+    `failure_code: ${order.failureCode ?? "none"}`,
+    `failure_message: ${order.failureMessage ?? "none"}`,
+    `exchange_response_available: ${order.exchangeResponseJson ? "true" : "false"}`,
+    `event_count: ${sortedEvents.length}`,
+    ...formatOrderEventLines(sortedEvents),
+    `fill_count: ${sortedFills.length}`,
+    ...formatFillLines(sortedFills),
+    `operator_boundary: ${MANUAL_INPUT_NOTE}`,
+  ].join("\n");
+}
+
+function formatHelpCommandGroup(
+  label: string,
+  contracts: readonly TelegramCommandContract[],
+): string[] {
+  if (contracts.length === 0) {
+    return [`${label}: none`];
+  }
+
+  return [
+    `${label}:`,
+    ...contracts.map(
+      (contract) => `- ${contract.command} | ${contract.usage} | ${contract.summary}`,
+    ),
+  ];
+}
+
+function describeRuntimeConfigLiveBlockers(config: TelegramRuntimeConfigSnapshot): string[] {
+  const blockers: string[] = [];
+
+  if (config.executionMode !== "LIVE") {
+    blockers.push("DRY_RUN");
+  }
+
+  if (config.liveExecutionGate !== "ENABLED") {
+    blockers.push("LIVE_GATE_DISABLED");
+  }
+
+  if (config.liveSendPath === "DRY_RUN_ADAPTER") {
+    blockers.push("DRY_RUN_ADAPTER");
+  }
+
+  return blockers;
+}
+
+function formatOrderEventLines(events: OrderEventRecord[]): string[] {
+  if (events.length === 0) {
+    return ["events: none"];
+  }
+
+  return [
+    "events:",
+    ...events.map(
+      (event) =>
+        `- ${event.createdAt} | ${event.eventSource} | ${event.eventType} | payload=${summarizeJsonPayload(event.payloadJson)}`,
+    ),
+  ];
+}
+
+function formatFillLines(fills: FillRecord[]): string[] {
+  if (fills.length === 0) {
+    return ["fills: none"];
+  }
+
+  return [
+    "fills:",
+    ...fills.map(
+      (fill) =>
+        `- ${fill.filledAt} | ${fill.market} | ${fill.side} | price=${fill.price} | volume=${fill.volume} | fee=${fill.feeAmount ?? "none"} ${fill.feeCurrency ?? "none"} | exchange_fill_id=${fill.exchangeFillId}`,
+    ),
+  ];
+}
+
+function summarizeJsonPayload(rawJson: string): string {
+  const normalized = rawJson.replace(/\s+/gu, " ").trim();
+  if (normalized.length <= 160) {
+    return normalized || "{}";
+  }
+
+  return `${normalized.slice(0, 157)}...`;
+}
+
 export function formatRiskEventsMessage(events: RiskEventRecord[]): string {
   if (events.length === 0) {
     return [
@@ -349,6 +552,62 @@ export function formatStrategyRunMessage(result: TelegramStrategyRunResult): str
     `order_id: ${result.orderId ?? "none"}`,
     `order_status: ${result.orderStatus ?? "none"}`,
     `detail: ${result.detail}`,
+    `operator_boundary: ${MANUAL_INPUT_NOTE}`,
+  ].join("\n");
+}
+
+export function formatStrategySchedulerRunsMessage(runs: StrategySchedulerRunRecord[]): string {
+  if (runs.length === 0) {
+    return [
+      "Strategy Scheduler History",
+      "count: 0",
+      "state_source: persisted strategy_scheduler_runs",
+      "note: No strategy scheduler runs are stored yet.",
+      `operator_boundary: ${MANUAL_INPUT_NOTE}`,
+    ].join("\n");
+  }
+
+  const sortedRuns = [...runs].sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+
+  return [
+    "Strategy Scheduler History",
+    `count: ${sortedRuns.length}`,
+    "state_source: persisted strategy_scheduler_runs",
+    ...sortedRuns.map(
+      (run) =>
+        `- ${run.startedAt} | ${run.market} | ${run.status} | trigger=${run.triggerSource} | completed_at=${run.completedAt ?? "none"} | interval_ms=${run.intervalMs} | run_on_start=${run.runOnStart} | decision=${run.strategyDecisionId ?? "none"} | action=${run.action ?? "none"} | order=${run.orderId ?? "none"} | order_status=${run.orderStatus ?? "none"} | accepted=${run.submissionAccepted === null ? "none" : run.submissionAccepted} | error=${run.errorMessage ?? "none"} | detail=${run.detail ?? "none"}`,
+    ),
+    `operator_boundary: ${MANUAL_INPUT_NOTE}`,
+  ].join("\n");
+}
+
+export function formatTelegramInboundMessage(
+  status: TelegramInboundPollingStatus | null,
+  offset: TelegramInboundOffsetRecord | null,
+): string {
+  return [
+    "Telegram Inbound",
+    "state_source: runtime polling status + persisted telegram_inbound_offsets",
+    `enabled: ${status?.enabled ?? "unknown"}`,
+    `configured: ${status?.configured ?? "unknown"}`,
+    `running: ${status?.running ?? "unknown"}`,
+    `offset_storage: ${status?.offsetStorage ?? "unknown"}`,
+    `offset_loaded: ${status?.offsetLoaded ?? "unknown"}`,
+    `runtime_next_offset: ${status?.nextOffset ?? "none"}`,
+    `runtime_last_update_id: ${status?.lastUpdateId ?? "none"}`,
+    `poll_interval_ms: ${status?.pollIntervalMs ?? "unknown"}`,
+    `long_poll_timeout_seconds: ${status?.longPollTimeoutSeconds ?? "unknown"}`,
+    `poll_limit: ${status?.limit ?? "unknown"}`,
+    `last_poll_at: ${status?.lastPollAt ?? "none"}`,
+    `processed_count: ${status?.processedCount ?? "unknown"}`,
+    `ignored_count: ${status?.ignoredCount ?? "unknown"}`,
+    `failed_count: ${status?.failedCount ?? "unknown"}`,
+    `last_error: ${status?.lastError ?? "none"}`,
+    `persisted_offset_available: ${offset ? "true" : "false"}`,
+    `persisted_bot_token_ref: ${offset?.botTokenRef ?? "none"}`,
+    `persisted_next_offset: ${offset?.nextOffset ?? "none"}`,
+    `persisted_last_update_id: ${offset?.lastUpdateId ?? "none"}`,
+    `persisted_updated_at: ${offset?.updatedAt ?? "none"}`,
     `operator_boundary: ${MANUAL_INPUT_NOTE}`,
   ].join("\n");
 }

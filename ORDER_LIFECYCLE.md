@@ -140,9 +140,19 @@ Telegram should report lifecycle outcomes, such as:
 - unexplained portfolio drift detected during reconciliation
 - one-shot strategy runner outcomes from `/run BTC|ETH`, including HOLD/no-order decisions and risk-blocked submissions
 - scheduled strategy runner outcomes when `STRATEGY_SCHEDULER_ENABLED=true`
+- static operator command help through `/help`
+- non-secret runtime configuration inspection through `/config`
+- single-order lifecycle detail through `/order <order-id|identifier>`, including persisted order events and fills
+- persisted scheduler run history through `/scheduler`
 
 Notifications are derived from lifecycle state, not treated as lifecycle state.
+`/help` is static command-contract inspection and must not create an order-lifecycle transition or trigger sync, strategy runs, scheduler ticks, exchange reads, or order mutation.
+`/config` is runtime configuration inspection and must not create an order-lifecycle transition or expose raw secrets.
+`/order <order-id|identifier>` is a lifecycle inspection view over persisted `orders`, `order_events`, and `fills`; it does not create, cancel, retry, or reconcile orders by itself.
 Scheduler run history is likewise operational audit state, not order lifecycle truth; orders and fills remain the durable lifecycle records.
+Inbound Telegram update offsets are durable transport progress state, not order lifecycle truth.
+The `/inbound` command may inspect that transport progress, but it must not become an order-lifecycle transition.
+The `smoke:telegram:inbound` script may route at most one fetched operator update through the command router, but it remains transport validation and must not become an order-lifecycle transition by itself.
 They should be persisted first into `operator_notifications`, then delivered through a separate `PENDING -> SENT/FAILED` path.
 Notification delivery failure must never be treated as an order-lifecycle transition.
 Retryable Telegram failures may keep the notification in `PENDING` with a scheduled `next_attempt_at`, but that retry state is still separate from order lifecycle.

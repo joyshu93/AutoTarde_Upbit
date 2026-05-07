@@ -473,6 +473,8 @@ export interface RiskEvaluationResult {
 
 export interface OperatorCommand {
   command:
+    | "/help"
+    | "/config"
     | "/status"
     | "/statehistory"
     | "/synchistory"
@@ -482,12 +484,25 @@ export interface OperatorCommand {
     | "/balances"
     | "/positions"
     | "/orders"
+    | "/order"
+    | "/scheduler"
+    | "/inbound"
     | "/pause"
     | "/resume"
     | "/killswitch"
     | "/sync"
     | "/run";
   args: string[];
+}
+
+export interface TelegramInboundOffsetRecord {
+  id: string;
+  exchangeAccountId: string;
+  updateSource: "GET_UPDATES";
+  botTokenRef: string;
+  nextOffset: number;
+  lastUpdateId: number | null;
+  updatedAt: string;
 }
 
 export function getMarketForAsset(asset: SupportedAsset): SupportedMarket {

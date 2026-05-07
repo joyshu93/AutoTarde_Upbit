@@ -19,6 +19,10 @@ export interface AppConfig {
   telegramDeliveryBaseBackoffMs: number;
   telegramDeliveryMaxBackoffMs: number;
   telegramDeliveryLeaseMs: number;
+  telegramInboundPollingEnabled: boolean;
+  telegramInboundPollIntervalMs: number;
+  telegramInboundPollTimeoutSeconds: number;
+  telegramInboundPollLimit: number;
   strategySchedulerEnabled: boolean;
   strategySchedulerRunOnStart: boolean;
   strategySchedulerBtcIntervalMs: number;
@@ -41,6 +45,9 @@ const DEFAULT_TELEGRAM_DELIVERY_MAX_ATTEMPTS = 5;
 const DEFAULT_TELEGRAM_DELIVERY_BASE_BACKOFF_MS = 15_000;
 const DEFAULT_TELEGRAM_DELIVERY_MAX_BACKOFF_MS = 300_000;
 const DEFAULT_TELEGRAM_DELIVERY_LEASE_MS = 30_000;
+const DEFAULT_TELEGRAM_INBOUND_POLL_INTERVAL_MS = 2_000;
+const DEFAULT_TELEGRAM_INBOUND_POLL_TIMEOUT_SECONDS = 25;
+const DEFAULT_TELEGRAM_INBOUND_POLL_LIMIT = 10;
 const DEFAULT_STRATEGY_SCHEDULER_INTERVAL_MS = 3_600_000;
 const DEFAULT_RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN = 10;
 const DEFAULT_RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET = 3;
@@ -84,6 +91,19 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     telegramDeliveryLeaseMs: parseNumber(
       env.TELEGRAM_DELIVERY_LEASE_MS,
       DEFAULT_TELEGRAM_DELIVERY_LEASE_MS,
+    ),
+    telegramInboundPollingEnabled: parseBoolean(env.ENABLE_TELEGRAM_INBOUND_POLLING),
+    telegramInboundPollIntervalMs: parsePositiveNumber(
+      env.TELEGRAM_INBOUND_POLL_INTERVAL_MS,
+      DEFAULT_TELEGRAM_INBOUND_POLL_INTERVAL_MS,
+    ),
+    telegramInboundPollTimeoutSeconds: parseNumber(
+      env.TELEGRAM_INBOUND_POLL_TIMEOUT_SECONDS,
+      DEFAULT_TELEGRAM_INBOUND_POLL_TIMEOUT_SECONDS,
+    ),
+    telegramInboundPollLimit: parsePositiveNumber(
+      env.TELEGRAM_INBOUND_POLL_LIMIT,
+      DEFAULT_TELEGRAM_INBOUND_POLL_LIMIT,
     ),
     strategySchedulerEnabled: parseBoolean(env.STRATEGY_SCHEDULER_ENABLED),
     strategySchedulerRunOnStart: parseBoolean(env.STRATEGY_SCHEDULER_RUN_ON_START),

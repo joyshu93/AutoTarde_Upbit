@@ -1,4 +1,9 @@
 import { createApp } from "./app/create-app.js";
+import {
+  hasBackgroundRuntime,
+  installRuntimeSignalHandlers,
+  stopAppRuntime,
+} from "./app/runtime-lifecycle.js";
 import { applyStartupRecoveryPolicy, runStartupRecovery } from "./app/startup-recovery.js";
 import { detectExecutionStateSeedMismatches } from "./modules/db/interfaces.js";
 
@@ -55,6 +60,17 @@ async function main(): Promise<void> {
 
   const state = await app.operatorState.getState();
   const strategySchedulerStatus = app.strategyScheduler.start();
+  const telegramInboundPollingStatus = app.telegramInboundPolling.start();
+  const runtimeHasBackgroundWork = hasBackgroundRuntime({
+    strategyScheduler: strategySchedulerStatus,
+    telegramInboundPolling: telegramInboundPollingStatus,
+  });
+  const runtimeShutdown = runtimeHasBackgroundWork
+    ? "SIGNAL_HANDLERS_INSTALLED"
+    : "NO_BACKGROUND_RUNTIME";
+  if (runtimeHasBackgroundWork) {
+    installRuntimeSignalHandlers({ app });
+  }
   const seedMismatches = detectExecutionStateSeedMismatches(state, {
     executionMode: app.config.executionMode,
     liveExecutionGate: app.config.liveExecutionGate,
@@ -87,11 +103,20 @@ async function main(): Promise<void> {
     telegramDeliveryMaxBackoffMs: app.config.telegramDeliveryMaxBackoffMs,
     telegramDeliveryLeaseMs: app.config.telegramDeliveryLeaseMs,
     notificationDeliverySummary,
+    runtimeHasBackgroundWork,
+    runtimeShutdown,
+    telegramInboundPollingEnabled: app.config.telegramInboundPollingEnabled,
+    telegramInboundPollingConfigured: app.telegramInboundPolling.isConfigured(),
+    telegramInboundPolling: telegramInboundPollingStatus,
     strategyScheduler: strategySchedulerStatus,
     supportedCommands: app.telegramRouter.getSupportedCommands(),
   };
 
   console.log(JSON.stringify(banner, null, 2));
+
+  if (!runtimeHasBackgroundWork) {
+    stopAppRuntime(app);
+  }
 }
 
 void main().catch((error) => {

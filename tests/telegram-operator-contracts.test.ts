@@ -12,28 +12,47 @@ import { TelegramCommandRouter } from "../src/modules/telegram/commands.js";
 import {
   buildUnsupportedCommandMessage,
   buildUsageMessage,
+  listTelegramCommandContracts,
   parseTelegramCommand,
   validateTelegramCommand,
 } from "../src/modules/telegram/contracts.js";
 import {
   formatBalanceMessage,
+  formatHelpMessage,
   formatOperatorNotificationsMessage,
+  formatOrderDetailMessage,
   formatPositionMessage,
   formatReconciliationRunsMessage,
   formatRiskEventsMessage,
+  formatRuntimeConfigMessage,
+  formatStrategySchedulerRunsMessage,
+  formatTelegramInboundMessage,
 } from "../src/modules/telegram/formatter.js";
 import type { TelegramSyncResult } from "../src/modules/telegram/interfaces.js";
 import { test } from "./harness.js";
 
 test("parseTelegramCommand normalizes bot mentions and preserves arguments", () => {
+  const helpParsed = parseTelegramCommand("/HELP@autotrade_upbit_bot");
+  const configParsed = parseTelegramCommand("/CONFIG@autotrade_upbit_bot");
   const parsed = parseTelegramCommand("/STATUS@autotrade_upbit_bot");
   const historyParsed = parseTelegramCommand("/STATEHISTORY@autotrade_upbit_bot");
   const syncHistoryParsed = parseTelegramCommand("/SYNCHISTORY@autotrade_upbit_bot");
   const recoveryParsed = parseTelegramCommand("/RECOVERY@autotrade_upbit_bot");
   const alertsParsed = parseTelegramCommand("/ALERTS@autotrade_upbit_bot");
   const risksParsed = parseTelegramCommand("/RISKS@autotrade_upbit_bot");
+  const schedulerParsed = parseTelegramCommand("/SCHEDULER@autotrade_upbit_bot");
+  const inboundParsed = parseTelegramCommand("/INBOUND@autotrade_upbit_bot");
+  const orderParsed = parseTelegramCommand("/ORDER@autotrade_upbit_bot order-1");
   const runParsed = parseTelegramCommand("/RUN@autotrade_upbit_bot BTC");
 
+  assert.ok(helpParsed);
+  assert.equal(helpParsed.command, "/help");
+  assert.deepEqual(helpParsed.args, []);
+  assert.equal(helpParsed.contract.summary, "Show supported Telegram operator commands and safety boundaries.");
+  assert.ok(configParsed);
+  assert.equal(configParsed.command, "/config");
+  assert.deepEqual(configParsed.args, []);
+  assert.equal(configParsed.contract.summary, "Show non-secret runtime configuration, safety gates, and explicit risk limits.");
   assert.ok(parsed);
   assert.equal(parsed.command, "/status");
   assert.deepEqual(parsed.args, []);
@@ -53,6 +72,16 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.ok(risksParsed);
   assert.equal(risksParsed.command, "/risks");
   assert.equal(risksParsed.contract.summary, "Show recent persisted risk_events for operator inspection.");
+  assert.ok(schedulerParsed);
+  assert.equal(schedulerParsed.command, "/scheduler");
+  assert.equal(schedulerParsed.contract.summary, "Show recent persisted strategy_scheduler_runs for operator inspection.");
+  assert.ok(inboundParsed);
+  assert.equal(inboundParsed.command, "/inbound");
+  assert.equal(inboundParsed.contract.summary, "Show Telegram inbound polling status and persisted update offset.");
+  assert.ok(orderParsed);
+  assert.equal(orderParsed.command, "/order");
+  assert.deepEqual(orderParsed.args, ["order-1"]);
+  assert.equal(orderParsed.contract.summary, "Show one persisted order with lifecycle events and fills.");
   assert.ok(runParsed);
   assert.equal(runParsed.command, "/run");
   assert.deepEqual(runParsed.args, ["BTC"]);
@@ -63,20 +92,36 @@ test("manual input commands are rejected by the operator contract", () => {
   const message = buildUnsupportedCommandMessage("/setposition BTC 0.25 95000000");
 
   assert.match(message, /Manual cash and position input is not supported in Telegram\./);
-  assert.match(message, /\/status \/statehistory \/synchistory \/recovery \/alerts \/risks \/balances \/positions \/orders \/pause \/resume \/killswitch \/sync \/run/);
+  assert.match(message, /\/help \/config \/status \/statehistory \/synchistory \/recovery \/alerts \/risks \/balances \/positions \/orders \/order \/scheduler \/inbound \/pause \/resume \/killswitch \/sync \/run/);
 });
 
 test("no-argument commands return usage guidance when extra arguments are supplied", () => {
+  const helpParsed = parseTelegramCommand("/help now");
+  const configParsed = parseTelegramCommand("/config now");
   const parsed = parseTelegramCommand("/resume now");
   const historyParsed = parseTelegramCommand("/statehistory now");
   const syncHistoryParsed = parseTelegramCommand("/synchistory now");
   const recoveryParsed = parseTelegramCommand("/recovery now");
   const alertsParsed = parseTelegramCommand("/alerts now");
   const risksParsed = parseTelegramCommand("/risks now");
+  const schedulerParsed = parseTelegramCommand("/scheduler now");
+  const inboundParsed = parseTelegramCommand("/inbound now");
+  const missingOrderParsed = parseTelegramCommand("/order");
+  const extraOrderParsed = parseTelegramCommand("/order order-1 now");
   const missingRunAssetParsed = parseTelegramCommand("/run");
   const unsupportedRunAssetParsed = parseTelegramCommand("/run DOGE");
   const extraRunArgParsed = parseTelegramCommand("/run BTC now");
 
+  assert.ok(helpParsed);
+  assert.equal(
+    validateTelegramCommand(helpParsed),
+    buildUsageMessage("/help"),
+  );
+  assert.ok(configParsed);
+  assert.equal(
+    validateTelegramCommand(configParsed),
+    buildUsageMessage("/config"),
+  );
   assert.ok(parsed);
   assert.equal(
     validateTelegramCommand(parsed),
@@ -106,6 +151,26 @@ test("no-argument commands return usage guidance when extra arguments are suppli
   assert.equal(
     validateTelegramCommand(risksParsed),
     buildUsageMessage("/risks"),
+  );
+  assert.ok(schedulerParsed);
+  assert.equal(
+    validateTelegramCommand(schedulerParsed),
+    buildUsageMessage("/scheduler"),
+  );
+  assert.ok(inboundParsed);
+  assert.equal(
+    validateTelegramCommand(inboundParsed),
+    buildUsageMessage("/inbound"),
+  );
+  assert.ok(missingOrderParsed);
+  assert.equal(
+    validateTelegramCommand(missingOrderParsed),
+    buildUsageMessage("/order"),
+  );
+  assert.ok(extraOrderParsed);
+  assert.equal(
+    validateTelegramCommand(extraOrderParsed),
+    buildUsageMessage("/order"),
   );
   assert.ok(missingRunAssetParsed);
   assert.equal(
@@ -213,6 +278,105 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
       errorMessage: null,
     },
   ]);
+  const emptySchedulerRunsMessage = formatStrategySchedulerRunsMessage([]);
+  const schedulerRunsMessage = formatStrategySchedulerRunsMessage([
+    {
+      id: "strategy-scheduler-run-1",
+      exchangeAccountId: "primary",
+      market: "KRW-BTC",
+      triggerSource: "SCHEDULER",
+      status: "SKIPPED",
+      startedAt: "2026-04-20T00:08:00.000Z",
+      completedAt: "2026-04-20T00:08:00.000Z",
+      intervalMs: 1_800_000,
+      runOnStart: true,
+      strategyDecisionId: null,
+      action: null,
+      orderId: null,
+      orderStatus: null,
+      submissionAccepted: null,
+      detail: "Previous run still active.",
+      errorMessage: null,
+      summaryJson: JSON.stringify({ status: "SKIPPED" }),
+    },
+  ]);
+  const telegramInboundMessage = formatTelegramInboundMessage({
+    enabled: true,
+    configured: true,
+    running: false,
+    nextOffset: 77,
+    pollIntervalMs: 2_000,
+    longPollTimeoutSeconds: 25,
+    limit: 10,
+    lastPollAt: "2026-04-20T00:09:00.000Z",
+    lastUpdateId: 76,
+    offsetLoaded: true,
+    offsetStorage: "DURABLE",
+    processedCount: 4,
+    ignoredCount: 2,
+    failedCount: 1,
+    lastError: "telegram_http_500",
+  }, {
+    id: "telegram-inbound-offset-1",
+    exchangeAccountId: "primary",
+    updateSource: "GET_UPDATES",
+    botTokenRef: "sha256:bot-a",
+    nextOffset: 77,
+    lastUpdateId: 76,
+    updatedAt: "2026-04-20T00:09:01.000Z",
+  });
+  const orderDetailMessage = formatOrderDetailMessage(createOrder({
+    id: "order-1",
+    status: "FAILED",
+    failureCode: "order_submission_failed",
+    failureMessage: "telegram-inspectable failure",
+  }), [
+    {
+      id: "order-event-1",
+      orderId: "order-1",
+      eventType: "ORDER_SUBMISSION_FAILED",
+      eventSource: "LOCAL",
+      payloadJson: JSON.stringify({ failure: true }),
+      createdAt: "2026-04-20T00:09:30.000Z",
+    },
+  ], [], "order-identifier");
+  const helpMessage = formatHelpMessage(listTelegramCommandContracts());
+  const runtimeConfigMessage = formatRuntimeConfigMessage({
+    serviceName: "AutoTrade_Upbit",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    liveSendPath: "DRY_RUN_ADAPTER",
+    upbitBaseUrl: "https://api.upbit.com",
+    databasePath: "./var/autotrade-upbit.sqlite",
+    exchangeBackedReadEnabled: false,
+    telegramDeliveryEnabled: false,
+    telegramBotTokenConfigured: false,
+    telegramOperatorChatIdConfigured: false,
+    telegramDeliveryMaxAttempts: 5,
+    telegramDeliveryBaseBackoffMs: 15_000,
+    telegramDeliveryMaxBackoffMs: 300_000,
+    telegramDeliveryLeaseMs: 30_000,
+    telegramInboundPollingEnabled: false,
+    telegramInboundPollIntervalMs: 2_000,
+    telegramInboundPollTimeoutSeconds: 25,
+    telegramInboundPollLimit: 10,
+    strategySchedulerEnabled: false,
+    strategySchedulerRunOnStart: false,
+    strategySchedulerBtcIntervalMs: 3_600_000,
+    strategySchedulerEthIntervalMs: 3_600_000,
+    reconciliationMaxOrderLookupsPerRun: 10,
+    reconciliationHistoryMaxPagesPerMarket: 3,
+    reconciliationClosedOrderLookbackDays: 7,
+    reconciliationHistoryStopBeforeDays: 365,
+    reconciliationHistoryRetentionAssumptionDays: 365,
+    stalePriceThresholdMs: 30_000,
+    minimumOrderValueKrw: 5_000,
+    maxAllocationByAsset: {
+      BTC: 0.6,
+      ETH: 0.6,
+    },
+    totalExposureCap: 0.75,
+  });
   const risksMessage = formatRiskEventsMessage([
     {
       id: "risk-event-1",
@@ -246,6 +410,48 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
   assert.match(reconciliationRunsMessage, /state_source: persisted reconciliation_runs/);
   assert.match(reconciliationRunsMessage, /\| SUCCESS \| source=OPERATOR_SYNC \| issues=0 \| codes=none \| processed=1 \| deferred=0 \| history=none \| completed_at=2026-04-20T00:07:02.000Z \| error=none/);
 
+  assert.match(emptySchedulerRunsMessage, /Strategy Scheduler History/);
+  assert.match(emptySchedulerRunsMessage, /count: 0/);
+  assert.match(emptySchedulerRunsMessage, /state_source: persisted strategy_scheduler_runs/);
+  assert.match(emptySchedulerRunsMessage, /note: No strategy scheduler runs are stored yet\./);
+
+  assert.match(schedulerRunsMessage, /Strategy Scheduler History/);
+  assert.match(schedulerRunsMessage, /count: 1/);
+  assert.match(schedulerRunsMessage, /\| KRW-BTC \| SKIPPED \| trigger=SCHEDULER \| completed_at=2026-04-20T00:08:00.000Z \| interval_ms=1800000 \| run_on_start=true \| decision=none \| action=none \| order=none \| order_status=none \| accepted=none \| error=none \| detail=Previous run still active\./);
+
+  assert.match(telegramInboundMessage, /Telegram Inbound/);
+  assert.match(telegramInboundMessage, /state_source: runtime polling status \+ persisted telegram_inbound_offsets/);
+  assert.match(telegramInboundMessage, /offset_storage: DURABLE/);
+  assert.match(telegramInboundMessage, /runtime_next_offset: 77/);
+  assert.match(telegramInboundMessage, /failed_count: 1/);
+  assert.match(telegramInboundMessage, /last_error: telegram_http_500/);
+  assert.match(telegramInboundMessage, /persisted_bot_token_ref: sha256:bot-a/);
+  assert.match(telegramInboundMessage, /persisted_next_offset: 77/);
+
+  assert.match(orderDetailMessage, /Order Detail/);
+  assert.match(orderDetailMessage, /state_source: persisted orders \+ order_events \+ fills/);
+  assert.match(orderDetailMessage, /status: FAILED/);
+  assert.match(orderDetailMessage, /failure_code: order_submission_failed/);
+  assert.match(orderDetailMessage, /failure_message: telegram-inspectable failure/);
+  assert.match(orderDetailMessage, /event_count: 1/);
+  assert.match(orderDetailMessage, /\| LOCAL \| ORDER_SUBMISSION_FAILED \| payload=\{"failure":true\}/);
+  assert.match(orderDetailMessage, /fill_count: 0/);
+  assert.match(orderDetailMessage, /fills: none/);
+
+  assert.match(helpMessage, /Operator Help/);
+  assert.match(helpMessage, /state_source: static telegram command contracts/);
+  assert.match(helpMessage, /- \/help \| \/help \| Show supported Telegram operator commands and safety boundaries\./);
+  assert.match(helpMessage, /- \/sync \| \/sync \| Request a reconciliation sync through the operator control plane\./);
+  assert.match(helpMessage, /read_only_boundary: \/help never triggers sync, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission\./);
+  assert.match(helpMessage, /operator_boundary: Telegram does not accept manual cash or position input\./);
+
+  assert.match(runtimeConfigMessage, /Runtime Config/);
+  assert.match(runtimeConfigMessage, /state_source: runtime app configuration/);
+  assert.match(runtimeConfigMessage, /telegram_bot_token_configured: false/);
+  assert.match(runtimeConfigMessage, /telegram_operator_chat_id_configured: false/);
+  assert.match(runtimeConfigMessage, /config_live_blockers: DRY_RUN,LIVE_GATE_DISABLED,DRY_RUN_ADAPTER/);
+  assert.match(runtimeConfigMessage, /secret_boundary: secret values are never rendered/);
+
   assert.match(risksMessage, /Risk Events/);
   assert.match(risksMessage, /count: 1/);
   assert.match(risksMessage, /state_source: persisted risk_events/);
@@ -257,6 +463,8 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   const historyRequests: number[] = [];
   const alertRequests: number[] = [];
   const reconciliationRequests: number[] = [];
+  const schedulerRequests: number[] = [];
+  let inboundOffsetRequests = 0;
   const recoveryCheckpointRequests: string[] = [];
   let currentState = createExecutionState({
     systemStatus: "RUNNING",
@@ -416,6 +624,30 @@ test("router applies control commands, blocks invalid arguments, and advertises 
           },
         ];
       },
+      async listStrategySchedulerRuns(_exchangeAccountId, limit) {
+        schedulerRequests.push(limit ?? -1);
+        return [
+          {
+            id: "strategy-scheduler-run-1",
+            exchangeAccountId: "primary",
+            market: "KRW-BTC",
+            triggerSource: "SCHEDULER",
+            status: "COMPLETED",
+            startedAt: "2026-04-20T00:03:20.000Z",
+            completedAt: "2026-04-20T00:03:22.000Z",
+            intervalMs: 1_800_000,
+            runOnStart: false,
+            strategyDecisionId: "strategy-decision-1",
+            action: "HOLD",
+            orderId: null,
+            orderStatus: null,
+            submissionAccepted: null,
+            detail: "Decision HOLD persisted; no order submission was requested.",
+            errorMessage: null,
+            summaryJson: JSON.stringify({ status: "COMPLETED" }),
+          },
+        ];
+      },
       async listHistoryRecoveryCheckpoints(exchangeAccountId) {
         recoveryCheckpointRequests.push(exchangeAccountId);
         return [
@@ -463,6 +695,41 @@ test("router applies control commands, blocks invalid arguments, and advertises 
       killSwitchActive: false,
     },
     liveSendPath: "DRY_RUN_ADAPTER",
+    telegramInboundStatus: () => ({
+      enabled: true,
+      configured: true,
+      running: false,
+      nextOffset: 88,
+      pollIntervalMs: 2_000,
+      longPollTimeoutSeconds: 25,
+      limit: 10,
+      lastPollAt: "2026-04-20T00:03:45.000Z",
+      lastUpdateId: 87,
+      offsetLoaded: true,
+      offsetStorage: "DURABLE",
+      processedCount: 2,
+      ignoredCount: 1,
+      failedCount: 0,
+      lastError: null,
+    }),
+    telegramInboundBotTokenRef: "sha256:bot-a",
+    telegramInboundOffsetStore: {
+      async getTelegramInboundOffset() {
+        inboundOffsetRequests += 1;
+        return {
+          id: "telegram-inbound-offset-1",
+          exchangeAccountId: "primary",
+          updateSource: "GET_UPDATES",
+          botTokenRef: "sha256:bot-a",
+          nextOffset: 88,
+          lastUpdateId: 87,
+          updatedAt: "2026-04-20T00:03:45.000Z",
+        };
+      },
+      async saveTelegramInboundOffset() {
+        throw new Error("inbound inspection must not mutate offset state");
+      },
+    },
     now: () => "2026-04-20T00:04:00.000Z",
   });
 
@@ -472,6 +739,8 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   const recoveryResponse = await router.route("/recovery");
   const alertsResponse = await router.route("/alerts");
   const risksResponse = await router.route("/risks");
+  const schedulerResponse = await router.route("/scheduler");
+  const inboundResponse = await router.route("/inbound");
   const pauseResponse = await router.route("/pause maintenance window");
   const invalidResumeResponse = await router.route("/resume now");
   const invalidHistoryResponse = await router.route("/statehistory now");
@@ -520,9 +789,18 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   assert.match(risksResponse.text, /count: 1/);
   assert.match(risksResponse.text, /state_source: persisted risk_events/);
   assert.match(risksResponse.text, /GLOBAL_KILL_SWITCH/);
+  assert.match(schedulerResponse.text, /Strategy Scheduler History/);
+  assert.match(schedulerResponse.text, /count: 1/);
+  assert.match(schedulerResponse.text, /state_source: persisted strategy_scheduler_runs/);
+  assert.match(schedulerResponse.text, /\| KRW-BTC \| COMPLETED \| trigger=SCHEDULER/);
+  assert.match(inboundResponse.text, /Telegram Inbound/);
+  assert.match(inboundResponse.text, /enabled: true/);
+  assert.match(inboundResponse.text, /persisted_next_offset: 88/);
   assert.deepEqual(historyRequests, [3, 10]);
   assert.deepEqual(alertRequests, [10, 500, 5000]);
   assert.deepEqual(reconciliationRequests, [1, 10, 1]);
+  assert.deepEqual(schedulerRequests, [5, 20]);
+  assert.equal(inboundOffsetRequests, 1);
   assert.deepEqual(recoveryCheckpointRequests, ["primary"]);
 
   assert.match(pauseResponse.text, /Execution Control/);
@@ -554,6 +832,16 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   assert.equal(
     invalidRisksResponse.text,
     "Usage: /risks\nShow recent persisted risk_events for operator inspection.",
+  );
+  const invalidSchedulerResponse = await router.route("/scheduler now");
+  assert.equal(
+    invalidSchedulerResponse.text,
+    "Usage: /scheduler\nShow recent persisted strategy_scheduler_runs for operator inspection.",
+  );
+  const invalidInboundResponse = await router.route("/inbound now");
+  assert.equal(
+    invalidInboundResponse.text,
+    "Usage: /inbound\nShow Telegram inbound polling status and persisted update offset.",
   );
   assert.deepEqual(stateTransitions, ["pause:maintenance window"]);
 
@@ -706,6 +994,9 @@ function createRepositoryStub(overrides: Partial<ExecutionRepository> = {}): Exe
     async findOrderByIdempotencyKey() {
       return null;
     },
+    async findOrderByReference(_exchangeAccountId, reference) {
+      return orders.find((order) => order.id === reference || order.identifier === reference) ?? null;
+    },
     async listActiveOrders() {
       return [];
     },
@@ -713,6 +1004,9 @@ function createRepositoryStub(overrides: Partial<ExecutionRepository> = {}): Exe
       return orders;
     },
     async appendOrderEvent() {},
+    async listOrderEvents() {
+      return [];
+    },
     async saveFill() {},
     async listFills() {
       return [];
@@ -805,5 +1099,32 @@ function createNotification(
     createdAt,
     deliveredAt: null,
     lastError: null,
+  };
+}
+
+function createOrder(overrides: Partial<OrderRecord> & Pick<OrderRecord, "id">): OrderRecord {
+  return {
+    strategyDecisionId: "strategy-decision-1",
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    side: "bid",
+    ordType: "price",
+    volume: null,
+    price: "500000",
+    timeInForce: null,
+    smpType: null,
+    identifier: "order-identifier",
+    idempotencyKey: "idempotency-1",
+    origin: "STRATEGY",
+    requestedAt: "2026-04-20T00:00:00.000Z",
+    upbitUuid: null,
+    status: "PERSISTED",
+    executionMode: "DRY_RUN",
+    exchangeResponseJson: null,
+    failureCode: null,
+    failureMessage: null,
+    createdAt: "2026-04-20T00:00:00.000Z",
+    updatedAt: "2026-04-20T00:00:00.000Z",
+    ...overrides,
   };
 }

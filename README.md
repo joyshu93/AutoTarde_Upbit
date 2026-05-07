@@ -63,8 +63,10 @@ Current remaining gaps:
 - Telegram delivery now also persists a separate `operator_notification_delivery_attempts` audit trail, and `/alerts` shows recent delivery attempt outcomes alongside the current notification rows
 - Telegram delivery now persists `operator_notification_delivery_runs` for each inline worker execution, including skipped/not-configured runs and failed worker runs
 - `/alerts` now exposes delivery-worker queue metrics such as pending totals, due/scheduled counts, active/expired leases, abandoned-lease candidates, recent worker-run summaries, recent attempt outcome counts, and latest/oldest timestamps
+- Telegram inbound polling is now available behind `ENABLE_TELEGRAM_INBOUND_POLLING=false` by default, uses the existing command router, only accepts messages from `TELEGRAM_OPERATOR_CHAT_ID`, persists `getUpdates` offset progress in `telegram_inbound_offsets`, and exposes `/inbound` inspection
 - startup recovery can now mark persisted operator state `DEGRADED` when unresolved portfolio drift remains after exchange-backed bootstrap checks
-- scheduler-triggered strategy cycles now persist `strategy_scheduler_runs` so scheduled run starts, completions, failures, and skips remain inspectable after process restart
+- scheduler-triggered strategy cycles now persist `strategy_scheduler_runs` so scheduled run starts, completions, failures, and skips remain inspectable after process restart, including through `/scheduler`
+- `/order <order-id|identifier>` now exposes one persisted order, order events, and fills for read-only lifecycle investigation
 
 Current risk-policy framing is budget-first rather than asset-count-first:
 - total exposure cap is the main reserve control
@@ -82,18 +84,24 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 7. In the current default path, a dry-run adapter simulates acceptance without sending a live order.
 8. The default local store is SQLite-backed persistence at `DATABASE_PATH`.
 9. `execution_state` and `execution_state_transitions` provide the operator control ledger.
-10. Telegram inspection currently includes `/status`, `/statehistory`, `/synchistory`, `/recovery`, `/alerts`, `/risks`, `/balances`, `/positions`, `/orders`, and `/sync` for operator visibility, with `/status` also summarizing the latest persisted reconciliation run, recent issue codes, checkpointed history-recovery progress, and persisted degraded metadata when present.
+10. Telegram inspection currently includes `/help`, `/config`, `/status`, `/statehistory`, `/synchistory`, `/recovery`, `/alerts`, `/risks`, `/balances`, `/positions`, `/orders`, `/order <order-id|identifier>`, `/scheduler`, `/inbound`, and `/sync` for operator visibility, with `/status` also summarizing the latest persisted reconciliation run, recent issue codes, checkpointed history-recovery progress, and persisted degraded metadata when present.
 11. `/sync` connects to reconciliation so snapshot and reconciliation records are persisted, using read-only public ticker valuation when available.
 12. `/run BTC|ETH` requests one deterministic PositionGuard runner cycle for a supported asset and returns the persisted decision, action, and any DRY_RUN order lifecycle result.
 13. When `STRATEGY_SCHEDULER_ENABLED=true`, the scheduler uses the same safe runner/controller path as `/run BTC|ETH`; it is disabled by default.
-14. Scheduler-triggered cycles are persisted in `strategy_scheduler_runs` before runner execution and updated on completion, failure, or skip.
+14. Scheduler-triggered cycles are persisted in `strategy_scheduler_runs` before runner execution and updated on completion, failure, or skip; `/scheduler` exposes a fuller read-only history than the compact `/status` summary.
 15. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
 16. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
 17. Telegram delivery claims due `PENDING` notifications with a lease token, then only finalizes rows that still match that lease.
 18. Each delivery attempt now also writes a durable `operator_notification_delivery_attempts` record so `/alerts` can show recent delivery outcomes separately from the summary row in `operator_notifications`.
 19. Each delivery worker kick also writes a durable `operator_notification_delivery_runs` record so operators can inspect skipped, completed, and failed delivery-worker executions.
 20. Retryable Telegram delivery failures stay `PENDING` with a later `next_attempt_at`, while permanent failures become `FAILED`.
-21. Reconciliation and Telegram inspection surfaces operate on persisted state.
+21. Telegram inbound polling is disabled by default and, when enabled, only routes messages from the configured operator chat through the existing command router.
+22. Telegram inbound offset progress is persisted in `telegram_inbound_offsets` before routing each update, scoped by exchange account and non-secret bot-token fingerprint.
+23. Reconciliation and Telegram inspection surfaces operate on persisted state.
+24. When scheduler or inbound polling starts background timers, runtime signal handlers stop polling, stop the scheduler, and close SQLite persistence on `SIGINT` / `SIGTERM`; when no background runtime starts, startup closes persistence after printing the banner.
+
+`/help` is static command-contract inspection. It does not read exchange state, query repositories, trigger `/sync`, run strategy cycles, tick the scheduler, mutate orders, or enable live order transmission.
+`/config` is non-secret runtime configuration inspection. It shows configured/not-configured booleans for credentials and Telegram identifiers instead of raw secret values.
 
 ## Folder Layout
 
@@ -151,6 +159,10 @@ Environment variables currently recognized:
 - `TELEGRAM_DELIVERY_BASE_BACKOFF_MS`
 - `TELEGRAM_DELIVERY_MAX_BACKOFF_MS`
 - `TELEGRAM_DELIVERY_LEASE_MS`
+- `ENABLE_TELEGRAM_INBOUND_POLLING`
+- `TELEGRAM_INBOUND_POLL_INTERVAL_MS`
+- `TELEGRAM_INBOUND_POLL_TIMEOUT_SECONDS`
+- `TELEGRAM_INBOUND_POLL_LIMIT`
 - `RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN`
 - `RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET`
 - `RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS`
@@ -172,6 +184,25 @@ When Telegram delivery is enabled, due notifications are claimed behind a lease,
 Each delivery kick is also appended to `operator_notification_delivery_runs` with worker name, status, counts, skipped reason, and error metadata.
 `/alerts` also derives delivery-worker queue metrics from persisted rows, including active leases, expired leases, abandoned-lease candidates, recent delivery-run summaries, and recent attempt outcome counts.
 
+Telegram inbound polling stays disabled unless all three conditions are true:
+- `ENABLE_TELEGRAM_INBOUND_POLLING=true`
+- `TELEGRAM_BOT_TOKEN` is configured
+- `TELEGRAM_OPERATOR_CHAT_ID` is configured
+
+Inbound polling is separate from `ENABLE_TELEGRAM_DELIVERY`: delivery controls outbound queued notifications, while inbound polling controls operator command receiving.
+Inbound polling persists update offsets before routing each update to avoid replaying the same operator command indefinitely after process restart. Reply or route failures are explicit in the polling status; they do not mutate execution, reconciliation, order, balance, or position truth.
+
+For a bounded real-bot smoke test, use:
+
+```powershell
+$env:TELEGRAM_BOT_TOKEN = "<bot-token>"
+$env:TELEGRAM_OPERATOR_CHAT_ID = "<operator-chat-id>"
+$env:DATABASE_PATH = "./var/telegram-inbound-smoke.sqlite"
+npm run smoke:telegram:inbound
+```
+
+The smoke script forcibly sets `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, disables the strategy scheduler, enables inbound polling, sets `TELEGRAM_INBOUND_POLL_TIMEOUT_SECONDS=0`, and sets `TELEGRAM_INBOUND_POLL_LIMIT=1`. It calls `pollOnce()` only and never starts the long-running inbound loop. If Telegram credentials are missing, the script reports `SKIPPED` instead of polling.
+
 Exchange-backed startup recovery runs only when `UPBIT_ACCESS_KEY` and `UPBIT_SECRET_KEY` are configured. Without them, startup recovery is skipped and the app stays in local-inspection mode.
 Order reconciliation also respects `RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN` so `/sync` and startup recovery do not burst unbounded `getOrder` reads.
 Recent and archival exchange-history recovery also respect `RECONCILIATION_HISTORY_MAX_PAGES_PER_MARKET`, `RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS`, `RECONCILIATION_HISTORY_STOP_BEFORE_DAYS`, and `RECONCILIATION_HISTORY_RETENTION_ASSUMPTION_DAYS` so recovery sweeps page through Upbit order history in bounded windows, checkpoint deeper archive progress per market, and report whether archive coverage is still `IN_PROGRESS` or `COMPLETE`.
@@ -183,7 +214,10 @@ The strategy scheduler is disabled unless `STRATEGY_SCHEDULER_ENABLED=true`.
 When enabled, `STRATEGY_SCHEDULER_BTC_INTERVAL_MS` and `STRATEGY_SCHEDULER_ETH_INTERVAL_MS` control the BTC/ETH cadence, and `STRATEGY_SCHEDULER_RUN_ON_START=true` requests an immediate first tick after startup recovery policy has completed.
 The scheduler still uses the same runner/controller path as `/run BTC|ETH`, so it does not enable live order transmission by itself.
 
+When either scheduler or Telegram inbound polling is running, use normal process signals such as `Ctrl+C` / `SIGINT` or `SIGTERM` to stop the process. Shutdown is explicit: inbound polling is stopped, scheduler timers are cleared, and SQLite persistence is closed before the process exits.
+
 ## Immediate Next Steps
 
-- add a dedicated `/scheduler` inspection command for fuller persisted scheduler run history beyond the compact `/status` summary
+- run `npm run smoke:telegram:inbound` with a real bot token/operator chat in `DRY_RUN` mode after sending a low-risk command such as `/status` or `/inbound` to the bot
+- run a long-lived local `DRY_RUN` process with inbound polling enabled and verify signal shutdown in the operator environment
 - keep live order transmission gated by `APP_EXECUTION_MODE=LIVE` plus `ENABLE_LIVE_ORDERS=true`

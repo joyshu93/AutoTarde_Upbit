@@ -1,12 +1,17 @@
 import type {
+  ExecutionMode,
   ExecutionStateSeed,
+  LiveExecutionGate,
   OperatorCommand,
   OrderLifecycleStatus,
   StrategySchedulerStatus,
   StrategyDecisionAction,
+  SupportedAsset,
   SupportedMarket,
+  TelegramInboundOffsetRecord,
 } from "../../domain/types.js";
-import type { ExecutionRepository, OperatorStateStore } from "../db/interfaces.js";
+import type { ExecutionRepository, OperatorStateStore, TelegramInboundOffsetStore } from "../db/interfaces.js";
+import type { TelegramInboundPollingStatus } from "./inbound.js";
 
 export interface TelegramResponse {
   text: string;
@@ -14,7 +19,7 @@ export interface TelegramResponse {
 
 export type SupportedTelegramCommand = OperatorCommand["command"];
 export type TelegramCommandCategory = "inspection" | "control";
-export type TelegramCommandArgumentPolicy = "none" | "optional_reason" | "asset_required";
+export type TelegramCommandArgumentPolicy = "none" | "optional_reason" | "asset_required" | "order_reference_required";
 
 export interface TelegramCommandContract {
   readonly command: SupportedTelegramCommand;
@@ -69,13 +74,53 @@ export interface TelegramStrategyRunController {
   requestRun(request: TelegramStrategyRunRequest): Promise<TelegramStrategyRunResult>;
 }
 
+export interface TelegramRuntimeConfigSnapshot {
+  readonly serviceName: string;
+  readonly executionMode: ExecutionMode;
+  readonly liveExecutionGate: LiveExecutionGate;
+  readonly liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
+  readonly upbitBaseUrl: string;
+  readonly databasePath: string;
+  readonly exchangeBackedReadEnabled: boolean;
+  readonly telegramDeliveryEnabled: boolean;
+  readonly telegramBotTokenConfigured: boolean;
+  readonly telegramOperatorChatIdConfigured: boolean;
+  readonly telegramDeliveryMaxAttempts: number;
+  readonly telegramDeliveryBaseBackoffMs: number;
+  readonly telegramDeliveryMaxBackoffMs: number;
+  readonly telegramDeliveryLeaseMs: number;
+  readonly telegramInboundPollingEnabled: boolean;
+  readonly telegramInboundPollIntervalMs: number;
+  readonly telegramInboundPollTimeoutSeconds: number;
+  readonly telegramInboundPollLimit: number;
+  readonly strategySchedulerEnabled: boolean;
+  readonly strategySchedulerRunOnStart: boolean;
+  readonly strategySchedulerBtcIntervalMs: number;
+  readonly strategySchedulerEthIntervalMs: number;
+  readonly reconciliationMaxOrderLookupsPerRun: number;
+  readonly reconciliationHistoryMaxPagesPerMarket: number;
+  readonly reconciliationClosedOrderLookbackDays: number;
+  readonly reconciliationHistoryStopBeforeDays: number;
+  readonly reconciliationHistoryRetentionAssumptionDays: number;
+  readonly stalePriceThresholdMs: number;
+  readonly minimumOrderValueKrw: number;
+  readonly maxAllocationByAsset: Record<SupportedAsset, number>;
+  readonly totalExposureCap: number;
+}
+
 export interface TelegramRouterDependencies {
   readonly operatorState: OperatorStateStore;
   readonly repositories: ExecutionRepository;
+  readonly runtimeConfig?: TelegramRuntimeConfigSnapshot;
   readonly executionStateSeed?: ExecutionStateSeed;
   readonly liveSendPath?: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
   readonly syncController?: TelegramSyncController;
   readonly strategyRunController?: TelegramStrategyRunController;
   readonly schedulerStatus?: () => StrategySchedulerStatus;
+  readonly telegramInboundStatus?: () => TelegramInboundPollingStatus | null;
+  readonly telegramInboundOffsetStore?: TelegramInboundOffsetStore;
+  readonly telegramInboundBotTokenRef?: string | null;
   readonly now?: () => string;
 }
+
+export type TelegramInboundOffset = TelegramInboundOffsetRecord;

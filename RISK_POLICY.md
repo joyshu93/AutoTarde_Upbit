@@ -86,6 +86,8 @@ The execution path should validate orders through:
 ## Operator Controls
 
 The operator surface should expose:
+- `/help`
+- `/config`
 - `/status`
 - `/statehistory`
 - `/synchistory`
@@ -95,6 +97,9 @@ The operator surface should expose:
 - `/balances`
 - `/positions`
 - `/orders`
+- `/order <order-id|identifier>`
+- `/scheduler`
+- `/inbound`
 - `/pause`
 - `/resume`
 - `/killswitch`
@@ -102,7 +107,14 @@ The operator surface should expose:
 - `/run BTC|ETH`
 
 These commands exist for control and inspection, not for manual portfolio editing.
+`/help` is static command-contract inspection only and must not trigger sync, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission.
+`/config` is non-secret runtime configuration inspection only; it may expose live blockers and explicit risk limits but must not print raw credentials, tokens, or chat identifiers.
+Inbound polling must stay disabled by default, must reject non-operator chat IDs before routing commands, and may persist only Telegram update-offset progress as transport state.
+`/inbound` is inspection-only and must not call Telegram polling, trigger command routing, or mutate offset state.
+The Telegram inbound smoke command must force `DRY_RUN`, force `ENABLE_LIVE_ORDERS=false`, disable scheduler starts, and execute only one bounded poll.
 `/run BTC|ETH` is a controlled strategy trigger, not discretionary manual trading; it must produce deterministic strategy evidence and pass the same risk and execution guards as any scheduled cycle.
+`/order <order-id|identifier>` is inspection-only and must read persisted order lifecycle evidence without creating, canceling, syncing, or retrying orders.
+`/scheduler` is inspection-only; it may read persisted scheduler run history but must not trigger or retry strategy cycles.
 The strategy scheduler is disabled by default, must use explicit intervals, and must share the same deterministic runner, duplicate protection, execution-state guardrails, and live-send blockers as `/run BTC|ETH`.
 
 ## Audit Expectations
@@ -124,10 +136,12 @@ Every important transition should leave a durable trail:
 - operator notification delivery-worker run records, including skipped, completed, and failed worker executions
 - derived operator notification queue metrics, including active leases, expired leases, abandoned-lease candidates, recent delivery-run summaries, and recent delivery-attempt outcomes
 - strategy scheduler run records, including started, completed, failed, and skipped scheduler-triggered cycles
+- Telegram inbound offset records, including the next update offset and last update id for replay prevention
 
 Telegram delivery failure must not alter execution, reconciliation, or risk outcomes. It is an operator-reporting concern with its own durable state.
 Retryable delivery failures should remain explicit as `PENDING` plus future `nextAttemptAt`, not silently disappear.
 Concurrent delivery workers should only finalize a notification when the persisted lease token still matches the worker claim.
+Long-running runtime shutdown should be explicit: signal handling must stop inbound polling, clear scheduler timers, and close SQLite persistence. Cleanup failures should be visible as partial shutdown failures instead of being swallowed.
 
 ## Current Implementation Note
 
