@@ -80,8 +80,12 @@ In the current scaffold:
 3. persist the order
 4. call the dry-run adapter
 5. record a synthetic accepted state for inspection
+6. immediately settle supported dry-run orders as `FILLED` with a durable synthetic fill and `ORDER_FILLED` event
 
 The dry-run path must still use the real order tables so that the operational shape matches the future live path.
+Dry-run settlement must never mutate exchange state and must remain visibly marked as simulated evidence.
+If an older dry-run adapter artifact remains active or `RECONCILIATION_REQUIRED`, reconciliation must repair it locally instead of querying Upbit for its `dryrun_*` UUID. When price and volume evidence are available, the repair records a synthetic local fill and moves the order to `FILLED`; otherwise it moves the local dry-run artifact to `CANCELED` with explicit repair evidence.
+Synthetic dry-run fills are lifecycle evidence only and must be excluded from exchange-backed portfolio drift explanation.
 
 ## Live Path
 
@@ -145,6 +149,7 @@ Telegram should report lifecycle outcomes, such as:
 - read-only operator readiness inspection through `/readiness`, including bounded local persistence health
 - single-order lifecycle detail through `/order <order-id|identifier>`, including persisted order events and fills
 - persisted scheduler run history through `/scheduler`
+- bounded `/orders` summaries with `/order <order-id|identifier>` for details
 
 Notifications are derived from lifecycle state, not treated as lifecycle state.
 `/help` is static command-contract inspection and must not create an order-lifecycle transition or trigger sync, strategy runs, scheduler ticks, exchange reads, or order mutation.

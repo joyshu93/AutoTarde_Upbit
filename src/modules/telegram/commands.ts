@@ -90,7 +90,7 @@ export class TelegramCommandRouter {
       case "/positions":
         return { text: formatPositionMessage(await this.dependencies.repositories.getLatestPositionSnapshot(exchangeAccountId)) };
       case "/orders":
-        return { text: formatOrdersMessage(await this.dependencies.repositories.listOrders(exchangeAccountId)) };
+        return { text: formatOrdersMessage(await this.dependencies.repositories.listOrders(exchangeAccountId), { limit: 20 }) };
       case "/order":
         return this.buildOrderDetailResponse(exchangeAccountId, parsed.args[0] ?? "");
       case "/scheduler":

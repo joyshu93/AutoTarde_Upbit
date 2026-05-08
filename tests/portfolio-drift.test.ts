@@ -139,6 +139,86 @@ test("portfolio drift explains cash and position movement with local fills befor
   assert.deepEqual(evaluation.findings, []);
 });
 
+test("portfolio drift ignores dry-run synthetic fills because they do not mutate exchange balances", () => {
+  const evaluation = detectPortfolioDrift({
+    previousBalanceSnapshot: {
+      id: "balance-prev-dryrun",
+      exchangeAccountId: "primary",
+      capturedAt: "2026-04-20T00:00:00.000Z",
+      source: "RECONCILIATION",
+      totalKrwValue: "10000000",
+      balancesJson: JSON.stringify([
+        { currency: "KRW", balance: "10000000", locked: "0", avgBuyPrice: "0", unitCurrency: "KRW" },
+        { currency: "BTC", balance: "0.01", locked: "0", avgBuyPrice: "100000000", unitCurrency: "KRW" },
+      ]),
+    },
+    currentBalanceSnapshot: {
+      id: "balance-current-dryrun",
+      exchangeAccountId: "primary",
+      capturedAt: "2026-04-20T00:10:00.000Z",
+      source: "RECONCILIATION",
+      totalKrwValue: "10000000",
+      balancesJson: JSON.stringify([
+        { currency: "KRW", balance: "10000000", locked: "0", avgBuyPrice: "0", unitCurrency: "KRW" },
+        { currency: "BTC", balance: "0.01", locked: "0", avgBuyPrice: "100000000", unitCurrency: "KRW" },
+      ]),
+    },
+    previousPositionSnapshot: {
+      id: "position-prev-dryrun",
+      exchangeAccountId: "primary",
+      capturedAt: "2026-04-20T00:00:00.000Z",
+      source: "RECONCILIATION",
+      positionsJson: JSON.stringify([
+        {
+          asset: "BTC",
+          market: "KRW-BTC",
+          quantity: "0.01",
+          averageEntryPrice: "100000000",
+          markPrice: "100000000",
+          marketValue: "1000000",
+          exposureRatio: null,
+          capturedAt: "2026-04-20T00:00:00.000Z",
+        },
+      ]),
+    },
+    currentPositionSnapshot: {
+      id: "position-current-dryrun",
+      exchangeAccountId: "primary",
+      capturedAt: "2026-04-20T00:10:00.000Z",
+      source: "RECONCILIATION",
+      positionsJson: JSON.stringify([
+        {
+          asset: "BTC",
+          market: "KRW-BTC",
+          quantity: "0.01",
+          averageEntryPrice: "100000000",
+          markPrice: "100000000",
+          marketValue: "1000000",
+          exposureRatio: null,
+          capturedAt: "2026-04-20T00:10:00.000Z",
+        },
+      ]),
+    },
+    fills: [
+      {
+        id: "fill-dryrun",
+        orderId: "order-dryrun",
+        exchangeFillId: "dryrun_repair:order-dryrun",
+        market: "KRW-BTC",
+        side: "ask",
+        price: "100000000",
+        volume: "0.01",
+        feeCurrency: null,
+        feeAmount: "0",
+        filledAt: "2026-04-20T00:05:00.000Z",
+        rawPayloadJson: JSON.stringify({ mode: "DRY_RUN", settlement: "LOCAL_DRY_RUN_REPAIR" }),
+      },
+    ],
+  });
+
+  assert.deepEqual(evaluation.findings, []);
+});
+
 test("portfolio drift flags unexplained cash and quantity changes", () => {
   const evaluation = detectPortfolioDrift({
     previousBalanceSnapshot: {

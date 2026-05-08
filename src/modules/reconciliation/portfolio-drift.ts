@@ -65,7 +65,10 @@ function detectBalanceDrift(input: {
     };
   }
 
-  const explained = aggregateFillDeltas(input.fills.filter((fill) => fill.filledAt > input.previousBalanceSnapshot!.capturedAt));
+  const fillsSincePrevious = input.fills.filter(
+    (fill) => fill.filledAt > input.previousBalanceSnapshot!.capturedAt && isExchangeBackedFill(fill),
+  );
+  const explained = aggregateFillDeltas(fillsSincePrevious);
   const actualKrwDelta = current.KRW - previous.KRW;
   const unexplainedKrwDelta = actualKrwDelta - explained.KRW;
   if (isEffectivelyZero(unexplainedKrwDelta)) {
@@ -90,7 +93,7 @@ function detectBalanceDrift(input: {
         actualKrwDelta,
         explainedKrwDelta: explained.KRW,
         unexplainedKrwDelta,
-        fillsConsidered: input.fills.filter((fill) => fill.filledAt > input.previousBalanceSnapshot!.capturedAt).length,
+        fillsConsidered: fillsSincePrevious.length,
       },
     },
   };
@@ -113,7 +116,9 @@ function detectPositionDrift(input: {
     };
   }
 
-  const fillsSincePrevious = input.fills.filter((fill) => fill.filledAt > input.previousPositionSnapshot!.capturedAt);
+  const fillsSincePrevious = input.fills.filter(
+    (fill) => fill.filledAt > input.previousPositionSnapshot!.capturedAt && isExchangeBackedFill(fill),
+  );
   const explained = aggregateFillDeltas(fillsSincePrevious);
   const residualByAsset = MANAGED_ASSETS.reduce<Record<SupportedAsset, number>>(
     (accumulator, asset) => {
@@ -238,6 +243,15 @@ function aggregateFillDeltas(fills: FillRecord[]): {
       ETH: 0,
     },
   );
+}
+
+function isExchangeBackedFill(fill: FillRecord): boolean {
+  if (fill.exchangeFillId.startsWith("dryrun_")) {
+    return false;
+  }
+
+  const parsed = tryParseJson<Record<string, unknown>>(fill.rawPayloadJson);
+  return parsed?.mode !== "DRY_RUN";
 }
 
 function tryParseJson<T>(rawJson: string): T | null {

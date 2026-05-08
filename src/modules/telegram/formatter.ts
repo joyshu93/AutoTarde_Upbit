@@ -380,7 +380,7 @@ export function formatPositionMessage(snapshot: PositionSnapshotRecord | null): 
   ].join("\n");
 }
 
-export function formatOrdersMessage(orders: OrderRecord[]): string {
+export function formatOrdersMessage(orders: OrderRecord[], options?: { limit?: number }): string {
   if (orders.length === 0) {
     return [
       "Orders",
@@ -390,14 +390,22 @@ export function formatOrdersMessage(orders: OrderRecord[]): string {
   }
 
   const sortedOrders = [...orders].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const limit = Math.max(1, Math.trunc(options?.limit ?? sortedOrders.length));
+  const visibleOrders = sortedOrders.slice(0, limit);
+  const omittedCount = Math.max(0, sortedOrders.length - visibleOrders.length);
 
   return [
     "Orders",
     `count: ${sortedOrders.length}`,
-    ...sortedOrders.map(
+    `displayed_count: ${visibleOrders.length}`,
+    `omitted_count: ${omittedCount}`,
+    ...visibleOrders.map(
       (order) =>
         `- ${order.updatedAt} | ${order.market} | ${order.side} | ${order.status} | mode=${order.executionMode} | price=${order.price ?? "market"} | volume=${order.volume ?? "notional"} | id=${order.identifier}`,
     ),
+    ...(omittedCount > 0
+      ? [`note: Showing the most recent ${visibleOrders.length} order(s). Use /order <id|identifier> for details.`]
+      : []),
   ].join("\n");
 }
 
@@ -575,10 +583,8 @@ function buildReadinessChecks(input: {
     },
     {
       name: "latest_reconciliation",
-      status: describeReconciliationReadinessStatus(input.latestReconciliationRun),
-      detail: input.latestReconciliationRun
-        ? `latest reconciliation status=${input.latestReconciliationRun.status} completed_at=${input.latestReconciliationRun.completedAt ?? "none"}`
-        : "no reconciliation run is stored yet",
+      status: describeReconciliationReadiness(input.latestReconciliationRun).status,
+      detail: describeReconciliationReadiness(input.latestReconciliationRun).detail,
     },
     {
       name: "active_orders",
@@ -608,18 +614,53 @@ function countRiskBlocks(events: readonly RiskEventRecord[]): number {
   return events.filter((event) => event.level === "BLOCK").length;
 }
 
-function describeReconciliationReadinessStatus(
+function describeReconciliationReadiness(
   run: ReconciliationRunRecord | null,
-): "PASS" | "WARN" | "BLOCK" {
+): { status: "PASS" | "WARN" | "BLOCK"; detail: string } {
   if (!run) {
-    return "WARN";
+    return {
+      status: "WARN",
+      detail: "no reconciliation run is stored yet",
+    };
   }
 
   if (run.status === "SUCCESS") {
-    return "PASS";
+    return {
+      status: "PASS",
+      detail: `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"}`,
+    };
   }
 
-  return "BLOCK";
+  const meta = tryParseReconciliationSummaryMeta(run.summaryJson);
+  const blockingIssueCodes = meta.issueCodes.filter(isBlockingReconciliationIssueCode);
+  const issueSummary = meta.issueCodes.length === 0 ? "none" : meta.issueCodes.join(",");
+  if (blockingIssueCodes.length > 0) {
+    return {
+      status: "BLOCK",
+      detail:
+        `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ` +
+        `blocking_issue_codes=${blockingIssueCodes.join(",")} issue_codes=${issueSummary}`,
+    };
+  }
+
+  return {
+    status: "WARN",
+    detail:
+      `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ` +
+      `non_blocking_issue_codes=${issueSummary}`,
+  };
+}
+
+function isBlockingReconciliationIssueCode(code: string): boolean {
+  return [
+    "BALANCE_DRIFT_DETECTED",
+    "POSITION_DRIFT_DETECTED",
+    "ORDER_MARKED_FOR_RECOVERY",
+    "ORDER_REFERENCE_MISSING",
+    "ORDER_LOOKUP_TRANSIENT_FAILURE",
+    "ORDER_LOOKUP_DEFERRED",
+    "ORDER_HISTORY_LOOKUP_FAILED",
+  ].includes(code);
 }
 
 function formatOrderEventLines(events: OrderEventRecord[]): string[] {

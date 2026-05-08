@@ -89,11 +89,69 @@ test("execution service persists a dry-run order and blocks duplicate idempotent
 
   const first = await service.submitOrderFromDecision(input);
   assert.equal(first.accepted, true);
-  assert.equal(first.order?.status, "OPEN");
+  assert.equal(first.order?.status, "FILLED");
+
+  const activeOrders = await repositories.listActiveOrders("primary");
+  const events = await repositories.listOrderEvents(first.order?.id ?? "");
+  const fills = await repositories.listFills(first.order?.id);
+  assert.equal(activeOrders.length, 0);
+  assert.equal(events.at(-1)?.eventType, "ORDER_FILLED");
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0]?.price, "100000000");
+  assert.equal(fills[0]?.volume, "0.001");
 
   const second = await service.submitOrderFromDecision(input);
   assert.equal(second.accepted, false);
   assert.match(second.reason ?? "", /Duplicate order intent/);
+});
+
+test("execution service settles dry-run price bids with a synthetic fill derived from reference price", async () => {
+  const { service, repositories } = createExecutionService();
+  await repositories.saveBalanceSnapshot({
+    id: "balance-price-bid",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:00:00.000Z",
+    source: "EXCHANGE_POLL",
+    totalKrwValue: "10000000",
+    balancesJson: "[]",
+  });
+  await repositories.savePositionSnapshot({
+    id: "position-price-bid",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:00:00.000Z",
+    source: "EXCHANGE_POLL",
+    positionsJson: "[]",
+  });
+
+  const result = await service.submitOrderFromDecision({
+    exchangeAccountId: "primary",
+    strategyDecisionId: "decision-price-bid",
+    decision: {
+      strategyKey: "deterministic.stub.v1",
+      market: "KRW-BTC",
+      action: "ENTER",
+      reasonCodes: ["PRICE_BID"],
+      referencePrice: 100_000_000,
+      requestedNotionalKrw: 100_000,
+      requestedQuantity: null,
+      metadata: {},
+    },
+    side: "bid",
+    ordType: "price",
+    price: "100000",
+    volume: null,
+  });
+
+  const activeOrders = await repositories.listActiveOrders("primary");
+  const fills = await repositories.listFills(result.order?.id);
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.order?.status, "FILLED");
+  assert.equal(activeOrders.length, 0);
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0]?.price, "100000000");
+  assert.equal(fills[0]?.volume, "0.001");
+  assert.match(fills[0]?.rawPayloadJson ?? "", /SIMULATED_IMMEDIATE_FILL/);
 });
 
 test("execution service blocks new orders when startup recovery has left the system DEGRADED", async () => {
@@ -634,6 +692,12 @@ test("execution service records order mode from persisted operator state", async
     volume: "0.03",
   });
 
+  const events = await repositories.listOrderEvents(result.order?.id ?? "");
+  const fills = await repositories.listFills(result.order?.id);
+
   assert.equal(result.accepted, true);
   assert.equal(result.order?.executionMode, "LIVE");
+  assert.equal(result.order?.status, "OPEN");
+  assert.equal(events.some((event) => event.eventType === "ORDER_FILLED"), false);
+  assert.equal(fills.length, 0);
 });

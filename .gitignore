@@ -5,6 +5,7 @@ dist/
 .env.local
 .env.example.local
 .env.*.local
+scripts/*.local.ps1
 coverage/
 *.log
 *.tsbuildinfo

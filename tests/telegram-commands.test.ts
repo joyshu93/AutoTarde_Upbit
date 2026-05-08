@@ -27,10 +27,50 @@ function createRouter(): TelegramCommandRouter {
   });
 }
 
+function createRuntimeConfig() {
+  return {
+    serviceName: "AutoTrade_Upbit",
+    executionMode: "DRY_RUN" as const,
+    liveExecutionGate: "DISABLED" as const,
+    liveSendPath: "DRY_RUN_ADAPTER" as const,
+    upbitBaseUrl: "https://api.upbit.com",
+    databasePath: "./var/autotrade-upbit.sqlite",
+    exchangeBackedReadEnabled: true,
+    telegramDeliveryEnabled: true,
+    telegramBotTokenConfigured: true,
+    telegramOperatorChatIdConfigured: true,
+    telegramDeliveryMaxAttempts: 5,
+    telegramDeliveryBaseBackoffMs: 15_000,
+    telegramDeliveryMaxBackoffMs: 300_000,
+    telegramDeliveryLeaseMs: 30_000,
+    telegramInboundPollingEnabled: true,
+    telegramInboundPollIntervalMs: 2_000,
+    telegramInboundPollTimeoutSeconds: 25,
+    telegramInboundPollLimit: 10,
+    strategySchedulerEnabled: false,
+    strategySchedulerRunOnStart: false,
+    strategySchedulerBtcIntervalMs: 3_600_000,
+    strategySchedulerEthIntervalMs: 3_600_000,
+    reconciliationMaxOrderLookupsPerRun: 10,
+    reconciliationHistoryMaxPagesPerMarket: 3,
+    reconciliationClosedOrderLookbackDays: 7,
+    reconciliationHistoryStopBeforeDays: 365,
+    reconciliationHistoryRetentionAssumptionDays: 365,
+    stalePriceThresholdMs: 30_000,
+    minimumOrderValueKrw: 5_000,
+    maxAllocationByAsset: {
+      BTC: 0.6,
+      ETH: 0.6,
+    },
+    totalExposureCap: 0.75,
+  };
+}
+
 test("telegram router parses supported operator commands only", () => {
   const router = createRouter();
 
   const helpParsed = router.parse("/help");
+  const startParsed = router.parse("/start");
   const configParsed = router.parse("/config");
   const readinessParsed = router.parse("/readiness");
   const parsed = router.parse("/status");
@@ -46,6 +86,8 @@ test("telegram router parses supported operator commands only", () => {
   assert.equal(helpParsed?.command, "/help");
   assert.deepEqual(helpParsed?.args, []);
   assert.equal(helpParsed?.contract.category, "inspection");
+  assert.equal(startParsed?.command, "/help");
+  assert.deepEqual(startParsed?.args, []);
   assert.equal(configParsed?.command, "/config");
   assert.deepEqual(configParsed?.args, []);
   assert.equal(configParsed?.contract.category, "inspection");
@@ -362,6 +404,119 @@ test("telegram router readiness summarizes persistence health warnings", async (
   assert.match(response.text, /- pending_notifications: WARN \| 1 pending operator notification\(s\) in bounded sample/);
 });
 
+test("telegram router readiness warns for non-blocking reconciliation recovery progress", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveBalanceSnapshot({
+    id: "balance-recovery-progress",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:01:00.000Z",
+    source: "RECONCILIATION",
+    totalKrwValue: "1000000",
+    balancesJson: "[]",
+  });
+  await repository.savePositionSnapshot({
+    id: "position-recovery-progress",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:02:00.000Z",
+    source: "RECONCILIATION",
+    positionsJson: "[]",
+  });
+  await repository.saveReconciliationRun({
+    id: "recon-recovery-progress",
+    exchangeAccountId: "primary",
+    status: "DRIFT_DETECTED",
+    startedAt: "2026-04-20T00:03:00.000Z",
+    completedAt: "2026-04-20T00:03:01.000Z",
+    summaryJson: JSON.stringify({
+      source: "OPERATOR_SYNC",
+      status: "DRIFT_DETECTED",
+      issues: [
+        { code: "EXCHANGE_ORDER_RECOVERED", message: "Recovered exchange order." },
+        { code: "TERMINAL_ORDER_RECHECKED", message: "Terminal order rechecked." },
+        { code: "ORDER_FILLS_BACKFILLED", message: "Backfilled fills." },
+      ],
+    }),
+    errorMessage: null,
+  });
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-recovery-progress",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    runtimeConfig: createRuntimeConfig(),
+  });
+
+  const response = await router.route("/readiness");
+
+  assert.match(response.text, /overall_status: WARN/);
+  assert.match(response.text, /latest_reconciliation_status: DRIFT_DETECTED/);
+  assert.match(response.text, /- latest_reconciliation: WARN \| latest reconciliation status=DRIFT_DETECTED completed_at=2026-04-20T00:03:01.000Z non_blocking_issue_codes=EXCHANGE_ORDER_RECOVERED,TERMINAL_ORDER_RECHECKED,ORDER_FILLS_BACKFILLED/);
+});
+
+test("telegram router readiness blocks for portfolio drift reconciliation issues", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveBalanceSnapshot({
+    id: "balance-drift-block",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:01:00.000Z",
+    source: "RECONCILIATION",
+    totalKrwValue: "1000000",
+    balancesJson: "[]",
+  });
+  await repository.savePositionSnapshot({
+    id: "position-drift-block",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:02:00.000Z",
+    source: "RECONCILIATION",
+    positionsJson: "[]",
+  });
+  await repository.saveReconciliationRun({
+    id: "recon-drift-block",
+    exchangeAccountId: "primary",
+    status: "DRIFT_DETECTED",
+    startedAt: "2026-04-20T00:03:00.000Z",
+    completedAt: "2026-04-20T00:03:01.000Z",
+    summaryJson: JSON.stringify({
+      source: "OPERATOR_SYNC",
+      status: "DRIFT_DETECTED",
+      issues: [
+        { code: "BALANCE_DRIFT_DETECTED", message: "Balance drift." },
+      ],
+    }),
+    errorMessage: null,
+  });
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-drift-block",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    runtimeConfig: createRuntimeConfig(),
+  });
+
+  const response = await router.route("/readiness");
+
+  assert.match(response.text, /overall_status: BLOCK/);
+  assert.match(response.text, /- latest_reconciliation: BLOCK \| latest reconciliation status=DRIFT_DETECTED completed_at=2026-04-20T00:03:01.000Z blocking_issue_codes=BALANCE_DRIFT_DETECTED issue_codes=BALANCE_DRIFT_DETECTED/);
+});
+
 test("telegram router readiness blocks unhealthy execution state without triggering controllers", async () => {
   const router = new TelegramCommandRouter({
     repositories: new InMemoryExecutionRepository(),
@@ -589,6 +744,42 @@ test("telegram router reports missing order detail without reading events or fil
   assert.match(response.text, /query: unknown-order/);
   assert.equal(eventLookupCount, 0);
   assert.equal(fillLookupCount, 0);
+});
+
+test("telegram router bounds /orders output for delivery-safe summaries", async () => {
+  const repository = new InMemoryExecutionRepository();
+  for (let index = 0; index < 25; index += 1) {
+    await repository.saveOrder(createOrder({
+      id: `order-summary-${index}`,
+      identifier: `order-summary-identifier-${index}`,
+      updatedAt: `2026-04-20T00:${String(index).padStart(2, "0")}:00.000Z`,
+    }));
+  }
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-orders-summary",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+  });
+
+  const response = await router.route("/orders");
+
+  assert.match(response.text, /Orders/);
+  assert.match(response.text, /count: 25/);
+  assert.match(response.text, /displayed_count: 20/);
+  assert.match(response.text, /omitted_count: 5/);
+  assert.match(response.text, /order-summary-identifier-24/);
+  assert.doesNotMatch(response.text, /order-summary-identifier-0/);
+  assert.match(response.text, /Use \/order <id\|identifier> for details\./);
 });
 
 test("telegram router exposes persisted execution status with explicit blockers", async () => {

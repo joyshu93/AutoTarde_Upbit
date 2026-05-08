@@ -16,7 +16,8 @@ export interface ReconciliationIssue {
     | "ORDER_LOOKUP_TRANSIENT_FAILURE"
     | "ORDER_LOOKUP_DEFERRED"
     | "EXCHANGE_ORDER_RECOVERED"
-    | "ORDER_HISTORY_LOOKUP_FAILED";
+    | "ORDER_HISTORY_LOOKUP_FAILED"
+    | "DRY_RUN_ORDER_REPAIRED";
   message: string;
 }
 

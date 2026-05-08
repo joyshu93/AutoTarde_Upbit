@@ -249,6 +249,10 @@ function normalizeCommandToken(rawCommand: string): SupportedTelegramCommand | n
     return null;
   }
 
+  if (normalized === "/start") {
+    return "/help";
+  }
+
   if (!TELEGRAM_COMMAND_CONTRACT_MAP.has(normalized as SupportedTelegramCommand)) {
     return null;
   }

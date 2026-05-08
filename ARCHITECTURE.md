@@ -94,8 +94,10 @@ Owns recovery-oriented comparison between persisted local lifecycle state and ex
 
 Current slice:
 - exchange-backed active-order reconciliation through `/sync`
+- local dry-run order repair during reconciliation, so `dryrun_*` UUIDs are never queried against Upbit as real exchange orders
 - terminal-order fill backfill during `/sync`
 - balance and position drift detection by comparing new exchange-backed snapshots against the prior persisted snapshots plus local fill history
+- portfolio drift detection excludes simulated `DRY_RUN` fills because they do not mutate exchange balances
 - startup recovery sweep when exchange-backed Upbit reads are configured
 - per-run reconciliation lookup budgeting with oldest-first processing inside each priority tier
 - checkpointed exchange-history recovery with an explicit stop-before boundary, explicit exchange-retention assumption metadata, `IN_PROGRESS` / `COMPLETE` coverage status, and separate `HIGH` / `PARTIAL` / `FAILED` confidence classification
@@ -114,8 +116,10 @@ Telegram is an operator surface only.
 
 It provides:
 - `/help` for static command-contract inspection and operator safety boundaries
+- `/start` as a transport-friendly alias to `/help`
 - `/config` for non-secret runtime configuration, live blockers, and explicit risk-limit inspection
 - `/readiness` for read-only operator readiness over runtime config, execution state, worker status, latest persisted health records, and bounded local persistence health
+- `/readiness` classifies reconciliation recovery progress as warnings while keeping portfolio drift and unresolved order recovery as blockers
 - inspection commands
 - pause/resume/killswitch controls
 - reporting-friendly formatters
@@ -207,6 +211,8 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 - order intents are persisted to the active repository
 - risk is evaluated
 - the dry-run exchange adapter simulates submission without live transmission
+- submitted dry-run orders are immediately settled with simulated `FILLED` lifecycle evidence and synthetic fills when the order shape supports it
+- reconciliation repairs older local dry-run artifacts to terminal local states without issuing Upbit private order lookups
 - operator surfaces still see realistic lifecycle records
 
 ### `LIVE`

@@ -223,12 +223,13 @@ export class ExecutionService {
         smpType: null,
       });
 
+      const submittedAt = new Date().toISOString();
       const updatedOrder: OrderRecord = {
         ...order,
         upbitUuid: exchangeOrder.uuid,
-        status: exchangeOrder.executedVolume && Number(exchangeOrder.executedVolume) > 0 ? "PARTIALLY_FILLED" : "OPEN",
+        status: mapExchangeOrderStatus(exchangeOrder.state, exchangeOrder.executedVolume),
         exchangeResponseJson: JSON.stringify(exchangeOrder.raw),
-        updatedAt: new Date().toISOString(),
+        updatedAt: submittedAt,
       };
 
       await this.dependencies.repositories.updateOrder(updatedOrder);
@@ -241,6 +242,7 @@ export class ExecutionService {
         createdAt: updatedOrder.updatedAt,
       });
 
+      let savedFillCount = 0;
       for (const fill of exchangeOrder.fills) {
         await this.dependencies.repositories.saveFill({
           id: createId("fill"),
@@ -255,6 +257,55 @@ export class ExecutionService {
           filledAt: fill.createdAt ?? updatedOrder.updatedAt,
           rawPayloadJson: JSON.stringify(fill.raw),
         });
+        savedFillCount += 1;
+      }
+
+      if (state.executionMode === "DRY_RUN") {
+        const settledAt = new Date().toISOString();
+        const syntheticFill = createDryRunSyntheticFill({
+          orderId: order.id,
+          market,
+          side: input.side,
+          ordType: input.ordType,
+          price: input.price,
+          volume: input.volume,
+          referencePrice: decision.referencePrice,
+          requestedNotionalKrw,
+          filledAt: settledAt,
+          exchangeOrderRaw: exchangeOrder.raw,
+        });
+
+        if (savedFillCount === 0 && syntheticFill) {
+          await this.dependencies.repositories.saveFill(syntheticFill);
+          savedFillCount += 1;
+        }
+
+        const settledOrder: OrderRecord = {
+          ...updatedOrder,
+          status: "FILLED",
+          updatedAt: settledAt,
+        };
+
+        await this.dependencies.repositories.updateOrder(settledOrder);
+        await this.dependencies.repositories.appendOrderEvent({
+          id: createId("order_event"),
+          orderId: order.id,
+          eventType: "ORDER_FILLED",
+          eventSource: "LOCAL",
+          payloadJson: JSON.stringify({
+            mode: "DRY_RUN",
+            settlement: "SIMULATED_IMMEDIATE_FILL",
+            syntheticFillCreated: Boolean(syntheticFill && savedFillCount > 0),
+            fillCount: savedFillCount,
+          }),
+          createdAt: settledAt,
+        });
+
+        return {
+          accepted: true,
+          order: settledOrder,
+          reason: null,
+        };
       }
 
       return {
@@ -509,6 +560,75 @@ function composeExecutionPolicy(
     stalePriceThresholdMs: riskLimits.stalePriceThresholdMs,
     minimumOrderValueKrw: riskLimits.minimumOrderValueKrw,
   };
+}
+
+function mapExchangeOrderStatus(
+  exchangeState: string,
+  executedVolume: string | null,
+): OrderRecord["status"] {
+  if (exchangeState === "done") {
+    return "FILLED";
+  }
+  if (exchangeState === "cancel") {
+    return "CANCELED";
+  }
+
+  return executedVolume && Number(executedVolume) > 0 ? "PARTIALLY_FILLED" : "OPEN";
+}
+
+function createDryRunSyntheticFill(input: {
+  orderId: string;
+  market: OrderRecord["market"];
+  side: OrderRecord["side"];
+  ordType: OrderRecord["ordType"];
+  price: string | null;
+  volume: string | null;
+  referencePrice: number;
+  requestedNotionalKrw: number | null;
+  filledAt: string;
+  exchangeOrderRaw: unknown;
+}) {
+  const price =
+    input.ordType === "price" || input.price === null
+      ? String(input.referencePrice)
+      : input.price;
+  const volume = input.volume ?? deriveDryRunVolume(input.requestedNotionalKrw, input.referencePrice);
+
+  if (!volume || Number(volume) <= 0 || Number(price) <= 0) {
+    return null;
+  }
+
+  return {
+    id: createId("fill"),
+    orderId: input.orderId,
+    exchangeFillId: createId("dryrun_fill"),
+    market: input.market,
+    side: input.side,
+    price,
+    volume,
+    feeCurrency: "KRW",
+    feeAmount: "0",
+    filledAt: input.filledAt,
+    rawPayloadJson: JSON.stringify({
+      mode: "DRY_RUN",
+      settlement: "SIMULATED_IMMEDIATE_FILL",
+      exchangeOrderRaw: input.exchangeOrderRaw,
+    }),
+  };
+}
+
+function deriveDryRunVolume(requestedNotionalKrw: number | null, referencePrice: number): string | null {
+  if (
+    typeof requestedNotionalKrw !== "number" ||
+    !Number.isFinite(requestedNotionalKrw) ||
+    requestedNotionalKrw <= 0 ||
+    !Number.isFinite(referencePrice) ||
+    referencePrice <= 0
+  ) {
+    return null;
+  }
+
+  return (requestedNotionalKrw / referencePrice).toFixed(12).replace(/0+$/u, "").replace(/\.$/u, "");
 }
 
 function createRiskEvent(

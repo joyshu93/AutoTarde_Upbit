@@ -109,6 +109,100 @@ test("reconciliation service updates active orders from exchange state and captu
   assert.equal(fills[0]?.exchangeFillId, "trade-1");
 });
 
+test("reconciliation service repairs local dry-run orders without querying Upbit", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-dryrun-repair",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  });
+  await repositories.savePositionSnapshot({
+    id: "position-snapshot-dryrun-repair",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:00:00.000Z",
+    source: "RECONCILIATION",
+    positionsJson: JSON.stringify([
+      {
+        asset: "BTC",
+        market: "KRW-BTC",
+        quantity: "0.00007489",
+        averageEntryPrice: "115950000",
+        markPrice: "117860000",
+        marketValue: "8826.5354",
+        exposureRatio: null,
+        capturedAt: "2026-04-20T00:00:00.000Z",
+      },
+    ]),
+  });
+  await repositories.saveOrder({
+    id: "order-dryrun-repair",
+    strategyDecisionId: "decision-dryrun-repair",
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    side: "ask",
+    ordType: "market",
+    volume: "0.00007489",
+    price: null,
+    timeInForce: null,
+    smpType: null,
+    identifier: "KRW-BTC-ask-dryrun-repair",
+    idempotencyKey: "idem-dryrun-repair",
+    origin: "STRATEGY",
+    requestedAt: "2026-04-20T00:00:00.000Z",
+    upbitUuid: "dryrun_order_1",
+    status: "RECONCILIATION_REQUIRED",
+    executionMode: "DRY_RUN",
+    exchangeResponseJson: JSON.stringify({ mode: "DRY_RUN" }),
+    failureCode: "RECONCILIATION_REQUIRED",
+    failureMessage: "Exchange order lookup failed: Upbit private request failed (404 Not Found).",
+    createdAt: "2026-04-20T00:00:00.000Z",
+    updatedAt: "2026-04-20T00:10:00.000Z",
+  });
+  let lookupCount = 0;
+  const service = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: {
+      async getOrder() {
+        lookupCount += 1;
+        throw new Error("dry-run orders must not be queried on Upbit");
+      },
+    },
+  });
+
+  const summary = await service.run("primary");
+  const orders = await repositories.listOrders("primary");
+  const fills = await repositories.listFills("order-dryrun-repair");
+  const events = await repositories.listOrderEvents("order-dryrun-repair");
+  const activeOrders = await repositories.listActiveOrders("primary");
+
+  assert.equal(lookupCount, 0);
+  assert.equal(summary.status, "DRIFT_DETECTED");
+  assert.equal(summary.candidateCount, 0);
+  assert.deepEqual(summary.issues, [
+    {
+      code: "DRY_RUN_ORDER_REPAIRED",
+      message: "Dry-run local order order-dryrun-repair was repaired to FILLED with a synthetic local fill.",
+    },
+  ]);
+  assert.equal(orders[0]?.status, "FILLED");
+  assert.equal(orders[0]?.failureCode, null);
+  assert.equal(orders[0]?.failureMessage, null);
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0]?.exchangeFillId, "dryrun_repair:order-dryrun-repair");
+  assert.equal(fills[0]?.price, "117860000");
+  assert.equal(fills[0]?.volume, "0.00007489");
+  assert.equal(events.at(-1)?.eventType, "ORDER_FILLED");
+  assert.equal(activeOrders.length, 0);
+});
+
 test("reconciliation service recovers exchange-only orders from recent exchange history", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = new InMemoryOperatorStateStore({

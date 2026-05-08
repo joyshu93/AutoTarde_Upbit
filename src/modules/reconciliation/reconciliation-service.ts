@@ -1,8 +1,10 @@
 import type {
   BalanceSnapshotRecord,
   ExecutionMode,
+  FillRecord,
   OrderLifecycleStatus,
   OrderRecord,
+  PositionSnapshot,
   PositionSnapshotRecord,
   RiskEventRecord,
 } from "../../domain/types.js";
@@ -68,9 +70,12 @@ export class ReconciliationService {
       this.dependencies.repositories.listOrders(exchangeAccountId),
       this.dependencies.operatorState.getState(),
     ]);
-    const terminalOrders = await this.listTerminalOrdersNeedingBackfill(allOrders);
-    const candidates = buildReconciliationCandidates(openOrders, terminalOrders);
     const issues: ReconciliationIssue[] = [];
+    const dryRunRepairIssues = await this.repairLocalDryRunOrders(openOrders, startedAt);
+    issues.push(...dryRunRepairIssues);
+    const exchangeBackedOpenOrders = openOrders.filter((order) => !isLocalDryRunExchangeArtifact(order));
+    const terminalOrders = await this.listTerminalOrdersNeedingBackfill(allOrders);
+    const candidates = buildReconciliationCandidates(exchangeBackedOpenOrders, terminalOrders);
     let processedCount = 0;
 
     const historyRecovery = await this.recoverMissingExchangeOrders(
@@ -190,6 +195,7 @@ export class ReconciliationService {
   private async listTerminalOrdersNeedingBackfill(orders: OrderRecord[]): Promise<OrderRecord[]> {
     const candidates = orders.filter(
       (order) =>
+        !isLocalDryRunExchangeArtifact(order) &&
         TERMINAL_RECONCILIATION_STATUSES.has(order.status) &&
         Boolean(order.upbitUuid || order.identifier),
     );
@@ -203,6 +209,154 @@ export class ReconciliationService {
     return fillsByOrder
       .filter(({ order, fills }) => shouldReconcileTerminalOrder(order, fills.length))
       .map(({ order }) => order);
+  }
+
+  private async repairLocalDryRunOrders(
+    orders: OrderRecord[],
+    repairedAt: string,
+  ): Promise<ReconciliationIssue[]> {
+    const issues: ReconciliationIssue[] = [];
+    const dryRunOrders = orders.filter(isLocalDryRunExchangeArtifact);
+
+    for (const order of dryRunOrders) {
+      const existingFills = await this.dependencies.repositories.listFills(order.id);
+      if (existingFills.length > 0) {
+        await this.dependencies.repositories.updateOrder({
+          ...order,
+          status: "FILLED",
+          failureCode: null,
+          failureMessage: null,
+          updatedAt: repairedAt,
+        });
+        await this.dependencies.repositories.appendOrderEvent({
+          id: createId("order_event"),
+          orderId: order.id,
+          eventType: "DRY_RUN_ORDER_REPAIRED",
+          eventSource: "RECONCILIATION",
+          payloadJson: JSON.stringify({
+            previousStatus: order.status,
+            nextStatus: "FILLED",
+            existingFillCount: existingFills.length,
+            settlement: "LOCAL_DRY_RUN_REPAIR",
+          }),
+          createdAt: repairedAt,
+        });
+        issues.push({
+          code: "DRY_RUN_ORDER_REPAIRED",
+          message: `Dry-run local order ${order.id} was repaired to FILLED using existing local fill evidence.`,
+        });
+        continue;
+      }
+
+      const syntheticFill = await this.createDryRunRepairFill(order, repairedAt);
+      if (!syntheticFill) {
+        await this.dependencies.repositories.updateOrder({
+          ...order,
+          status: "CANCELED",
+          failureCode: null,
+          failureMessage: null,
+          updatedAt: repairedAt,
+        });
+        await this.dependencies.repositories.appendOrderEvent({
+          id: createId("order_event"),
+          orderId: order.id,
+          eventType: "DRY_RUN_ORDER_REPAIRED",
+          eventSource: "RECONCILIATION",
+          payloadJson: JSON.stringify({
+            previousStatus: order.status,
+            nextStatus: "CANCELED",
+            syntheticFillCreated: false,
+            settlement: "LOCAL_DRY_RUN_REPAIR",
+            reason: "price_or_volume_unavailable",
+          }),
+          createdAt: repairedAt,
+        });
+        issues.push({
+          code: "DRY_RUN_ORDER_REPAIRED",
+          message: `Dry-run local order ${order.id} was repaired to CANCELED because price or volume evidence was unavailable.`,
+        });
+        continue;
+      }
+
+      await this.dependencies.repositories.saveFill(syntheticFill);
+      await this.dependencies.repositories.updateOrder({
+        ...order,
+        status: "FILLED",
+        failureCode: null,
+        failureMessage: null,
+        updatedAt: repairedAt,
+      });
+      await this.dependencies.repositories.appendOrderEvent({
+        id: createId("order_event"),
+        orderId: order.id,
+        eventType: "ORDER_FILLED",
+        eventSource: "RECONCILIATION",
+        payloadJson: JSON.stringify({
+          previousStatus: order.status,
+          nextStatus: "FILLED",
+          syntheticFillCreated: true,
+          settlement: "LOCAL_DRY_RUN_REPAIR",
+          fillId: syntheticFill.exchangeFillId,
+        }),
+        createdAt: repairedAt,
+      });
+      issues.push({
+        code: "DRY_RUN_ORDER_REPAIRED",
+        message: `Dry-run local order ${order.id} was repaired to FILLED with a synthetic local fill.`,
+      });
+    }
+
+    return issues;
+  }
+
+  private async createDryRunRepairFill(
+    order: OrderRecord,
+    repairedAt: string,
+  ): Promise<FillRecord | null> {
+    const price = await this.resolveDryRunRepairPrice(order);
+    const volume = resolveDryRunRepairVolume(order, price);
+    if (!price || !volume) {
+      return null;
+    }
+
+    const exchangeFillId = `dryrun_repair:${order.id}`;
+    return {
+      id: createId("fill"),
+      orderId: order.id,
+      exchangeFillId,
+      market: order.market,
+      side: order.side,
+      price,
+      volume,
+      feeCurrency: null,
+      feeAmount: null,
+      filledAt: repairedAt,
+      rawPayloadJson: JSON.stringify({
+        mode: "DRY_RUN",
+        settlement: "LOCAL_DRY_RUN_REPAIR",
+        orderId: order.id,
+        identifier: order.identifier,
+        upbitUuid: order.upbitUuid,
+      }),
+    };
+  }
+
+  private async resolveDryRunRepairPrice(order: OrderRecord): Promise<string | null> {
+    if (isPositiveNumericString(order.price)) {
+      return order.price;
+    }
+
+    const snapshot = await this.dependencies.repositories.getLatestPositionSnapshot(order.exchangeAccountId);
+    const position = parsePositions(snapshot).find((candidate) => candidate.market === order.market);
+    if (isPositiveNumericString(position?.markPrice ?? null)) {
+      return position?.markPrice ?? null;
+    }
+
+    if (isPositiveNumericString(position?.averageEntryPrice ?? null)) {
+      return position?.averageEntryPrice ?? null;
+    }
+
+    return null;
   }
 
   private async recoverMissingExchangeOrders(
@@ -970,6 +1124,85 @@ function shouldReconcileTerminalOrder(order: OrderRecord, fillCount: number): bo
       return order.exchangeResponseJson === null && order.failureCode !== "TERMINAL_ORDER_CONFIRMED_ABSENT";
     default:
       return false;
+  }
+}
+
+function isLocalDryRunExchangeArtifact(order: OrderRecord): boolean {
+  if (order.upbitUuid?.startsWith("dryrun_")) {
+    return true;
+  }
+
+  const parsed = parseJsonObject(order.exchangeResponseJson);
+  return parsed?.mode === "DRY_RUN";
+}
+
+function resolveDryRunRepairVolume(order: OrderRecord, price: string | null): string | null {
+  if (isPositiveNumericString(order.volume)) {
+    return order.volume;
+  }
+
+  if (order.side === "bid" && isPositiveNumericString(order.price) && isPositiveNumericString(price)) {
+    const notional = Number(order.price);
+    const referencePrice = Number(price);
+    const derivedVolume = notional / referencePrice;
+    return Number.isFinite(derivedVolume) && derivedVolume > 0 ? derivedVolume.toFixed(8) : null;
+  }
+
+  return null;
+}
+
+function parsePositions(snapshot: PositionSnapshotRecord | null): PositionSnapshot[] {
+  if (!snapshot) {
+    return [];
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(snapshot.positionsJson);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed.filter(isPositionSnapshot);
+  } catch {
+    return [];
+  }
+}
+
+function isPositionSnapshot(value: unknown): value is PositionSnapshot {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<PositionSnapshot>;
+  return (
+    (candidate.asset === "BTC" || candidate.asset === "ETH") &&
+    (candidate.market === "KRW-BTC" || candidate.market === "KRW-ETH") &&
+    typeof candidate.quantity === "string" &&
+    typeof candidate.capturedAt === "string"
+  );
+}
+
+function isPositiveNumericString(value: string | null | undefined): value is string {
+  if (typeof value !== "string" || value.length === 0) {
+    return false;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0;
+}
+
+function parseJsonObject(value: string | null): Record<string, unknown> | null {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
   }
 }
 
