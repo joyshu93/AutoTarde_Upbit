@@ -32,6 +32,7 @@ test("telegram router parses supported operator commands only", () => {
 
   const helpParsed = router.parse("/help");
   const configParsed = router.parse("/config");
+  const readinessParsed = router.parse("/readiness");
   const parsed = router.parse("/status");
   const historyParsed = router.parse("/statehistory");
   const syncHistoryParsed = router.parse("/synchistory");
@@ -48,6 +49,9 @@ test("telegram router parses supported operator commands only", () => {
   assert.equal(configParsed?.command, "/config");
   assert.deepEqual(configParsed?.args, []);
   assert.equal(configParsed?.contract.category, "inspection");
+  assert.equal(readinessParsed?.command, "/readiness");
+  assert.deepEqual(readinessParsed?.args, []);
+  assert.equal(readinessParsed?.contract.category, "inspection");
   assert.equal(parsed?.command, "/status");
   assert.deepEqual(parsed?.args, []);
   assert.equal(parsed?.contract.command, "/status");
@@ -149,6 +153,168 @@ test("telegram router exposes non-secret runtime config inspection", async () =>
   assert.doesNotMatch(response.text, /123456:real-bot-token|real-upbit-secret|UPBIT_SECRET_KEY=/);
 });
 
+test("telegram router exposes read-only operator readiness", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveBalanceSnapshot({
+    id: "balance-1",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:01:00.000Z",
+    source: "RECONCILIATION",
+    totalKrwValue: "1000000",
+    balancesJson: "[]",
+  });
+  await repository.savePositionSnapshot({
+    id: "position-1",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:02:00.000Z",
+    source: "RECONCILIATION",
+    positionsJson: "[]",
+  });
+  await repository.saveReconciliationRun({
+    id: "recon-run-1",
+    exchangeAccountId: "primary",
+    status: "SUCCESS",
+    startedAt: "2026-04-20T00:03:00.000Z",
+    completedAt: "2026-04-20T00:03:02.000Z",
+    summaryJson: JSON.stringify({ source: "OPERATOR_SYNC", issues: [] }),
+    errorMessage: null,
+  });
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    runtimeConfig: {
+      serviceName: "AutoTrade_Upbit",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      upbitBaseUrl: "https://api.upbit.com",
+      databasePath: "./var/autotrade-upbit.sqlite",
+      exchangeBackedReadEnabled: true,
+      telegramDeliveryEnabled: true,
+      telegramBotTokenConfigured: true,
+      telegramOperatorChatIdConfigured: true,
+      telegramDeliveryMaxAttempts: 5,
+      telegramDeliveryBaseBackoffMs: 15_000,
+      telegramDeliveryMaxBackoffMs: 300_000,
+      telegramDeliveryLeaseMs: 30_000,
+      telegramInboundPollingEnabled: true,
+      telegramInboundPollIntervalMs: 2_000,
+      telegramInboundPollTimeoutSeconds: 25,
+      telegramInboundPollLimit: 10,
+      strategySchedulerEnabled: true,
+      strategySchedulerRunOnStart: false,
+      strategySchedulerBtcIntervalMs: 3_600_000,
+      strategySchedulerEthIntervalMs: 3_600_000,
+      reconciliationMaxOrderLookupsPerRun: 10,
+      reconciliationHistoryMaxPagesPerMarket: 3,
+      reconciliationClosedOrderLookbackDays: 7,
+      reconciliationHistoryStopBeforeDays: 365,
+      reconciliationHistoryRetentionAssumptionDays: 365,
+      stalePriceThresholdMs: 30_000,
+      minimumOrderValueKrw: 5_000,
+      maxAllocationByAsset: {
+        BTC: 0.6,
+        ETH: 0.6,
+      },
+      totalExposureCap: 0.75,
+    },
+    schedulerStatus: () => ({
+      enabled: true,
+      started: true,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [],
+    }),
+    telegramInboundStatus: () => ({
+      enabled: true,
+      configured: true,
+      running: true,
+      nextOffset: 42,
+      pollIntervalMs: 2_000,
+      longPollTimeoutSeconds: 25,
+      limit: 10,
+      lastPollAt: "2026-04-20T00:04:00.000Z",
+      lastUpdateId: 41,
+      offsetLoaded: true,
+      offsetStorage: "DURABLE",
+      processedCount: 3,
+      ignoredCount: 0,
+      failedCount: 0,
+      lastError: null,
+    }),
+  });
+
+  const response = await router.route("/readiness");
+
+  assert.match(response.text, /Operator Readiness/);
+  assert.match(response.text, /state_source: runtime config \+ persisted execution_state \+ latest persisted snapshots/);
+  assert.match(response.text, /overall_status: PASS/);
+  assert.match(response.text, /live_gate: DISABLED/);
+  assert.match(response.text, /latest_balance_snapshot_at: 2026-04-20T00:01:00.000Z/);
+  assert.match(response.text, /latest_position_snapshot_at: 2026-04-20T00:02:00.000Z/);
+  assert.match(response.text, /latest_reconciliation_status: SUCCESS/);
+  assert.match(response.text, /- live_send_safety: PASS \| live order path blocked by DRY_RUN,LIVE_GATE_DISABLED,DRY_RUN_ADAPTER/);
+  assert.match(response.text, /- telegram_inbound: PASS \| inbound configured running=true offset_storage=DURABLE/);
+  assert.match(response.text, /- strategy_scheduler: PASS \| scheduler enabled started=true/);
+  assert.match(response.text, /read_only_boundary: \/readiness never triggers sync, Telegram polling, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission\./);
+  assert.match(response.text, /secret_boundary: secret values are never rendered/);
+});
+
+test("telegram router readiness blocks unhealthy execution state without triggering controllers", async () => {
+  const router = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "DEGRADED",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: "startup_portfolio_drift_detected",
+      degradedAt: "2026-04-20T00:00:00.000Z",
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    syncController: {
+      async requestSync() {
+        throw new Error("/readiness must not call syncController");
+      },
+    },
+    strategyRunController: {
+      async requestRun() {
+        throw new Error("/readiness must not call strategyRunController");
+      },
+    },
+    telegramInboundOffsetStore: {
+      async getTelegramInboundOffset() {
+        throw new Error("/readiness must not read persisted inbound offsets");
+      },
+      async saveTelegramInboundOffset() {
+        throw new Error("/readiness must not mutate inbound offsets");
+      },
+    },
+  });
+
+  const response = await router.route("/readiness");
+
+  assert.match(response.text, /overall_status: BLOCK/);
+  assert.match(response.text, /system_status: DEGRADED/);
+  assert.match(response.text, /degraded_reason: startup_portfolio_drift_detected/);
+  assert.match(response.text, /- execution_state: BLOCK \| current blockers: DRY_RUN,LIVE_GATE_DISABLED,DEGRADED,DRY_RUN_ADAPTER/);
+  assert.match(response.text, /- runtime_config: BLOCK \| runtime configuration was not supplied/);
+});
+
 test("telegram router exposes static operator help without touching runtime state", async () => {
   const throwingRepositories = new Proxy(new InMemoryExecutionRepository(), {
     get(target, property, receiver) {
@@ -210,7 +376,7 @@ test("telegram router exposes static operator help without touching runtime stat
 
   assert.match(response.text, /Operator Help/);
   assert.match(response.text, /state_source: static telegram command contracts/);
-  assert.match(response.text, /command_count: 19/);
+  assert.match(response.text, /command_count: 20/);
   assert.match(response.text, /inspection_commands:/);
   assert.match(response.text, /- \/help \| \/help \| Show supported Telegram operator commands and safety boundaries\./);
   assert.match(response.text, /- \/order \| \/order <order-id\|identifier> \| Show one persisted order with lifecycle events and fills\./);

@@ -22,6 +22,7 @@ import {
   formatOperatorNotificationsMessage,
   formatOrderDetailMessage,
   formatPositionMessage,
+  formatReadinessMessage,
   formatReconciliationRunsMessage,
   formatRiskEventsMessage,
   formatRuntimeConfigMessage,
@@ -34,6 +35,7 @@ import { test } from "./harness.js";
 test("parseTelegramCommand normalizes bot mentions and preserves arguments", () => {
   const helpParsed = parseTelegramCommand("/HELP@autotrade_upbit_bot");
   const configParsed = parseTelegramCommand("/CONFIG@autotrade_upbit_bot");
+  const readinessParsed = parseTelegramCommand("/READINESS@autotrade_upbit_bot");
   const parsed = parseTelegramCommand("/STATUS@autotrade_upbit_bot");
   const historyParsed = parseTelegramCommand("/STATEHISTORY@autotrade_upbit_bot");
   const syncHistoryParsed = parseTelegramCommand("/SYNCHISTORY@autotrade_upbit_bot");
@@ -53,6 +55,10 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.equal(configParsed.command, "/config");
   assert.deepEqual(configParsed.args, []);
   assert.equal(configParsed.contract.summary, "Show non-secret runtime configuration, safety gates, and explicit risk limits.");
+  assert.ok(readinessParsed);
+  assert.equal(readinessParsed.command, "/readiness");
+  assert.deepEqual(readinessParsed.args, []);
+  assert.equal(readinessParsed.contract.summary, "Show read-only operator readiness checks for DRY_RUN operations.");
   assert.ok(parsed);
   assert.equal(parsed.command, "/status");
   assert.deepEqual(parsed.args, []);
@@ -92,12 +98,13 @@ test("manual input commands are rejected by the operator contract", () => {
   const message = buildUnsupportedCommandMessage("/setposition BTC 0.25 95000000");
 
   assert.match(message, /Manual cash and position input is not supported in Telegram\./);
-  assert.match(message, /\/help \/config \/status \/statehistory \/synchistory \/recovery \/alerts \/risks \/balances \/positions \/orders \/order \/scheduler \/inbound \/pause \/resume \/killswitch \/sync \/run/);
+  assert.match(message, /\/help \/config \/readiness \/status \/statehistory \/synchistory \/recovery \/alerts \/risks \/balances \/positions \/orders \/order \/scheduler \/inbound \/pause \/resume \/killswitch \/sync \/run/);
 });
 
 test("no-argument commands return usage guidance when extra arguments are supplied", () => {
   const helpParsed = parseTelegramCommand("/help now");
   const configParsed = parseTelegramCommand("/config now");
+  const readinessParsed = parseTelegramCommand("/readiness now");
   const parsed = parseTelegramCommand("/resume now");
   const historyParsed = parseTelegramCommand("/statehistory now");
   const syncHistoryParsed = parseTelegramCommand("/synchistory now");
@@ -121,6 +128,11 @@ test("no-argument commands return usage guidance when extra arguments are suppli
   assert.equal(
     validateTelegramCommand(configParsed),
     buildUsageMessage("/config"),
+  );
+  assert.ok(readinessParsed);
+  assert.equal(
+    validateTelegramCommand(readinessParsed),
+    buildUsageMessage("/readiness"),
   );
   assert.ok(parsed);
   assert.equal(
@@ -377,6 +389,18 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
     },
     totalExposureCap: 0.75,
   });
+  const readinessMessage = formatReadinessMessage({
+    runtimeConfig: null,
+    executionState: createExecutionState({
+      systemStatus: "PAUSED",
+      pauseReason: "maintenance",
+    }),
+    latestBalanceSnapshot: null,
+    latestPositionSnapshot: null,
+    latestReconciliationRun: null,
+    schedulerStatus: null,
+    inboundStatus: null,
+  });
   const risksMessage = formatRiskEventsMessage([
     {
       id: "risk-event-1",
@@ -451,6 +475,13 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
   assert.match(runtimeConfigMessage, /telegram_operator_chat_id_configured: false/);
   assert.match(runtimeConfigMessage, /config_live_blockers: DRY_RUN,LIVE_GATE_DISABLED,DRY_RUN_ADAPTER/);
   assert.match(runtimeConfigMessage, /secret_boundary: secret values are never rendered/);
+
+  assert.match(readinessMessage, /Operator Readiness/);
+  assert.match(readinessMessage, /overall_status: BLOCK/);
+  assert.match(readinessMessage, /- runtime_config: BLOCK \| runtime configuration was not supplied/);
+  assert.match(readinessMessage, /- execution_state: BLOCK \| current blockers: DRY_RUN,LIVE_GATE_DISABLED,PAUSED,DRY_RUN_ADAPTER/);
+  assert.match(readinessMessage, /read_only_boundary: \/readiness never triggers sync, Telegram polling, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission\./);
+  assert.match(readinessMessage, /secret_boundary: secret values are never rendered/);
 
   assert.match(risksMessage, /Risk Events/);
   assert.match(risksMessage, /count: 1/);

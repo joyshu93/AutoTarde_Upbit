@@ -84,7 +84,7 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 7. In the current default path, a dry-run adapter simulates acceptance without sending a live order.
 8. The default local store is SQLite-backed persistence at `DATABASE_PATH`.
 9. `execution_state` and `execution_state_transitions` provide the operator control ledger.
-10. Telegram inspection currently includes `/help`, `/config`, `/status`, `/statehistory`, `/synchistory`, `/recovery`, `/alerts`, `/risks`, `/balances`, `/positions`, `/orders`, `/order <order-id|identifier>`, `/scheduler`, `/inbound`, and `/sync` for operator visibility, with `/status` also summarizing the latest persisted reconciliation run, recent issue codes, checkpointed history-recovery progress, and persisted degraded metadata when present.
+10. Telegram inspection currently includes `/help`, `/config`, `/readiness`, `/status`, `/statehistory`, `/synchistory`, `/recovery`, `/alerts`, `/risks`, `/balances`, `/positions`, `/orders`, `/order <order-id|identifier>`, `/scheduler`, `/inbound`, and `/sync` for operator visibility, with `/status` also summarizing the latest persisted reconciliation run, recent issue codes, checkpointed history-recovery progress, and persisted degraded metadata when present.
 11. `/sync` connects to reconciliation so snapshot and reconciliation records are persisted, using read-only public ticker valuation when available.
 12. `/run BTC|ETH` requests one deterministic PositionGuard runner cycle for a supported asset and returns the persisted decision, action, and any DRY_RUN order lifecycle result.
 13. When `STRATEGY_SCHEDULER_ENABLED=true`, the scheduler uses the same safe runner/controller path as `/run BTC|ETH`; it is disabled by default.
@@ -102,6 +102,7 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 
 `/help` is static command-contract inspection. It does not read exchange state, query repositories, trigger `/sync`, run strategy cycles, tick the scheduler, mutate orders, or enable live order transmission.
 `/config` is non-secret runtime configuration inspection. It shows configured/not-configured booleans for credentials and Telegram identifiers instead of raw secret values.
+`/readiness` is read-only operator readiness inspection. It summarizes runtime config, persisted execution state, worker status, latest snapshots, and latest reconciliation without active Upbit or Telegram probes.
 
 ## Folder Layout
 

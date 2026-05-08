@@ -115,6 +115,7 @@ Telegram is an operator surface only.
 It provides:
 - `/help` for static command-contract inspection and operator safety boundaries
 - `/config` for non-secret runtime configuration, live blockers, and explicit risk-limit inspection
+- `/readiness` for read-only operator readiness over runtime config, execution state, worker status, and latest persisted health records
 - inspection commands
 - pause/resume/killswitch controls
 - reporting-friendly formatters
@@ -143,6 +144,7 @@ It provides:
 
 `/help` is intentionally contract-derived and does not read repositories, poll Telegram, inspect exchange state, start sync, start strategy runs, start scheduler ticks, mutate orders, or enable live order transmission.
 `/config` is intentionally non-secret and runtime-derived; it renders configured/not-configured booleans for secrets and never prints raw credentials, tokens, or chat identifiers.
+`/readiness` is intentionally inspection-only; it reads bounded local state and runtime status but does not poll Telegram, call Upbit, start sync, run strategies, tick schedulers, mutate offsets, deliver notifications, or mutate orders.
 
 It does not provide:
 - portfolio truth entry

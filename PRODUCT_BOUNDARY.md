@@ -48,6 +48,7 @@ Live mode requires both:
 Telegram may expose:
 - `/help`
 - `/config`
+- `/readiness`
 - `/status`
 - `/statehistory`
 - `/synchistory`
@@ -69,6 +70,7 @@ Telegram may expose:
 Telegram commands are operational controls and inspection requests, not portfolio data entry.
 `/help` may list supported Telegram commands from static command contracts and safety boundaries, but it must not trigger exchange reads, sync, strategy runs, scheduler ticks, order mutation, or live order transmission.
 `/config` may inspect non-secret runtime configuration, explicit risk limits, and live-send blockers, but it must render only configured/not-configured booleans for secrets and must not mutate runtime or exchange state.
+`/readiness` may summarize read-only operator readiness from runtime configuration, persisted execution state, runtime worker status, and latest persisted health records, but it must not perform active probes, poll Telegram, call Upbit, trigger sync, run strategies, tick schedulers, mutate offsets, or submit/cancel orders.
 Telegram inbound polling is a transport for those commands only; it is disabled by default, accepts only the configured operator chat, and persists only update-offset transport progress.
 `/inbound` may inspect runtime inbound polling status and persisted offset progress, but it must not poll Telegram or route commands by itself.
 `npm run smoke:telegram:inbound` may perform one bounded Telegram `getUpdates` poll for operator validation, but it forcibly uses `DRY_RUN`, disables live-send and scheduler paths, and never starts the long-running polling loop.

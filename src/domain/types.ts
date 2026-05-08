@@ -475,6 +475,7 @@ export interface OperatorCommand {
   command:
     | "/help"
     | "/config"
+    | "/readiness"
     | "/status"
     | "/statehistory"
     | "/synchistory"

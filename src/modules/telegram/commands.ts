@@ -14,6 +14,7 @@ import {
   formatOrderDetailMessage,
   formatOrdersMessage,
   formatPositionMessage,
+  formatReadinessMessage,
   formatReconciliationRunsMessage,
   formatRecoveryProgressMessage,
   formatRiskEventsMessage,
@@ -70,6 +71,8 @@ export class TelegramCommandRouter {
         return {
           text: formatRuntimeConfigMessage(this.dependencies.runtimeConfig ?? null),
         };
+      case "/readiness":
+        return this.buildReadinessResponse(exchangeAccountId);
       case "/status":
         return this.buildStatusResponse(exchangeAccountId);
       case "/statehistory":
@@ -203,6 +206,27 @@ export class TelegramCommandRouter {
         state,
         buildStatusFormatOptions(this.dependencies, transitions, runs[0] ?? null, schedulerRuns),
       ),
+    };
+  }
+
+  private async buildReadinessResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+    const [executionState, latestBalanceSnapshot, latestPositionSnapshot, reconciliationRuns] = await Promise.all([
+      this.dependencies.operatorState.getState(),
+      this.dependencies.repositories.getLatestBalanceSnapshot(exchangeAccountId),
+      this.dependencies.repositories.getLatestPositionSnapshot(exchangeAccountId),
+      this.dependencies.repositories.listReconciliationRuns(exchangeAccountId, 1),
+    ]);
+
+    return {
+      text: formatReadinessMessage({
+        runtimeConfig: this.dependencies.runtimeConfig ?? null,
+        executionState,
+        latestBalanceSnapshot,
+        latestPositionSnapshot,
+        latestReconciliationRun: reconciliationRuns[0] ?? null,
+        schedulerStatus: this.dependencies.schedulerStatus?.() ?? null,
+        inboundStatus: this.dependencies.telegramInboundStatus?.() ?? null,
+      }),
     };
   }
 

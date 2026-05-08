@@ -103,6 +103,44 @@ export function formatRuntimeConfigMessage(config: TelegramRuntimeConfigSnapshot
   ].join("\n");
 }
 
+export function formatReadinessMessage(input: {
+  runtimeConfig: TelegramRuntimeConfigSnapshot | null;
+  executionState: ExecutionStateRecord;
+  latestBalanceSnapshot: BalanceSnapshotRecord | null;
+  latestPositionSnapshot: PositionSnapshotRecord | null;
+  latestReconciliationRun: ReconciliationRunRecord | null;
+  schedulerStatus: StrategySchedulerStatus | null;
+  inboundStatus: TelegramInboundPollingStatus | null;
+}): string {
+  const checks = buildReadinessChecks(input);
+  const overallStatus = checks.some((check) => check.status === "BLOCK")
+    ? "BLOCK"
+    : checks.some((check) => check.status === "WARN")
+      ? "WARN"
+      : "PASS";
+
+  return [
+    "Operator Readiness",
+    "state_source: runtime config + persisted execution_state + latest persisted snapshots",
+    `overall_status: ${overallStatus}`,
+    `exchange_account_id: ${input.executionState.exchangeAccountId}`,
+    `system_status: ${input.executionState.systemStatus}`,
+    `execution_mode: ${input.executionState.executionMode}`,
+    `live_gate: ${input.executionState.liveExecutionGate}`,
+    `kill_switch: ${input.executionState.killSwitchActive ? "on" : "off"}`,
+    `degraded_reason: ${input.executionState.degradedReason ?? "none"}`,
+    `latest_balance_snapshot_at: ${input.latestBalanceSnapshot?.capturedAt ?? "none"}`,
+    `latest_position_snapshot_at: ${input.latestPositionSnapshot?.capturedAt ?? "none"}`,
+    `latest_reconciliation_status: ${input.latestReconciliationRun?.status ?? "none"}`,
+    `latest_reconciliation_completed_at: ${input.latestReconciliationRun?.completedAt ?? "none"}`,
+    "checks:",
+    ...checks.map((check) => `- ${check.name}: ${check.status} | ${check.detail}`),
+    "read_only_boundary: /readiness never triggers sync, Telegram polling, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission.",
+    "secret_boundary: secret values are never rendered; only configured/not_configured readiness is shown.",
+    `operator_boundary: ${MANUAL_INPUT_NOTE}`,
+  ].join("\n");
+}
+
 export function formatStatusMessage(
   state: ExecutionStateRecord,
   options?: {
@@ -443,6 +481,111 @@ function describeRuntimeConfigLiveBlockers(config: TelegramRuntimeConfigSnapshot
   }
 
   return blockers;
+}
+
+function buildReadinessChecks(input: {
+  runtimeConfig: TelegramRuntimeConfigSnapshot | null;
+  executionState: ExecutionStateRecord;
+  latestBalanceSnapshot: BalanceSnapshotRecord | null;
+  latestPositionSnapshot: PositionSnapshotRecord | null;
+  latestReconciliationRun: ReconciliationRunRecord | null;
+  schedulerStatus: StrategySchedulerStatus | null;
+  inboundStatus: TelegramInboundPollingStatus | null;
+}): Array<{ name: string; status: "PASS" | "WARN" | "BLOCK"; detail: string }> {
+  const config = input.runtimeConfig;
+  const liveBlockers = config ? describeRuntimeConfigLiveBlockers(config) : ["CONFIG_UNAVAILABLE"];
+  const stateBlockers = describeLiveOrderBlockers(input.executionState, config?.liveSendPath ?? "DRY_RUN_ADAPTER");
+
+  return [
+    {
+      name: "runtime_config",
+      status: config ? "PASS" : "BLOCK",
+      detail: config ? "runtime configuration is available" : "runtime configuration was not supplied",
+    },
+    {
+      name: "live_send_safety",
+      status: liveBlockers.length > 0 ? "PASS" : "BLOCK",
+      detail: liveBlockers.length > 0
+        ? `live order path blocked by ${liveBlockers.join(",")}`
+        : "live order path is enabled by config",
+    },
+    {
+      name: "execution_state",
+      status: stateBlockers.some((blocker) => blocker === "KILL_SWITCHED" || blocker === "PAUSED" || blocker === "DEGRADED")
+        ? "BLOCK"
+        : "PASS",
+      detail: stateBlockers.length === 0
+        ? "execution state allows orders"
+        : `current blockers: ${stateBlockers.join(",")}`,
+    },
+    {
+      name: "upbit_read_credentials",
+      status: config?.exchangeBackedReadEnabled ? "PASS" : "WARN",
+      detail: config?.exchangeBackedReadEnabled
+        ? "Upbit read credentials are configured"
+        : "Upbit read credentials are not configured; startup recovery and exchange-backed sync are limited",
+    },
+    {
+      name: "telegram_delivery",
+      status: config?.telegramDeliveryEnabled && config.telegramBotTokenConfigured && config.telegramOperatorChatIdConfigured
+        ? "PASS"
+        : "WARN",
+      detail: config?.telegramDeliveryEnabled && config.telegramBotTokenConfigured && config.telegramOperatorChatIdConfigured
+        ? "Telegram delivery is configured"
+        : "Telegram delivery is not fully configured; durable notifications remain inspectable through /alerts",
+    },
+    {
+      name: "telegram_inbound",
+      status: input.inboundStatus?.enabled && input.inboundStatus.configured
+        ? "PASS"
+        : "WARN",
+      detail: input.inboundStatus?.enabled && input.inboundStatus.configured
+        ? `inbound configured running=${input.inboundStatus.running} offset_storage=${input.inboundStatus.offsetStorage}`
+        : "Telegram inbound polling is disabled or not configured",
+    },
+    {
+      name: "strategy_scheduler",
+      status: input.schedulerStatus?.enabled ? "PASS" : "WARN",
+      detail: input.schedulerStatus?.enabled
+        ? `scheduler enabled started=${input.schedulerStatus.started}`
+        : "scheduler is disabled; only explicit /run commands can trigger strategy cycles",
+    },
+    {
+      name: "balance_snapshot",
+      status: input.latestBalanceSnapshot ? "PASS" : "WARN",
+      detail: input.latestBalanceSnapshot
+        ? `latest balance snapshot captured_at=${input.latestBalanceSnapshot.capturedAt}`
+        : "no balance snapshot is stored yet",
+    },
+    {
+      name: "position_snapshot",
+      status: input.latestPositionSnapshot ? "PASS" : "WARN",
+      detail: input.latestPositionSnapshot
+        ? `latest position snapshot captured_at=${input.latestPositionSnapshot.capturedAt}`
+        : "no position snapshot is stored yet",
+    },
+    {
+      name: "latest_reconciliation",
+      status: describeReconciliationReadinessStatus(input.latestReconciliationRun),
+      detail: input.latestReconciliationRun
+        ? `latest reconciliation status=${input.latestReconciliationRun.status} completed_at=${input.latestReconciliationRun.completedAt ?? "none"}`
+        : "no reconciliation run is stored yet",
+    },
+  ];
+}
+
+function describeReconciliationReadinessStatus(
+  run: ReconciliationRunRecord | null,
+): "PASS" | "WARN" | "BLOCK" {
+  if (!run) {
+    return "WARN";
+  }
+
+  if (run.status === "SUCCESS") {
+    return "PASS";
+  }
+
+  return "BLOCK";
 }
 
 function formatOrderEventLines(events: OrderEventRecord[]): string[] {

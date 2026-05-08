@@ -21,6 +21,13 @@ const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
     argumentPolicy: "none",
   },
   {
+    command: "/readiness",
+    category: "inspection",
+    usage: "/readiness",
+    summary: "Show read-only operator readiness checks for DRY_RUN operations.",
+    argumentPolicy: "none",
+  },
+  {
     command: "/status",
     category: "inspection",
     usage: "/status",
