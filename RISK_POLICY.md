@@ -110,7 +110,7 @@ The operator surface should expose:
 These commands exist for control and inspection, not for manual portfolio editing.
 `/help` is static command-contract inspection only and must not trigger sync, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission.
 `/config` is non-secret runtime configuration inspection only; it may expose live blockers and explicit risk limits but must not print raw credentials, tokens, or chat identifiers.
-`/readiness` is read-only operator readiness inspection only; it may summarize blockers and warnings but must not actively probe Upbit or Telegram, mutate offset state, trigger sync, run strategies, tick schedulers, submit orders, or cancel orders.
+`/readiness` is read-only operator readiness inspection only; it may summarize blockers, warnings, and bounded local persistence health such as active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count, but must not actively probe Upbit or Telegram, mutate offset state, trigger sync, run strategies, tick schedulers, submit orders, cancel orders, or deliver notifications.
 Inbound polling must stay disabled by default, must reject non-operator chat IDs before routing commands, and may persist only Telegram update-offset progress as transport state.
 `/inbound` is inspection-only and must not call Telegram polling, trigger command routing, or mutate offset state.
 The Telegram inbound smoke command must force `DRY_RUN`, force `ENABLE_LIVE_ORDERS=false`, disable scheduler starts, and execute only one bounded poll.

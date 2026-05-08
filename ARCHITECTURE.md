@@ -115,7 +115,7 @@ Telegram is an operator surface only.
 It provides:
 - `/help` for static command-contract inspection and operator safety boundaries
 - `/config` for non-secret runtime configuration, live blockers, and explicit risk-limit inspection
-- `/readiness` for read-only operator readiness over runtime config, execution state, worker status, and latest persisted health records
+- `/readiness` for read-only operator readiness over runtime config, execution state, worker status, latest persisted health records, and bounded local persistence health
 - inspection commands
 - pause/resume/killswitch controls
 - reporting-friendly formatters
@@ -144,7 +144,7 @@ It provides:
 
 `/help` is intentionally contract-derived and does not read repositories, poll Telegram, inspect exchange state, start sync, start strategy runs, start scheduler ticks, mutate orders, or enable live order transmission.
 `/config` is intentionally non-secret and runtime-derived; it renders configured/not-configured booleans for secrets and never prints raw credentials, tokens, or chat identifiers.
-`/readiness` is intentionally inspection-only; it reads bounded local state and runtime status but does not poll Telegram, call Upbit, start sync, run strategies, tick schedulers, mutate offsets, deliver notifications, or mutate orders.
+`/readiness` is intentionally inspection-only; it reads bounded local state and runtime status, including active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count, but does not poll Telegram, call Upbit, start sync, run strategies, tick schedulers, mutate offsets, deliver notifications, or mutate orders.
 
 It does not provide:
 - portfolio truth entry
@@ -195,6 +195,7 @@ Lease metadata is durable as well, so workers can claim rows and finalize only w
 `operator_notification_delivery_attempts` add append-oriented delivery observability without changing the current-summary semantics of `operator_notifications`.
 `operator_notification_delivery_runs` add one row per delivery-worker execution so scheduled or inline workers leave a durable summary even when no notification was sent.
 Delivery-worker queue metrics are currently derived from persisted notification, delivery-run, and attempt rows.
+Readiness-local health metrics are likewise bounded persisted summaries only: active/non-terminal order count from order state, recent risk `BLOCK` count from `risk_events`, and pending operator notification count from `operator_notifications`.
 `strategy_scheduler_runs` records scheduler-triggered strategy cycles separately from strategy decisions and orders so operators can inspect scheduler health without treating scheduler state as trading truth.
 `telegram_inbound_offsets` records `getUpdates` transport progress, scoped by exchange account and non-secret bot-token fingerprint. It is durable transport state, not portfolio truth.
 

@@ -59,6 +59,8 @@ const ACTIVE_ORDER_STATUSES = new Set<OrderRecord["status"]>([
   "CANCEL_REQUESTED",
   "RECONCILIATION_REQUIRED",
 ]);
+const ACTIVE_ORDER_STATUS_VALUES = Array.from(ACTIVE_ORDER_STATUSES);
+const ACTIVE_ORDER_STATUS_PLACEHOLDERS = ACTIVE_ORDER_STATUS_VALUES.map(() => "?").join(", ");
 
 export function createSqlitePersistence(options: SqliteBootstrapOptions): SqlitePersistenceBundle {
   const handle = openSqliteDatabase(options.databasePath);
@@ -225,20 +227,30 @@ export class SqliteExecutionRepository implements ExecutionRepository {
     return row ? mapOrderRow(row) : null;
   }
 
-  async listActiveOrders(exchangeAccountId: string, market?: SupportedMarket): Promise<OrderRecord[]> {
-    const rows = market
-      ? (this.db.prepare(`
-          SELECT * FROM orders
-          WHERE exchange_account_id = ? AND market = ?
-          ORDER BY updated_at DESC
-        `).all(exchangeAccountId, market) as unknown as SqliteOrderRow[])
-      : (this.db.prepare(`
-          SELECT * FROM orders
-          WHERE exchange_account_id = ?
-          ORDER BY updated_at DESC
-        `).all(exchangeAccountId) as unknown as SqliteOrderRow[]);
+  async listActiveOrders(
+    exchangeAccountId: string,
+    market?: SupportedMarket,
+    limit?: number,
+  ): Promise<OrderRecord[]> {
+    const marketClause = market ? "AND market = ?" : "";
+    const limitClause = typeof limit === "number" ? "LIMIT ?" : "";
+    const params: Array<string | number> = [
+      exchangeAccountId,
+      ...ACTIVE_ORDER_STATUS_VALUES,
+      ...(market ? [market] : []),
+      ...(typeof limit === "number" ? [limit] : []),
+    ];
 
-    return rows.map(mapOrderRow).filter((order) => ACTIVE_ORDER_STATUSES.has(order.status));
+    const rows = this.db.prepare(`
+      SELECT * FROM orders
+      WHERE exchange_account_id = ?
+        AND status IN (${ACTIVE_ORDER_STATUS_PLACEHOLDERS})
+        ${marketClause}
+      ORDER BY updated_at DESC
+      ${limitClause}
+    `).all(...params) as unknown as SqliteOrderRow[];
+
+    return rows.map(mapOrderRow);
   }
 
   async listOrders(exchangeAccountId: string): Promise<OrderRecord[]> {

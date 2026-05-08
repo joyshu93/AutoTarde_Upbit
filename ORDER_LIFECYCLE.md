@@ -142,14 +142,14 @@ Telegram should report lifecycle outcomes, such as:
 - scheduled strategy runner outcomes when `STRATEGY_SCHEDULER_ENABLED=true`
 - static operator command help through `/help`
 - non-secret runtime configuration inspection through `/config`
-- read-only operator readiness inspection through `/readiness`
+- read-only operator readiness inspection through `/readiness`, including bounded local persistence health
 - single-order lifecycle detail through `/order <order-id|identifier>`, including persisted order events and fills
 - persisted scheduler run history through `/scheduler`
 
 Notifications are derived from lifecycle state, not treated as lifecycle state.
 `/help` is static command-contract inspection and must not create an order-lifecycle transition or trigger sync, strategy runs, scheduler ticks, exchange reads, or order mutation.
 `/config` is runtime configuration inspection and must not create an order-lifecycle transition or expose raw secrets.
-`/readiness` is operator readiness inspection and must not create an order-lifecycle transition, call Upbit, poll Telegram, mutate offsets, trigger sync, run strategies, tick schedulers, submit orders, or cancel orders.
+`/readiness` is operator readiness inspection and may summarize active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count from local persistence, but it must not create an order-lifecycle transition, call Upbit, poll Telegram, mutate offsets, trigger sync, run strategies, tick schedulers, submit orders, cancel orders, or deliver notifications.
 `/order <order-id|identifier>` is a lifecycle inspection view over persisted `orders`, `order_events`, and `fills`; it does not create, cancel, retry, or reconcile orders by itself.
 Scheduler run history is likewise operational audit state, not order lifecycle truth; orders and fills remain the durable lifecycle records.
 Inbound Telegram update offsets are durable transport progress state, not order lifecycle truth.

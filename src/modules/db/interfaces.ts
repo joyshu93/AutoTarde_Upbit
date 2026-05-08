@@ -36,7 +36,7 @@ export interface ExecutionRepository {
   updateOrder(record: OrderRecord): Promise<void>;
   findOrderByIdempotencyKey(exchangeAccountId: string, idempotencyKey: string): Promise<OrderRecord | null>;
   findOrderByReference(exchangeAccountId: string, reference: string): Promise<OrderRecord | null>;
-  listActiveOrders(exchangeAccountId: string, market?: SupportedMarket): Promise<OrderRecord[]>;
+  listActiveOrders(exchangeAccountId: string, market?: SupportedMarket, limit?: number): Promise<OrderRecord[]>;
   listOrders(exchangeAccountId: string): Promise<OrderRecord[]>;
   appendOrderEvent(record: OrderEventRecord): Promise<void>;
   listOrderEvents(orderId: string): Promise<OrderEventRecord[]>;

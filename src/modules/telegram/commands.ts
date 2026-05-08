@@ -210,11 +210,22 @@ export class TelegramCommandRouter {
   }
 
   private async buildReadinessResponse(exchangeAccountId: string): Promise<TelegramResponse> {
-    const [executionState, latestBalanceSnapshot, latestPositionSnapshot, reconciliationRuns] = await Promise.all([
+    const [
+      executionState,
+      latestBalanceSnapshot,
+      latestPositionSnapshot,
+      reconciliationRuns,
+      activeOrders,
+      recentRiskEvents,
+      pendingNotifications,
+    ] = await Promise.all([
       this.dependencies.operatorState.getState(),
       this.dependencies.repositories.getLatestBalanceSnapshot(exchangeAccountId),
       this.dependencies.repositories.getLatestPositionSnapshot(exchangeAccountId),
       this.dependencies.repositories.listReconciliationRuns(exchangeAccountId, 1),
+      this.dependencies.repositories.listActiveOrders(exchangeAccountId, undefined, 20),
+      this.dependencies.repositories.listRiskEvents(exchangeAccountId, 20),
+      this.dependencies.repositories.listPendingOperatorNotifications(exchangeAccountId, { limit: 20 }),
     ]);
 
     return {
@@ -224,6 +235,9 @@ export class TelegramCommandRouter {
         latestBalanceSnapshot,
         latestPositionSnapshot,
         latestReconciliationRun: reconciliationRuns[0] ?? null,
+        activeOrders,
+        recentRiskEvents,
+        pendingNotifications,
         schedulerStatus: this.dependencies.schedulerStatus?.() ?? null,
         inboundStatus: this.dependencies.telegramInboundStatus?.() ?? null,
       }),

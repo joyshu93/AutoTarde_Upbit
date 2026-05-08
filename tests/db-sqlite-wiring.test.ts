@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import type {
   BalanceSnapshotRecord,
   OperatorNotificationRecord,
+  OrderRecord,
   PositionSnapshotRecord,
   StrategySchedulerRunRecord,
   StrategyDecisionRecord,
@@ -774,6 +775,64 @@ test("sqlite order updates preserve existing order events and fills", async () =
   }
 });
 
+test("sqlite active-order listing excludes terminal orders and applies bounded newest-first limits", async () => {
+  const databasePath = await createTempDatabasePath("active-order-limit");
+  const bundle = createSqlitePersistence({
+    databasePath,
+    exchangeAccountId: "primary",
+    userId: "user-active-orders",
+    userTelegramId: "telegram-user-active-orders",
+    userDisplayName: "Active Order Operator",
+    accessKeyRef: "secret://upbit/access",
+    secretKeyRef: "secret://upbit/secret",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    killSwitchActive: false,
+  });
+
+  try {
+    await bundle.repositories.saveOrder(createOrderRecord({
+      id: "old-active-btc",
+      market: "KRW-BTC",
+      status: "OPEN",
+      updatedAt: "2026-04-20T00:00:01.000Z",
+    }));
+    await bundle.repositories.saveOrder(createOrderRecord({
+      id: "new-active-btc",
+      market: "KRW-BTC",
+      status: "PARTIALLY_FILLED",
+      updatedAt: "2026-04-20T00:00:03.000Z",
+    }));
+    await bundle.repositories.saveOrder(createOrderRecord({
+      id: "active-eth",
+      market: "KRW-ETH",
+      status: "CANCEL_REQUESTED",
+      updatedAt: "2026-04-20T00:00:02.000Z",
+    }));
+    await bundle.repositories.saveOrder(createOrderRecord({
+      id: "terminal-btc",
+      market: "KRW-BTC",
+      status: "FILLED",
+      updatedAt: "2026-04-20T00:00:04.000Z",
+    }));
+
+    const latestTwoActive = await bundle.repositories.listActiveOrders("primary", undefined, 2);
+    const latestBtcActive = await bundle.repositories.listActiveOrders("primary", "KRW-BTC", 1);
+
+    assert.deepEqual(
+      latestTwoActive.map((order) => order.id),
+      ["new-active-btc", "active-eth"],
+    );
+    assert.deepEqual(
+      latestBtcActive.map((order) => order.id),
+      ["new-active-btc"],
+    );
+  } finally {
+    bundle.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
 test("compiled sqlite modules stay importable if a dedicated src/modules/db/sqlite folder is added later", async () => {
   const sqliteDir = path.resolve(process.cwd(), "dist", "src", "modules", "db", "sqlite");
 
@@ -878,6 +937,33 @@ function createStrategySchedulerRun(
     detail: null,
     errorMessage: null,
     summaryJson: "{}",
+    ...overrides,
+  };
+}
+
+function createOrderRecord(overrides: Partial<OrderRecord> & Pick<OrderRecord, "id">): OrderRecord {
+  return {
+    strategyDecisionId: null,
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    side: "bid",
+    ordType: "price",
+    volume: null,
+    price: "500000",
+    timeInForce: null,
+    smpType: null,
+    identifier: `${overrides.id}-identifier`,
+    idempotencyKey: `${overrides.id}-idempotency`,
+    origin: "STRATEGY",
+    requestedAt: "2026-04-20T00:00:00.000Z",
+    upbitUuid: null,
+    status: "OPEN",
+    executionMode: "DRY_RUN",
+    exchangeResponseJson: null,
+    failureCode: null,
+    failureMessage: null,
+    createdAt: "2026-04-20T00:00:00.000Z",
+    updatedAt: "2026-04-20T00:00:00.000Z",
     ...overrides,
   };
 }

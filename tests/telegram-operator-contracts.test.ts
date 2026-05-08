@@ -398,6 +398,9 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
     latestBalanceSnapshot: null,
     latestPositionSnapshot: null,
     latestReconciliationRun: null,
+    activeOrders: [],
+    recentRiskEvents: [],
+    pendingNotifications: [],
     schedulerStatus: null,
     inboundStatus: null,
   });

@@ -109,6 +109,9 @@ export function formatReadinessMessage(input: {
   latestBalanceSnapshot: BalanceSnapshotRecord | null;
   latestPositionSnapshot: PositionSnapshotRecord | null;
   latestReconciliationRun: ReconciliationRunRecord | null;
+  activeOrders: OrderRecord[];
+  recentRiskEvents: RiskEventRecord[];
+  pendingNotifications: OperatorNotificationRecord[];
   schedulerStatus: StrategySchedulerStatus | null;
   inboundStatus: TelegramInboundPollingStatus | null;
 }): string {
@@ -133,6 +136,9 @@ export function formatReadinessMessage(input: {
     `latest_position_snapshot_at: ${input.latestPositionSnapshot?.capturedAt ?? "none"}`,
     `latest_reconciliation_status: ${input.latestReconciliationRun?.status ?? "none"}`,
     `latest_reconciliation_completed_at: ${input.latestReconciliationRun?.completedAt ?? "none"}`,
+    `active_order_count: ${input.activeOrders.length}`,
+    `recent_risk_block_count: ${countRiskBlocks(input.recentRiskEvents)}`,
+    `pending_notification_count: ${input.pendingNotifications.length}`,
     "checks:",
     ...checks.map((check) => `- ${check.name}: ${check.status} | ${check.detail}`),
     "read_only_boundary: /readiness never triggers sync, Telegram polling, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission.",
@@ -489,6 +495,9 @@ function buildReadinessChecks(input: {
   latestBalanceSnapshot: BalanceSnapshotRecord | null;
   latestPositionSnapshot: PositionSnapshotRecord | null;
   latestReconciliationRun: ReconciliationRunRecord | null;
+  activeOrders: OrderRecord[];
+  recentRiskEvents: RiskEventRecord[];
+  pendingNotifications: OperatorNotificationRecord[];
   schedulerStatus: StrategySchedulerStatus | null;
   inboundStatus: TelegramInboundPollingStatus | null;
 }): Array<{ name: string; status: "PASS" | "WARN" | "BLOCK"; detail: string }> {
@@ -571,7 +580,32 @@ function buildReadinessChecks(input: {
         ? `latest reconciliation status=${input.latestReconciliationRun.status} completed_at=${input.latestReconciliationRun.completedAt ?? "none"}`
         : "no reconciliation run is stored yet",
     },
+    {
+      name: "active_orders",
+      status: input.activeOrders.length === 0 ? "PASS" : "WARN",
+      detail: input.activeOrders.length === 0
+        ? "no active or reconciliation-required orders are currently stored"
+        : `${input.activeOrders.length} active or reconciliation-required order(s) need operator visibility`,
+    },
+    {
+      name: "recent_risk_blocks",
+      status: countRiskBlocks(input.recentRiskEvents) === 0 ? "PASS" : "WARN",
+      detail: countRiskBlocks(input.recentRiskEvents) === 0
+        ? `no BLOCK risk events in recent sample size=${input.recentRiskEvents.length}`
+        : `${countRiskBlocks(input.recentRiskEvents)} BLOCK risk event(s) in recent sample size=${input.recentRiskEvents.length}`,
+    },
+    {
+      name: "pending_notifications",
+      status: input.pendingNotifications.length === 0 ? "PASS" : "WARN",
+      detail: input.pendingNotifications.length === 0
+        ? "no pending operator notifications in recent bounded sample"
+        : `${input.pendingNotifications.length} pending operator notification(s) in bounded sample`,
+    },
   ];
+}
+
+function countRiskBlocks(events: readonly RiskEventRecord[]): number {
+  return events.filter((event) => event.level === "BLOCK").length;
 }
 
 function describeReconciliationReadinessStatus(

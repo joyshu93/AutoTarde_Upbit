@@ -99,16 +99,24 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     ) ?? null;
   }
 
-  async listActiveOrders(exchangeAccountId: string, market?: SupportedMarket): Promise<OrderRecord[]> {
-    return this.orders.filter((candidate) => {
-      if (candidate.exchangeAccountId !== exchangeAccountId) {
-        return false;
-      }
-      if (market && candidate.market !== market) {
-        return false;
-      }
-      return ACTIVE_ORDER_STATUSES.has(candidate.status);
-    });
+  async listActiveOrders(
+    exchangeAccountId: string,
+    market?: SupportedMarket,
+    limit?: number,
+  ): Promise<OrderRecord[]> {
+    const orders = this.orders
+      .filter((candidate) => {
+        if (candidate.exchangeAccountId !== exchangeAccountId) {
+          return false;
+        }
+        if (market && candidate.market !== market) {
+          return false;
+        }
+        return ACTIVE_ORDER_STATUSES.has(candidate.status);
+      })
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+
+    return typeof limit === "number" ? orders.slice(0, limit) : orders;
   }
 
   async listOrders(exchangeAccountId: string): Promise<OrderRecord[]> {

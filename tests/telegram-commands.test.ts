@@ -264,11 +264,102 @@ test("telegram router exposes read-only operator readiness", async () => {
   assert.match(response.text, /latest_balance_snapshot_at: 2026-04-20T00:01:00.000Z/);
   assert.match(response.text, /latest_position_snapshot_at: 2026-04-20T00:02:00.000Z/);
   assert.match(response.text, /latest_reconciliation_status: SUCCESS/);
+  assert.match(response.text, /active_order_count: 0/);
+  assert.match(response.text, /recent_risk_block_count: 0/);
+  assert.match(response.text, /pending_notification_count: 0/);
   assert.match(response.text, /- live_send_safety: PASS \| live order path blocked by DRY_RUN,LIVE_GATE_DISABLED,DRY_RUN_ADAPTER/);
   assert.match(response.text, /- telegram_inbound: PASS \| inbound configured running=true offset_storage=DURABLE/);
   assert.match(response.text, /- strategy_scheduler: PASS \| scheduler enabled started=true/);
+  assert.match(response.text, /- active_orders: PASS \| no active or reconciliation-required orders are currently stored/);
+  assert.match(response.text, /- recent_risk_blocks: PASS \| no BLOCK risk events in recent sample size=0/);
+  assert.match(response.text, /- pending_notifications: PASS \| no pending operator notifications in recent bounded sample/);
   assert.match(response.text, /read_only_boundary: \/readiness never triggers sync, Telegram polling, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission\./);
   assert.match(response.text, /secret_boundary: secret values are never rendered/);
+});
+
+test("telegram router readiness summarizes persistence health warnings", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveOrder(createOrder({
+    id: "active-order-1",
+    status: "OPEN",
+    updatedAt: "2026-04-20T00:05:00.000Z",
+  }));
+  await repository.saveRiskEvent({
+    id: "risk-event-block-1",
+    exchangeAccountId: "primary",
+    strategyDecisionId: "decision-1",
+    orderId: "active-order-1",
+    level: "BLOCK",
+    ruleCode: "DUPLICATE_ORDER_GUARD",
+    message: "Duplicate active order.",
+    payloadJson: "{}",
+    createdAt: "2026-04-20T00:04:00.000Z",
+  });
+  await repository.saveOperatorNotification(createNotification({
+    id: "pending-notification-1",
+    createdAt: "2026-04-20T00:06:00.000Z",
+  }));
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    runtimeConfig: {
+      serviceName: "AutoTrade_Upbit",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      upbitBaseUrl: "https://api.upbit.com",
+      databasePath: "./var/autotrade-upbit.sqlite",
+      exchangeBackedReadEnabled: true,
+      telegramDeliveryEnabled: true,
+      telegramBotTokenConfigured: true,
+      telegramOperatorChatIdConfigured: true,
+      telegramDeliveryMaxAttempts: 5,
+      telegramDeliveryBaseBackoffMs: 15_000,
+      telegramDeliveryMaxBackoffMs: 300_000,
+      telegramDeliveryLeaseMs: 30_000,
+      telegramInboundPollingEnabled: false,
+      telegramInboundPollIntervalMs: 2_000,
+      telegramInboundPollTimeoutSeconds: 25,
+      telegramInboundPollLimit: 10,
+      strategySchedulerEnabled: false,
+      strategySchedulerRunOnStart: false,
+      strategySchedulerBtcIntervalMs: 3_600_000,
+      strategySchedulerEthIntervalMs: 3_600_000,
+      reconciliationMaxOrderLookupsPerRun: 10,
+      reconciliationHistoryMaxPagesPerMarket: 3,
+      reconciliationClosedOrderLookbackDays: 7,
+      reconciliationHistoryStopBeforeDays: 365,
+      reconciliationHistoryRetentionAssumptionDays: 365,
+      stalePriceThresholdMs: 30_000,
+      minimumOrderValueKrw: 5_000,
+      maxAllocationByAsset: {
+        BTC: 0.6,
+        ETH: 0.6,
+      },
+      totalExposureCap: 0.75,
+    },
+  });
+
+  const response = await router.route("/readiness");
+
+  assert.match(response.text, /overall_status: WARN/);
+  assert.match(response.text, /active_order_count: 1/);
+  assert.match(response.text, /recent_risk_block_count: 1/);
+  assert.match(response.text, /pending_notification_count: 1/);
+  assert.match(response.text, /- active_orders: WARN \| 1 active or reconciliation-required order\(s\) need operator visibility/);
+  assert.match(response.text, /- recent_risk_blocks: WARN \| 1 BLOCK risk event\(s\) in recent sample size=1/);
+  assert.match(response.text, /- pending_notifications: WARN \| 1 pending operator notification\(s\) in bounded sample/);
 });
 
 test("telegram router readiness blocks unhealthy execution state without triggering controllers", async () => {
