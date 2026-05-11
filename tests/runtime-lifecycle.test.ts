@@ -143,6 +143,7 @@ function createSchedulerStatus(started: boolean) {
     started,
     exchangeAccountId: "primary",
     liveSendPath: "DRY_RUN_ADAPTER" as const,
+    startupPreflight: null,
     markets: [],
   };
 }

@@ -276,6 +276,7 @@ test("telegram router exposes read-only operator readiness", async () => {
       started: true,
       exchangeAccountId: "primary",
       liveSendPath: "DRY_RUN_ADAPTER",
+      startupPreflight: null,
       markets: [],
     }),
     telegramInboundStatus: () => ({
@@ -846,6 +847,7 @@ test("telegram router includes strategy scheduler state in /status when wired", 
       started: true,
       exchangeAccountId: "primary",
       liveSendPath: "DRY_RUN_ADAPTER",
+      startupPreflight: null,
       markets: [
         {
           market: "KRW-BTC",

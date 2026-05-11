@@ -4,6 +4,7 @@ import {
   installRuntimeSignalHandlers,
   stopAppRuntime,
 } from "./app/runtime-lifecycle.js";
+import { buildStrategySchedulerStartupPreflight } from "./app/scheduler-preflight.js";
 import { applyStartupRecoveryPolicy, runStartupRecovery } from "./app/startup-recovery.js";
 import { detectExecutionStateSeedMismatches } from "./modules/db/interfaces.js";
 
@@ -59,6 +60,15 @@ async function main(): Promise<void> {
   }
 
   const state = await app.operatorState.getState();
+  const strategySchedulerStartupPreflight = await buildStrategySchedulerStartupPreflight({
+    config: app.config,
+    exchangeAccountId: "primary",
+    executionState: state,
+    repositories: app.repositories,
+    exchangeBackedReadEnabled: app.exchangeBackedReadEnabled,
+    liveSendPath: "DRY_RUN_ADAPTER",
+  });
+  app.strategyScheduler.setStartupPreflight(strategySchedulerStartupPreflight);
   const strategySchedulerStatus = app.strategyScheduler.start();
   const telegramInboundPollingStatus = app.telegramInboundPolling.start();
   const runtimeHasBackgroundWork = hasBackgroundRuntime({
@@ -108,6 +118,7 @@ async function main(): Promise<void> {
     telegramInboundPollingEnabled: app.config.telegramInboundPollingEnabled,
     telegramInboundPollingConfigured: app.telegramInboundPolling.isConfigured(),
     telegramInboundPolling: telegramInboundPollingStatus,
+    strategySchedulerStartupPreflight,
     strategyScheduler: strategySchedulerStatus,
     supportedCommands: app.telegramRouter.getSupportedCommands(),
   };

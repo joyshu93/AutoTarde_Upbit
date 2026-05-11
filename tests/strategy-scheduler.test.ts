@@ -80,6 +80,54 @@ test("strategy scheduler schedules configured markets without immediate run by d
   assert.equal(status.markets[1]?.nextRunAt, "2026-04-20T00:45:00.000Z");
 });
 
+test("strategy scheduler does not start when live startup preflight blocks it", () => {
+  const scheduledDelays: number[] = [];
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      startupPreflight: {
+        checkedAt: "2026-04-20T00:00:00.000Z",
+        scope: "LIVE",
+        status: "BLOCK",
+        detail: "Live scheduler startup blocked by active_orders.",
+        checks: [
+          {
+            name: "active_orders",
+            status: "BLOCK",
+            detail: "1 active or reconciliation-required order(s) must be resolved first.",
+          },
+        ],
+      },
+      markets: [
+        {
+          market: "KRW-BTC",
+          intervalMs: 1_800_000,
+        },
+      ],
+    },
+    controller: createController(),
+    now: () => "2026-04-20T00:00:00.000Z",
+    setTimer: (callback, delayMs) => {
+      scheduledDelays.push(delayMs);
+      const timer = setTimeout(callback, 0);
+      clearTimeout(timer);
+      return timer;
+    },
+  });
+
+  const status = scheduler.start();
+
+  assert.equal(status.enabled, true);
+  assert.equal(status.started, false);
+  assert.equal(status.startupPreflight?.status, "BLOCK");
+  assert.deepEqual(scheduledDelays, []);
+  assert.equal(status.markets[0]?.lastStatus, "STARTUP_BLOCKED");
+  assert.match(status.markets[0]?.lastError ?? "", /active_orders/);
+});
+
 test("strategy scheduler records completed run outcomes through the shared run controller", async () => {
   const requests: TelegramStrategyRunRequest[] = [];
   const repository = new InMemoryExecutionRepository();

@@ -72,6 +72,7 @@ Current remaining gaps:
 - `/orders` now returns a bounded recent-order summary and points operators to `/order <id|identifier>` for details
 - `/readiness` treats exchange-history recovery progress as a warning instead of blocking when no portfolio drift or unresolved order recovery remains
 - Telegram `/start` is handled as a `/help` alias
+- scheduler startup now records an automatic `strategySchedulerStartupPreflight`; in `LIVE` mode it blocks scheduler timers unless live gate, live adapter wiring, execution state, exchange-backed snapshots, reconciliation health, and active-order state are safe
 
 Current risk-policy framing is budget-first rather than asset-count-first:
 - total exposure cap is the main reserve control
@@ -94,17 +95,18 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 12. `/sync` connects to reconciliation so snapshot and reconciliation records are persisted, using read-only public ticker valuation when available.
 13. `/run BTC|ETH` requests one deterministic PositionGuard runner cycle for a supported asset and returns the persisted decision, action, and any DRY_RUN order lifecycle result.
 14. When `STRATEGY_SCHEDULER_ENABLED=true`, the scheduler uses the same safe runner/controller path as `/run BTC|ETH`; it is disabled by default.
-15. Scheduler-triggered cycles are persisted in `strategy_scheduler_runs` before runner execution and updated on completion, failure, or skip; `/scheduler` exposes a fuller read-only history than the compact `/status` summary.
-16. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
-17. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
-18. Telegram delivery claims due `PENDING` notifications with a lease token, then only finalizes rows that still match that lease.
-19. Each delivery attempt now also writes a durable `operator_notification_delivery_attempts` record so `/alerts` can show recent delivery outcomes separately from the summary row in `operator_notifications`.
-20. Each delivery worker kick also writes a durable `operator_notification_delivery_runs` record so operators can inspect skipped, completed, and failed delivery-worker executions.
-21. Retryable Telegram delivery failures stay `PENDING` with a later `next_attempt_at`, while permanent failures become `FAILED`.
-22. Telegram inbound polling is disabled by default and, when enabled, only routes messages from the configured operator chat through the existing command router.
-23. Telegram inbound offset progress is persisted in `telegram_inbound_offsets` before routing each update, scoped by exchange account and non-secret bot-token fingerprint.
-24. Reconciliation and Telegram inspection surfaces operate on persisted state.
-25. When scheduler or inbound polling starts background timers, runtime signal handlers stop polling, stop the scheduler, and close SQLite persistence on `SIGINT` / `SIGTERM`; when no background runtime starts, startup closes persistence after printing the banner.
+15. In `LIVE` mode, scheduler startup runs an automatic preflight before any timer is installed; this replaces a mandatory manual-first-run ritual with inspectable startup safety checks.
+16. Scheduler-triggered cycles are persisted in `strategy_scheduler_runs` before runner execution and updated on completion, failure, or skip; `/scheduler` exposes a fuller read-only history than the compact `/status` summary.
+17. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
+18. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
+19. Telegram delivery claims due `PENDING` notifications with a lease token, then only finalizes rows that still match that lease.
+20. Each delivery attempt now also writes a durable `operator_notification_delivery_attempts` record so `/alerts` can show recent delivery outcomes separately from the summary row in `operator_notifications`.
+21. Each delivery worker kick also writes a durable `operator_notification_delivery_runs` record so operators can inspect skipped, completed, and failed delivery-worker executions.
+22. Retryable Telegram delivery failures stay `PENDING` with a later `next_attempt_at`, while permanent failures become `FAILED`.
+23. Telegram inbound polling is disabled by default and, when enabled, only routes messages from the configured operator chat through the existing command router.
+24. Telegram inbound offset progress is persisted in `telegram_inbound_offsets` before routing each update, scoped by exchange account and non-secret bot-token fingerprint.
+25. Reconciliation and Telegram inspection surfaces operate on persisted state.
+26. When scheduler or inbound polling starts background timers, runtime signal handlers stop polling, stop the scheduler, and close SQLite persistence on `SIGINT` / `SIGTERM`; when no background runtime starts, startup closes persistence after printing the banner.
 
 `/help` is static command-contract inspection. It does not read exchange state, query repositories, trigger `/sync`, run strategy cycles, tick the scheduler, mutate orders, or enable live order transmission.
 `/config` is non-secret runtime configuration inspection. It shows configured/not-configured booleans for credentials and Telegram identifiers instead of raw secret values.
@@ -220,6 +222,7 @@ If startup recovery finds unresolved portfolio drift against the prior persisted
 The strategy scheduler is disabled unless `STRATEGY_SCHEDULER_ENABLED=true`.
 When enabled, `STRATEGY_SCHEDULER_BTC_INTERVAL_MS` and `STRATEGY_SCHEDULER_ETH_INTERVAL_MS` control the BTC/ETH cadence, and `STRATEGY_SCHEDULER_RUN_ON_START=true` requests an immediate first tick after startup recovery policy has completed.
 The scheduler still uses the same runner/controller path as `/run BTC|ETH`, so it does not enable live order transmission by itself.
+If the scheduler is enabled while `APP_EXECUTION_MODE=LIVE`, startup first runs an automatic scheduler preflight. It blocks timer installation unless the live gate is enabled, the execution service is wired to the live adapter, operator state is `RUNNING`, Upbit read credentials and fresh persisted snapshots exist, no active local orders require visibility, and the latest reconciliation has no blocking issue codes. Non-blocking exchange-history recovery evidence remains a warning.
 
 When either scheduler or Telegram inbound polling is running, use normal process signals such as `Ctrl+C` / `SIGINT` or `SIGTERM` to stop the process. Shutdown is explicit: inbound polling is stopped, scheduler timers are cleared, and SQLite persistence is closed before the process exits.
 

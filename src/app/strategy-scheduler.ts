@@ -1,6 +1,7 @@
 import type {
   StrategySchedulerMarketStatus,
   StrategySchedulerRunRecord,
+  StrategySchedulerStartupPreflight,
   StrategySchedulerStatus,
   SupportedMarket,
 } from "../domain/types.js";
@@ -21,6 +22,7 @@ export interface StrategySchedulerConfig {
   runOnStart: boolean;
   exchangeAccountId: string;
   liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
+  startupPreflight?: StrategySchedulerStartupPreflight | null;
   markets: StrategySchedulerMarketConfig[];
 }
 
@@ -30,6 +32,7 @@ export class StrategyScheduler {
   private started = false;
   private readonly timers = new Map<SupportedMarket, SchedulerTimer>();
   private readonly statusByMarket = new Map<SupportedMarket, StrategySchedulerMarketStatus>();
+  private startupPreflight: StrategySchedulerStartupPreflight | null;
 
   constructor(
     private readonly dependencies: {
@@ -41,13 +44,23 @@ export class StrategyScheduler {
       clearTimer?: (timer: SchedulerTimer) => void;
     },
   ) {
+    this.startupPreflight = dependencies.config.startupPreflight ?? null;
     for (const market of dependencies.config.markets) {
       this.statusByMarket.set(market.market, createInitialMarketStatus(market));
     }
   }
 
+  setStartupPreflight(preflight: StrategySchedulerStartupPreflight | null): void {
+    this.startupPreflight = preflight;
+  }
+
   start(): StrategySchedulerStatus {
     if (!this.dependencies.config.enabled || this.started) {
+      return this.getStatus();
+    }
+
+    if (this.startupPreflight?.status === "BLOCK") {
+      this.applyStartupBlock(this.startupPreflight);
       return this.getStatus();
     }
 
@@ -87,6 +100,7 @@ export class StrategyScheduler {
       started: this.started,
       exchangeAccountId: this.dependencies.config.exchangeAccountId,
       liveSendPath: this.dependencies.config.liveSendPath,
+      startupPreflight: this.startupPreflight,
       markets: this.dependencies.config.markets.map((market) => {
         const status = this.statusByMarket.get(market.market);
         return status ? { ...status } : createInitialMarketStatus(market);
@@ -289,6 +303,18 @@ export class StrategyScheduler {
     });
   }
 
+  private applyStartupBlock(preflight: StrategySchedulerStartupPreflight): void {
+    for (const market of this.dependencies.config.markets) {
+      this.updateMarketStatus(market.market, {
+        running: false,
+        nextRunAt: null,
+        lastCompletedAt: preflight.checkedAt,
+        lastStatus: "STARTUP_BLOCKED",
+        lastError: preflight.detail,
+      });
+    }
+  }
+
   private now(): string {
     return this.dependencies.now?.() ?? new Date().toISOString();
   }
@@ -386,6 +412,7 @@ export function createDefaultStrategySchedulerConfig(input: {
     runOnStart: input.runOnStart,
     exchangeAccountId: input.exchangeAccountId,
     liveSendPath: "DRY_RUN_ADAPTER",
+    startupPreflight: null,
     markets: [
       {
         market: "KRW-BTC",

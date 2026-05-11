@@ -562,10 +562,8 @@ function buildReadinessChecks(input: {
     },
     {
       name: "strategy_scheduler",
-      status: input.schedulerStatus?.enabled ? "PASS" : "WARN",
-      detail: input.schedulerStatus?.enabled
-        ? `scheduler enabled started=${input.schedulerStatus.started}`
-        : "scheduler is disabled; only explicit /run commands can trigger strategy cycles",
+      status: describeStrategySchedulerReadiness(input.schedulerStatus).status,
+      detail: describeStrategySchedulerReadiness(input.schedulerStatus).detail,
     },
     {
       name: "balance_snapshot",
@@ -612,6 +610,31 @@ function buildReadinessChecks(input: {
 
 function countRiskBlocks(events: readonly RiskEventRecord[]): number {
   return events.filter((event) => event.level === "BLOCK").length;
+}
+
+function describeStrategySchedulerReadiness(
+  status: StrategySchedulerStatus | null,
+): { status: "PASS" | "WARN" | "BLOCK"; detail: string } {
+  if (!status?.enabled) {
+    return {
+      status: "WARN",
+      detail: "scheduler is disabled; only explicit /run commands can trigger strategy cycles",
+    };
+  }
+
+  if (status.startupPreflight?.status === "BLOCK") {
+    return {
+      status: "BLOCK",
+      detail: `scheduler startup blocked: ${status.startupPreflight.detail}`,
+    };
+  }
+
+  return {
+    status: status.started ? "PASS" : "WARN",
+    detail:
+      `scheduler enabled started=${status.started} ` +
+      `startup_preflight=${status.startupPreflight?.status ?? "none"}`,
+  };
 }
 
 function describeReconciliationReadiness(
@@ -844,11 +867,28 @@ function formatStrategySchedulerStatusLines(status: StrategySchedulerStatus | nu
     `strategy_scheduler_started: ${status.started}`,
     `strategy_scheduler_exchange_account_id: ${status.exchangeAccountId}`,
     `strategy_scheduler_live_send_path: ${status.liveSendPath}`,
+    `strategy_scheduler_startup_preflight_status: ${status.startupPreflight?.status ?? "none"}`,
+    `strategy_scheduler_startup_preflight_scope: ${status.startupPreflight?.scope ?? "none"}`,
+    `strategy_scheduler_startup_preflight_detail: ${status.startupPreflight?.detail ?? "none"}`,
+    ...formatStrategySchedulerPreflightCheckLines(status.startupPreflight?.checks ?? []),
     `strategy_scheduler_markets: ${status.markets.length}`,
     ...status.markets.map(
       (market) =>
         `- ${market.market} interval_ms=${market.intervalMs} running=${market.running} next_run_at=${market.nextRunAt ?? "none"} last_status=${market.lastStatus} run_count=${market.runCount} success=${market.successCount} failure=${market.failureCount} skipped=${market.skippedCount} last_started_at=${market.lastStartedAt ?? "none"} last_completed_at=${market.lastCompletedAt ?? "none"} last_decision=${market.lastStrategyDecisionId ?? "none"} last_action=${market.lastAction ?? "none"} last_order=${market.lastOrderId ?? "none"} last_order_status=${market.lastOrderStatus ?? "none"} last_error=${market.lastError ?? "none"}`,
     ),
+  ];
+}
+
+function formatStrategySchedulerPreflightCheckLines(
+  checks: NonNullable<StrategySchedulerStatus["startupPreflight"]>["checks"],
+): string[] {
+  if (checks.length === 0) {
+    return ["strategy_scheduler_startup_preflight_checks: none"];
+  }
+
+  return [
+    `strategy_scheduler_startup_preflight_checks: ${checks.length}`,
+    ...checks.map((check) => `- ${check.name}: ${check.status} | ${check.detail}`),
   ];
 }
 

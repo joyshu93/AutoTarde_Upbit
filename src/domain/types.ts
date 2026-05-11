@@ -41,8 +41,11 @@ export type StrategySchedulerLastStatus =
   | "COMPLETED"
   | "FAILED"
   | "NOT_CONNECTED"
-  | "ALREADY_RUNNING";
+  | "ALREADY_RUNNING"
+  | "STARTUP_BLOCKED";
 export type StrategySchedulerRunStatus = "STARTED" | "COMPLETED" | "FAILED" | "SKIPPED";
+export type StrategySchedulerStartupPreflightStatus = "NOT_REQUIRED" | "PASS" | "WARN" | "BLOCK";
+export type StrategySchedulerStartupPreflightScope = "DISABLED" | "DRY_RUN" | "LIVE";
 export type RiskEventLevel = "INFO" | "WARN" | "BLOCK";
 export type OperatorNotificationChannel = "TELEGRAM";
 export type OperatorNotificationSeverity = "INFO" | "WARN" | "ERROR";
@@ -283,7 +286,22 @@ export interface StrategySchedulerStatus {
   started: boolean;
   exchangeAccountId: string;
   liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
+  startupPreflight: StrategySchedulerStartupPreflight | null;
   markets: StrategySchedulerMarketStatus[];
+}
+
+export interface StrategySchedulerStartupPreflightCheck {
+  name: string;
+  status: "PASS" | "WARN" | "BLOCK";
+  detail: string;
+}
+
+export interface StrategySchedulerStartupPreflight {
+  checkedAt: string;
+  scope: StrategySchedulerStartupPreflightScope;
+  status: StrategySchedulerStartupPreflightStatus;
+  detail: string;
+  checks: StrategySchedulerStartupPreflightCheck[];
 }
 
 export interface StrategySchedulerRunRecord {

@@ -44,6 +44,7 @@ Current strategy direction:
 - the port preserves invalidation-first exits, no-chase entries, staged entry/add sizing, soft reduce logic, and borderline hourly confirmation semantics
 - Telegram `/run BTC|ETH` now exposes a controlled operator trigger for one runner cycle without enabling live order transmission
 - the disabled-by-default strategy scheduler now uses the same runner/controller path and still inherits the default live-order blockers
+- live-mode scheduler startup now has an automatic preflight gate before timers are installed
 
 ### `risk`
 
@@ -136,6 +137,7 @@ It provides:
 - `/sync` for reconciliation-triggered snapshot and reconciliation record persistence with read-only public ticker valuation
 - `/run BTC|ETH` for one deterministic PositionGuard strategy runner cycle through the configured safe execution path
 - `/status` strategy-scheduler lines for disabled/enabled state, configured intervals, next run timestamps, recent in-memory scheduler outcomes, and persisted recent scheduler run history
+- `/status` strategy-scheduler lines also expose startup preflight status, scope, detail, and check results
 - `/order <order-id|identifier>` for one persisted order plus order-event and fill detail without exchange mutation
 - `/scheduler` for fuller read-only persisted `strategy_scheduler_runs` history without triggering scheduler execution
 - `/inbound` for read-only runtime inbound polling status and persisted `telegram_inbound_offsets` inspection
@@ -227,22 +229,23 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 2. Optionally run an exchange-backed startup recovery sweep when Upbit read credentials are configured.
 3. During startup recovery, persist fresh balance and position snapshots, reconcile orders/fills, detect unexplained portfolio drift, then apply the bootstrap-only `DEGRADED` policy if needed.
 4. Load execution policy and operator state.
-5. Build a deterministic strategy decision, either from an explicit operator `/run BTC|ETH` request or the disabled-by-default scheduler.
-6. Convert the decision into an order intent with an idempotency key.
-7. Run risk guards.
-8. Run exchange pre-trade validation through `orders/chance` and `orders/test`.
-9. Persist the order record and append an order event.
-10. Call the exchange adapter.
-11. Persist the updated order state.
-12. Persist operator_notifications for significant operator-facing outcomes.
-13. Kick best-effort Telegram delivery without letting network delivery alter execution outcomes.
-14. Due notifications are claimed with a lease token so concurrent workers do not finalize the same row blindly.
-15. Delivery attempt outcomes are also written to `operator_notification_delivery_attempts` so operators can inspect recent send behavior separately from the summary row.
-16. Delivery worker executions are written to `operator_notification_delivery_runs` with completed, skipped, or failed status.
-17. Retryable Telegram delivery failures stay `PENDING` with future `next_attempt_at`, while permanent failures become `FAILED`.
-18. Expose inspection and reconciliation surfaces.
-19. If scheduler or inbound polling background timers are started, install signal handlers that stop Telegram inbound polling, stop scheduler timers, and close SQLite persistence on `SIGINT` / `SIGTERM`.
-20. If no background runtime is started, close SQLite persistence immediately after the startup banner is printed.
+5. If the scheduler is enabled, build a scheduler startup preflight; in `LIVE` scope, block timer installation unless live-send configuration, execution state, persisted snapshots, latest reconciliation, and active-order state are safe.
+6. Build a deterministic strategy decision, either from an explicit operator `/run BTC|ETH` request or the disabled-by-default scheduler.
+7. Convert the decision into an order intent with an idempotency key.
+8. Run risk guards.
+9. Run exchange pre-trade validation through `orders/chance` and `orders/test`.
+10. Persist the order record and append an order event.
+11. Call the exchange adapter.
+12. Persist the updated order state.
+13. Persist operator_notifications for significant operator-facing outcomes.
+14. Kick best-effort Telegram delivery without letting network delivery alter execution outcomes.
+15. Due notifications are claimed with a lease token so concurrent workers do not finalize the same row blindly.
+16. Delivery attempt outcomes are also written to `operator_notification_delivery_attempts` so operators can inspect recent send behavior separately from the summary row.
+17. Delivery worker executions are written to `operator_notification_delivery_runs` with completed, skipped, or failed status.
+18. Retryable Telegram delivery failures stay `PENDING` with future `next_attempt_at`, while permanent failures become `FAILED`.
+19. Expose inspection and reconciliation surfaces.
+20. If scheduler or inbound polling background timers are started, install signal handlers that stop Telegram inbound polling, stop scheduler timers, and close SQLite persistence on `SIGINT` / `SIGTERM`.
+21. If no background runtime is started, close SQLite persistence immediately after the startup banner is printed.
 
 ## Failure Posture
 
@@ -256,6 +259,7 @@ Examples:
 - if Telegram delivery fails, keep the notification and mark it `FAILED` rather than mutating execution or reconciliation outcomes
 - if Telegram inbound reply delivery fails, surface that failure in polling status rather than mutating execution, reconciliation, or order state
 - if the Telegram inbound smoke script detects non-smoke safety settings after its forced environment patch, block polling and report the blocker explicitly
+- if live scheduler startup is requested while live-send configuration or persisted account health is unsafe, block scheduler timers and expose the startup preflight detail
 - if runtime shutdown cleanup fails, report a partial shutdown failure instead of silently skipping resource cleanup
 
 ## Current Gaps
