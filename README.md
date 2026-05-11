@@ -268,8 +268,17 @@ If Windows blocks local PowerShell scripts, run the local live copy with:
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\start-company-live.local.ps1
 ```
 
+Before starting the local live copy, run the non-mutating live readiness smoke:
+
+```powershell
+npm run smoke:live:readiness
+```
+
+This smoke only checks local configuration, persisted execution state, adapter wiring, recent local snapshots, and local active-order visibility. It does not send orders, run strategy, start the scheduler, start Telegram polling, run `/sync`, or call Upbit.
+The example live startup script runs this smoke before `npm run start`; if it returns `BLOCK`, the live process is not started.
+
 ## Immediate Next Steps
 
 - run the local `DRY_RUN` script and confirm `/readiness`, `/sync`, `/balances`, `/positions`, and `/run BTC|ETH` behavior
-- only then run the local `LIVE` script with scheduler disabled and `MAX_LIVE_ORDER_VALUE_KRW` set to a small value
+- only then run `npm run smoke:live:readiness`, followed by the local `LIVE` script with scheduler disabled and `MAX_LIVE_ORDER_VALUE_KRW` set to a small value
 - after a clean live validation run, decide separately whether to enable the scheduler

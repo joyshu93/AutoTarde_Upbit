@@ -17,6 +17,7 @@ await import("./execution-service.test.js");
 await import("./telegram-delivery.test.js");
 await import("./telegram-inbound.test.js");
 await import("./telegram-inbound-smoke.test.js");
+await import("./live-readiness-smoke.test.js");
 await import("./telegram-operator-contracts.test.js");
 await import("./position-guard-market-structure.test.js");
 await import("./position-guard-snapshot.test.js");

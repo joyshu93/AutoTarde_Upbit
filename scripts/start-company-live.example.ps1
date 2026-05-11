@@ -48,5 +48,5 @@ Write-Host "MAX_LIVE_ORDER_VALUE_KRW=$env:MAX_LIVE_ORDER_VALUE_KRW"
 Write-Host "Strategy scheduler is disabled by default for the first LIVE validation run."
 Write-Host "Real Upbit order submission is enabled only if runtime readiness and risk guards pass."
 
-npm.cmd run build
+npm.cmd run smoke:live:readiness
 npm.cmd run start
