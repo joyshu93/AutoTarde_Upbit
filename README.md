@@ -73,6 +73,8 @@ Current remaining gaps:
 - `/readiness` treats exchange-history recovery progress as a warning instead of blocking when no portfolio drift or unresolved order recovery remains
 - Telegram `/start` is handled as a `/help` alias
 - scheduler startup now records an automatic `strategySchedulerStartupPreflight`; in `LIVE` mode it blocks scheduler timers unless live gate, live adapter wiring, execution state, exchange-backed snapshots, reconciliation health, and active-order state are safe
+- the runtime can now derive `LIVE_ADAPTER` send wiring only when mode, live gate, and Upbit credentials are all explicitly configured; otherwise it remains on `DRY_RUN_ADAPTER`
+- `MAX_LIVE_ORDER_VALUE_KRW` adds an optional live-only single-order ceiling without changing ratio-based strategy sizing
 
 Current risk-policy framing is budget-first rather than asset-count-first:
 - total exposure cap is the main reserve control
@@ -132,7 +134,8 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 - `ENABLE_LIVE_ORDERS` defaults to disabled
 - `GLOBAL_KILL_SWITCH` defaults to off, but can block execution immediately when enabled
 - Telegram is treated as an operator interface only
-- live order transmission requires both `APP_EXECUTION_MODE=LIVE` and `ENABLE_LIVE_ORDERS=true`
+- live order transmission requires `APP_EXECUTION_MODE=LIVE`, `ENABLE_LIVE_ORDERS=true`, and configured Upbit credentials
+- `MAX_LIVE_ORDER_VALUE_KRW` is unset by default and only applies to `LIVE` orders when explicitly configured
 
 ## Getting Started
 
@@ -179,6 +182,7 @@ Environment variables currently recognized:
 - `RECONCILIATION_HISTORY_RETENTION_ASSUMPTION_DAYS`
 - `STALE_PRICE_THRESHOLD_MS`
 - `MINIMUM_ORDER_VALUE_KRW`
+- `MAX_LIVE_ORDER_VALUE_KRW`
 - `MAX_ALLOCATION_BTC`
 - `MAX_ALLOCATION_ETH`
 - `TOTAL_EXPOSURE_CAP`
@@ -223,6 +227,7 @@ The strategy scheduler is disabled unless `STRATEGY_SCHEDULER_ENABLED=true`.
 When enabled, `STRATEGY_SCHEDULER_BTC_INTERVAL_MS` and `STRATEGY_SCHEDULER_ETH_INTERVAL_MS` control the BTC/ETH cadence, and `STRATEGY_SCHEDULER_RUN_ON_START=true` requests an immediate first tick after startup recovery policy has completed.
 The scheduler still uses the same runner/controller path as `/run BTC|ETH`, so it does not enable live order transmission by itself.
 If the scheduler is enabled while `APP_EXECUTION_MODE=LIVE`, startup first runs an automatic scheduler preflight. It blocks timer installation unless the live gate is enabled, the execution service is wired to the live adapter, operator state is `RUNNING`, Upbit read credentials and fresh persisted snapshots exist, no active local orders require visibility, and the latest reconciliation has no blocking issue codes. Non-blocking exchange-history recovery evidence remains a warning.
+`MAX_LIVE_ORDER_VALUE_KRW`, when set, adds a live-only ceiling for one order request. It is an operational safety guard, not a strategy sizing rule.
 
 When either scheduler or Telegram inbound polling is running, use normal process signals such as `Ctrl+C` / `SIGINT` or `SIGTERM` to stop the process. Shutdown is explicit: inbound polling is stopped, scheduler timers are cleared, and SQLite persistence is closed before the process exits.
 
@@ -242,8 +247,29 @@ powershell.exe -ExecutionPolicy Bypass -File .\scripts\start-company-dryrun.loca
 
 The `*.local.ps1` copy is ignored by Git. Keep `APP_EXECUTION_MODE=DRY_RUN` and `ENABLE_LIVE_ORDERS=false` until live order transmission is explicitly approved.
 
+## Local LIVE Script
+
+For an explicit live validation run, copy `scripts/start-company-live.example.ps1` to `scripts/start-company-live.local.ps1`, fill in secrets, set:
+
+```powershell
+$LiveOrderConfirmation = "I_UNDERSTAND_REAL_ORDERS"
+```
+
+The example intentionally keeps:
+- `STRATEGY_SCHEDULER_ENABLED=false`
+- `STRATEGY_SCHEDULER_RUN_ON_START=false`
+- `MAX_LIVE_ORDER_VALUE_KRW=6000`
+
+This means the first LIVE process can receive Telegram commands and run readiness/sync checks without starting automatic scheduled trading. Real order submission is possible only when the app is in `LIVE`, live gate is enabled, Upbit credentials are configured, readiness/risk guards pass, and a deterministic `/run BTC|ETH` or later scheduler tick creates an eligible order.
+
+If Windows blocks local PowerShell scripts, run the local live copy with:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\start-company-live.local.ps1
+```
+
 ## Immediate Next Steps
 
-- run `npm run smoke:telegram:inbound` with a real bot token/operator chat in `DRY_RUN` mode after sending a low-risk command such as `/status` or `/inbound` to the bot
-- run a long-lived local `DRY_RUN` process with inbound polling enabled and verify signal shutdown in the operator environment
-- keep live order transmission gated by `APP_EXECUTION_MODE=LIVE` plus `ENABLE_LIVE_ORDERS=true`
+- run the local `DRY_RUN` script and confirm `/readiness`, `/sync`, `/balances`, `/positions`, and `/run BTC|ETH` behavior
+- only then run the local `LIVE` script with scheduler disabled and `MAX_LIVE_ORDER_VALUE_KRW` set to a small value
+- after a clean live validation run, decide separately whether to enable the scheduler

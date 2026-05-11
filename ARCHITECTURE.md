@@ -57,6 +57,7 @@ Current guard families:
 - stale price guard
 - duplicate order guard
 - minimum order value guard
+- optional max live order value guard
 - per-asset allocation cap
 - total exposure cap
 
@@ -76,6 +77,7 @@ Owns:
 - pre-trade validation via Upbit `orders/chance` and `orders/test`
 
 The execution layer is where `DRY_RUN` and `LIVE` diverge operationally, while still preserving the same durable order model.
+The runtime wires the live Upbit adapter only when execution mode is `LIVE`, the live gate is enabled, and Upbit credentials are present; otherwise the send path remains the dry-run adapter.
 
 ### `exchange`
 
@@ -221,6 +223,8 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 
 - not wired as the default application path
 - requires both `APP_EXECUTION_MODE=LIVE` and `ENABLE_LIVE_ORDERS=true`
+- requires configured Upbit credentials before the live adapter can become the send path
+- may additionally cap each live order through `MAX_LIVE_ORDER_VALUE_KRW`
 - must still use the same order lifecycle tables and risk gates
 
 ## Runtime Flow

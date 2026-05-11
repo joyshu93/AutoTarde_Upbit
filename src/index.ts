@@ -66,7 +66,7 @@ async function main(): Promise<void> {
     executionState: state,
     repositories: app.repositories,
     exchangeBackedReadEnabled: app.exchangeBackedReadEnabled,
-    liveSendPath: "DRY_RUN_ADAPTER",
+    liveSendPath: app.liveSendPath,
   });
   app.strategyScheduler.setStartupPreflight(strategySchedulerStartupPreflight);
   const strategySchedulerStatus = app.strategyScheduler.start();
@@ -94,7 +94,7 @@ async function main(): Promise<void> {
     liveExecutionGate: state.liveExecutionGate,
     systemStatus: state.systemStatus,
     killSwitchActive: state.killSwitchActive,
-    liveSendPath: "DRY_RUN_ADAPTER",
+    liveSendPath: app.liveSendPath,
     seedMismatches,
     upbitBaseUrl: app.config.upbitBaseUrl,
     databasePath: app.config.databasePath,

@@ -39,6 +39,9 @@ Live mode requires both:
 - explicit user intent
 - explicit configuration enabling live order submission
 
+The application may wire the live Upbit adapter only when `APP_EXECUTION_MODE=LIVE`, `ENABLE_LIVE_ORDERS=true`, and Upbit credentials are configured. If any condition is missing, the runtime must fall back to the dry-run send path.
+`MAX_LIVE_ORDER_VALUE_KRW` is an optional live-only guardrail that caps a single live order without changing the ratio-based strategy model.
+
 ## Asset And Market Limits
 - assets: `BTC`, `ETH`
 - markets: `KRW-BTC`, `KRW-ETH`

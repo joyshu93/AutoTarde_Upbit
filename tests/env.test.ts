@@ -28,9 +28,11 @@ test("loadAppConfig defaults to DRY_RUN with live gate disabled", () => {
   assert.equal(config.reconciliationHistoryRetentionAssumptionDays, 365);
   assert.equal(config.globalKillSwitch, false);
   assert.equal(config.databasePath, "./var/autotrade-upbit.sqlite");
+  assert.equal(config.maxLiveOrderValueKrw, null);
 
   const riskLimits = buildExecutionRiskLimits(config);
   assert.equal(riskLimits.minimumOrderValueKrw, 5_000);
+  assert.equal(riskLimits.maxLiveOrderValueKrw, null);
   assert.equal(riskLimits.totalExposureCap, 0.75);
 });
 
@@ -55,6 +57,7 @@ test("loadAppConfig allows LIVE only when explicitly requested", () => {
     RECONCILIATION_CLOSED_ORDER_LOOKBACK_DAYS: "2",
     RECONCILIATION_HISTORY_STOP_BEFORE_DAYS: "30",
     RECONCILIATION_HISTORY_RETENTION_ASSUMPTION_DAYS: "90",
+    MAX_LIVE_ORDER_VALUE_KRW: "6000",
   });
 
   assert.equal(config.executionMode, "LIVE");
@@ -76,6 +79,7 @@ test("loadAppConfig allows LIVE only when explicitly requested", () => {
   assert.equal(config.reconciliationClosedOrderLookbackDays, 2);
   assert.equal(config.reconciliationHistoryStopBeforeDays, 30);
   assert.equal(config.reconciliationHistoryRetentionAssumptionDays, 90);
+  assert.equal(config.maxLiveOrderValueKrw, 6_000);
 });
 
 test("loadAppConfig accepts an explicit sqlite database path override", () => {

@@ -104,6 +104,7 @@ export interface TelegramRuntimeConfigSnapshot {
   readonly reconciliationHistoryRetentionAssumptionDays: number;
   readonly stalePriceThresholdMs: number;
   readonly minimumOrderValueKrw: number;
+  readonly maxLiveOrderValueKrw: number | null;
   readonly maxAllocationByAsset: Record<SupportedAsset, number>;
   readonly totalExposureCap: number;
 }

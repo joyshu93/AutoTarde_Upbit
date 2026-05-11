@@ -52,6 +52,20 @@ export function evaluateRiskGuards(context: RiskEvaluationContext): RiskEvaluati
     triggeredRules.push(block("MINIMUM_ORDER_VALUE_GUARD", "Requested order value is below the configured minimum."));
   }
 
+  if (
+    context.policy.executionMode === "LIVE" &&
+    typeof context.policy.maxLiveOrderValueKrw === "number" &&
+    typeof context.requestedNotionalKrw === "number" &&
+    context.requestedNotionalKrw > context.policy.maxLiveOrderValueKrw
+  ) {
+    triggeredRules.push(
+      block(
+        "MAX_LIVE_ORDER_VALUE_GUARD",
+        `Requested live order value exceeds configured max ${context.policy.maxLiveOrderValueKrw} KRW.`,
+      ),
+    );
+  }
+
   if (hasDuplicateOpenOrder(context)) {
     triggeredRules.push(block("DUPLICATE_ORDER_GUARD", "A matching active order already exists."));
   }

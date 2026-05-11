@@ -44,6 +44,7 @@ export interface AppServices {
   positionGuardRunner: PositionGuardStrategyRunner;
   liveExchangeClient: UpbitPrivateClient;
   exchangeBackedReadEnabled: boolean;
+  liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
   notificationDelivery: OperatorNotificationDeliveryService;
   telegramInboundPolling: TelegramInboundPollingService;
   persistence: SqlitePersistenceBundle;
@@ -76,6 +77,12 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
   const dryRunExchangeAdapter = new DryRunExchangeAdapter();
   const exchangeBackedReadEnabled = Boolean(process.env.UPBIT_ACCESS_KEY && process.env.UPBIT_SECRET_KEY);
   const syncExchangeAdapter = exchangeBackedReadEnabled ? liveExchangeClient : dryRunExchangeAdapter;
+  const liveSendEnabled =
+    config.executionMode === "LIVE" &&
+    config.liveExecutionGate === "ENABLED" &&
+    exchangeBackedReadEnabled;
+  const liveSendPath = liveSendEnabled ? "LIVE_ADAPTER" : "DRY_RUN_ADAPTER";
+  const executionExchangeAdapter = liveSendEnabled ? liveExchangeClient : dryRunExchangeAdapter;
   const telegramMessageClient = config.telegramBotToken
     ? new TelegramBotApiClient({
         botToken: config.telegramBotToken,
@@ -98,7 +105,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
 
   const executionService = new ExecutionService({
     riskLimits: buildExecutionRiskLimits(config),
-    exchangeAdapter: dryRunExchangeAdapter,
+    exchangeAdapter: executionExchangeAdapter,
     validationAdapter: syncExchangeAdapter,
     repositories,
     operatorState,
@@ -118,6 +125,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
       enabled: config.strategySchedulerEnabled,
       runOnStart: config.strategySchedulerRunOnStart,
       exchangeAccountId: "primary",
+      liveSendPath,
       btcIntervalMs: config.strategySchedulerBtcIntervalMs,
       ethIntervalMs: config.strategySchedulerEthIntervalMs,
     }),
@@ -152,7 +160,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
       serviceName: config.serviceName,
       executionMode: config.executionMode,
       liveExecutionGate: config.liveExecutionGate,
-      liveSendPath: "DRY_RUN_ADAPTER",
+      liveSendPath,
       upbitBaseUrl: config.upbitBaseUrl,
       databasePath: config.databasePath,
       exchangeBackedReadEnabled,
@@ -178,6 +186,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
       reconciliationHistoryRetentionAssumptionDays: config.reconciliationHistoryRetentionAssumptionDays,
       stalePriceThresholdMs: config.stalePriceThresholdMs,
       minimumOrderValueKrw: config.minimumOrderValueKrw,
+      maxLiveOrderValueKrw: config.maxLiveOrderValueKrw,
       maxAllocationByAsset: config.maxAllocationByAsset,
       totalExposureCap: config.totalExposureCap,
     },
@@ -195,7 +204,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
       liveExecutionGate: config.liveExecutionGate,
       killSwitchActive: config.globalKillSwitch,
     },
-    liveSendPath: "DRY_RUN_ADAPTER",
+    liveSendPath,
   });
   const telegramInboundUpdateClient = config.telegramInboundPollingEnabled && config.telegramBotToken
     ? new TelegramBotUpdateClient({
@@ -229,6 +238,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
     positionGuardRunner,
     liveExchangeClient,
     exchangeBackedReadEnabled,
+    liveSendPath,
     notificationDelivery,
     telegramInboundPolling,
     persistence,

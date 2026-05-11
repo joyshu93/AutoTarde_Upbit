@@ -404,6 +404,7 @@ export function createDefaultStrategySchedulerConfig(input: {
   enabled: boolean;
   runOnStart: boolean;
   exchangeAccountId: string;
+  liveSendPath?: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
   btcIntervalMs: number;
   ethIntervalMs: number;
 }): StrategySchedulerConfig {
@@ -411,7 +412,7 @@ export function createDefaultStrategySchedulerConfig(input: {
     enabled: input.enabled,
     runOnStart: input.runOnStart,
     exchangeAccountId: input.exchangeAccountId,
-    liveSendPath: "DRY_RUN_ADAPTER",
+    liveSendPath: input.liveSendPath ?? "DRY_RUN_ADAPTER",
     startupPreflight: null,
     markets: [
       {
