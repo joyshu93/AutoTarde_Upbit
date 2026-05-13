@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 
 import type { AppConfig } from "../src/app/env.js";
-import type { ExecutionStateRecord } from "../src/domain/types.js";
+import type { ExecutionStateRecord, ReconciliationRunRecord } from "../src/domain/types.js";
 import {
+  buildLiveReadinessNextActions,
   buildLiveReadinessSmokeChecks,
   summarizeLiveReadinessSmokeStatus,
 } from "../src/smoke/live-readiness.js";
@@ -20,7 +21,9 @@ test("live readiness smoke checks block default dry-run wiring", () => {
     activeOrderCount: 0,
     latestBalanceSnapshotAt: null,
     latestPositionSnapshotAt: null,
-    latestReconciliationStatus: null,
+    latestReconciliationRun: null,
+    latestReconciliationIssueCodes: [],
+    latestReconciliationBlockingIssueCodes: [],
   });
 
   assert.equal(summarizeLiveReadinessSmokeStatus(checks), "BLOCK");
@@ -28,6 +31,12 @@ test("live readiness smoke checks block default dry-run wiring", () => {
   assert.equal(checks.find((check) => check.name === "live_mode")?.status, "BLOCK");
   assert.equal(checks.find((check) => check.name === "live_gate")?.status, "BLOCK");
   assert.equal(checks.find((check) => check.name === "live_send_path")?.status, "BLOCK");
+  assert.deepEqual(buildLiveReadinessNextActions(checks).slice(0, 4), [
+    "Set APP_EXECUTION_MODE=LIVE in the local live script before running this smoke.",
+    "Set ENABLE_LIVE_ORDERS=true only in the local live script after confirming real-order intent.",
+    "Configure UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY in the local script; never commit those values.",
+    "Resolve mode, live gate, and Upbit credential blockers until liveSendPath becomes LIVE_ADAPTER.",
+  ]);
 });
 
 test("live readiness smoke checks pass only for explicitly gated live wiring", () => {
@@ -49,11 +58,16 @@ test("live readiness smoke checks pass only for explicitly gated live wiring", (
     activeOrderCount: 0,
     latestBalanceSnapshotAt: "2026-05-11T00:00:00.000Z",
     latestPositionSnapshotAt: "2026-05-11T00:00:00.000Z",
-    latestReconciliationStatus: "SUCCESS",
+    latestReconciliationRun: createReconciliationRun({ status: "SUCCESS" }),
+    latestReconciliationIssueCodes: [],
+    latestReconciliationBlockingIssueCodes: [],
   });
 
   assert.equal(summarizeLiveReadinessSmokeStatus(checks), "PASS");
   assert.equal(checks.every((check) => check.status === "PASS"), true);
+  assert.deepEqual(buildLiveReadinessNextActions(checks), [
+    "Live readiness smoke has no blocking or warning actions. Continue with scheduler disabled until operator checks pass.",
+  ]);
 });
 
 test("live readiness smoke blocks automatic scheduler startup during validation", () => {
@@ -77,12 +91,76 @@ test("live readiness smoke blocks automatic scheduler startup during validation"
     activeOrderCount: 0,
     latestBalanceSnapshotAt: "2026-05-11T00:00:00.000Z",
     latestPositionSnapshotAt: "2026-05-11T00:00:00.000Z",
-    latestReconciliationStatus: "SUCCESS",
+    latestReconciliationRun: createReconciliationRun({ status: "SUCCESS" }),
+    latestReconciliationIssueCodes: [],
+    latestReconciliationBlockingIssueCodes: [],
   });
 
   assert.equal(summarizeLiveReadinessSmokeStatus(checks), "BLOCK");
   assert.equal(checks.find((check) => check.name === "scheduler_disabled_for_validation")?.status, "BLOCK");
   assert.equal(checks.find((check) => check.name === "scheduler_run_on_start_disabled")?.status, "BLOCK");
+  assert.deepEqual(buildLiveReadinessNextActions(checks), [
+    "Set STRATEGY_SCHEDULER_ENABLED=false for live validation; enable the scheduler only after separate approval.",
+    "Set STRATEGY_SCHEDULER_RUN_ON_START=false so startup cannot immediately trigger a strategy cycle.",
+  ]);
+});
+
+test("live readiness smoke next actions guide snapshot warnings without blocking", () => {
+  const checks = buildLiveReadinessSmokeChecks({
+    app: {
+      config: createConfig({
+        executionMode: "LIVE",
+        liveExecutionGate: "ENABLED",
+        maxLiveOrderValueKrw: 6_000,
+      }),
+      exchangeBackedReadEnabled: true,
+      liveSendPath: "LIVE_ADAPTER",
+    },
+    executionState: createExecutionState({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+    }),
+    seedMismatches: [],
+    activeOrderCount: 0,
+    latestBalanceSnapshotAt: null,
+    latestPositionSnapshotAt: null,
+    latestReconciliationRun: null,
+    latestReconciliationIssueCodes: [],
+    latestReconciliationBlockingIssueCodes: [],
+  });
+
+  assert.equal(summarizeLiveReadinessSmokeStatus(checks), "WARN");
+  assert.deepEqual(buildLiveReadinessNextActions(checks), [
+    "After the live process starts with scheduler disabled, run /sync and re-check /readiness before /run.",
+  ]);
+});
+
+test("live readiness smoke blocks reconciliation drift issue codes", () => {
+  const checks = buildLiveReadinessSmokeChecks({
+    app: {
+      config: createConfig({
+        executionMode: "LIVE",
+        liveExecutionGate: "ENABLED",
+        maxLiveOrderValueKrw: 6_000,
+      }),
+      exchangeBackedReadEnabled: true,
+      liveSendPath: "LIVE_ADAPTER",
+    },
+    executionState: createExecutionState({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+    }),
+    seedMismatches: [],
+    activeOrderCount: 0,
+    latestBalanceSnapshotAt: "2026-05-11T00:00:00.000Z",
+    latestPositionSnapshotAt: "2026-05-11T00:00:00.000Z",
+    latestReconciliationRun: createReconciliationRun({ status: "DRIFT_DETECTED" }),
+    latestReconciliationIssueCodes: ["BALANCE_DRIFT_DETECTED"],
+    latestReconciliationBlockingIssueCodes: ["BALANCE_DRIFT_DETECTED"],
+  });
+
+  assert.equal(summarizeLiveReadinessSmokeStatus(checks), "BLOCK");
+  assert.equal(checks.find((check) => check.name === "latest_reconciliation")?.status, "BLOCK");
 });
 
 function createConfig(overrides: Partial<AppConfig> = {}): AppConfig {
@@ -137,6 +215,21 @@ function createExecutionState(overrides: Partial<ExecutionStateRecord> = {}): Ex
     degradedReason: null,
     degradedAt: null,
     updatedAt: "2026-05-11T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function createReconciliationRun(
+  overrides: Partial<ReconciliationRunRecord> = {},
+): ReconciliationRunRecord {
+  return {
+    id: "reconciliation_run_test",
+    exchangeAccountId: "primary",
+    status: "SUCCESS",
+    startedAt: "2026-05-11T00:00:00.000Z",
+    completedAt: "2026-05-11T00:00:01.000Z",
+    summaryJson: "{\"issues\":[]}",
+    errorMessage: null,
     ...overrides,
   };
 }

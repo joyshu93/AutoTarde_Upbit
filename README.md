@@ -276,6 +276,7 @@ npm run smoke:live:readiness
 
 This smoke only checks local configuration, persisted execution state, adapter wiring, recent local snapshots, and local active-order visibility. It does not send orders, run strategy, start the scheduler, start Telegram polling, run `/sync`, or call Upbit.
 The example live startup script runs this smoke before `npm run start`; if it returns `BLOCK`, the live process is not started.
+The output includes `blockingCheckNames`, `warningCheckNames`, and `nextActions` so the operator can fix the local script, persisted execution state, or required `/sync` step without guessing.
 
 ## Immediate Next Steps
 
