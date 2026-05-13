@@ -274,6 +274,12 @@ Before starting the local live copy, run the non-mutating live readiness smoke:
 npm run smoke:live:readiness
 ```
 
+For repeated checks with the same LIVE environment, copy `scripts/smoke-live-readiness.example.ps1` to `scripts/smoke-live-readiness.local.ps1`, fill in secrets, set the confirmation string, and run:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke-live-readiness.local.ps1
+```
+
 This smoke only checks local configuration, persisted execution state, adapter wiring, recent local snapshots, and local active-order visibility. It does not send orders, run strategy, start the scheduler, start Telegram polling, run `/sync`, or call Upbit.
 The example live startup script runs this smoke before `npm run start`; if it returns `BLOCK`, the live process is not started.
 The output includes `blockingCheckNames`, `warningCheckNames`, and `nextActions` so the operator can fix the local script, persisted execution state, or required `/sync` step without guessing.
