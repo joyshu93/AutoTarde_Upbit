@@ -522,10 +522,10 @@ function buildReadinessChecks(input: {
     },
     {
       name: "live_send_safety",
-      status: liveBlockers.length > 0 ? "PASS" : "BLOCK",
+      status: liveBlockers.length > 0 ? "PASS" : "WARN",
       detail: liveBlockers.length > 0
         ? `live order path blocked by ${liveBlockers.join(",")}`
-        : "live order path is enabled by config",
+        : "live order path is enabled by config; /run commands are real-order capable",
     },
     {
       name: "execution_state",

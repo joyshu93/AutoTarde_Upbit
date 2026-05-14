@@ -323,6 +323,102 @@ test("telegram router exposes read-only operator readiness", async () => {
   assert.match(response.text, /secret_boundary: secret values are never rendered/);
 });
 
+test("telegram router readiness warns when live send path is intentionally enabled", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveBalanceSnapshot({
+    id: "balance-live-ready",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-05-13T07:19:29.233Z",
+    source: "RECONCILIATION",
+    totalKrwValue: "8967.627519169999",
+    balancesJson: "[]",
+  });
+  await repository.savePositionSnapshot({
+    id: "position-live-ready",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-05-13T07:19:29.233Z",
+    source: "RECONCILIATION",
+    positionsJson: "[]",
+  });
+  await repository.saveReconciliationRun({
+    id: "recon-live-ready",
+    exchangeAccountId: "primary",
+    status: "DRIFT_DETECTED",
+    startedAt: "2026-05-13T07:19:29.233Z",
+    completedAt: "2026-05-13T07:19:29.388Z",
+    summaryJson: JSON.stringify({
+      source: "OPERATOR_SYNC",
+      issues: [
+        { code: "EXCHANGE_ORDER_RECOVERED", message: "Recovered exchange order." },
+      ],
+    }),
+    errorMessage: null,
+  });
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-live-ready",
+      exchangeAccountId: "primary",
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-05-13T07:09:45.563Z",
+    }),
+    runtimeConfig: {
+      ...createRuntimeConfig(),
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      liveSendPath: "LIVE_ADAPTER",
+      maxLiveOrderValueKrw: 6_000,
+    },
+    schedulerStatus: () => ({
+      enabled: false,
+      started: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      startupPreflight: {
+        checkedAt: "2026-05-13T07:19:10.683Z",
+        scope: "DISABLED",
+        status: "NOT_REQUIRED",
+        detail: "Strategy scheduler is disabled.",
+        checks: [],
+      },
+      markets: [],
+    }),
+    telegramInboundStatus: () => ({
+      enabled: true,
+      configured: true,
+      running: true,
+      nextOffset: null,
+      pollIntervalMs: 2_000,
+      longPollTimeoutSeconds: 25,
+      limit: 10,
+      lastPollAt: null,
+      lastUpdateId: null,
+      offsetLoaded: false,
+      offsetStorage: "DURABLE",
+      processedCount: 0,
+      ignoredCount: 0,
+      failedCount: 0,
+      lastError: null,
+    }),
+  });
+
+  const response = await router.route("/readiness");
+
+  assert.match(response.text, /overall_status: WARN/);
+  assert.match(response.text, /execution_mode: LIVE/);
+  assert.match(response.text, /live_gate: ENABLED/);
+  assert.match(response.text, /- live_send_safety: WARN \| live order path is enabled by config; \/run commands are real-order capable/);
+  assert.match(response.text, /- execution_state: PASS \| execution state allows orders/);
+  assert.match(response.text, /- latest_reconciliation: WARN \| latest reconciliation status=DRIFT_DETECTED completed_at=2026-05-13T07:19:29.388Z non_blocking_issue_codes=EXCHANGE_ORDER_RECOVERED/);
+  assert.doesNotMatch(response.text, /overall_status: BLOCK/);
+});
+
 test("telegram router readiness summarizes persistence health warnings", async () => {
   const repository = new InMemoryExecutionRepository();
   await repository.saveOrder(createOrder({
