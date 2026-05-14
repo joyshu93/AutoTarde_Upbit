@@ -131,6 +131,7 @@ The Telegram inbound smoke command must force `DRY_RUN`, force `ENABLE_LIVE_ORDE
 The strategy scheduler is disabled by default, must use explicit intervals, and must share the same deterministic runner, duplicate protection, execution-state guardrails, and live-send blockers as `/run BTC|ETH`.
 When the scheduler is enabled in `LIVE` mode, startup must run an automatic preflight before installing timers. It must block on dry-run adapter wiring, disabled live gate, non-running/degraded/paused/killswitched operator state, missing Upbit read credentials, missing balance or position snapshots, active or reconciliation-required orders, and blocking reconciliation issue codes. Historical exchange-order recovery progress can remain a warning when no portfolio drift or unresolved order recovery is present.
 The product does not require a ritualized manual first order before scheduler startup; the safety contract is the explicit preflight plus the same per-order risk and execution guards used by `/run BTC|ETH`.
+A standalone live scheduler preflight smoke may assume scheduler-enabled startup preflight and report whether timers would be allowed, but it must not start the runtime, install timers, run a strategy cycle, run `/sync`, poll Telegram, call Upbit, or transmit orders.
 
 ## Audit Expectations
 

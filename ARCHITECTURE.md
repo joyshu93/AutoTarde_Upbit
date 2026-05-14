@@ -264,6 +264,7 @@ Examples:
 - if Telegram inbound reply delivery fails, surface that failure in polling status rather than mutating execution, reconciliation, or order state
 - if the Telegram inbound smoke script detects non-smoke safety settings after its forced environment patch, block polling and report the blocker explicitly
 - if live scheduler startup is requested while live-send configuration or persisted account health is unsafe, block scheduler timers and expose the startup preflight detail
+- if live scheduler startup preflight is checked by a smoke command, report the same preflight result without starting timers, polling Telegram, calling Upbit, running `/sync`, running strategy, or submitting orders
 - if runtime shutdown cleanup fails, report a partial shutdown failure instead of silently skipping resource cleanup
 
 ## Current Gaps

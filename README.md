@@ -285,8 +285,22 @@ This smoke only checks local configuration, persisted execution state, adapter w
 The example live startup script runs this smoke before `npm run start`; if it returns `BLOCK`, the live process is not started.
 The output includes `blockingCheckNames`, `warningCheckNames`, and `nextActions` so the operator can fix the local script, persisted execution state, or required `/sync` step without guessing.
 
+After the manual LIVE process is healthy and `/sync` has produced fresh snapshots, check whether the automatic scheduler would pass its startup preflight without actually starting timers:
+
+```powershell
+npm run smoke:live:scheduler-preflight
+```
+
+For repeated checks with the same LIVE environment, copy `scripts/smoke-live-scheduler-preflight.example.ps1` to `scripts/smoke-live-scheduler-preflight.local.ps1`, fill in secrets, set the confirmation string, and run:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke-live-scheduler-preflight.local.ps1
+```
+
+This scheduler smoke assumes scheduler-enabled startup preflight internally but does not start the runtime, start scheduler timers, set `RUN_ON_START`, run strategy, run `/sync`, poll Telegram, call Upbit, or send orders. A `PASS` or intentional `WARN` means the scheduler preflight would not block timer installation; starting the scheduler still requires a separate explicit local script change.
+
 ## Immediate Next Steps
 
 - run the local `DRY_RUN` script and confirm `/readiness`, `/sync`, `/balances`, `/positions`, and `/run BTC|ETH` behavior
 - only then run `npm run smoke:live:readiness`, followed by the local `LIVE` script with scheduler disabled and `MAX_LIVE_ORDER_VALUE_KRW` set to a small value
-- after a clean live validation run, decide separately whether to enable the scheduler
+- after a clean live validation run, run `npm run smoke:live:scheduler-preflight` and decide separately whether to enable the scheduler
