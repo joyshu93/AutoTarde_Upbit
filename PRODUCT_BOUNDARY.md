@@ -83,6 +83,7 @@ Telegram `/start` is treated as a `/help` alias for first-run bot UX and does no
 `/run BTC|ETH` may request one deterministic PositionGuard strategy cycle for a supported asset, but it must route through the configured execution path and inherits the default `DRY_RUN` live-send blockers.
 `/scheduler` may inspect persisted `strategy_scheduler_runs`, but it must not trigger execution or mutate portfolio truth.
 The strategy scheduler may run the same deterministic cycle automatically only when `STRATEGY_SCHEDULER_ENABLED=true`; it is disabled by default and does not bypass execution-state, risk, or live-send gates.
+Any local script that enables the live scheduler must keep automatic startup execution disabled by default and require a separate explicit confirmation that scheduled live orders are understood.
 Startup recovery is read-only against exchange truth and must never create or cancel orders.
 When startup recovery confirms unresolved portfolio drift against persisted state, the operator state may move into `DEGRADED` without enabling any live path.
 

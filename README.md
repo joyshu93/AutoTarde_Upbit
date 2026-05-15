@@ -299,8 +299,33 @@ powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke-live-scheduler-pref
 
 This scheduler smoke assumes scheduler-enabled startup preflight internally but does not start the runtime, start scheduler timers, set `RUN_ON_START`, run strategy, run `/sync`, poll Telegram, call Upbit, or send orders. A `PASS` or intentional `WARN` means the scheduler preflight would not block timer installation; starting the scheduler still requires a separate explicit local script change.
 
+## Local LIVE Scheduler Script
+
+After the LIVE process has been validated manually and `smoke:live:scheduler-preflight` has been reviewed, copy `scripts/start-company-live-scheduler.example.ps1` to `scripts/start-company-live-scheduler.local.ps1`, fill in secrets, and set both confirmation strings:
+
+```powershell
+$LiveSchedulerConfirmation = "I_UNDERSTAND_REAL_ORDERS"
+$LiveSchedulerSecondConfirmation = "I_UNDERSTAND_AUTOMATIC_SCHEDULED_ORDERS"
+```
+
+The example intentionally keeps:
+- `STRATEGY_SCHEDULER_ENABLED=true`
+- `STRATEGY_SCHEDULER_RUN_ON_START=false`
+- `STRATEGY_SCHEDULER_BTC_INTERVAL_MS=3600000`
+- `STRATEGY_SCHEDULER_ETH_INTERVAL_MS=3600000`
+- `MAX_LIVE_ORDER_VALUE_KRW=6000`
+
+Run the local copy with:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\start-company-live-scheduler.local.ps1
+```
+
+The scheduler startup still runs the same automatic preflight before timers are installed. `RUN_ON_START=false` means startup itself does not immediately trigger a strategy cycle; the first scheduled cycle occurs after the configured interval. Real Upbit order submission remains possible on later scheduled cycles only if execution state, reconciliation health, risk guards, exchange validation, and live-send wiring all pass.
+
 ## Immediate Next Steps
 
 - run the local `DRY_RUN` script and confirm `/readiness`, `/sync`, `/balances`, `/positions`, and `/run BTC|ETH` behavior
 - only then run `npm run smoke:live:readiness`, followed by the local `LIVE` script with scheduler disabled and `MAX_LIVE_ORDER_VALUE_KRW` set to a small value
-- after a clean live validation run, run `npm run smoke:live:scheduler-preflight` and decide separately whether to enable the scheduler
+- after a clean live validation run, run `npm run smoke:live:scheduler-preflight`
+- only after reviewing that output, use the local LIVE scheduler script if automatic scheduled operation is intended
