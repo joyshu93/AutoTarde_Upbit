@@ -81,8 +81,9 @@ test("strategy scheduler schedules configured markets without immediate run by d
   assert.equal(status.markets[1]?.nextRunAt, "2026-04-20T00:45:00.000Z");
 });
 
-test("strategy scheduler does not start when live startup preflight blocks it", () => {
+test("strategy scheduler does not start when live startup preflight blocks it", async () => {
   const scheduledDelays: number[] = [];
+  const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
   const scheduler = new StrategyScheduler({
     config: {
       enabled: true,
@@ -110,6 +111,7 @@ test("strategy scheduler does not start when live startup preflight blocks it", 
       ],
     },
     controller: createController(),
+    reporter: createReporter(notifications),
     now: () => "2026-04-20T00:00:00.000Z",
     setTimer: (callback, delayMs) => {
       scheduledDelays.push(delayMs);
@@ -120,6 +122,8 @@ test("strategy scheduler does not start when live startup preflight blocks it", 
   });
 
   const status = scheduler.start();
+  const notified = await scheduler.reportStartupBlockIfNeeded();
+  const duplicateNotified = await scheduler.reportStartupBlockIfNeeded();
 
   assert.equal(status.enabled, true);
   assert.equal(status.started, false);
@@ -127,6 +131,14 @@ test("strategy scheduler does not start when live startup preflight blocks it", 
   assert.deepEqual(scheduledDelays, []);
   assert.equal(status.markets[0]?.lastStatus, "STARTUP_BLOCKED");
   assert.match(status.markets[0]?.lastError ?? "", /active_orders/);
+  assert.equal(notified, true);
+  assert.equal(duplicateNotified, false);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.notificationType, "SCHEDULER_STARTUP_BLOCKED");
+  assert.equal(notifications[0]?.severity, "ERROR");
+  assert.match(notifications[0]?.message ?? "", /active_orders/);
+  assert.equal(notifications[0]?.payload?.scope, "LIVE");
+  assert.equal(notifications[0]?.payload?.liveSendPath, "LIVE_ADAPTER");
 });
 
 test("strategy scheduler records completed run outcomes through the shared run controller", async () => {

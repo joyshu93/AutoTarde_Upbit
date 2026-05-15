@@ -63,6 +63,7 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
     assert.ok(migrationRows.some((row) => row.filename === "0011_add_strategy_scheduler_runs.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0012_add_telegram_inbound_offsets.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0014_extend_scheduler_operator_notification_types.sql"));
+    assert.ok(migrationRows.some((row) => row.filename === "0015_add_scheduler_startup_blocked_notification_type.sql"));
 
     for (const tableName of [
       "users",
@@ -429,6 +430,16 @@ test("createSqlitePersistence bootstraps operator state and round-trips app-faci
       createdAt: "2026-04-20T00:03:15.000Z",
     }));
     await bundle.repositories.saveOperatorNotification(createNotification({
+      id: "operator-notification-scheduler-startup-blocked",
+      notificationType: "SCHEDULER_STARTUP_BLOCKED",
+      severity: "ERROR",
+      title: "Strategy scheduler startup blocked",
+      message: "Live scheduler startup blocked by active_orders.",
+      payloadJson: JSON.stringify({ scope: "LIVE", liveSendPath: "LIVE_ADAPTER" }),
+      deliveryStatus: "SENT",
+      createdAt: "2026-04-20T00:03:17.000Z",
+    }));
+    await bundle.repositories.saveOperatorNotification(createNotification({
       id: "operator-notification-3",
       notificationType: "RECONCILIATION_DRIFT_DETECTED",
       title: "Reconciliation drift detected",
@@ -471,7 +482,12 @@ test("createSqlitePersistence bootstraps operator state and round-trips app-faci
     const schedulerNotification = oldestFirstPendingNotifications.find((notification) =>
       notification.id === "operator-notification-scheduler"
     );
+    const startupBlockNotification = (await bundle.repositories.listOperatorNotifications("primary", 10)).find((notification) =>
+      notification.id === "operator-notification-scheduler-startup-blocked"
+    );
     assert.equal(schedulerNotification?.notificationType, "SCHEDULER_ORDER_SUBMITTED");
+    assert.equal(startupBlockNotification?.notificationType, "SCHEDULER_STARTUP_BLOCKED");
+    assert.equal(startupBlockNotification?.severity, "ERROR");
     assert.deepEqual(
       oldestFirstPendingNotifications.map((notification) => notification.id),
       ["operator-notification-scheduler", "operator-notification-3", "operator-notification-2"],

@@ -70,6 +70,7 @@ async function main(): Promise<void> {
   });
   app.strategyScheduler.setStartupPreflight(strategySchedulerStartupPreflight);
   const strategySchedulerStatus = app.strategyScheduler.start();
+  const strategySchedulerStartupBlockNotified = await app.strategyScheduler.reportStartupBlockIfNeeded();
   const telegramInboundPollingStatus = app.telegramInboundPolling.start();
   const runtimeHasBackgroundWork = hasBackgroundRuntime({
     strategyScheduler: strategySchedulerStatus,
@@ -119,6 +120,7 @@ async function main(): Promise<void> {
     telegramInboundPollingConfigured: app.telegramInboundPolling.isConfigured(),
     telegramInboundPolling: telegramInboundPollingStatus,
     strategySchedulerStartupPreflight,
+    strategySchedulerStartupBlockNotified,
     strategyScheduler: strategySchedulerStatus,
     supportedCommands: app.telegramRouter.getSupportedCommands(),
   };

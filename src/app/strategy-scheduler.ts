@@ -31,6 +31,7 @@ type SchedulerTimer = ReturnType<typeof setTimeout>;
 
 export class StrategyScheduler {
   private started = false;
+  private startupBlockReported = false;
   private readonly timers = new Map<SupportedMarket, SchedulerTimer>();
   private readonly statusByMarket = new Map<SupportedMarket, StrategySchedulerMarketStatus>();
   private startupPreflight: StrategySchedulerStartupPreflight | null;
@@ -54,6 +55,7 @@ export class StrategyScheduler {
 
   setStartupPreflight(preflight: StrategySchedulerStartupPreflight | null): void {
     this.startupPreflight = preflight;
+    this.startupBlockReported = false;
   }
 
   start(): StrategySchedulerStatus {
@@ -77,6 +79,16 @@ export class StrategyScheduler {
     }
 
     return this.getStatus();
+  }
+
+  async reportStartupBlockIfNeeded(): Promise<boolean> {
+    if (this.startupPreflight?.status !== "BLOCK" || this.startupBlockReported) {
+      return false;
+    }
+
+    this.startupBlockReported = true;
+    await this.reportSchedulerStartupBlock(this.startupPreflight);
+    return true;
   }
 
   stop(): StrategySchedulerStatus {
@@ -362,6 +374,33 @@ export class StrategyScheduler {
       await this.dependencies.reporter.report(notification);
     } catch {
       // Scheduler execution outcomes must not be changed by Telegram reporting failures.
+    }
+  }
+
+  private async reportSchedulerStartupBlock(
+    preflight: StrategySchedulerStartupPreflight,
+  ): Promise<void> {
+    if (!this.dependencies.reporter) {
+      return;
+    }
+
+    try {
+      await this.dependencies.reporter.report({
+        exchangeAccountId: this.dependencies.config.exchangeAccountId,
+        notificationType: "SCHEDULER_STARTUP_BLOCKED",
+        severity: "ERROR",
+        title: "Strategy scheduler startup blocked",
+        message: preflight.detail,
+        payload: {
+          checkedAt: preflight.checkedAt,
+          scope: preflight.scope,
+          status: preflight.status,
+          liveSendPath: this.dependencies.config.liveSendPath,
+          checks: preflight.checks,
+        },
+      });
+    } catch {
+      // Startup safety decisions must not be changed by Telegram reporting failures.
     }
   }
 

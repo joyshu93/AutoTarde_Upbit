@@ -147,6 +147,7 @@ Telegram should report lifecycle outcomes, such as:
 - unexplained portfolio drift detected during reconciliation
 - one-shot strategy runner outcomes from `/run BTC|ETH`, including HOLD/no-order decisions and risk-blocked submissions
 - scheduled strategy runner outcomes when `STRATEGY_SCHEDULER_ENABLED=true`
+- live scheduler startup preflight blocks before automatic timers are installed
 - scheduler-triggered failures, overlapping-run skips, and scheduler-triggered order submission/rejection outcomes
 - static operator command help through `/help`
 - non-secret runtime configuration inspection through `/config`
@@ -161,7 +162,7 @@ Notifications are derived from lifecycle state, not treated as lifecycle state.
 `/readiness` is operator readiness inspection and may summarize active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count from local persistence, but it must not create an order-lifecycle transition, call Upbit, poll Telegram, mutate offsets, trigger sync, run strategies, tick schedulers, submit orders, cancel orders, or deliver notifications.
 `/order <order-id|identifier>` is a lifecycle inspection view over persisted `orders`, `order_events`, and `fills`; it does not create, cancel, retry, or reconcile orders by itself.
 Scheduler run history is likewise operational audit state, not order lifecycle truth; orders and fills remain the durable lifecycle records.
-Scheduler startup preflight state is also operational control state, not order lifecycle truth. It may block timers and be shown in `/status` or `/readiness`, but it must not create, cancel, retry, or reconcile an order by itself.
+Scheduler startup preflight state is also operational control state, not order lifecycle truth. It may block timers, be shown in `/status` or `/readiness`, and persist a scheduler-startup-blocked operator notification, but it must not create, cancel, retry, or reconcile an order by itself.
 Inbound Telegram update offsets are durable transport progress state, not order lifecycle truth.
 The `/inbound` command may inspect that transport progress, but it must not become an order-lifecycle transition.
 The `smoke:telegram:inbound` script may route at most one fetched operator update through the command router, but it remains transport validation and must not become an order-lifecycle transition by itself.
