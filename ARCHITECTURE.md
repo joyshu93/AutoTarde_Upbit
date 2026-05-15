@@ -140,6 +140,7 @@ It provides:
 - `/run BTC|ETH` for one deterministic PositionGuard strategy runner cycle through the configured safe execution path
 - `/status` strategy-scheduler lines for disabled/enabled state, configured intervals, next run timestamps, recent in-memory scheduler outcomes, and persisted recent scheduler run history
 - `/status` strategy-scheduler lines also expose startup preflight status, scope, detail, and check results
+- scheduler-triggered failures, overlapping-run skips, and scheduler-triggered order submission/rejection outcomes are persisted as operator notifications so automatic operation does not fail silently
 - `/order <order-id|identifier>` for one persisted order plus order-event and fill detail without exchange mutation
 - `/scheduler` for fuller read-only persisted `strategy_scheduler_runs` history without triggering scheduler execution
 - `/inbound` for read-only runtime inbound polling status and persisted `telegram_inbound_offsets` inspection
@@ -265,6 +266,7 @@ Examples:
 - if the Telegram inbound smoke script detects non-smoke safety settings after its forced environment patch, block polling and report the blocker explicitly
 - if live scheduler startup is requested while live-send configuration or persisted account health is unsafe, block scheduler timers and expose the startup preflight detail
 - if live scheduler startup preflight is checked by a smoke command, report the same preflight result without starting timers, polling Telegram, calling Upbit, running `/sync`, running strategy, or submitting orders
+- if a scheduled strategy run fails, overlaps a still-running market cycle, submits an order, or has its order rejected, persist an operator notification without changing the scheduler run outcome
 - if runtime shutdown cleanup fails, report a partial shutdown failure instead of silently skipping resource cleanup
 
 ## Current Gaps

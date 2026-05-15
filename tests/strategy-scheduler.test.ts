@@ -7,6 +7,7 @@ import type {
   TelegramStrategyRunRequest,
   TelegramStrategyRunResult,
 } from "../src/modules/telegram/interfaces.js";
+import type { OperatorNotificationReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
 
 test("strategy scheduler is disabled by default and does not schedule timers", () => {
@@ -130,6 +131,7 @@ test("strategy scheduler does not start when live startup preflight blocks it", 
 
 test("strategy scheduler records completed run outcomes through the shared run controller", async () => {
   const requests: TelegramStrategyRunRequest[] = [];
+  const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
   const repository = new InMemoryExecutionRepository();
   const scheduler = new StrategyScheduler({
     config: {
@@ -161,6 +163,7 @@ test("strategy scheduler records completed run outcomes through the shared run c
       },
     }),
     repositories: repository,
+    reporter: createReporter(notifications),
     now: createNowSequence([
       "2026-04-20T00:00:00.000Z",
       "2026-04-20T00:00:02.000Z",
@@ -185,10 +188,12 @@ test("strategy scheduler records completed run outcomes through the shared run c
   assert.equal(persistedRuns[0]?.status, "COMPLETED");
   assert.equal(persistedRuns[0]?.strategyDecisionId, "strategy-decision-1");
   assert.equal(persistedRuns[0]?.action, "HOLD");
+  assert.deepEqual(notifications, []);
 });
 
 test("strategy scheduler prevents same-market overlapping runs", async () => {
   let releaseRun: (() => void) | undefined;
+  const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
   const repository = new InMemoryExecutionRepository();
   const scheduler = new StrategyScheduler({
     config: {
@@ -222,6 +227,7 @@ test("strategy scheduler prevents same-market overlapping runs", async () => {
       },
     }),
     repositories: repository,
+    reporter: createReporter(notifications),
     now: createNowSequence([
       "2026-04-20T00:00:00.000Z",
       "2026-04-20T00:00:01.000Z",
@@ -250,6 +256,145 @@ test("strategy scheduler prevents same-market overlapping runs", async () => {
     persistedRuns.map((run) => run.status).sort(),
     ["COMPLETED", "SKIPPED"],
   );
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.notificationType, "SCHEDULER_RUN_SKIPPED");
+  assert.equal(notifications[0]?.severity, "WARN");
+});
+
+test("strategy scheduler notifies when a scheduled run submits an order", async () => {
+  const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [
+        {
+          market: "KRW-BTC",
+          intervalMs: 3_600_000,
+        },
+      ],
+    },
+    controller: createController({
+      async requestRun(request) {
+        return {
+          status: "COMPLETED",
+          requestedAt: "2026-04-20T00:00:00.000Z",
+          market: request.market,
+          strategyDecisionId: "strategy-decision-1",
+          action: "EXIT",
+          orderId: "order-1",
+          orderStatus: "OPEN",
+          submissionAccepted: true,
+          detail: "Decision EXIT persisted and submitted through the configured execution path.",
+        };
+      },
+    }),
+    reporter: createReporter(notifications),
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:02.000Z",
+    ]),
+  });
+
+  await scheduler.runMarketNow("KRW-BTC");
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.notificationType, "SCHEDULER_ORDER_SUBMITTED");
+  assert.equal(notifications[0]?.severity, "INFO");
+  assert.equal(notifications[0]?.payload?.orderId, "order-1");
+  assert.equal(notifications[0]?.payload?.liveSendPath, "LIVE_ADAPTER");
+});
+
+test("strategy scheduler notifies when a scheduled order is rejected", async () => {
+  const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [
+        {
+          market: "KRW-BTC",
+          intervalMs: 3_600_000,
+        },
+      ],
+    },
+    controller: createController({
+      async requestRun(request) {
+        return {
+          status: "COMPLETED",
+          requestedAt: "2026-04-20T00:00:00.000Z",
+          market: request.market,
+          strategyDecisionId: "strategy-decision-1",
+          action: "EXIT",
+          orderId: null,
+          orderStatus: null,
+          submissionAccepted: false,
+          detail: "Decision EXIT persisted; order submission rejected: A matching active order already exists.",
+        };
+      },
+    }),
+    reporter: createReporter(notifications),
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:02.000Z",
+    ]),
+  });
+
+  await scheduler.runMarketNow("KRW-BTC");
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.notificationType, "SCHEDULER_ORDER_REJECTED");
+  assert.equal(notifications[0]?.severity, "WARN");
+  assert.match(notifications[0]?.message ?? "", /A matching active order already exists/);
+});
+
+test("strategy scheduler notifies when a scheduled run fails", async () => {
+  const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [
+        {
+          market: "KRW-BTC",
+          intervalMs: 3_600_000,
+        },
+      ],
+    },
+    controller: createController({
+      async requestRun(request) {
+        return {
+          status: "FAILED",
+          requestedAt: "2026-04-20T00:00:00.000Z",
+          market: request.market,
+          strategyDecisionId: null,
+          action: null,
+          orderId: null,
+          orderStatus: null,
+          submissionAccepted: null,
+          detail: "Strategy run failed: ticker unavailable.",
+        };
+      },
+    }),
+    reporter: createReporter(notifications),
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:02.000Z",
+    ]),
+  });
+
+  await scheduler.runMarketNow("KRW-BTC");
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.notificationType, "SCHEDULER_RUN_FAILED");
+  assert.equal(notifications[0]?.severity, "ERROR");
+  assert.match(notifications[0]?.message ?? "", /ticker unavailable/);
 });
 
 function createController(
@@ -270,6 +415,16 @@ function createController(
       };
     },
     ...overrides,
+  };
+}
+
+function createReporter(
+  notifications: Parameters<OperatorNotificationReporter["report"]>[0][],
+): OperatorNotificationReporter {
+  return {
+    async report(input) {
+      notifications.push(input);
+    },
   };
 }
 

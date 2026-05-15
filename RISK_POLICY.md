@@ -153,6 +153,7 @@ Every important transition should leave a durable trail:
 - operator notification delivery-worker run records, including skipped, completed, and failed worker executions
 - derived operator notification queue metrics, including active leases, expired leases, abandoned-lease candidates, recent delivery-run summaries, and recent delivery-attempt outcomes
 - strategy scheduler run records, including started, completed, failed, and skipped scheduler-triggered cycles
+- scheduler operator notifications for failed scheduled cycles, overlapping-run skips, and scheduler-triggered order submission or rejection
 - Telegram inbound offset records, including the next update offset and last update id for replay prevention
 
 Telegram delivery failure must not alter execution, reconciliation, or risk outcomes. It is an operator-reporting concern with its own durable state.

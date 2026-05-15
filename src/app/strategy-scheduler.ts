@@ -10,6 +10,7 @@ import type {
   TelegramStrategyRunController,
   TelegramStrategyRunResult,
 } from "../modules/telegram/interfaces.js";
+import type { OperatorNotificationReporter } from "../modules/telegram/reporter.js";
 import { createId } from "../shared/ids.js";
 
 export interface StrategySchedulerMarketConfig {
@@ -39,6 +40,7 @@ export class StrategyScheduler {
       config: StrategySchedulerConfig;
       controller: TelegramStrategyRunController;
       repositories?: Pick<ExecutionRepository, "saveStrategySchedulerRun" | "updateStrategySchedulerRun">;
+      reporter?: OperatorNotificationReporter;
       now?: () => string;
       setTimer?: (callback: () => void, delayMs: number) => SchedulerTimer;
       clearTimer?: (timer: SchedulerTimer) => void;
@@ -148,6 +150,12 @@ export class StrategyScheduler {
         }),
         update: false,
       });
+      await this.reportSchedulerResult({
+        market,
+        result: skipped,
+        intervalMs: config.intervalMs,
+        runOnStart: this.dependencies.config.runOnStart,
+      });
       return skipped;
     }
 
@@ -186,6 +194,12 @@ export class StrategyScheduler {
         detail: "Strategy scheduler did not run because scheduler history could not be persisted.",
       };
       this.applyRunResult(market, failed, startedAt, failedAt);
+      await this.reportSchedulerResult({
+        market,
+        result: failed,
+        intervalMs: config.intervalMs,
+        runOnStart: this.dependencies.config.runOnStart,
+      });
       return failed;
     }
 
@@ -200,6 +214,12 @@ export class StrategyScheduler {
     await this.persistSchedulerRun({
       run: completeSchedulerRunRecord(runRecord, result, completedAt),
       update: true,
+    });
+    await this.reportSchedulerResult({
+      market,
+      result,
+      intervalMs: config.intervalMs,
+      runOnStart: this.dependencies.config.runOnStart,
     });
     return result;
   }
@@ -228,6 +248,22 @@ export class StrategyScheduler {
             submissionAccepted: null,
             detail: `Strategy scheduler failed: ${message}`,
           }, completedAt, completedAt);
+          void this.reportSchedulerResult({
+            market: config.market,
+            result: {
+              status: "FAILED",
+              requestedAt: completedAt,
+              market: config.market,
+              strategyDecisionId: null,
+              action: null,
+              orderId: null,
+              orderStatus: null,
+              submissionAccepted: null,
+              detail: `Strategy scheduler failed: ${message}`,
+            },
+            intervalMs: config.intervalMs,
+            runOnStart: this.dependencies.config.runOnStart,
+          });
         })
         .finally(() => this.scheduleMarket(config, config.intervalMs));
     }, delayMs);
@@ -303,6 +339,32 @@ export class StrategyScheduler {
     });
   }
 
+  private async reportSchedulerResult(input: {
+    market: SupportedMarket;
+    result: TelegramStrategyRunResult;
+    intervalMs: number;
+    runOnStart: boolean;
+  }): Promise<void> {
+    if (!this.dependencies.reporter) {
+      return;
+    }
+
+    const notification = buildSchedulerNotification({
+      exchangeAccountId: this.dependencies.config.exchangeAccountId,
+      liveSendPath: this.dependencies.config.liveSendPath,
+      ...input,
+    });
+    if (!notification) {
+      return;
+    }
+
+    try {
+      await this.dependencies.reporter.report(notification);
+    } catch {
+      // Scheduler execution outcomes must not be changed by Telegram reporting failures.
+    }
+  }
+
   private applyStartupBlock(preflight: StrategySchedulerStartupPreflight): void {
     for (const market of this.dependencies.config.markets) {
       this.updateMarketStatus(market.market, {
@@ -318,6 +380,74 @@ export class StrategyScheduler {
   private now(): string {
     return this.dependencies.now?.() ?? new Date().toISOString();
   }
+}
+
+function buildSchedulerNotification(input: {
+  exchangeAccountId: string;
+  liveSendPath: StrategySchedulerConfig["liveSendPath"];
+  market: SupportedMarket;
+  result: TelegramStrategyRunResult;
+  intervalMs: number;
+  runOnStart: boolean;
+}): Parameters<OperatorNotificationReporter["report"]>[0] | null {
+  const payload = {
+    market: input.market,
+    intervalMs: input.intervalMs,
+    runOnStart: input.runOnStart,
+    liveSendPath: input.liveSendPath,
+    strategyDecisionId: input.result.strategyDecisionId,
+    action: input.result.action,
+    orderId: input.result.orderId,
+    orderStatus: input.result.orderStatus,
+    submissionAccepted: input.result.submissionAccepted,
+    requestedAt: input.result.requestedAt,
+  };
+
+  if (input.result.status === "FAILED") {
+    return {
+      exchangeAccountId: input.exchangeAccountId,
+      notificationType: "SCHEDULER_RUN_FAILED",
+      severity: "ERROR",
+      title: "Scheduled strategy run failed",
+      message: input.result.detail,
+      payload,
+    };
+  }
+
+  if (input.result.status === "ALREADY_RUNNING") {
+    return {
+      exchangeAccountId: input.exchangeAccountId,
+      notificationType: "SCHEDULER_RUN_SKIPPED",
+      severity: "WARN",
+      title: "Scheduled strategy run skipped",
+      message: input.result.detail,
+      payload,
+    };
+  }
+
+  if (input.result.orderId && input.result.submissionAccepted === true) {
+    return {
+      exchangeAccountId: input.exchangeAccountId,
+      notificationType: "SCHEDULER_ORDER_SUBMITTED",
+      severity: "INFO",
+      title: "Scheduled strategy submitted an order",
+      message: `${input.market} scheduled ${input.result.action ?? "UNKNOWN"} created order ${input.result.orderId}.`,
+      payload,
+    };
+  }
+
+  if (input.result.submissionAccepted === false) {
+    return {
+      exchangeAccountId: input.exchangeAccountId,
+      notificationType: "SCHEDULER_ORDER_REJECTED",
+      severity: "WARN",
+      title: "Scheduled strategy order was rejected",
+      message: input.result.detail,
+      payload,
+    };
+  }
+
+  return null;
 }
 
 function createSchedulerRunRecord(input: {

@@ -147,6 +147,7 @@ Telegram should report lifecycle outcomes, such as:
 - unexplained portfolio drift detected during reconciliation
 - one-shot strategy runner outcomes from `/run BTC|ETH`, including HOLD/no-order decisions and risk-blocked submissions
 - scheduled strategy runner outcomes when `STRATEGY_SCHEDULER_ENABLED=true`
+- scheduler-triggered failures, overlapping-run skips, and scheduler-triggered order submission/rejection outcomes
 - static operator command help through `/help`
 - non-secret runtime configuration inspection through `/config`
 - read-only operator readiness inspection through `/readiness`, including bounded local persistence health

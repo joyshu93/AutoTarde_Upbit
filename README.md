@@ -66,6 +66,7 @@ Current remaining gaps:
 - Telegram inbound polling is now available behind `ENABLE_TELEGRAM_INBOUND_POLLING=false` by default, uses the existing command router, only accepts messages from `TELEGRAM_OPERATOR_CHAT_ID`, persists `getUpdates` offset progress in `telegram_inbound_offsets`, and exposes `/inbound` inspection
 - startup recovery can now mark persisted operator state `DEGRADED` when unresolved portfolio drift remains after exchange-backed bootstrap checks
 - scheduler-triggered strategy cycles now persist `strategy_scheduler_runs` so scheduled run starts, completions, failures, and skips remain inspectable after process restart, including through `/scheduler`
+- scheduler-triggered failures, overlapping-run skips, and scheduler-triggered order submission/rejection outcomes now also persist operator notifications so automatic operation has an alert trail
 - `/order <order-id|identifier>` now exposes one persisted order, order events, and fills for read-only lifecycle investigation
 - reconciliation now repairs older local dry-run artifacts without querying Upbit for `dryrun_*` UUIDs
 - portfolio drift detection ignores simulated `DRY_RUN` fills because those fills do not mutate Upbit balances

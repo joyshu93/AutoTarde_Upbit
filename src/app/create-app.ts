@@ -131,6 +131,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
     }),
     controller: strategyRunController,
     repositories,
+    reporter,
   });
 
   const reconciliationDependencies = {

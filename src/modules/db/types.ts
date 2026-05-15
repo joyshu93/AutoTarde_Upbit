@@ -205,7 +205,15 @@ export interface SqliteOperatorNotificationRow {
   id: string;
   exchange_account_id: string;
   channel: "TELEGRAM";
-  notification_type: "ORDER_REJECTED" | "ORDER_SUBMISSION_FAILED" | "RECONCILIATION_DRIFT_DETECTED" | "SYNC_FAILED";
+  notification_type:
+    | "ORDER_REJECTED"
+    | "ORDER_SUBMISSION_FAILED"
+    | "RECONCILIATION_DRIFT_DETECTED"
+    | "SCHEDULER_ORDER_REJECTED"
+    | "SCHEDULER_ORDER_SUBMITTED"
+    | "SCHEDULER_RUN_FAILED"
+    | "SCHEDULER_RUN_SKIPPED"
+    | "SYNC_FAILED";
   severity: "INFO" | "WARN" | "ERROR";
   title: string;
   message: string;

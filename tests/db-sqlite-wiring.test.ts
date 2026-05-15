@@ -62,6 +62,7 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
     assert.ok(migrationRows.some((row) => row.filename === "0010_add_operator_notification_delivery_runs.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0011_add_strategy_scheduler_runs.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0012_add_telegram_inbound_offsets.sql"));
+    assert.ok(migrationRows.some((row) => row.filename === "0014_extend_scheduler_operator_notification_types.sql"));
 
     for (const tableName of [
       "users",
@@ -419,6 +420,15 @@ test("createSqlitePersistence bootstraps operator state and round-trips app-faci
       createdAt: "2026-04-20T00:03:10.000Z",
     }));
     await bundle.repositories.saveOperatorNotification(createNotification({
+      id: "operator-notification-scheduler",
+      notificationType: "SCHEDULER_ORDER_SUBMITTED",
+      severity: "INFO",
+      title: "Scheduled strategy submitted an order",
+      message: "KRW-BTC scheduled EXIT created order order-1.",
+      payloadJson: JSON.stringify({ market: "KRW-BTC", orderId: "order-1" }),
+      createdAt: "2026-04-20T00:03:15.000Z",
+    }));
+    await bundle.repositories.saveOperatorNotification(createNotification({
       id: "operator-notification-3",
       notificationType: "RECONCILIATION_DRIFT_DETECTED",
       title: "Reconciliation drift detected",
@@ -458,13 +468,17 @@ test("createSqlitePersistence bootstraps operator state and round-trips app-faci
       limit: 1,
       dueBefore: "2026-04-20T00:04:20.000Z",
     });
+    const schedulerNotification = oldestFirstPendingNotifications.find((notification) =>
+      notification.id === "operator-notification-scheduler"
+    );
+    assert.equal(schedulerNotification?.notificationType, "SCHEDULER_ORDER_SUBMITTED");
     assert.deepEqual(
       oldestFirstPendingNotifications.map((notification) => notification.id),
-      ["operator-notification-3", "operator-notification-2"],
+      ["operator-notification-scheduler", "operator-notification-3", "operator-notification-2"],
     );
     assert.deepEqual(
       limitedPendingNotifications.map((notification) => notification.id),
-      ["operator-notification-3"],
+      ["operator-notification-scheduler"],
     );
 
     const claimedNotifications = await bundle.repositories.claimPendingOperatorNotifications("primary", {
@@ -483,7 +497,7 @@ test("createSqlitePersistence bootstraps operator state and round-trips app-faci
     });
     assert.deepEqual(
       claimedNotifications.map((notification) => notification.id),
-      ["operator-notification-3", "operator-notification-2"],
+      ["operator-notification-scheduler", "operator-notification-3", "operator-notification-2"],
     );
     assert.equal(competingClaim.length, 0);
 
