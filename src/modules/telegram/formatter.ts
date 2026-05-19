@@ -798,12 +798,20 @@ export function formatStrategyRunMessage(result: TelegramStrategyRunResult): str
   ].join("\n");
 }
 
-export function formatStrategySchedulerRunsMessage(runs: StrategySchedulerRunRecord[]): string {
+export function formatStrategySchedulerRunsMessage(
+  runs: StrategySchedulerRunRecord[],
+  options?: {
+    schedulerStatus?: StrategySchedulerStatus | null;
+  },
+): string {
+  const runtimeLines = formatStrategySchedulerInspectionStatusLines(options?.schedulerStatus ?? null);
+
   if (runs.length === 0) {
     return [
       "Strategy Scheduler History",
       "count: 0",
-      "state_source: persisted strategy_scheduler_runs",
+      "state_source: runtime scheduler status + persisted strategy_scheduler_runs",
+      ...runtimeLines,
       "note: No strategy scheduler runs are stored yet.",
       `operator_boundary: ${MANUAL_INPUT_NOTE}`,
     ].join("\n");
@@ -814,13 +822,57 @@ export function formatStrategySchedulerRunsMessage(runs: StrategySchedulerRunRec
   return [
     "Strategy Scheduler History",
     `count: ${sortedRuns.length}`,
-    "state_source: persisted strategy_scheduler_runs",
+    "state_source: runtime scheduler status + persisted strategy_scheduler_runs",
+    ...runtimeLines,
     ...sortedRuns.map(
       (run) =>
         `- ${run.startedAt} | ${run.market} | ${run.status} | trigger=${run.triggerSource} | completed_at=${run.completedAt ?? "none"} | interval_ms=${run.intervalMs} | run_on_start=${run.runOnStart} | decision=${run.strategyDecisionId ?? "none"} | action=${run.action ?? "none"} | order=${run.orderId ?? "none"} | order_status=${run.orderStatus ?? "none"} | accepted=${run.submissionAccepted === null ? "none" : run.submissionAccepted} | error=${run.errorMessage ?? "none"} | detail=${run.detail ?? "none"}`,
     ),
     `operator_boundary: ${MANUAL_INPUT_NOTE}`,
   ].join("\n");
+}
+
+function formatStrategySchedulerInspectionStatusLines(status: StrategySchedulerStatus | null): string[] {
+  if (!status) {
+    return [
+      "runtime_status_source: unavailable",
+      "runtime_enabled: unknown",
+      "runtime_started: unknown",
+      "runtime_live_send_path: unknown",
+      "runtime_startup_preflight_status: none",
+      "runtime_startup_preflight_checks: none",
+      "runtime_market_count: 0",
+    ];
+  }
+
+  return [
+    "runtime_status_source: in-memory scheduler status",
+    `runtime_enabled: ${status.enabled}`,
+    `runtime_started: ${status.started}`,
+    `runtime_live_send_path: ${status.liveSendPath}`,
+    `runtime_startup_preflight_status: ${status.startupPreflight?.status ?? "none"}`,
+    `runtime_startup_preflight_scope: ${status.startupPreflight?.scope ?? "none"}`,
+    `runtime_startup_preflight_detail: ${status.startupPreflight?.detail ?? "none"}`,
+    ...formatRuntimeSchedulerPreflightChecks(status.startupPreflight?.checks ?? []),
+    `runtime_market_count: ${status.markets.length}`,
+    ...status.markets.map(
+      (market) =>
+        `- runtime ${market.market} interval_ms=${market.intervalMs} running=${market.running} next_run_at=${market.nextRunAt ?? "none"} last_status=${market.lastStatus} run_count=${market.runCount} success=${market.successCount} failure=${market.failureCount} skipped=${market.skippedCount} last_error=${market.lastError ?? "none"}`,
+    ),
+  ];
+}
+
+function formatRuntimeSchedulerPreflightChecks(
+  checks: NonNullable<StrategySchedulerStatus["startupPreflight"]>["checks"],
+): string[] {
+  if (checks.length === 0) {
+    return ["runtime_startup_preflight_checks: none"];
+  }
+
+  return [
+    `runtime_startup_preflight_checks: ${checks.length}`,
+    ...checks.map((check) => `- runtime_preflight ${check.name}: ${check.status} | ${check.detail}`),
+  ];
 }
 
 export function formatTelegramInboundMessage(

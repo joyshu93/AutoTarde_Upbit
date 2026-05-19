@@ -66,6 +66,7 @@ Current remaining gaps:
 - Telegram inbound polling is now available behind `ENABLE_TELEGRAM_INBOUND_POLLING=false` by default, uses the existing command router, only accepts messages from `TELEGRAM_OPERATOR_CHAT_ID`, persists `getUpdates` offset progress in `telegram_inbound_offsets`, and exposes `/inbound` inspection
 - startup recovery can now mark persisted operator state `DEGRADED` when unresolved portfolio drift remains after exchange-backed bootstrap checks
 - scheduler-triggered strategy cycles now persist `strategy_scheduler_runs` so scheduled run starts, completions, failures, and skips remain inspectable after process restart, including through `/scheduler`
+- `/scheduler` now shows current in-memory scheduler status and startup preflight summary before the persisted scheduler-run history
 - scheduler-triggered failures, overlapping-run skips, and scheduler-triggered order submission/rejection outcomes now also persist operator notifications so automatic operation has an alert trail
 - `/order <order-id|identifier>` now exposes one persisted order, order events, and fills for read-only lifecycle investigation
 - reconciliation now repairs older local dry-run artifacts without querying Upbit for `dryrun_*` UUIDs
@@ -100,7 +101,7 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 13. `/run BTC|ETH` requests one deterministic PositionGuard runner cycle for a supported asset and returns the persisted decision, action, and any DRY_RUN order lifecycle result.
 14. When `STRATEGY_SCHEDULER_ENABLED=true`, the scheduler uses the same safe runner/controller path as `/run BTC|ETH`; it is disabled by default.
 15. In `LIVE` mode, scheduler startup runs an automatic preflight before any timer is installed; this replaces a mandatory manual-first-run ritual with inspectable startup safety checks.
-16. Scheduler-triggered cycles are persisted in `strategy_scheduler_runs` before runner execution and updated on completion, failure, or skip; `/scheduler` exposes a fuller read-only history than the compact `/status` summary.
+16. Scheduler-triggered cycles are persisted in `strategy_scheduler_runs` before runner execution and updated on completion, failure, or skip; `/scheduler` exposes current runtime scheduler status plus a fuller read-only history than the compact `/status` summary.
 17. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
 18. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
 19. Telegram delivery claims due `PENDING` notifications with a lease token, then only finalizes rows that still match that lease.

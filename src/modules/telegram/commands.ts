@@ -264,7 +264,9 @@ export class TelegramCommandRouter {
     const runs = await this.dependencies.repositories.listStrategySchedulerRuns(exchangeAccountId, 20);
 
     return {
-      text: formatStrategySchedulerRunsMessage(runs),
+      text: formatStrategySchedulerRunsMessage(runs, {
+        schedulerStatus: this.dependencies.schedulerStatus?.() ?? null,
+      }),
     };
   }
 

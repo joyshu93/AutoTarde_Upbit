@@ -153,7 +153,7 @@ Telegram should report lifecycle outcomes, such as:
 - non-secret runtime configuration inspection through `/config`
 - read-only operator readiness inspection through `/readiness`, including bounded local persistence health
 - single-order lifecycle detail through `/order <order-id|identifier>`, including persisted order events and fills
-- persisted scheduler run history through `/scheduler`
+- runtime scheduler status plus persisted scheduler run history through `/scheduler`
 - bounded `/orders` summaries with `/order <order-id|identifier>` for details
 
 Notifications are derived from lifecycle state, not treated as lifecycle state.
@@ -161,7 +161,7 @@ Notifications are derived from lifecycle state, not treated as lifecycle state.
 `/config` is runtime configuration inspection and must not create an order-lifecycle transition or expose raw secrets.
 `/readiness` is operator readiness inspection and may summarize active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count from local persistence, but it must not create an order-lifecycle transition, call Upbit, poll Telegram, mutate offsets, trigger sync, run strategies, tick schedulers, submit orders, cancel orders, or deliver notifications.
 `/order <order-id|identifier>` is a lifecycle inspection view over persisted `orders`, `order_events`, and `fills`; it does not create, cancel, retry, or reconcile orders by itself.
-Scheduler run history is likewise operational audit state, not order lifecycle truth; orders and fills remain the durable lifecycle records.
+Scheduler runtime status and scheduler run history are likewise operational audit state, not order lifecycle truth; orders and fills remain the durable lifecycle records.
 Scheduler startup preflight state is also operational control state, not order lifecycle truth. It may block timers, be shown in `/status` or `/readiness`, and persist a scheduler-startup-blocked operator notification, but it must not create, cancel, retry, or reconcile an order by itself.
 Inbound Telegram update offsets are durable transport progress state, not order lifecycle truth.
 The `/inbound` command may inspect that transport progress, but it must not become an order-lifecycle transition.

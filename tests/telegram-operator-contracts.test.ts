@@ -80,7 +80,10 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.equal(risksParsed.contract.summary, "Show recent persisted risk_events for operator inspection.");
   assert.ok(schedulerParsed);
   assert.equal(schedulerParsed.command, "/scheduler");
-  assert.equal(schedulerParsed.contract.summary, "Show recent persisted strategy_scheduler_runs for operator inspection.");
+  assert.equal(
+    schedulerParsed.contract.summary,
+    "Show runtime scheduler status and recent persisted strategy_scheduler_runs for operator inspection.",
+  );
   assert.ok(inboundParsed);
   assert.equal(inboundParsed.command, "/inbound");
   assert.equal(inboundParsed.contract.summary, "Show Telegram inbound polling status and persisted update offset.");
@@ -440,11 +443,14 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
 
   assert.match(emptySchedulerRunsMessage, /Strategy Scheduler History/);
   assert.match(emptySchedulerRunsMessage, /count: 0/);
-  assert.match(emptySchedulerRunsMessage, /state_source: persisted strategy_scheduler_runs/);
+  assert.match(emptySchedulerRunsMessage, /state_source: runtime scheduler status \+ persisted strategy_scheduler_runs/);
+  assert.match(emptySchedulerRunsMessage, /runtime_status_source: unavailable/);
   assert.match(emptySchedulerRunsMessage, /note: No strategy scheduler runs are stored yet\./);
 
   assert.match(schedulerRunsMessage, /Strategy Scheduler History/);
   assert.match(schedulerRunsMessage, /count: 1/);
+  assert.match(schedulerRunsMessage, /runtime_enabled: unknown/);
+  assert.match(schedulerRunsMessage, /runtime_startup_preflight_checks: none/);
   assert.match(schedulerRunsMessage, /\| KRW-BTC \| SKIPPED \| trigger=SCHEDULER \| completed_at=2026-04-20T00:08:00.000Z \| interval_ms=1800000 \| run_on_start=true \| decision=none \| action=none \| order=none \| order_status=none \| accepted=none \| error=none \| detail=Previous run still active\./);
 
   assert.match(telegramInboundMessage, /Telegram Inbound/);
@@ -826,7 +832,8 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   assert.match(risksResponse.text, /GLOBAL_KILL_SWITCH/);
   assert.match(schedulerResponse.text, /Strategy Scheduler History/);
   assert.match(schedulerResponse.text, /count: 1/);
-  assert.match(schedulerResponse.text, /state_source: persisted strategy_scheduler_runs/);
+  assert.match(schedulerResponse.text, /state_source: runtime scheduler status \+ persisted strategy_scheduler_runs/);
+  assert.match(schedulerResponse.text, /runtime_status_source: unavailable/);
   assert.match(schedulerResponse.text, /\| KRW-BTC \| COMPLETED \| trigger=SCHEDULER/);
   assert.match(inboundResponse.text, /Telegram Inbound/);
   assert.match(inboundResponse.text, /enabled: true/);
@@ -871,7 +878,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   const invalidSchedulerResponse = await router.route("/scheduler now");
   assert.equal(
     invalidSchedulerResponse.text,
-    "Usage: /scheduler\nShow recent persisted strategy_scheduler_runs for operator inspection.",
+    "Usage: /scheduler\nShow runtime scheduler status and recent persisted strategy_scheduler_runs for operator inspection.",
   );
   const invalidInboundResponse = await router.route("/inbound now");
   assert.equal(

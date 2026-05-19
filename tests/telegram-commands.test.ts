@@ -1037,13 +1037,61 @@ test("telegram router exposes dedicated strategy scheduler inspection", async ()
       degradedAt: null,
       updatedAt: "2026-04-20T00:00:00.000Z",
     }),
+    schedulerStatus: () => ({
+      enabled: true,
+      started: true,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      startupPreflight: {
+        checkedAt: "2026-04-20T00:00:00.000Z",
+        scope: "LIVE",
+        status: "WARN",
+        detail: "Live scheduler startup preflight passed with warnings.",
+        checks: [
+          {
+            name: "latest_reconciliation",
+            status: "WARN",
+            detail: "Exchange-history archive recovery is still in progress.",
+          },
+        ],
+      },
+      markets: [
+        {
+          market: "KRW-BTC",
+          intervalMs: 1_800_000,
+          running: false,
+          runCount: 3,
+          successCount: 2,
+          failureCount: 1,
+          skippedCount: 0,
+          lastStartedAt: "2026-04-20T00:00:00.000Z",
+          lastCompletedAt: "2026-04-20T00:00:02.000Z",
+          lastStatus: "COMPLETED",
+          lastStrategyDecisionId: "strategy-decision-1",
+          lastAction: "HOLD",
+          lastOrderId: null,
+          lastOrderStatus: null,
+          lastError: null,
+          nextRunAt: "2026-04-20T00:30:00.000Z",
+        },
+      ],
+    }),
   });
 
   const scheduler = await router.route("/scheduler");
 
   assert.match(scheduler.text, /Strategy Scheduler History/);
   assert.match(scheduler.text, /count: 2/);
-  assert.match(scheduler.text, /state_source: persisted strategy_scheduler_runs/);
+  assert.match(scheduler.text, /state_source: runtime scheduler status \+ persisted strategy_scheduler_runs/);
+  assert.match(scheduler.text, /runtime_status_source: in-memory scheduler status/);
+  assert.match(scheduler.text, /runtime_enabled: true/);
+  assert.match(scheduler.text, /runtime_started: true/);
+  assert.match(scheduler.text, /runtime_live_send_path: LIVE_ADAPTER/);
+  assert.match(scheduler.text, /runtime_startup_preflight_status: WARN/);
+  assert.match(scheduler.text, /runtime_startup_preflight_scope: LIVE/);
+  assert.match(scheduler.text, /runtime_startup_preflight_checks: 1/);
+  assert.match(scheduler.text, /- runtime_preflight latest_reconciliation: WARN \| Exchange-history archive recovery is still in progress\./);
+  assert.match(scheduler.text, /- runtime KRW-BTC interval_ms=1800000 running=false next_run_at=2026-04-20T00:30:00.000Z last_status=COMPLETED run_count=3 success=2 failure=1 skipped=0/);
   assert.match(scheduler.text, /2026-04-20T00:10:00.000Z \| KRW-ETH \| FAILED \| trigger=SCHEDULER/);
   assert.match(scheduler.text, /interval_ms=1800000 \| run_on_start=false/);
   assert.match(scheduler.text, /error=upbit_timeout/);
@@ -1059,7 +1107,9 @@ test("telegram router exposes empty strategy scheduler history", async () => {
 
   assert.match(scheduler.text, /Strategy Scheduler History/);
   assert.match(scheduler.text, /count: 0/);
-  assert.match(scheduler.text, /state_source: persisted strategy_scheduler_runs/);
+  assert.match(scheduler.text, /state_source: runtime scheduler status \+ persisted strategy_scheduler_runs/);
+  assert.match(scheduler.text, /runtime_status_source: unavailable/);
+  assert.match(scheduler.text, /runtime_startup_preflight_checks: none/);
   assert.match(scheduler.text, /note: No strategy scheduler runs are stored yet\./);
 });
 
