@@ -240,6 +240,7 @@ export class TelegramCommandRouter {
         pendingNotifications,
         schedulerStatus: this.dependencies.schedulerStatus?.() ?? null,
         inboundStatus: this.dependencies.telegramInboundStatus?.() ?? null,
+        now: this.dependencies.now?.() ?? new Date().toISOString(),
       }),
     };
   }

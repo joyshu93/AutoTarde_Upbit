@@ -139,6 +139,7 @@ It provides:
 - `/run BTC|ETH` for one deterministic PositionGuard strategy runner cycle through the configured safe execution path
 - `/status` strategy-scheduler lines for disabled/enabled state, configured intervals, next run timestamps, recent in-memory scheduler outcomes, and persisted recent scheduler run history
 - `/status` strategy-scheduler lines also expose startup preflight status, scope, detail, and check results
+- `/readiness` warns when a `LIVE` scheduler is running while the latest persisted balance snapshot, position snapshot, or reconciliation run is older than the shortest configured scheduler interval
 - live scheduler startup preflight blocks are persisted as operator notifications before startup can close local persistence
 - scheduler-triggered failures, overlapping-run skips, and scheduler-triggered order submission/rejection outcomes are persisted as operator notifications so automatic operation does not fail silently
 - Windows Task Scheduler helpers register manual-only launch wrappers around ignored local startup scripts; they never store secrets in task definitions or add startup/logon triggers
@@ -234,7 +235,7 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 2. Optionally run an exchange-backed startup recovery sweep when Upbit read credentials are configured.
 3. During startup recovery, persist fresh balance and position snapshots, reconcile orders/fills, detect unexplained portfolio drift, then apply the bootstrap-only `DEGRADED` policy if needed.
 4. Load execution policy and operator state.
-5. If the scheduler is enabled, build a scheduler startup preflight; in `LIVE` scope, block timer installation unless live-send configuration, execution state, persisted snapshots, latest reconciliation, and active-order state are safe.
+5. If the scheduler is enabled, build a scheduler startup preflight; in `LIVE` scope, block timer installation unless live-send configuration, execution state, fresh persisted snapshots, fresh latest reconciliation, and active-order state are safe.
 6. Build a deterministic strategy decision, either from an explicit operator `/run BTC|ETH` request or the disabled-by-default scheduler.
 7. Convert the decision into an order intent with an idempotency key.
 8. Run risk guards.

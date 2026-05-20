@@ -119,6 +119,7 @@ export function formatReadinessMessage(input: {
   pendingNotifications: OperatorNotificationRecord[];
   schedulerStatus: StrategySchedulerStatus | null;
   inboundStatus: TelegramInboundPollingStatus | null;
+  now?: string;
 }): string {
   const checks = buildReadinessChecks(input);
   const overallStatus = checks.some((check) => check.status === "BLOCK")
@@ -513,6 +514,7 @@ function buildReadinessChecks(input: {
   pendingNotifications: OperatorNotificationRecord[];
   schedulerStatus: StrategySchedulerStatus | null;
   inboundStatus: TelegramInboundPollingStatus | null;
+  now?: string;
 }): Array<{ name: string; status: "PASS" | "WARN" | "BLOCK"; detail: string }> {
   const config = input.runtimeConfig;
   const liveBlockers = config ? describeRuntimeConfigLiveBlockers(config) : ["CONFIG_UNAVAILABLE"];
@@ -572,22 +574,58 @@ function buildReadinessChecks(input: {
     },
     {
       name: "balance_snapshot",
-      status: input.latestBalanceSnapshot ? "PASS" : "WARN",
+      status: describeReadinessTimestampFreshness(
+        input.latestBalanceSnapshot?.capturedAt ?? null,
+        input.now,
+        config,
+        input.schedulerStatus,
+      ).status,
       detail: input.latestBalanceSnapshot
-        ? `latest balance snapshot captured_at=${input.latestBalanceSnapshot.capturedAt}`
+        ? appendOptionalDetail(
+          `latest balance snapshot captured_at=${input.latestBalanceSnapshot.capturedAt}`,
+          describeReadinessTimestampFreshness(
+            input.latestBalanceSnapshot.capturedAt,
+            input.now,
+            config,
+            input.schedulerStatus,
+          ).detail,
+        )
         : "no balance snapshot is stored yet",
     },
     {
       name: "position_snapshot",
-      status: input.latestPositionSnapshot ? "PASS" : "WARN",
+      status: describeReadinessTimestampFreshness(
+        input.latestPositionSnapshot?.capturedAt ?? null,
+        input.now,
+        config,
+        input.schedulerStatus,
+      ).status,
       detail: input.latestPositionSnapshot
-        ? `latest position snapshot captured_at=${input.latestPositionSnapshot.capturedAt}`
+        ? appendOptionalDetail(
+          `latest position snapshot captured_at=${input.latestPositionSnapshot.capturedAt}`,
+          describeReadinessTimestampFreshness(
+            input.latestPositionSnapshot.capturedAt,
+            input.now,
+            config,
+            input.schedulerStatus,
+          ).detail,
+        )
         : "no position snapshot is stored yet",
     },
     {
       name: "latest_reconciliation",
-      status: describeReconciliationReadiness(input.latestReconciliationRun).status,
-      detail: describeReconciliationReadiness(input.latestReconciliationRun).detail,
+      status: describeReconciliationReadiness(
+        input.latestReconciliationRun,
+        input.now,
+        config,
+        input.schedulerStatus,
+      ).status,
+      detail: describeReconciliationReadiness(
+        input.latestReconciliationRun,
+        input.now,
+        config,
+        input.schedulerStatus,
+      ).detail,
     },
     {
       name: "active_orders",
@@ -611,6 +649,57 @@ function buildReadinessChecks(input: {
         : `${input.pendingNotifications.length} pending operator notification(s) in bounded sample`,
     },
   ];
+}
+
+function describeReadinessTimestampFreshness(
+  timestamp: string | null,
+  now: string | undefined,
+  config: TelegramRuntimeConfigSnapshot | null,
+  schedulerStatus: StrategySchedulerStatus | null,
+): { status: "PASS" | "WARN"; detail: string } {
+  if (timestamp === null) {
+    return {
+      status: "WARN",
+      detail: "missing timestamp",
+    };
+  }
+
+  if (!shouldCheckLiveSchedulerFreshness(config, schedulerStatus) || !now) {
+    return {
+      status: "PASS",
+      detail: "",
+    };
+  }
+
+  const maxAgeMs = getSchedulerFreshnessThresholdMs(config);
+  const ageMs = Date.parse(now) - Date.parse(timestamp);
+  if (!Number.isFinite(ageMs) || ageMs < 0) {
+    return {
+      status: "WARN",
+      detail: "freshness_check=uncomparable",
+    };
+  }
+
+  return ageMs <= maxAgeMs
+    ? {
+        status: "PASS",
+        detail: `fresh_age_ms=${ageMs} max_age_ms=${maxAgeMs}`,
+      }
+    : {
+        status: "WARN",
+        detail: `stale_age_ms=${ageMs} max_age_ms=${maxAgeMs}`,
+      };
+}
+
+function shouldCheckLiveSchedulerFreshness(
+  config: TelegramRuntimeConfigSnapshot | null,
+  schedulerStatus: StrategySchedulerStatus | null,
+): config is TelegramRuntimeConfigSnapshot {
+  return Boolean(config && config.executionMode === "LIVE" && schedulerStatus?.enabled);
+}
+
+function getSchedulerFreshnessThresholdMs(config: TelegramRuntimeConfigSnapshot): number {
+  return Math.min(config.strategySchedulerBtcIntervalMs, config.strategySchedulerEthIntervalMs);
 }
 
 function countRiskBlocks(events: readonly RiskEventRecord[]): number {
@@ -644,6 +733,9 @@ function describeStrategySchedulerReadiness(
 
 function describeReconciliationReadiness(
   run: ReconciliationRunRecord | null,
+  now?: string,
+  config?: TelegramRuntimeConfigSnapshot | null,
+  schedulerStatus?: StrategySchedulerStatus | null,
 ): { status: "PASS" | "WARN" | "BLOCK"; detail: string } {
   if (!run) {
     return {
@@ -652,10 +744,20 @@ function describeReconciliationReadiness(
     };
   }
 
+  const freshness = describeReadinessTimestampFreshness(
+    run.completedAt,
+    now,
+    config ?? null,
+    schedulerStatus ?? null,
+  );
+
   if (run.status === "SUCCESS") {
     return {
-      status: "PASS",
-      detail: `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"}`,
+      status: freshness.status,
+      detail: appendOptionalDetail(
+        `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"}`,
+        freshness.detail,
+      ),
     };
   }
 
@@ -665,18 +767,34 @@ function describeReconciliationReadiness(
   if (blockingIssueCodes.length > 0) {
     return {
       status: "BLOCK",
-      detail:
-        `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ` +
-        `blocking_issue_codes=${blockingIssueCodes.join(",")} issue_codes=${issueSummary}`,
+      detail: appendOptionalDetail(
+        `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"}`,
+        freshness.detail,
+      ) + ` blocking_issue_codes=${blockingIssueCodes.join(",")} issue_codes=${issueSummary}`,
+    };
+  }
+
+  if (freshness.status === "WARN" && shouldCheckLiveSchedulerFreshness(config ?? null, schedulerStatus ?? null)) {
+    return {
+      status: "WARN",
+      detail: appendOptionalDetail(
+        `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"}`,
+        freshness.detail,
+      ) + ` non_blocking_issue_codes=${issueSummary}`,
     };
   }
 
   return {
     status: "WARN",
-    detail:
-      `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ` +
-      `non_blocking_issue_codes=${issueSummary}`,
+    detail: appendOptionalDetail(
+      `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"}`,
+      freshness.detail,
+    ) + ` non_blocking_issue_codes=${issueSummary}`,
   };
+}
+
+function appendOptionalDetail(base: string, detail: string): string {
+  return detail.length > 0 ? `${base} ${detail}` : base;
 }
 
 function isBlockingReconciliationIssueCode(code: string): boolean {

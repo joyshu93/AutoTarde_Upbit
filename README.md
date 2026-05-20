@@ -74,7 +74,7 @@ Current remaining gaps:
 - `/orders` now returns a bounded recent-order summary and points operators to `/order <id|identifier>` for details
 - `/readiness` treats exchange-history recovery progress as a warning instead of blocking when no portfolio drift or unresolved order recovery remains
 - Telegram `/start` is handled as a `/help` alias
-- scheduler startup now records an automatic `strategySchedulerStartupPreflight`; in `LIVE` mode it blocks scheduler timers unless live gate, live adapter wiring, execution state, exchange-backed snapshots, reconciliation health, and active-order state are safe
+- scheduler startup now records an automatic `strategySchedulerStartupPreflight`; in `LIVE` mode it blocks scheduler timers unless live gate, live adapter wiring, execution state, fresh exchange-backed snapshots, fresh reconciliation health, and active-order state are safe
 - live scheduler startup blocks now persist an operator notification before startup can close local persistence
 - the runtime can now derive `LIVE_ADAPTER` send wiring only when mode, live gate, and Upbit credentials are all explicitly configured; otherwise it remains on `DRY_RUN_ADAPTER`
 
@@ -99,7 +99,7 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 12. `/sync` connects to reconciliation so snapshot and reconciliation records are persisted, using read-only public ticker valuation when available.
 13. `/run BTC|ETH` requests one deterministic PositionGuard runner cycle for a supported asset and returns the persisted decision, action, and any DRY_RUN order lifecycle result.
 14. When `STRATEGY_SCHEDULER_ENABLED=true`, the scheduler uses the same safe runner/controller path as `/run BTC|ETH`; it is disabled by default.
-15. In `LIVE` mode, scheduler startup runs an automatic preflight before any timer is installed; this replaces a mandatory manual-first-run ritual with inspectable startup safety checks.
+15. In `LIVE` mode, scheduler startup runs an automatic preflight before any timer is installed; this replaces a mandatory manual-first-run ritual with inspectable startup safety checks and rejects stale persisted account-health evidence.
 16. Scheduler-triggered cycles are persisted in `strategy_scheduler_runs` before runner execution and updated on completion, failure, or skip; `/scheduler` exposes current runtime scheduler status plus a fuller read-only history than the compact `/status` summary.
 17. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
 18. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
@@ -115,7 +115,7 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 `/help` is static command-contract inspection. It does not read exchange state, query repositories, trigger `/sync`, run strategy cycles, tick the scheduler, mutate orders, or enable live order transmission.
 `/config` is non-secret runtime configuration inspection. It shows configured/not-configured booleans for credentials and Telegram identifiers instead of raw secret values, and it lists ignored deprecated environment variable names when stale local scripts still set them.
 `/readiness` is read-only operator readiness inspection. It summarizes runtime config, persisted execution state, worker status, latest snapshots, latest reconciliation, and bounded local persistence health: active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count. It does this without active Upbit or Telegram probes, without triggering sync, strategy, or scheduler work, and without mutating offsets, orders, or notification delivery state.
-In intentional `LIVE` operation, `/readiness` reports the enabled live send path as a warning so operators remember that `/run` is real-order capable, while true health blockers still produce `BLOCK`.
+In intentional `LIVE` operation, `/readiness` reports the enabled live send path as a warning so operators remember that `/run` is real-order capable, while true health blockers still produce `BLOCK`. When the `LIVE` scheduler is enabled, `/readiness` also warns if the latest balance snapshot, position snapshot, or reconciliation run is older than the shortest configured scheduler interval.
 
 ## Folder Layout
 
@@ -227,7 +227,7 @@ If startup recovery finds unresolved portfolio drift against the prior persisted
 The strategy scheduler is disabled unless `STRATEGY_SCHEDULER_ENABLED=true`.
 When enabled, `STRATEGY_SCHEDULER_BTC_INTERVAL_MS` and `STRATEGY_SCHEDULER_ETH_INTERVAL_MS` control the BTC/ETH cadence, and `STRATEGY_SCHEDULER_RUN_ON_START=true` requests an immediate first tick after startup recovery policy has completed.
 The scheduler still uses the same runner/controller path as `/run BTC|ETH`, so it does not enable live order transmission by itself.
-If the scheduler is enabled while `APP_EXECUTION_MODE=LIVE`, startup first runs an automatic scheduler preflight. It blocks timer installation unless the live gate is enabled, the execution service is wired to the live adapter, operator state is `RUNNING`, Upbit read credentials and fresh persisted snapshots exist, no active local orders require visibility, and the latest reconciliation has no blocking issue codes. Non-blocking exchange-history recovery evidence remains a warning.
+If the scheduler is enabled while `APP_EXECUTION_MODE=LIVE`, startup first runs an automatic scheduler preflight. It blocks timer installation unless the live gate is enabled, the execution service is wired to the live adapter, operator state is `RUNNING`, Upbit read credentials and fresh persisted snapshots exist, no active local orders require visibility, and the latest reconciliation is fresh and has no blocking issue codes. Freshness uses the shortest configured scheduler interval, so with the default one-hour BTC/ETH intervals a snapshot or reconciliation older than one hour blocks automatic scheduler startup. Non-blocking exchange-history recovery evidence remains a warning.
 If that live scheduler startup preflight blocks timer installation, the runtime persists a `SCHEDULER_STARTUP_BLOCKED` operator notification with the preflight detail and failed checks before local persistence can be closed.
 When either scheduler or Telegram inbound polling is running, use normal process signals such as `Ctrl+C` / `SIGINT` or `SIGTERM` to stop the process. Shutdown is explicit: inbound polling is stopped, scheduler timers are cleared, and SQLite persistence is closed before the process exits.
 

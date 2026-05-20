@@ -72,6 +72,7 @@ export async function buildStrategySchedulerStartupPreflight(input: {
     executionState: input.executionState,
     exchangeBackedReadEnabled: input.exchangeBackedReadEnabled,
     liveSendPath: input.liveSendPath,
+    checkedAt,
     latestBalanceSnapshot,
     latestPositionSnapshot,
     latestReconciliationRun,
@@ -100,11 +101,14 @@ function buildLiveSchedulerChecks(input: {
   executionState: ExecutionStateRecord;
   exchangeBackedReadEnabled: boolean;
   liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
+  checkedAt: string;
   latestBalanceSnapshot: BalanceSnapshotRecord | null;
   latestPositionSnapshot: PositionSnapshotRecord | null;
   latestReconciliationRun: ReconciliationRunRecord | null;
   activeOrders: OrderRecord[];
 }): StrategySchedulerStartupPreflightCheck[] {
+  const maxAgeMs = getSchedulerFreshnessThresholdMs(input.config);
+
   return [
     {
       name: "live_gate",
@@ -134,19 +138,21 @@ function buildLiveSchedulerChecks(input: {
     },
     {
       name: "balance_snapshot",
-      status: input.latestBalanceSnapshot ? "PASS" : "BLOCK",
+      status: describeTimestampFreshness(input.latestBalanceSnapshot?.capturedAt ?? null, input.checkedAt, maxAgeMs).status,
       detail: input.latestBalanceSnapshot
-        ? `latest balance snapshot captured_at=${input.latestBalanceSnapshot.capturedAt}`
+        ? `latest balance snapshot captured_at=${input.latestBalanceSnapshot.capturedAt} ` +
+          describeTimestampFreshness(input.latestBalanceSnapshot.capturedAt, input.checkedAt, maxAgeMs).detail
         : "No balance snapshot is stored.",
     },
     {
       name: "position_snapshot",
-      status: input.latestPositionSnapshot ? "PASS" : "BLOCK",
+      status: describeTimestampFreshness(input.latestPositionSnapshot?.capturedAt ?? null, input.checkedAt, maxAgeMs).status,
       detail: input.latestPositionSnapshot
-        ? `latest position snapshot captured_at=${input.latestPositionSnapshot.capturedAt}`
+        ? `latest position snapshot captured_at=${input.latestPositionSnapshot.capturedAt} ` +
+          describeTimestampFreshness(input.latestPositionSnapshot.capturedAt, input.checkedAt, maxAgeMs).detail
         : "No position snapshot is stored.",
     },
-    describeLatestReconciliation(input.latestReconciliationRun),
+    describeLatestReconciliation(input.latestReconciliationRun, input.checkedAt, maxAgeMs),
     {
       name: "active_orders",
       status: input.activeOrders.length === 0 ? "PASS" : "BLOCK",
@@ -155,6 +161,41 @@ function buildLiveSchedulerChecks(input: {
         : `${input.activeOrders.length} active or reconciliation-required order(s) must be resolved first.`,
     },
   ];
+}
+
+function getSchedulerFreshnessThresholdMs(config: AppConfig): number {
+  return Math.min(config.strategySchedulerBtcIntervalMs, config.strategySchedulerEthIntervalMs);
+}
+
+function describeTimestampFreshness(
+  timestamp: string | null,
+  checkedAt: string,
+  maxAgeMs: number,
+): { status: "PASS" | "BLOCK"; detail: string } {
+  if (timestamp === null) {
+    return {
+      status: "BLOCK",
+      detail: "missing timestamp",
+    };
+  }
+
+  const ageMs = Date.parse(checkedAt) - Date.parse(timestamp);
+  if (!Number.isFinite(ageMs) || ageMs < 0) {
+    return {
+      status: "BLOCK",
+      detail: "timestamp is not comparable to preflight time",
+    };
+  }
+
+  return ageMs <= maxAgeMs
+    ? {
+        status: "PASS",
+        detail: `fresh_age_ms=${ageMs} max_age_ms=${maxAgeMs}`,
+      }
+    : {
+        status: "BLOCK",
+        detail: `stale_age_ms=${ageMs} max_age_ms=${maxAgeMs}`,
+      };
 }
 
 function isRunnableExecutionState(state: ExecutionStateRecord): boolean {
@@ -195,6 +236,8 @@ function describeExecutionState(state: ExecutionStateRecord): string {
 
 function describeLatestReconciliation(
   run: ReconciliationRunRecord | null,
+  checkedAt: string,
+  maxAgeMs: number,
 ): StrategySchedulerStartupPreflightCheck {
   if (!run) {
     return {
@@ -204,11 +247,21 @@ function describeLatestReconciliation(
     };
   }
 
+  const freshness = describeTimestampFreshness(run.completedAt, checkedAt, maxAgeMs);
+  if (freshness.status === "BLOCK") {
+    return {
+      name: "latest_reconciliation",
+      status: "BLOCK",
+      detail:
+        `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ${freshness.detail}`,
+    };
+  }
+
   if (run.status === "SUCCESS") {
     return {
       name: "latest_reconciliation",
       status: "PASS",
-      detail: `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"}`,
+      detail: `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ${freshness.detail}`,
     };
   }
 
@@ -220,7 +273,7 @@ function describeLatestReconciliation(
       status: "BLOCK",
       detail:
         `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ` +
-        `blocking_issue_codes=${blockingIssueCodes.join(",")} issue_codes=${formatIssueCodes(issueCodes)}`,
+        `${freshness.detail} blocking_issue_codes=${blockingIssueCodes.join(",")} issue_codes=${formatIssueCodes(issueCodes)}`,
     };
   }
 
@@ -229,7 +282,7 @@ function describeLatestReconciliation(
     status: "WARN",
     detail:
       `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ` +
-      `non_blocking_issue_codes=${formatIssueCodes(issueCodes)}`,
+      `${freshness.detail} non_blocking_issue_codes=${formatIssueCodes(issueCodes)}`,
   };
 }
 

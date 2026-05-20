@@ -117,6 +117,36 @@ test("scheduler startup preflight treats recovered exchange history as warning, 
   assert.equal(preflight.checks.find((check) => check.name === "latest_reconciliation")?.status, "WARN");
 });
 
+test("scheduler startup preflight blocks live scheduler when persisted health is stale", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await seedReadyPortfolio(repository);
+
+  const preflight = await buildStrategySchedulerStartupPreflight({
+    config: createConfig({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      strategySchedulerEnabled: true,
+      strategySchedulerBtcIntervalMs: 3_600_000,
+      strategySchedulerEthIntervalMs: 3_600_000,
+    }),
+    exchangeAccountId: "primary",
+    executionState: createExecutionState({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+    }),
+    repositories: repository,
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    checkedAt: "2026-05-08T02:00:01.000Z",
+  });
+
+  assert.equal(preflight.status, "BLOCK");
+  assert.equal(preflight.checks.find((check) => check.name === "balance_snapshot")?.status, "BLOCK");
+  assert.equal(preflight.checks.find((check) => check.name === "position_snapshot")?.status, "BLOCK");
+  assert.equal(preflight.checks.find((check) => check.name === "latest_reconciliation")?.status, "BLOCK");
+  assert.match(preflight.detail, /balance_snapshot/);
+});
+
 async function seedReadyPortfolio(
   repository: InMemoryExecutionRepository,
   reconciliationRun: ReconciliationRunRecord = createReconciliationRun({ status: "SUCCESS" }),
@@ -201,7 +231,7 @@ function createReconciliationRun(overrides: Partial<ReconciliationRunRecord>): R
     exchangeAccountId: "primary",
     status: "SUCCESS",
     startedAt: "2026-05-08T00:00:00.000Z",
-    completedAt: "2026-05-08T00:00:01.000Z",
+    completedAt: "2026-05-08T00:00:00.000Z",
     summaryJson: JSON.stringify({ issues: [] }),
     errorMessage: null,
     ...overrides,

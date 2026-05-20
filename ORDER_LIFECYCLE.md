@@ -128,7 +128,7 @@ Reconciliation should run when:
 - the disabled-by-default scheduler runs a deterministic cycle and the resulting strategy decision creates or updates an order lifecycle record
 
 The current scaffold now uses both process startup recovery and operator-triggered `/sync` as explicit reconciliation entry points.
-If scheduler startup is requested in `LIVE` mode, an automatic preflight runs before scheduler timers are installed. A blocked startup is scheduler runtime state, not an order lifecycle transition; no order is created unless a later deterministic runner cycle passes preflight, risk, validation, and persistence.
+If scheduler startup is requested in `LIVE` mode, an automatic preflight runs before scheduler timers are installed. It requires fresh persisted account-health evidence, including balance snapshot, position snapshot, and latest reconciliation data, using the shortest configured scheduler interval as the maximum acceptable age. A blocked startup is scheduler runtime state, not an order lifecycle transition; no order is created unless a later deterministic runner cycle passes preflight, risk, validation, and persistence.
 
 Restart recovery currently prioritizes persisted non-terminal orders first, then limited terminal backfill candidates, and respects a per-run exchange lookup budget.
 Exchange-history recovery advances per-market archive checkpoints only until the configured stop-before boundary, then reports that archive coverage as complete instead of continuing unbounded historical fetches.
@@ -162,7 +162,7 @@ Notifications are derived from lifecycle state, not treated as lifecycle state.
 `/readiness` is operator readiness inspection and may summarize active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count from local persistence, but it must not create an order-lifecycle transition, call Upbit, poll Telegram, mutate offsets, trigger sync, run strategies, tick schedulers, submit orders, cancel orders, or deliver notifications.
 `/order <order-id|identifier>` is a lifecycle inspection view over persisted `orders`, `order_events`, and `fills`; it does not create, cancel, retry, or reconcile orders by itself.
 Scheduler runtime status and scheduler run history are likewise operational audit state, not order lifecycle truth; orders and fills remain the durable lifecycle records.
-Scheduler startup preflight state is also operational control state, not order lifecycle truth. It may block timers, be shown in `/status` or `/readiness`, and persist a scheduler-startup-blocked operator notification, but it must not create, cancel, retry, or reconcile an order by itself.
+Scheduler startup preflight state is also operational control state, not order lifecycle truth. It may block timers because health evidence is missing or stale, be shown in `/status` or `/readiness`, and persist a scheduler-startup-blocked operator notification, but it must not create, cancel, retry, or reconcile an order by itself.
 Inbound Telegram update offsets are durable transport progress state, not order lifecycle truth.
 The `/inbound` command may inspect that transport progress, but it must not become an order-lifecycle transition.
 The `smoke:telegram:inbound` script may route at most one fetched operator update through the command router, but it remains transport validation and must not become an order-lifecycle transition by itself.

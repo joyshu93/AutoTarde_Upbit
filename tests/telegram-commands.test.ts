@@ -419,6 +419,81 @@ test("telegram router readiness warns when live send path is intentionally enabl
   assert.doesNotMatch(response.text, /overall_status: BLOCK/);
 });
 
+test("telegram router readiness warns when live scheduler health snapshots are stale", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveBalanceSnapshot({
+    id: "balance-live-stale",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-05-13T07:00:00.000Z",
+    source: "RECONCILIATION",
+    totalKrwValue: "9000",
+    balancesJson: "[]",
+  });
+  await repository.savePositionSnapshot({
+    id: "position-live-stale",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-05-13T07:00:00.000Z",
+    source: "RECONCILIATION",
+    positionsJson: "[]",
+  });
+  await repository.saveReconciliationRun({
+    id: "recon-live-stale",
+    exchangeAccountId: "primary",
+    status: "SUCCESS",
+    startedAt: "2026-05-13T07:00:00.000Z",
+    completedAt: "2026-05-13T07:00:00.000Z",
+    summaryJson: JSON.stringify({ source: "OPERATOR_SYNC", issues: [] }),
+    errorMessage: null,
+  });
+
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-live-stale",
+      exchangeAccountId: "primary",
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-05-13T07:00:00.000Z",
+    }),
+    runtimeConfig: {
+      ...createRuntimeConfig(),
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      liveSendPath: "LIVE_ADAPTER",
+      strategySchedulerEnabled: true,
+      strategySchedulerBtcIntervalMs: 3_600_000,
+      strategySchedulerEthIntervalMs: 3_600_000,
+    },
+    schedulerStatus: () => ({
+      enabled: true,
+      started: true,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      startupPreflight: {
+        checkedAt: "2026-05-13T07:00:00.000Z",
+        scope: "LIVE",
+        status: "PASS",
+        detail: "Live scheduler startup preflight passed.",
+        checks: [],
+      },
+      markets: [],
+    }),
+    now: () => "2026-05-13T09:00:01.000Z",
+  });
+
+  const response = await router.route("/readiness");
+
+  assert.match(response.text, /overall_status: WARN/);
+  assert.match(response.text, /- balance_snapshot: WARN \| latest balance snapshot captured_at=2026-05-13T07:00:00.000Z stale_age_ms=7201000 max_age_ms=3600000/);
+  assert.match(response.text, /- position_snapshot: WARN \| latest position snapshot captured_at=2026-05-13T07:00:00.000Z stale_age_ms=7201000 max_age_ms=3600000/);
+  assert.match(response.text, /- latest_reconciliation: WARN \| latest reconciliation status=SUCCESS completed_at=2026-05-13T07:00:00.000Z stale_age_ms=7201000 max_age_ms=3600000/);
+});
+
 test("telegram router readiness summarizes persistence health warnings", async () => {
   const repository = new InMemoryExecutionRepository();
   await repository.saveOrder(createOrder({
