@@ -38,7 +38,6 @@ test("live scheduler preflight smoke passes when startup preflight passes", () =
       config: createConfig({
         executionMode: "LIVE",
         liveExecutionGate: "ENABLED",
-        maxLiveOrderValueKrw: 6_000,
       }),
       exchangeBackedReadEnabled: true,
       liveSendPath: "LIVE_ADAPTER",
@@ -67,7 +66,6 @@ test("live scheduler preflight smoke keeps non-blocking history recovery as warn
       config: createConfig({
         executionMode: "LIVE",
         liveExecutionGate: "ENABLED",
-        maxLiveOrderValueKrw: 6_000,
       }),
       exchangeBackedReadEnabled: true,
       liveSendPath: "LIVE_ADAPTER",
@@ -98,7 +96,6 @@ test("live scheduler preflight smoke reports preflight blockers without starting
       config: createConfig({
         executionMode: "LIVE",
         liveExecutionGate: "ENABLED",
-        maxLiveOrderValueKrw: 6_000,
       }),
       exchangeBackedReadEnabled: true,
       liveSendPath: "LIVE_ADAPTER",
@@ -164,7 +161,6 @@ function createConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     reconciliationHistoryRetentionAssumptionDays: 365,
     stalePriceThresholdMs: 30_000,
     minimumOrderValueKrw: 5_000,
-    maxLiveOrderValueKrw: null,
     maxAllocationByAsset: {
       BTC: 0.6,
       ETH: 0.6,

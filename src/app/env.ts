@@ -34,7 +34,6 @@ export interface AppConfig {
   reconciliationHistoryRetentionAssumptionDays: number;
   stalePriceThresholdMs: number;
   minimumOrderValueKrw: number;
-  maxLiveOrderValueKrw: number | null;
   maxAllocationByAsset: Record<SupportedAsset, number>;
   totalExposureCap: number;
 }
@@ -138,7 +137,6 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ),
     stalePriceThresholdMs: parseNumber(env.STALE_PRICE_THRESHOLD_MS, DEFAULT_STALE_PRICE_THRESHOLD_MS),
     minimumOrderValueKrw: parseNumber(env.MINIMUM_ORDER_VALUE_KRW, DEFAULT_MINIMUM_ORDER_VALUE_KRW),
-    maxLiveOrderValueKrw: parseOptionalPositiveNumber(env.MAX_LIVE_ORDER_VALUE_KRW),
     totalExposureCap: parseNumber(env.TOTAL_EXPOSURE_CAP, DEFAULT_TOTAL_EXPOSURE_CAP),
     maxAllocationByAsset: {
       BTC: parseNumber(env.MAX_ALLOCATION_BTC, DEFAULT_MAX_ALLOCATION.BTC),
@@ -153,7 +151,6 @@ export function buildExecutionRiskLimits(config: AppConfig): ExecutionRiskLimits
     totalExposureCap: config.totalExposureCap,
     stalePriceThresholdMs: config.stalePriceThresholdMs,
     minimumOrderValueKrw: config.minimumOrderValueKrw,
-    maxLiveOrderValueKrw: config.maxLiveOrderValueKrw,
   };
 }
 
@@ -177,13 +174,4 @@ function parseNumber(input: string | undefined, fallback: number): number {
 function parsePositiveNumber(input: string | undefined, fallback: number): number {
   const parsed = Number(input);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function parseOptionalPositiveNumber(input: string | undefined): number | null {
-  if (!input?.trim()) {
-    return null;
-  }
-
-  const parsed = Number(input);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }

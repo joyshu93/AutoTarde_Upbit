@@ -58,7 +58,6 @@ function createRuntimeConfig() {
     reconciliationHistoryRetentionAssumptionDays: 365,
     stalePriceThresholdMs: 30_000,
     minimumOrderValueKrw: 5_000,
-    maxLiveOrderValueKrw: null,
     maxAllocationByAsset: {
       BTC: 0.6,
       ETH: 0.6,
@@ -167,7 +166,6 @@ test("telegram router exposes non-secret runtime config inspection", async () =>
       reconciliationHistoryRetentionAssumptionDays: 365,
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
-      maxLiveOrderValueKrw: null,
       maxAllocationByAsset: {
         BTC: 0.6,
         ETH: 0.6,
@@ -267,7 +265,6 @@ test("telegram router exposes read-only operator readiness", async () => {
       reconciliationHistoryRetentionAssumptionDays: 365,
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
-      maxLiveOrderValueKrw: null,
       maxAllocationByAsset: {
         BTC: 0.6,
         ETH: 0.6,
@@ -373,7 +370,6 @@ test("telegram router readiness warns when live send path is intentionally enabl
       executionMode: "LIVE",
       liveExecutionGate: "ENABLED",
       liveSendPath: "LIVE_ADAPTER",
-      maxLiveOrderValueKrw: 6_000,
     },
     schedulerStatus: () => ({
       enabled: false,
@@ -485,7 +481,6 @@ test("telegram router readiness summarizes persistence health warnings", async (
       reconciliationHistoryRetentionAssumptionDays: 365,
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
-      maxLiveOrderValueKrw: null,
       maxAllocationByAsset: {
         BTC: 0.6,
         ETH: 0.6,

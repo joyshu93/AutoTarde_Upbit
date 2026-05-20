@@ -95,7 +95,6 @@ export function formatRuntimeConfigMessage(config: TelegramRuntimeConfigSnapshot
     `reconciliation_history_retention_assumption_days: ${config.reconciliationHistoryRetentionAssumptionDays}`,
     `stale_price_threshold_ms: ${config.stalePriceThresholdMs}`,
     `minimum_order_value_krw: ${config.minimumOrderValueKrw}`,
-    `max_live_order_value_krw: ${config.maxLiveOrderValueKrw ?? "none"}`,
     `max_allocation_btc: ${config.maxAllocationByAsset.BTC}`,
     `max_allocation_eth: ${config.maxAllocationByAsset.ETH}`,
     `total_exposure_cap: ${config.totalExposureCap}`,

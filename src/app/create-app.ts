@@ -187,7 +187,6 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
       reconciliationHistoryRetentionAssumptionDays: config.reconciliationHistoryRetentionAssumptionDays,
       stalePriceThresholdMs: config.stalePriceThresholdMs,
       minimumOrderValueKrw: config.minimumOrderValueKrw,
-      maxLiveOrderValueKrw: config.maxLiveOrderValueKrw,
       maxAllocationByAsset: config.maxAllocationByAsset,
       totalExposureCap: config.totalExposureCap,
     },

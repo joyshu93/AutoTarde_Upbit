@@ -386,7 +386,6 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
     reconciliationHistoryRetentionAssumptionDays: 365,
     stalePriceThresholdMs: 30_000,
     minimumOrderValueKrw: 5_000,
-    maxLiveOrderValueKrw: null,
     maxAllocationByAsset: {
       BTC: 0.6,
       ETH: 0.6,

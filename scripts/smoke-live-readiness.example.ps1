@@ -13,7 +13,6 @@ if ($LiveReadinessConfirmation -ne "I_UNDERSTAND_REAL_ORDERS") {
 
 $env:APP_EXECUTION_MODE = "LIVE"
 $env:ENABLE_LIVE_ORDERS = "true"
-$env:MAX_LIVE_ORDER_VALUE_KRW = "6000"
 $env:DATABASE_PATH = "./var/company-live.sqlite"
 
 $env:UPBIT_ACCESS_KEY = "REPLACE_WITH_UPBIT_ACCESS_KEY"
@@ -31,8 +30,7 @@ $requiredEnv = @(
   "UPBIT_ACCESS_KEY",
   "UPBIT_SECRET_KEY",
   "TELEGRAM_BOT_TOKEN",
-  "TELEGRAM_OPERATOR_CHAT_ID",
-  "MAX_LIVE_ORDER_VALUE_KRW"
+  "TELEGRAM_OPERATOR_CHAT_ID"
 )
 
 foreach ($name in $requiredEnv) {
@@ -44,7 +42,6 @@ foreach ($name in $requiredEnv) {
 
 Write-Host "Checking AutoTrade_Upbit LIVE readiness without starting the runtime."
 Write-Host "DATABASE_PATH=$env:DATABASE_PATH"
-Write-Host "MAX_LIVE_ORDER_VALUE_KRW=$env:MAX_LIVE_ORDER_VALUE_KRW"
 Write-Host "Strategy scheduler remains disabled for this readiness check."
 Write-Host "No Upbit order is submitted by this script."
 

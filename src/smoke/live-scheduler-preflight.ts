@@ -40,7 +40,6 @@ export interface LiveSchedulerPreflightSmokeResult {
   readonly liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
   readonly databasePath: string;
   readonly exchangeBackedReadEnabled: boolean;
-  readonly maxLiveOrderValueKrw: number | null;
   readonly configuredSchedulerEnabled: boolean;
   readonly configuredSchedulerRunOnStart: boolean;
   readonly preflightAssumesSchedulerEnabled: true;
@@ -111,7 +110,6 @@ export async function buildLiveSchedulerPreflightSmokeResult(
     liveSendPath: app.liveSendPath,
     databasePath: app.config.databasePath,
     exchangeBackedReadEnabled: app.exchangeBackedReadEnabled,
-    maxLiveOrderValueKrw: app.config.maxLiveOrderValueKrw,
     configuredSchedulerEnabled: app.config.strategySchedulerEnabled,
     configuredSchedulerRunOnStart: app.config.strategySchedulerRunOnStart,
     preflightAssumesSchedulerEnabled: true,
@@ -171,13 +169,6 @@ export function buildLiveSchedulerPreflightSmokeChecks(input: {
       detail: "This smoke assumes STRATEGY_SCHEDULER_RUN_ON_START=false and does not request an immediate scheduler tick.",
     },
     {
-      name: "max_live_order_value",
-      status: input.app.config.maxLiveOrderValueKrw === null ? "WARN" : "PASS",
-      detail: input.app.config.maxLiveOrderValueKrw === null
-        ? "MAX_LIVE_ORDER_VALUE_KRW is unset; set an explicit ceiling before scheduler operation."
-        : `MAX_LIVE_ORDER_VALUE_KRW=${input.app.config.maxLiveOrderValueKrw}`,
-    },
-    {
       name: "scheduler_startup_preflight",
       status: normalizePreflightStatus(input.preflight.status),
       detail: input.preflight.detail,
@@ -212,10 +203,6 @@ export function buildLiveSchedulerPreflightNextActions(
 
   if (checkNames.has("live_mode") || checkNames.has("preflight_scope")) {
     actions.push("Run this smoke with APP_EXECUTION_MODE=LIVE in the local live scheduler environment.");
-  }
-
-  if (checkNames.has("max_live_order_value")) {
-    actions.push("Set MAX_LIVE_ORDER_VALUE_KRW to an explicit small ceiling before scheduled live operation.");
   }
 
   for (const check of checks) {

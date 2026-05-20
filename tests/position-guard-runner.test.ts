@@ -255,7 +255,6 @@ function createExecutionService(
       totalExposureCap: 0.75,
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
-      maxLiveOrderValueKrw: null,
     },
     exchangeAdapter,
     validationAdapter: exchangeAdapter,

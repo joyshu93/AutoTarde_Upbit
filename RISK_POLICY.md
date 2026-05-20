@@ -57,13 +57,6 @@ If either condition is missing, the system must behave as non-live, and risk eva
 - the system must reject orders below the configured local minimum
 - the local minimum is a risk control and must not be confused with exchange-enforced minimums
 
-### Max Live Order Value Guard
-
-- `MAX_LIVE_ORDER_VALUE_KRW` is optional and unset by default
-- when set, it applies only to `LIVE` orders
-- it caps one order request as a last-resort operational safety belt
-- it must not replace ratio-based strategy sizing, total exposure cap, or per-asset allocation caps
-
 ### Exposure Controls
 
 - enforce a per-asset allocation cap
@@ -164,4 +157,4 @@ Long-running runtime shutdown should be explicit: signal handling must stop inbo
 
 ## Current Implementation Note
 
-This repository now enforces the policy through pure guard logic, durable SQLite persistence, persisted execution-state controls, startup recovery sweep plus `/sync` reconciliation, checkpointed exchange-history recovery with bounded stop-before coverage reporting, retention-assumption confidence semantics, page-limit truncation flags, and lookup-failure confidence records, startup `DEGRADED` policy for unresolved portfolio drift, execution prechecks through Upbit `orders/chance` and `orders/test`, optional live-only max order value guardrail, immediate simulated `FILLED` settlement for supported `DRY_RUN` orders, local repair for older `DRY_RUN` adapter artifacts, automatic live scheduler startup preflight with durable startup-block notification, and durable `operator_notifications` with separately gated Telegram delivery retry/backoff, lease-based compare-and-set finalization, separate delivery-attempt history, delivery-worker run records, and derived claim/abandon queue metrics. The `PositionGuard_PaperTrade` runner can now persist decisions and route eligible decisions into the default `DRY_RUN` execution lifecycle through Telegram `/run BTC|ETH` and a disabled-by-default scheduler with persisted scheduler run history. The live send path remains intentionally disabled until explicit runtime configuration enables it.
+This repository now enforces the policy through pure guard logic, durable SQLite persistence, persisted execution-state controls, startup recovery sweep plus `/sync` reconciliation, checkpointed exchange-history recovery with bounded stop-before coverage reporting, retention-assumption confidence semantics, page-limit truncation flags, and lookup-failure confidence records, startup `DEGRADED` policy for unresolved portfolio drift, execution prechecks through Upbit `orders/chance` and `orders/test`, immediate simulated `FILLED` settlement for supported `DRY_RUN` orders, local repair for older `DRY_RUN` adapter artifacts, automatic live scheduler startup preflight with durable startup-block notification, and durable `operator_notifications` with separately gated Telegram delivery retry/backoff, lease-based compare-and-set finalization, separate delivery-attempt history, delivery-worker run records, and derived claim/abandon queue metrics. The `PositionGuard_PaperTrade` runner can now persist decisions and route eligible decisions into the default `DRY_RUN` execution lifecycle through Telegram `/run BTC|ETH` and a disabled-by-default scheduler with persisted scheduler run history. The live send path remains intentionally disabled until explicit runtime configuration enables it.

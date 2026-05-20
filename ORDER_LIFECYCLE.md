@@ -99,7 +99,7 @@ The intended live path is:
 6. ingest order-state changes and fills
 7. reconcile until terminal state is consistent
 
-The live send path is selected only when mode, live gate, and credentials are explicitly configured. If `MAX_LIVE_ORDER_VALUE_KRW` is set, risk approval must also reject any single live order above that ceiling before persistence.
+The live send path is selected only when mode, live gate, and credentials are explicitly configured.
 
 ## Idempotency
 

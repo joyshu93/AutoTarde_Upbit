@@ -559,7 +559,6 @@ function composeExecutionPolicy(
     totalExposureCap: riskLimits.totalExposureCap,
     stalePriceThresholdMs: riskLimits.stalePriceThresholdMs,
     minimumOrderValueKrw: riskLimits.minimumOrderValueKrw,
-    maxLiveOrderValueKrw: riskLimits.maxLiveOrderValueKrw,
   };
 }
 

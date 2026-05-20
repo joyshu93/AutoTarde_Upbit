@@ -12,7 +12,6 @@ function createExecutionService(overrides?: {
   validationAdapter?: Pick<ExchangeAdapter, "getOrderChance" | "testOrder">;
   reporter?: OperatorNotificationReporter;
   initialState?: Partial<ExecutionStateRecord>;
-  maxLiveOrderValueKrw?: number | null;
 }) {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = new InMemoryOperatorStateStore({
@@ -38,7 +37,6 @@ function createExecutionService(overrides?: {
       totalExposureCap: 0.75,
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
-      maxLiveOrderValueKrw: overrides?.maxLiveOrderValueKrw ?? null,
     },
     exchangeAdapter: overrides?.exchangeAdapter ?? new DryRunExchangeAdapter(),
     repositories,
@@ -204,59 +202,6 @@ test("execution service blocks new orders when startup recovery has left the sys
   assert.match(result.reason ?? "", /DEGRADED/i);
   assert.equal(riskEvents.length, 1);
   assert.equal(riskEvents[0]?.ruleCode, "SYSTEM_DEGRADED");
-});
-
-test("execution service blocks live orders above configured max live order value before persistence", async () => {
-  const { service, repositories } = createExecutionService({
-    initialState: {
-      executionMode: "LIVE",
-      liveExecutionGate: "ENABLED",
-    },
-    maxLiveOrderValueKrw: 6_000,
-  });
-  await repositories.saveBalanceSnapshot({
-    id: "balance-live-max",
-    exchangeAccountId: "primary",
-    capturedAt: "2026-04-20T00:00:00.000Z",
-    source: "EXCHANGE_POLL",
-    totalKrwValue: "100000",
-    balancesJson: "[]",
-  });
-  await repositories.savePositionSnapshot({
-    id: "position-live-max",
-    exchangeAccountId: "primary",
-    capturedAt: "2026-04-20T00:00:00.000Z",
-    source: "EXCHANGE_POLL",
-    positionsJson: "[]",
-  });
-
-  const result = await service.submitOrderFromDecision({
-    exchangeAccountId: "primary",
-    strategyDecisionId: "decision-live-max",
-    decision: {
-      strategyKey: "deterministic.stub.v1",
-      market: "KRW-BTC",
-      action: "ENTER",
-      reasonCodes: ["TEST"],
-      referencePrice: 100_000_000,
-      requestedNotionalKrw: 6_001,
-      requestedQuantity: 0.00006001,
-      metadata: {},
-    },
-    side: "bid",
-    ordType: "price",
-    price: "6001",
-    volume: null,
-  });
-  const orders = await repositories.listOrders("primary");
-  const riskEvents = await repositories.listRiskEvents("primary");
-
-  assert.equal(result.accepted, false);
-  assert.equal(result.order, null);
-  assert.match(result.reason ?? "", /exceeds configured max 6000 KRW/);
-  assert.equal(orders.length, 0);
-  assert.equal(riskEvents.length, 1);
-  assert.equal(riskEvents[0]?.ruleCode, "MAX_LIVE_ORDER_VALUE_GUARD");
 });
 
 test("execution service blocks order persistence when order chance rejects the requested order type", async () => {
@@ -433,7 +378,6 @@ test("execution service queues an operator notification when an order is rejecte
       totalExposureCap: 0.75,
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
-      maxLiveOrderValueKrw: null,
     },
     exchangeAdapter,
     validationAdapter: exchangeAdapter,
@@ -707,7 +651,6 @@ test("execution service records order mode from persisted operator state", async
       totalExposureCap: 0.75,
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
-      maxLiveOrderValueKrw: null,
     },
     exchangeAdapter: new DryRunExchangeAdapter(),
     repositories,

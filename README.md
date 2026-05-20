@@ -77,7 +77,6 @@ Current remaining gaps:
 - scheduler startup now records an automatic `strategySchedulerStartupPreflight`; in `LIVE` mode it blocks scheduler timers unless live gate, live adapter wiring, execution state, exchange-backed snapshots, reconciliation health, and active-order state are safe
 - live scheduler startup blocks now persist an operator notification before startup can close local persistence
 - the runtime can now derive `LIVE_ADAPTER` send wiring only when mode, live gate, and Upbit credentials are all explicitly configured; otherwise it remains on `DRY_RUN_ADAPTER`
-- `MAX_LIVE_ORDER_VALUE_KRW` adds an optional live-only single-order ceiling without changing ratio-based strategy sizing
 
 Current risk-policy framing is budget-first rather than asset-count-first:
 - total exposure cap is the main reserve control
@@ -139,7 +138,6 @@ In intentional `LIVE` operation, `/readiness` reports the enabled live send path
 - `GLOBAL_KILL_SWITCH` defaults to off, but can block execution immediately when enabled
 - Telegram is treated as an operator interface only
 - live order transmission requires `APP_EXECUTION_MODE=LIVE`, `ENABLE_LIVE_ORDERS=true`, and configured Upbit credentials
-- `MAX_LIVE_ORDER_VALUE_KRW` is unset by default and only applies to `LIVE` orders when explicitly configured
 
 ## Getting Started
 
@@ -186,7 +184,6 @@ Environment variables currently recognized:
 - `RECONCILIATION_HISTORY_RETENTION_ASSUMPTION_DAYS`
 - `STALE_PRICE_THRESHOLD_MS`
 - `MINIMUM_ORDER_VALUE_KRW`
-- `MAX_LIVE_ORDER_VALUE_KRW`
 - `MAX_ALLOCATION_BTC`
 - `MAX_ALLOCATION_ETH`
 - `TOTAL_EXPOSURE_CAP`
@@ -232,8 +229,6 @@ When enabled, `STRATEGY_SCHEDULER_BTC_INTERVAL_MS` and `STRATEGY_SCHEDULER_ETH_I
 The scheduler still uses the same runner/controller path as `/run BTC|ETH`, so it does not enable live order transmission by itself.
 If the scheduler is enabled while `APP_EXECUTION_MODE=LIVE`, startup first runs an automatic scheduler preflight. It blocks timer installation unless the live gate is enabled, the execution service is wired to the live adapter, operator state is `RUNNING`, Upbit read credentials and fresh persisted snapshots exist, no active local orders require visibility, and the latest reconciliation has no blocking issue codes. Non-blocking exchange-history recovery evidence remains a warning.
 If that live scheduler startup preflight blocks timer installation, the runtime persists a `SCHEDULER_STARTUP_BLOCKED` operator notification with the preflight detail and failed checks before local persistence can be closed.
-`MAX_LIVE_ORDER_VALUE_KRW`, when set, adds a live-only ceiling for one order request. It is an operational safety guard, not a strategy sizing rule.
-
 When either scheduler or Telegram inbound polling is running, use normal process signals such as `Ctrl+C` / `SIGINT` or `SIGTERM` to stop the process. Shutdown is explicit: inbound polling is stopped, scheduler timers are cleared, and SQLite persistence is closed before the process exits.
 
 ## Local DRY_RUN Script
@@ -263,7 +258,6 @@ $LiveOrderConfirmation = "I_UNDERSTAND_REAL_ORDERS"
 The example intentionally keeps:
 - `STRATEGY_SCHEDULER_ENABLED=false`
 - `STRATEGY_SCHEDULER_RUN_ON_START=false`
-- `MAX_LIVE_ORDER_VALUE_KRW=6000`
 
 This means the first LIVE process can receive Telegram commands and run readiness/sync checks without starting automatic scheduled trading. Real order submission is possible only when the app is in `LIVE`, live gate is enabled, Upbit credentials are configured, readiness/risk guards pass, and a deterministic `/run BTC|ETH` or later scheduler tick creates an eligible order.
 
@@ -317,7 +311,6 @@ The example intentionally keeps:
 - `STRATEGY_SCHEDULER_RUN_ON_START=false`
 - `STRATEGY_SCHEDULER_BTC_INTERVAL_MS=3600000`
 - `STRATEGY_SCHEDULER_ETH_INTERVAL_MS=3600000`
-- `MAX_LIVE_ORDER_VALUE_KRW=6000`
 
 Run the local copy with:
 
@@ -330,6 +323,6 @@ The scheduler startup still runs the same automatic preflight before timers are 
 ## Immediate Next Steps
 
 - run the local `DRY_RUN` script and confirm `/readiness`, `/sync`, `/balances`, `/positions`, and `/run BTC|ETH` behavior
-- only then run `npm run smoke:live:readiness`, followed by the local `LIVE` script with scheduler disabled and `MAX_LIVE_ORDER_VALUE_KRW` set to a small value
+- only then run `npm run smoke:live:readiness`, followed by the local `LIVE` script with scheduler disabled
 - after a clean live validation run, run `npm run smoke:live:scheduler-preflight`
 - only after reviewing that output, use the local LIVE scheduler script if automatic scheduled operation is intended

@@ -45,7 +45,6 @@ test("live readiness smoke checks pass only for explicitly gated live wiring", (
       config: createConfig({
         executionMode: "LIVE",
         liveExecutionGate: "ENABLED",
-        maxLiveOrderValueKrw: 6_000,
       }),
       exchangeBackedReadEnabled: true,
       liveSendPath: "LIVE_ADAPTER",
@@ -76,7 +75,6 @@ test("live readiness smoke blocks automatic scheduler startup during validation"
       config: createConfig({
         executionMode: "LIVE",
         liveExecutionGate: "ENABLED",
-        maxLiveOrderValueKrw: 6_000,
         strategySchedulerEnabled: true,
         strategySchedulerRunOnStart: true,
       }),
@@ -111,7 +109,6 @@ test("live readiness smoke next actions guide snapshot warnings without blocking
       config: createConfig({
         executionMode: "LIVE",
         liveExecutionGate: "ENABLED",
-        maxLiveOrderValueKrw: 6_000,
       }),
       exchangeBackedReadEnabled: true,
       liveSendPath: "LIVE_ADAPTER",
@@ -141,7 +138,6 @@ test("live readiness smoke blocks reconciliation drift issue codes", () => {
       config: createConfig({
         executionMode: "LIVE",
         liveExecutionGate: "ENABLED",
-        maxLiveOrderValueKrw: 6_000,
       }),
       exchangeBackedReadEnabled: true,
       liveSendPath: "LIVE_ADAPTER",
@@ -193,7 +189,6 @@ function createConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     reconciliationHistoryRetentionAssumptionDays: 365,
     stalePriceThresholdMs: 30_000,
     minimumOrderValueKrw: 5_000,
-    maxLiveOrderValueKrw: null,
     maxAllocationByAsset: {
       BTC: 0.6,
       ETH: 0.6,

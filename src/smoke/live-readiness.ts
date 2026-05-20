@@ -50,7 +50,6 @@ export interface LiveReadinessSmokeResult {
   readonly liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
   readonly databasePath: string;
   readonly exchangeBackedReadEnabled: boolean;
-  readonly maxLiveOrderValueKrw: number | null;
   readonly schedulerEnabled: boolean;
   readonly schedulerRunOnStart: boolean;
   readonly telegramInboundPollingEnabled: boolean;
@@ -130,7 +129,6 @@ export async function runLiveReadinessSmoke(): Promise<LiveReadinessSmokeResult>
       liveSendPath: app.liveSendPath,
       databasePath: app.config.databasePath,
       exchangeBackedReadEnabled: app.exchangeBackedReadEnabled,
-      maxLiveOrderValueKrw: app.config.maxLiveOrderValueKrw,
       schedulerEnabled: app.config.strategySchedulerEnabled,
       schedulerRunOnStart: app.config.strategySchedulerRunOnStart,
       telegramInboundPollingEnabled: app.config.telegramInboundPollingEnabled,
@@ -217,13 +215,6 @@ export function buildLiveReadinessSmokeChecks(input: {
       detail: input.app.liveSendPath === "LIVE_ADAPTER"
         ? "Execution service would use the live Upbit adapter if a later eligible strategy run submits an order."
         : "Execution service is still wired to the dry-run adapter.",
-    },
-    {
-      name: "max_live_order_value",
-      status: input.app.config.maxLiveOrderValueKrw === null ? "WARN" : "PASS",
-      detail: input.app.config.maxLiveOrderValueKrw === null
-        ? "MAX_LIVE_ORDER_VALUE_KRW is unset; ratio sizing can create larger live orders than intended."
-        : `MAX_LIVE_ORDER_VALUE_KRW=${input.app.config.maxLiveOrderValueKrw}`,
     },
     {
       name: "scheduler_disabled_for_validation",
@@ -392,10 +383,6 @@ export function buildLiveReadinessNextActions(checks: readonly LiveReadinessSmok
 
   if (checkNames.has("live_send_path")) {
     actions.push("Resolve mode, live gate, and Upbit credential blockers until liveSendPath becomes LIVE_ADAPTER.");
-  }
-
-  if (checkNames.has("max_live_order_value")) {
-    actions.push("Set MAX_LIVE_ORDER_VALUE_KRW to a small explicit ceiling, for example 6000, for first live validation.");
   }
 
   if (checkNames.has("scheduler_disabled_for_validation")) {

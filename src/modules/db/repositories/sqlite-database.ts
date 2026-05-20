@@ -287,7 +287,6 @@ function rebuildRiskEvents(db: DatabaseSync): void {
           'STALE_PRICE_GUARD',
           'DUPLICATE_ORDER_GUARD',
           'MINIMUM_ORDER_VALUE_GUARD',
-          'MAX_LIVE_ORDER_VALUE_GUARD',
           'LIVE_EXECUTION_DISABLED',
           'UNSUPPORTED_MARKET',
           'UNSUPPORTED_ORDER_TYPE',

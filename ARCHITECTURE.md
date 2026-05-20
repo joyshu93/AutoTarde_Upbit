@@ -57,7 +57,6 @@ Current guard families:
 - stale price guard
 - duplicate order guard
 - minimum order value guard
-- optional max live order value guard
 - per-asset allocation cap
 - total exposure cap
 
@@ -226,7 +225,6 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 - not wired as the default application path
 - requires both `APP_EXECUTION_MODE=LIVE` and `ENABLE_LIVE_ORDERS=true`
 - requires configured Upbit credentials before the live adapter can become the send path
-- may additionally cap each live order through `MAX_LIVE_ORDER_VALUE_KRW`
 - must still use the same order lifecycle tables and risk gates
 
 ## Runtime Flow

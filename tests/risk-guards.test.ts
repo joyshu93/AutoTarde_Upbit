@@ -25,7 +25,6 @@ test("risk guards block LIVE execution when the live gate is disabled", () => {
         totalExposureCap: 0.75,
         stalePriceThresholdMs: 30_000,
         minimumOrderValueKrw: 5_000,
-        maxLiveOrderValueKrw: null,
       },
     }),
   );
@@ -108,52 +107,6 @@ test("risk guards enforce the minimum order value", () => {
   );
 });
 
-test("risk guards enforce max live order value only in LIVE mode", () => {
-  const liveResult = evaluateRiskGuards(
-    createRiskContext({
-      policy: {
-        executionMode: "LIVE",
-        liveExecutionGate: "ENABLED",
-        globalKillSwitch: false,
-        maxAllocationByAsset: {
-          BTC: 0.6,
-          ETH: 0.6,
-        },
-        totalExposureCap: 0.75,
-        stalePriceThresholdMs: 30_000,
-        minimumOrderValueKrw: 5_000,
-        maxLiveOrderValueKrw: 100_000,
-      },
-      requestedNotionalKrw: 100_001,
-    }),
-  );
-  const dryRunResult = evaluateRiskGuards(
-    createRiskContext({
-      policy: {
-        executionMode: "DRY_RUN",
-        liveExecutionGate: "DISABLED",
-        globalKillSwitch: false,
-        maxAllocationByAsset: {
-          BTC: 0.6,
-          ETH: 0.6,
-        },
-        totalExposureCap: 0.75,
-        stalePriceThresholdMs: 30_000,
-        minimumOrderValueKrw: 5_000,
-        maxLiveOrderValueKrw: 100_000,
-      },
-      requestedNotionalKrw: 100_001,
-    }),
-  );
-
-  assert.equal(liveResult.accepted, false);
-  assert.deepEqual(
-    liveResult.triggeredRules.map((rule) => rule.code),
-    ["MAX_LIVE_ORDER_VALUE_GUARD"],
-  );
-  assert.equal(dryRunResult.accepted, true);
-});
-
 function createRiskContext(
   overrides: Partial<RiskEvaluationContext> = {},
 ): RiskEvaluationContext {
@@ -169,7 +122,6 @@ function createRiskContext(
       totalExposureCap: 0.75,
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
-      maxLiveOrderValueKrw: null,
     },
     systemStatus: "RUNNING",
     market: "KRW-BTC",
