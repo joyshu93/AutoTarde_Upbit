@@ -320,6 +320,36 @@ powershell.exe -ExecutionPolicy Bypass -File .\scripts\start-company-live-schedu
 
 The scheduler startup still runs the same automatic preflight before timers are installed. `RUN_ON_START=false` means startup itself does not immediately trigger a strategy cycle; the first scheduled cycle occurs after the configured interval. Real Upbit order submission remains possible on later scheduled cycles only if execution state, reconciliation health, risk guards, exchange validation, and live-send wiring all pass.
 
+## Windows Task Scheduler Manual Launchers
+
+For a company PC that must keep the process easy to restart, use the Task Scheduler helpers only as manual launchers. They do not add startup or logon triggers, do not store Upbit or Telegram secrets in the task definition, and do not start the task immediately after registration.
+
+To register a manual DRY_RUN launcher:
+
+```powershell
+Copy-Item .\scripts\register-autotrade-dryrun-task.example.ps1 .\scripts\register-autotrade-dryrun-task.local.ps1
+notepad .\scripts\register-autotrade-dryrun-task.local.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\register-autotrade-dryrun-task.local.ps1
+```
+
+To register a manual LIVE scheduler launcher:
+
+```powershell
+Copy-Item .\scripts\register-autotrade-live-scheduler-task.example.ps1 .\scripts\register-autotrade-live-scheduler-task.local.ps1
+notepad .\scripts\register-autotrade-live-scheduler-task.local.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\register-autotrade-live-scheduler-task.local.ps1
+```
+
+The LIVE scheduler task points to `scripts/start-company-live-scheduler.local.ps1`, so that local startup script must already be filled in, keep `STRATEGY_SCHEDULER_RUN_ON_START=false`, and run `smoke:live:scheduler-preflight`.
+
+Start a registered task manually from PowerShell:
+
+```powershell
+Start-ScheduledTask -TaskName "AutoTrade_Upbit_LIVE_Scheduler_Manual"
+```
+
+To unregister one of the approved tasks, copy `scripts/unregister-autotrade-task.example.ps1` to `scripts/unregister-autotrade-task.local.ps1`, set the confirmation string and desired task name in the local copy, then run it with `powershell.exe -ExecutionPolicy Bypass -File`.
+
 ## Immediate Next Steps
 
 - run the local `DRY_RUN` script and confirm `/readiness`, `/sync`, `/balances`, `/positions`, and `/run BTC|ETH` behavior

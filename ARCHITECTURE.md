@@ -141,6 +141,7 @@ It provides:
 - `/status` strategy-scheduler lines also expose startup preflight status, scope, detail, and check results
 - live scheduler startup preflight blocks are persisted as operator notifications before startup can close local persistence
 - scheduler-triggered failures, overlapping-run skips, and scheduler-triggered order submission/rejection outcomes are persisted as operator notifications so automatic operation does not fail silently
+- Windows Task Scheduler helpers register manual-only launch wrappers around ignored local startup scripts; they never store secrets in task definitions or add startup/logon triggers
 - `/order <order-id|identifier>` for one persisted order plus order-event and fill detail without exchange mutation
 - `/scheduler` for current in-memory scheduler status plus fuller read-only persisted `strategy_scheduler_runs` history without triggering scheduler execution
 - `/inbound` for read-only runtime inbound polling status and persisted `telegram_inbound_offsets` inspection

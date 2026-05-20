@@ -126,6 +126,7 @@ When the scheduler is enabled in `LIVE` mode, startup must run an automatic pref
 The product does not require a ritualized manual first order before scheduler startup; the safety contract is the explicit preflight plus the same per-order risk and execution guards used by `/run BTC|ETH`.
 A standalone live scheduler preflight smoke may assume scheduler-enabled startup preflight and report whether timers would be allowed, but it must not start the runtime, install timers, run a strategy cycle, run `/sync`, poll Telegram, call Upbit, or transmit orders.
 A live scheduler startup script must require a separate explicit automatic-scheduler confirmation, keep `STRATEGY_SCHEDULER_RUN_ON_START=false` by default, and run the scheduler preflight smoke before starting the runtime.
+Windows Task Scheduler registration helpers must remain manual-only. They may point to ignored local launcher scripts, but must not include API keys, Telegram secrets, startup/logon triggers, catch-up triggers, or automatic task starts after registration.
 
 ## Audit Expectations
 
