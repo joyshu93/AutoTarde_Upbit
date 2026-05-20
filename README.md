@@ -113,7 +113,7 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 26. When scheduler or inbound polling starts background timers, runtime signal handlers stop polling, stop the scheduler, and close SQLite persistence on `SIGINT` / `SIGTERM`; when no background runtime starts, startup closes persistence after printing the banner.
 
 `/help` is static command-contract inspection. It does not read exchange state, query repositories, trigger `/sync`, run strategy cycles, tick the scheduler, mutate orders, or enable live order transmission.
-`/config` is non-secret runtime configuration inspection. It shows configured/not-configured booleans for credentials and Telegram identifiers instead of raw secret values.
+`/config` is non-secret runtime configuration inspection. It shows configured/not-configured booleans for credentials and Telegram identifiers instead of raw secret values, and it lists ignored deprecated environment variable names when stale local scripts still set them.
 `/readiness` is read-only operator readiness inspection. It summarizes runtime config, persisted execution state, worker status, latest snapshots, latest reconciliation, and bounded local persistence health: active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count. It does this without active Upbit or Telegram probes, without triggering sync, strategy, or scheduler work, and without mutating offsets, orders, or notification delivery state.
 In intentional `LIVE` operation, `/readiness` reports the enabled live send path as a warning so operators remember that `/run` is real-order capable, while true health blockers still produce `BLOCK`.
 

@@ -23,6 +23,7 @@ export interface AppConfig {
   telegramInboundPollIntervalMs: number;
   telegramInboundPollTimeoutSeconds: number;
   telegramInboundPollLimit: number;
+  deprecatedIgnoredEnvVars: readonly string[];
   strategySchedulerEnabled: boolean;
   strategySchedulerRunOnStart: boolean;
   strategySchedulerBtcIntervalMs: number;
@@ -57,6 +58,7 @@ const DEFAULT_RECONCILIATION_HISTORY_RETENTION_ASSUMPTION_DAYS = 365;
 const DEFAULT_STALE_PRICE_THRESHOLD_MS = 30_000;
 const DEFAULT_MINIMUM_ORDER_VALUE_KRW = 5_000;
 const DEFAULT_TOTAL_EXPOSURE_CAP = 0.75;
+const DEPRECATED_IGNORED_ENV_VARS = ["MAX_LIVE_ORDER_VALUE_KRW"] as const;
 const DEFAULT_MAX_ALLOCATION: Record<SupportedAsset, number> = {
   BTC: 0.6,
   ETH: 0.6,
@@ -105,6 +107,7 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       env.TELEGRAM_INBOUND_POLL_LIMIT,
       DEFAULT_TELEGRAM_INBOUND_POLL_LIMIT,
     ),
+    deprecatedIgnoredEnvVars: listDeprecatedIgnoredEnvVars(env),
     strategySchedulerEnabled: parseBoolean(env.STRATEGY_SCHEDULER_ENABLED),
     strategySchedulerRunOnStart: parseBoolean(env.STRATEGY_SCHEDULER_RUN_ON_START),
     strategySchedulerBtcIntervalMs: parsePositiveNumber(
@@ -174,4 +177,8 @@ function parseNumber(input: string | undefined, fallback: number): number {
 function parsePositiveNumber(input: string | undefined, fallback: number): number {
   const parsed = Number(input);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function listDeprecatedIgnoredEnvVars(env: NodeJS.ProcessEnv): readonly string[] {
+  return DEPRECATED_IGNORED_ENV_VARS.filter((name) => Boolean(env[name]?.trim()));
 }

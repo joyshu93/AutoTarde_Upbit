@@ -47,6 +47,7 @@ function createRuntimeConfig() {
     telegramInboundPollIntervalMs: 2_000,
     telegramInboundPollTimeoutSeconds: 25,
     telegramInboundPollLimit: 10,
+    deprecatedIgnoredEnvVars: [],
     strategySchedulerEnabled: false,
     strategySchedulerRunOnStart: false,
     strategySchedulerBtcIntervalMs: 3_600_000,
@@ -155,6 +156,7 @@ test("telegram router exposes non-secret runtime config inspection", async () =>
       telegramInboundPollIntervalMs: 2_000,
       telegramInboundPollTimeoutSeconds: 25,
       telegramInboundPollLimit: 10,
+      deprecatedIgnoredEnvVars: ["MAX_LIVE_ORDER_VALUE_KRW"],
       strategySchedulerEnabled: false,
       strategySchedulerRunOnStart: false,
       strategySchedulerBtcIntervalMs: 3_600_000,
@@ -187,6 +189,7 @@ test("telegram router exposes non-secret runtime config inspection", async () =>
   assert.match(response.text, /telegram_bot_token_configured: true/);
   assert.match(response.text, /telegram_operator_chat_id_configured: true/);
   assert.match(response.text, /telegram_inbound_polling_enabled: true/);
+  assert.match(response.text, /deprecated_ignored_env_vars: MAX_LIVE_ORDER_VALUE_KRW/);
   assert.match(response.text, /strategy_scheduler_enabled: false/);
   assert.match(response.text, /minimum_order_value_krw: 5000/);
   assert.match(response.text, /max_allocation_btc: 0\.6/);
@@ -254,6 +257,7 @@ test("telegram router exposes read-only operator readiness", async () => {
       telegramInboundPollIntervalMs: 2_000,
       telegramInboundPollTimeoutSeconds: 25,
       telegramInboundPollLimit: 10,
+      deprecatedIgnoredEnvVars: [],
       strategySchedulerEnabled: true,
       strategySchedulerRunOnStart: false,
       strategySchedulerBtcIntervalMs: 3_600_000,
@@ -470,6 +474,7 @@ test("telegram router readiness summarizes persistence health warnings", async (
       telegramInboundPollIntervalMs: 2_000,
       telegramInboundPollTimeoutSeconds: 25,
       telegramInboundPollLimit: 10,
+      deprecatedIgnoredEnvVars: [],
       strategySchedulerEnabled: false,
       strategySchedulerRunOnStart: false,
       strategySchedulerBtcIntervalMs: 3_600_000,

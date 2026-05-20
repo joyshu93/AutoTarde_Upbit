@@ -28,10 +28,19 @@ test("loadAppConfig defaults to DRY_RUN with live gate disabled", () => {
   assert.equal(config.reconciliationHistoryRetentionAssumptionDays, 365);
   assert.equal(config.globalKillSwitch, false);
   assert.equal(config.databasePath, "./var/autotrade-upbit.sqlite");
+  assert.deepEqual(config.deprecatedIgnoredEnvVars, []);
 
   const riskLimits = buildExecutionRiskLimits(config);
   assert.equal(riskLimits.minimumOrderValueKrw, 5_000);
   assert.equal(riskLimits.totalExposureCap, 0.75);
+});
+
+test("loadAppConfig surfaces deprecated ignored environment variables", () => {
+  const config = loadAppConfig({
+    MAX_LIVE_ORDER_VALUE_KRW: "6000",
+  });
+
+  assert.deepEqual(config.deprecatedIgnoredEnvVars, ["MAX_LIVE_ORDER_VALUE_KRW"]);
 });
 
 test("loadAppConfig allows LIVE only when explicitly requested", () => {

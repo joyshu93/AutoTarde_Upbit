@@ -116,6 +116,7 @@ async function main(): Promise<void> {
     notificationDeliverySummary,
     runtimeHasBackgroundWork,
     runtimeShutdown,
+    deprecatedIgnoredEnvVars: app.config.deprecatedIgnoredEnvVars,
     telegramInboundPollingEnabled: app.config.telegramInboundPollingEnabled,
     telegramInboundPollingConfigured: app.telegramInboundPolling.isConfigured(),
     telegramInboundPolling: telegramInboundPollingStatus,

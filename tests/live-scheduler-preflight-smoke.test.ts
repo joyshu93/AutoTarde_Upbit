@@ -150,6 +150,7 @@ function createConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     telegramInboundPollIntervalMs: 2_000,
     telegramInboundPollTimeoutSeconds: 25,
     telegramInboundPollLimit: 10,
+    deprecatedIgnoredEnvVars: [],
     strategySchedulerEnabled: false,
     strategySchedulerRunOnStart: false,
     strategySchedulerBtcIntervalMs: 3_600_000,

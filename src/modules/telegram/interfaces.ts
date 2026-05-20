@@ -93,6 +93,7 @@ export interface TelegramRuntimeConfigSnapshot {
   readonly telegramInboundPollIntervalMs: number;
   readonly telegramInboundPollTimeoutSeconds: number;
   readonly telegramInboundPollLimit: number;
+  readonly deprecatedIgnoredEnvVars: readonly string[];
   readonly strategySchedulerEnabled: boolean;
   readonly strategySchedulerRunOnStart: boolean;
   readonly strategySchedulerBtcIntervalMs: number;

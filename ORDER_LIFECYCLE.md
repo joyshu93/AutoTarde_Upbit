@@ -158,7 +158,7 @@ Telegram should report lifecycle outcomes, such as:
 
 Notifications are derived from lifecycle state, not treated as lifecycle state.
 `/help` is static command-contract inspection and must not create an order-lifecycle transition or trigger sync, strategy runs, scheduler ticks, exchange reads, or order mutation.
-`/config` is runtime configuration inspection and must not create an order-lifecycle transition or expose raw secrets.
+`/config` is runtime configuration inspection and must not create an order-lifecycle transition or expose raw secrets. It may show ignored deprecated environment variable names so stale local scripts do not fail silently.
 `/readiness` is operator readiness inspection and may summarize active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count from local persistence, but it must not create an order-lifecycle transition, call Upbit, poll Telegram, mutate offsets, trigger sync, run strategies, tick schedulers, submit orders, cancel orders, or deliver notifications.
 `/order <order-id|identifier>` is a lifecycle inspection view over persisted `orders`, `order_events`, and `fills`; it does not create, cancel, retry, or reconcile orders by itself.
 Scheduler runtime status and scheduler run history are likewise operational audit state, not order lifecycle truth; orders and fills remain the durable lifecycle records.

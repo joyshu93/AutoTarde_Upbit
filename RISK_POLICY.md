@@ -111,7 +111,7 @@ The operator surface should expose:
 
 These commands exist for control and inspection, not for manual portfolio editing.
 `/help` is static command-contract inspection only and must not trigger sync, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission.
-`/config` is non-secret runtime configuration inspection only; it may expose live blockers and explicit risk limits but must not print raw credentials, tokens, or chat identifiers.
+`/config` is non-secret runtime configuration inspection only; it may expose live blockers, explicit risk limits, and ignored deprecated environment variable names, but must not print raw credentials, tokens, or chat identifiers.
 `/readiness` is read-only operator readiness inspection only; it may summarize blockers, warnings, and bounded local persistence health such as active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count, but must not actively probe Upbit or Telegram, mutate offset state, trigger sync, run strategies, tick schedulers, submit orders, cancel orders, or deliver notifications.
 When live order transmission is intentionally configured, `/readiness` should warn that `/run` is real-order capable rather than treating the live send path itself as a blocking health failure. Paused, kill-switched, degraded, active-order, unresolved-order, and blocking reconciliation states must still remain `BLOCK`.
 Reconciliation recovery progress such as recovered historical exchange orders and fill backfills may be reported as `WARN`; unresolved portfolio drift, missing order references, lookup failures, deferred lookups, or recovery-required orders remain `BLOCK`.

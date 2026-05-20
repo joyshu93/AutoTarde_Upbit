@@ -119,7 +119,7 @@ Telegram is an operator surface only.
 It provides:
 - `/help` for static command-contract inspection and operator safety boundaries
 - `/start` as a transport-friendly alias to `/help`
-- `/config` for non-secret runtime configuration, live blockers, and explicit risk-limit inspection
+- `/config` for non-secret runtime configuration, ignored deprecated environment variables, live blockers, and explicit risk-limit inspection
 - `/readiness` for read-only operator readiness over runtime config, execution state, worker status, latest persisted health records, and bounded local persistence health
 - `/readiness` classifies reconciliation recovery progress as warnings while keeping portfolio drift and unresolved order recovery as blockers
 - inspection commands
@@ -152,7 +152,7 @@ It provides:
 - a bounded `smoke:telegram:inbound` operator validation script that forces `DRY_RUN`, disables live orders and scheduler ticks, and calls only one inbound `pollOnce()` without starting the runtime loop
 
 `/help` is intentionally contract-derived and does not read repositories, poll Telegram, inspect exchange state, start sync, start strategy runs, start scheduler ticks, mutate orders, or enable live order transmission.
-`/config` is intentionally non-secret and runtime-derived; it renders configured/not-configured booleans for secrets and never prints raw credentials, tokens, or chat identifiers.
+`/config` is intentionally non-secret and runtime-derived; it renders configured/not-configured booleans for secrets, exposes ignored deprecated environment variable names when present, and never prints raw credentials, tokens, or chat identifiers.
 `/readiness` is intentionally inspection-only; it reads bounded local state and runtime status, including active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count, but does not poll Telegram, call Upbit, start sync, run strategies, tick schedulers, mutate offsets, deliver notifications, or mutate orders.
 
 It does not provide:

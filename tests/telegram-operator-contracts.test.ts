@@ -375,6 +375,7 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
     telegramInboundPollIntervalMs: 2_000,
     telegramInboundPollTimeoutSeconds: 25,
     telegramInboundPollLimit: 10,
+    deprecatedIgnoredEnvVars: ["MAX_LIVE_ORDER_VALUE_KRW"],
     strategySchedulerEnabled: false,
     strategySchedulerRunOnStart: false,
     strategySchedulerBtcIntervalMs: 3_600_000,
@@ -483,6 +484,7 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
   assert.match(runtimeConfigMessage, /telegram_bot_token_configured: false/);
   assert.match(runtimeConfigMessage, /telegram_operator_chat_id_configured: false/);
   assert.match(runtimeConfigMessage, /config_live_blockers: DRY_RUN,LIVE_GATE_DISABLED,DRY_RUN_ADAPTER/);
+  assert.match(runtimeConfigMessage, /deprecated_ignored_env_vars: MAX_LIVE_ORDER_VALUE_KRW/);
   assert.match(runtimeConfigMessage, /secret_boundary: secret values are never rendered/);
 
   assert.match(readinessMessage, /Operator Readiness/);

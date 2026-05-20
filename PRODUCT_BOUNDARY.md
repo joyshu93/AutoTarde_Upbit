@@ -71,7 +71,7 @@ Telegram may expose:
 
 Telegram commands are operational controls and inspection requests, not portfolio data entry.
 `/help` may list supported Telegram commands from static command contracts and safety boundaries, but it must not trigger exchange reads, sync, strategy runs, scheduler ticks, order mutation, or live order transmission.
-`/config` may inspect non-secret runtime configuration, explicit risk limits, and live-send blockers, but it must render only configured/not-configured booleans for secrets and must not mutate runtime or exchange state.
+`/config` may inspect non-secret runtime configuration, explicit risk limits, ignored deprecated environment variables, and live-send blockers, but it must render only configured/not-configured booleans for secrets and must not mutate runtime or exchange state.
 `/readiness` may summarize read-only operator readiness from runtime configuration, persisted execution state, runtime worker status, latest persisted health records, active-order counts, recent risk-block counts, and pending notification counts, but it must not perform active probes, poll Telegram, call Upbit, trigger sync, run strategies, tick schedulers, mutate offsets, submit/cancel orders, or deliver notifications.
 Telegram inbound polling is a transport for those commands only; it is disabled by default, accepts only the configured operator chat, and persists only update-offset transport progress.
 Telegram `/start` is treated as a `/help` alias for first-run bot UX and does not add a separate execution command.

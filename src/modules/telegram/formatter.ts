@@ -84,6 +84,7 @@ export function formatRuntimeConfigMessage(config: TelegramRuntimeConfigSnapshot
     `telegram_inbound_poll_interval_ms: ${config.telegramInboundPollIntervalMs}`,
     `telegram_inbound_poll_timeout_seconds: ${config.telegramInboundPollTimeoutSeconds}`,
     `telegram_inbound_poll_limit: ${config.telegramInboundPollLimit}`,
+    `deprecated_ignored_env_vars: ${formatStringList(config.deprecatedIgnoredEnvVars)}`,
     `strategy_scheduler_enabled: ${config.strategySchedulerEnabled}`,
     `strategy_scheduler_run_on_start: ${config.strategySchedulerRunOnStart}`,
     `strategy_scheduler_btc_interval_ms: ${config.strategySchedulerBtcIntervalMs}`,
@@ -101,6 +102,10 @@ export function formatRuntimeConfigMessage(config: TelegramRuntimeConfigSnapshot
     "secret_boundary: secret values are never rendered; only configured/not_configured booleans are shown.",
     `operator_boundary: ${MANUAL_INPUT_NOTE}`,
   ].join("\n");
+}
+
+function formatStringList(values: readonly string[]): string {
+  return values.length === 0 ? "none" : values.join(",");
 }
 
 export function formatReadinessMessage(input: {

@@ -176,6 +176,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
       telegramInboundPollIntervalMs: config.telegramInboundPollIntervalMs,
       telegramInboundPollTimeoutSeconds: config.telegramInboundPollTimeoutSeconds,
       telegramInboundPollLimit: config.telegramInboundPollLimit,
+      deprecatedIgnoredEnvVars: config.deprecatedIgnoredEnvVars,
       strategySchedulerEnabled: config.strategySchedulerEnabled,
       strategySchedulerRunOnStart: config.strategySchedulerRunOnStart,
       strategySchedulerBtcIntervalMs: config.strategySchedulerBtcIntervalMs,
