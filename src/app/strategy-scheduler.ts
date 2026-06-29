@@ -42,6 +42,7 @@ export class StrategyScheduler {
       controller: TelegramStrategyRunController;
       repositories?: Pick<ExecutionRepository, "saveStrategySchedulerRun" | "updateStrategySchedulerRun">;
       reporter?: OperatorNotificationReporter;
+      beforeRunPreflight?: () => Promise<StrategySchedulerStartupPreflight | null>;
       now?: () => string;
       setTimer?: (callback: () => void, delayMs: number) => SchedulerTimer;
       clearTimer?: (timer: SchedulerTimer) => void;
@@ -69,12 +70,12 @@ export class StrategyScheduler {
     }
 
     this.started = true;
-    for (const market of this.dependencies.config.markets) {
-      if (this.dependencies.config.runOnStart) {
-        this.scheduleMarket(market, 0);
-        continue;
-      }
+    if (this.dependencies.config.runOnStart) {
+      void this.runMarketsOnStartSequentially();
+      return this.getStatus();
+    }
 
+    for (const market of this.dependencies.config.markets) {
       this.scheduleMarket(market, market.intervalMs);
     }
 
@@ -178,6 +179,73 @@ export class StrategyScheduler {
       lastCompletedAt: null,
       lastError: null,
     });
+
+    const beforeRunPreflight = this.dependencies.beforeRunPreflight;
+    if (beforeRunPreflight) {
+      let preflight: StrategySchedulerStartupPreflight | null = null;
+      try {
+        preflight = await beforeRunPreflight();
+      } catch (error) {
+        const failedAt = this.now();
+        const failed = createFailedRunResult({
+          requestedAt: startedAt,
+          market,
+          detail: `Strategy scheduler preflight failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
+        this.applyRunResult(market, failed, startedAt, failedAt);
+        await this.persistSchedulerRun({
+          run: createSchedulerRunRecord({
+            exchangeAccountId: this.dependencies.config.exchangeAccountId,
+            market,
+            intervalMs: config.intervalMs,
+            runOnStart: this.dependencies.config.runOnStart,
+            status: "FAILED",
+            startedAt,
+            completedAt: failedAt,
+            result: failed,
+          }),
+          update: false,
+        });
+        await this.reportSchedulerResult({
+          market,
+          result: failed,
+          intervalMs: config.intervalMs,
+          runOnStart: this.dependencies.config.runOnStart,
+        });
+        return failed;
+      }
+
+      if (preflight?.status === "BLOCK") {
+        const blockedAt = this.now();
+        const blocked = createFailedRunResult({
+          requestedAt: startedAt,
+          market,
+          detail: `Strategy scheduler blocked before run: ${preflight.detail}`,
+        });
+        this.applyRunResult(market, blocked, startedAt, blockedAt);
+        await this.persistSchedulerRun({
+          run: createSchedulerRunRecord({
+            exchangeAccountId: this.dependencies.config.exchangeAccountId,
+            market,
+            intervalMs: config.intervalMs,
+            runOnStart: this.dependencies.config.runOnStart,
+            status: "FAILED",
+            startedAt,
+            completedAt: blockedAt,
+            result: blocked,
+          }),
+          update: false,
+        });
+        await this.reportSchedulerResult({
+          market,
+          result: blocked,
+          intervalMs: config.intervalMs,
+          runOnStart: this.dependencies.config.runOnStart,
+        });
+        return blocked;
+      }
+    }
+
     const runRecord = createSchedulerRunRecord({
       exchangeAccountId: this.dependencies.config.exchangeAccountId,
       market,
@@ -245,42 +313,50 @@ export class StrategyScheduler {
     this.updateMarketStatus(config.market, { nextRunAt });
     const timer = (this.dependencies.setTimer ?? setTimeout)(() => {
       this.timers.delete(config.market);
-      void this.runMarketNow(config.market)
-        .catch((error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          const completedAt = this.now();
-          this.applyRunResult(config.market, {
-            status: "FAILED",
-            requestedAt: completedAt,
-            market: config.market,
-            strategyDecisionId: null,
-            action: null,
-            orderId: null,
-            orderStatus: null,
-            submissionAccepted: null,
-            detail: `Strategy scheduler failed: ${message}`,
-          }, completedAt, completedAt);
-          void this.reportSchedulerResult({
-            market: config.market,
-            result: {
-              status: "FAILED",
-              requestedAt: completedAt,
-              market: config.market,
-              strategyDecisionId: null,
-              action: null,
-              orderId: null,
-              orderStatus: null,
-              submissionAccepted: null,
-              detail: `Strategy scheduler failed: ${message}`,
-            },
-            intervalMs: config.intervalMs,
-            runOnStart: this.dependencies.config.runOnStart,
-          });
-        })
+      void this.runScheduledMarket(config)
         .finally(() => this.scheduleMarket(config, config.intervalMs));
     }, delayMs);
 
     this.timers.set(config.market, timer);
+  }
+
+  private async runMarketsOnStartSequentially(): Promise<void> {
+    for (const market of this.dependencies.config.markets) {
+      if (!this.started || !this.dependencies.config.enabled) {
+        return;
+      }
+
+      await this.runScheduledMarket(market);
+      this.scheduleMarket(market, market.intervalMs);
+    }
+  }
+
+  private async runScheduledMarket(config: StrategySchedulerMarketConfig): Promise<void> {
+    try {
+      await this.runMarketNow(config.market);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const completedAt = this.now();
+      const result = {
+        status: "FAILED" as const,
+        requestedAt: completedAt,
+        market: config.market,
+        strategyDecisionId: null,
+        action: null,
+        orderId: null,
+        orderStatus: null,
+        submissionAccepted: null,
+        detail: `Strategy scheduler failed: ${message}`,
+      };
+
+      this.applyRunResult(config.market, result, completedAt, completedAt);
+      await this.reportSchedulerResult({
+        market: config.market,
+        result,
+        intervalMs: config.intervalMs,
+        runOnStart: this.dependencies.config.runOnStart,
+      });
+    }
   }
 
   private async persistSchedulerRun(input: {
@@ -487,6 +563,24 @@ function buildSchedulerNotification(input: {
   }
 
   return null;
+}
+
+function createFailedRunResult(input: {
+  requestedAt: string;
+  market: SupportedMarket;
+  detail: string;
+}): TelegramStrategyRunResult {
+  return {
+    status: "FAILED",
+    requestedAt: input.requestedAt,
+    market: input.market,
+    strategyDecisionId: null,
+    action: null,
+    orderId: null,
+    orderStatus: null,
+    submissionAccepted: null,
+    detail: input.detail,
+  };
 }
 
 function createSchedulerRunRecord(input: {

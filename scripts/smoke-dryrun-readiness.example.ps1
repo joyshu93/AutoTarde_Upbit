@@ -1,5 +1,8 @@
-# Copy this file to start-company-dryrun.local.ps1 and fill in secrets locally.
+# Copy this file to smoke-dryrun-readiness.local.ps1 and fill in secrets locally.
 # The .local.ps1 copy is ignored by Git. Do not commit API keys or bot tokens.
+#
+# This script checks DRY_RUN readiness only. It does not start the runtime,
+# start the scheduler, poll Telegram, run /sync, run strategy, or send orders.
 
 $ErrorActionPreference = "Stop"
 
@@ -28,14 +31,13 @@ $requiredEnv = @(
 foreach ($name in $requiredEnv) {
   $value = [Environment]::GetEnvironmentVariable($name, "Process")
   if ([string]::IsNullOrWhiteSpace($value) -or $value.StartsWith("REPLACE_WITH_")) {
-    throw "Refusing to start DRY_RUN mode because $name is not configured in the local copy."
+    throw "Refusing to check DRY_RUN readiness because $name is not configured in the local copy."
   }
 }
 
-Write-Host "Starting AutoTrade_Upbit in DRY_RUN mode."
+Write-Host "Checking AutoTrade_Upbit DRY_RUN readiness without starting the runtime."
 Write-Host "DATABASE_PATH=$env:DATABASE_PATH"
-Write-Host "Live orders are disabled by ENABLE_LIVE_ORDERS=false."
-Write-Host "Checking DRY_RUN readiness before starting the runtime."
+Write-Host "Live orders remain disabled by ENABLE_LIVE_ORDERS=false."
+Write-Host "No Upbit order is submitted by this script."
 
 npm.cmd run smoke:dryrun:readiness
-npm.cmd run start

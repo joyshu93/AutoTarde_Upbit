@@ -46,4 +46,8 @@ Write-Host "Strategy scheduler is disabled by default for the first LIVE validat
 Write-Host "Real Upbit order submission is enabled only if runtime readiness and risk guards pass."
 
 npm.cmd run smoke:live:readiness
+if ($LASTEXITCODE -ne 0) {
+  throw "Refusing to start LIVE mode because smoke:live:readiness failed with exit code $LASTEXITCODE."
+}
+
 npm.cmd run start

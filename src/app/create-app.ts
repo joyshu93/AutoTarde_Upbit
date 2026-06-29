@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { buildExecutionRiskLimits, loadAppConfig, type AppConfig } from "./env.js";
+import { buildStrategySchedulerStartupPreflight } from "./scheduler-preflight.js";
 import {
   createDefaultStrategySchedulerConfig,
   StrategyScheduler,
@@ -20,6 +21,7 @@ import {
   createDefaultPositionGuardRunnerConfig,
   PositionGuardStrategyRunner,
 } from "../modules/strategy/position-guard-runner.js";
+import type { PositionGuardPublicMarketDataReader } from "../modules/strategy/position-guard-snapshot.js";
 import { TelegramCommandRouter } from "../modules/telegram/commands.js";
 import {
   OperatorNotificationDeliveryService,
@@ -50,7 +52,14 @@ export interface AppServices {
   persistence: SqlitePersistenceBundle;
 }
 
-export function createApp(config: AppConfig = loadAppConfig()): AppServices {
+export interface CreateAppOverrides {
+  publicMarketDataReader?: PositionGuardPublicMarketDataReader;
+}
+
+export function createApp(
+  config: AppConfig = loadAppConfig(),
+  overrides: CreateAppOverrides = {},
+): AppServices {
   const persistence = createSqlitePersistence({
     databasePath: config.databasePath,
     exchangeAccountId: "primary",
@@ -71,7 +80,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
     secretKey: process.env.UPBIT_SECRET_KEY ?? "",
     baseUrl: config.upbitBaseUrl,
   });
-  const publicTickerClient = new UpbitPublicTickerClient({
+  const publicMarketDataReader = overrides.publicMarketDataReader ?? new UpbitPublicTickerClient({
     baseUrl: config.upbitBaseUrl,
   });
   const dryRunExchangeAdapter = new DryRunExchangeAdapter();
@@ -114,7 +123,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
   const positionGuardRunner = new PositionGuardStrategyRunner({
     repositories,
     executionService,
-    marketDataReader: publicTickerClient,
+    marketDataReader: publicMarketDataReader,
     config: createDefaultPositionGuardRunnerConfig("primary"),
   });
   const strategyRunController = new InlineTelegramStrategyRunController({
@@ -132,6 +141,15 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
     controller: strategyRunController,
     repositories,
     reporter,
+    beforeRunPreflight: async () =>
+      buildStrategySchedulerStartupPreflight({
+        config,
+        exchangeAccountId: "primary",
+        executionState: await operatorState.getState(),
+        repositories,
+        exchangeBackedReadEnabled,
+        liveSendPath,
+      }),
   });
 
   const reconciliationDependencies = {
@@ -148,7 +166,7 @@ export function createApp(config: AppConfig = loadAppConfig()): AppServices {
   const reconciliationService = new ReconciliationService(reconciliationDependencies);
   const portfolioSyncService = new PortfolioSyncService({
     exchangeAdapter: syncExchangeAdapter,
-    marketPriceReader: publicTickerClient,
+    marketPriceReader: publicMarketDataReader,
     repositories,
     reconciliationService,
   });

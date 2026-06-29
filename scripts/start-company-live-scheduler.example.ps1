@@ -59,4 +59,8 @@ Write-Host "The app startup preflight must pass before scheduler timers are inst
 Write-Host "Real Upbit order submission is possible on later scheduled strategy cycles if all guards pass."
 
 npm.cmd run smoke:live:scheduler-preflight
+if ($LASTEXITCODE -ne 0) {
+  throw "Refusing to start LIVE scheduler mode because smoke:live:scheduler-preflight failed with exit code $LASTEXITCODE."
+}
+
 npm.cmd run start

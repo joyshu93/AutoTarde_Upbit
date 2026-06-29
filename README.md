@@ -4,6 +4,8 @@
 
 This repository is building an Upbit-only BTC/ETH spot execution system with explicit order, fill, balance, risk, and reconciliation state. It is not a coaching bot and it does not accept manual cash or position input through Telegram.
 
+For a consolidated Korean development list and operator guide, see `PROJECT_GUIDE.md`.
+
 The current default runtime path is SQLite-backed local persistence via `DATABASE_PATH` (default: `./var/autotrade-upbit.sqlite`).
 Persisted `execution_state` in that database is the operator authority for pause, resume, kill-switch, and live-order gating decisions.
 
@@ -64,6 +66,11 @@ Current remaining gaps:
 - Telegram delivery now persists `operator_notification_delivery_runs` for each inline worker execution, including skipped/not-configured runs and failed worker runs
 - `/alerts` now exposes delivery-worker queue metrics such as pending totals, due/scheduled counts, active/expired leases, abandoned-lease candidates, recent worker-run summaries, recent attempt outcome counts, and latest/oldest timestamps
 - Telegram inbound polling is now available behind `ENABLE_TELEGRAM_INBOUND_POLLING=false` by default, uses the existing command router, only accepts messages from `TELEGRAM_OPERATOR_CHAT_ID`, persists `getUpdates` offset progress in `telegram_inbound_offsets`, and exposes `/inbound` inspection
+- `npm run smoke:dryrun:readiness` now provides a non-mutating local DRY_RUN preflight over runtime config and persisted readiness evidence before the local runtime starts
+- `npm run smoke:dryrun:sync` now provides an exchange-backed DRY_RUN `/sync` rehearsal that persists snapshots/reconciliation evidence but does not run strategy, Telegram transport, scheduler, or order transmission
+- `npm run smoke:dryrun:operator` now provides an offline, fixture-backed DRY_RUN operator rehearsal for `/config`, `/status`, `/readiness`, `/sync`, `/balances`, `/positions`, `/run BTC|ETH`, `/orders`, `/scheduler`, and `/alerts`
+- `scripts/start-company-dryrun-scheduler.example.ps1` now provides a local DRY_RUN scheduler launcher that keeps live orders disabled, runs DRY_RUN sync/readiness smokes, then starts the runtime with scheduler `RUN_ON_START=true`
+- `npm run smoke:dryrun:completion` now provides a persisted-evidence gate for marking the DRY_RUN automatic scheduler rehearsal complete without running sync, strategy, Telegram transport, scheduler timers, Upbit calls, or order transmission
 - startup recovery can now mark persisted operator state `DEGRADED` when unresolved portfolio drift remains after exchange-backed bootstrap checks
 - scheduler-triggered strategy cycles now persist `strategy_scheduler_runs` so scheduled run starts, completions, failures, and skips remain inspectable after process restart, including through `/scheduler`
 - `/scheduler` now shows current in-memory scheduler status and startup preflight summary before the persisted scheduler-run history
@@ -76,6 +83,7 @@ Current remaining gaps:
 - Telegram `/start` is handled as a `/help` alias
 - scheduler startup now records an automatic `strategySchedulerStartupPreflight`; in `LIVE` mode it blocks scheduler timers unless live gate, live adapter wiring, execution state, fresh exchange-backed snapshots, fresh reconciliation health, and active-order state are safe
 - live scheduler startup blocks now persist an operator notification before startup can close local persistence
+- live scheduler ticks now re-run the persisted-health preflight before the strategy runner is invoked, so stale or unsafe account-health evidence blocks the scheduled cycle before any strategy decision or order intent is created
 - the runtime can now derive `LIVE_ADAPTER` send wiring only when mode, live gate, and Upbit credentials are all explicitly configured; otherwise it remains on `DRY_RUN_ADAPTER`
 
 Current risk-policy framing is budget-first rather than asset-count-first:
@@ -100,17 +108,18 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 13. `/run BTC|ETH` requests one deterministic PositionGuard runner cycle for a supported asset and returns the persisted decision, action, and any DRY_RUN order lifecycle result.
 14. When `STRATEGY_SCHEDULER_ENABLED=true`, the scheduler uses the same safe runner/controller path as `/run BTC|ETH`; it is disabled by default.
 15. In `LIVE` mode, scheduler startup runs an automatic preflight before any timer is installed; this replaces a mandatory manual-first-run ritual with inspectable startup safety checks and rejects stale persisted account-health evidence.
-16. Scheduler-triggered cycles are persisted in `strategy_scheduler_runs` before runner execution and updated on completion, failure, or skip; `/scheduler` exposes current runtime scheduler status plus a fuller read-only history than the compact `/status` summary.
-17. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
-18. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
-19. Telegram delivery claims due `PENDING` notifications with a lease token, then only finalizes rows that still match that lease.
-20. Each delivery attempt now also writes a durable `operator_notification_delivery_attempts` record so `/alerts` can show recent delivery outcomes separately from the summary row in `operator_notifications`.
-21. Each delivery worker kick also writes a durable `operator_notification_delivery_runs` record so operators can inspect skipped, completed, and failed delivery-worker executions.
-22. Retryable Telegram delivery failures stay `PENDING` with a later `next_attempt_at`, while permanent failures become `FAILED`.
-23. Telegram inbound polling is disabled by default and, when enabled, only routes messages from the configured operator chat through the existing command router.
-24. Telegram inbound offset progress is persisted in `telegram_inbound_offsets` before routing each update, scoped by exchange account and non-secret bot-token fingerprint.
-25. Reconciliation and Telegram inspection surfaces operate on persisted state.
-26. When scheduler or inbound polling starts background timers, runtime signal handlers stop polling, stop the scheduler, and close SQLite persistence on `SIGINT` / `SIGTERM`; when no background runtime starts, startup closes persistence after printing the banner.
+16. In `LIVE` mode, each scheduled tick re-runs the persisted-health preflight before invoking the strategy runner; a block is persisted as scheduler audit state and operator notification without creating a strategy decision or order intent.
+17. Scheduler-triggered cycles are persisted in `strategy_scheduler_runs` before runner execution and updated on completion, failure, or skip; `/scheduler` exposes current runtime scheduler status plus a fuller read-only history than the compact `/status` summary.
+18. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY` and `OPERATOR_SYNC`, and use a per-run lookup budget to avoid unbounded private order reads.
+19. Risk inspection reads persisted `risk_events`, and automatic reporting persists durable `operator_notifications`, then non-blockingly kicks best-effort Telegram delivery behind a separate gate.
+20. Telegram delivery claims due `PENDING` notifications with a lease token, then only finalizes rows that still match that lease.
+21. Each delivery attempt now also writes a durable `operator_notification_delivery_attempts` record so `/alerts` can show recent delivery outcomes separately from the summary row in `operator_notifications`.
+22. Each delivery worker kick also writes a durable `operator_notification_delivery_runs` record so operators can inspect skipped, completed, and failed delivery-worker executions.
+23. Retryable Telegram delivery failures stay `PENDING` with a later `next_attempt_at`, while permanent failures become `FAILED`.
+24. Telegram inbound polling is disabled by default and, when enabled, only routes messages from the configured operator chat through the existing command router.
+25. Telegram inbound offset progress is persisted in `telegram_inbound_offsets` before routing each update, scoped by exchange account and non-secret bot-token fingerprint.
+26. Reconciliation and Telegram inspection surfaces operate on persisted state.
+27. When scheduler or inbound polling starts background timers, runtime signal handlers stop polling, stop the scheduler, and close SQLite persistence on `SIGINT` / `SIGTERM`; when no background runtime starts, startup closes persistence after printing the banner.
 
 `/help` is static command-contract inspection. It does not read exchange state, query repositories, trigger `/sync`, run strategy cycles, tick the scheduler, mutate orders, or enable live order transmission.
 `/config` is non-secret runtime configuration inspection. It shows configured/not-configured booleans for credentials and Telegram identifiers instead of raw secret values, and it lists ignored deprecated environment variable names when stale local scripts still set them.
@@ -226,12 +235,50 @@ If startup recovery finds unresolved portfolio drift against the prior persisted
 
 The strategy scheduler is disabled unless `STRATEGY_SCHEDULER_ENABLED=true`.
 When enabled, `STRATEGY_SCHEDULER_BTC_INTERVAL_MS` and `STRATEGY_SCHEDULER_ETH_INTERVAL_MS` control the BTC/ETH cadence, and `STRATEGY_SCHEDULER_RUN_ON_START=true` requests an immediate first tick after startup recovery policy has completed.
+When `RUN_ON_START=true`, configured markets are run sequentially before their regular interval timers are scheduled, so BTC and ETH do not collide with the account-scoped strategy runner lock at startup.
 The scheduler still uses the same runner/controller path as `/run BTC|ETH`, so it does not enable live order transmission by itself.
 If the scheduler is enabled while `APP_EXECUTION_MODE=LIVE`, startup first runs an automatic scheduler preflight. It blocks timer installation unless the live gate is enabled, the execution service is wired to the live adapter, operator state is `RUNNING`, Upbit read credentials and fresh persisted snapshots exist, no active local orders require visibility, and the latest reconciliation is fresh and has no blocking issue codes. Freshness uses the shortest configured scheduler interval, so with the default one-hour BTC/ETH intervals a snapshot or reconciliation older than one hour blocks automatic scheduler startup. Non-blocking exchange-history recovery evidence remains a warning.
 If that live scheduler startup preflight blocks timer installation, the runtime persists a `SCHEDULER_STARTUP_BLOCKED` operator notification with the preflight detail and failed checks before local persistence can be closed.
+Every later `LIVE` scheduled tick runs the same persisted-health preflight before the strategy runner is invoked. If account-health evidence has become stale or unsafe after startup, the tick is recorded as a failed `strategy_scheduler_runs` row and operator notification, and no strategy decision or order intent is created.
 When either scheduler or Telegram inbound polling is running, use normal process signals such as `Ctrl+C` / `SIGINT` or `SIGTERM` to stop the process. Shutdown is explicit: inbound polling is stopped, scheduler timers are cleared, and SQLite persistence is closed before the process exits.
 
 ## Local DRY_RUN Script
+
+Before connecting a real Telegram bot or Upbit read credentials, run the fixture-backed offline operator rehearsal:
+
+```powershell
+npm run smoke:dryrun:operator
+```
+
+By default this uses `DATABASE_PATH=./var/dryrun-operator-smoke.sqlite` when no `DATABASE_PATH` is already set. The smoke forcibly sets `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, disables Telegram delivery and inbound polling, disables the strategy scheduler, clears Upbit private read credentials for the process, and uses deterministic fixture public market data. It routes `/sync` and `/run BTC|ETH`, so it may write local DRY_RUN snapshots and strategy decisions, but it must not call Upbit private endpoints, poll Telegram, start scheduler timers, or transmit live orders.
+
+After filling in the local DRY_RUN script credentials, run the non-mutating readiness preflight against the intended local DB:
+
+```powershell
+npm run smoke:dryrun:readiness
+```
+
+For repeated checks with the same DRY_RUN environment, copy `scripts/smoke-dryrun-readiness.example.ps1` to `scripts/smoke-dryrun-readiness.local.ps1`, fill in secrets, and run:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke-dryrun-readiness.local.ps1
+```
+
+This smoke forces `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, `STRATEGY_SCHEDULER_ENABLED=false`, and `STRATEGY_SCHEDULER_RUN_ON_START=false`. It reads local runtime configuration, persisted execution state, latest snapshots, latest reconciliation, active orders, recent risk blocks, and pending notifications. It does not run `/sync`, run strategy, start the scheduler, poll Telegram, call Upbit, deliver notifications, or send orders. A `WARN` is expected on a fresh DB before `/sync`; a `BLOCK` must be resolved before continuing.
+
+After readiness is clean enough to proceed and Upbit read credentials are configured, run one exchange-backed DRY_RUN sync rehearsal:
+
+```powershell
+npm run smoke:dryrun:sync
+```
+
+For repeated checks with the same DRY_RUN environment, copy `scripts/smoke-dryrun-sync.example.ps1` to `scripts/smoke-dryrun-sync.local.ps1`, fill in the Upbit read credentials, and run:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke-dryrun-sync.local.ps1
+```
+
+This smoke forces `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, disables Telegram delivery and inbound polling, disables the scheduler, requires `UPBIT_ACCESS_KEY` and `UPBIT_SECRET_KEY`, routes `/sync`, then inspects `/balances`, `/positions`, `/readiness`, and `/synchistory`. It may persist balance snapshots, position snapshots, reconciliation runs, drift risk evidence, and recovery records, but it does not run strategy or transmit orders.
 
 For repeated local operation, copy `scripts/start-company-dryrun.example.ps1` to `scripts/start-company-dryrun.local.ps1`, fill in the Upbit and Telegram secrets in the local copy, then run:
 
@@ -246,6 +293,47 @@ powershell.exe -ExecutionPolicy Bypass -File .\scripts\start-company-dryrun.loca
 ```
 
 The `*.local.ps1` copy is ignored by Git. Keep `APP_EXECUTION_MODE=DRY_RUN` and `ENABLE_LIVE_ORDERS=false` until live order transmission is explicitly approved.
+The example DRY_RUN startup script refuses placeholder credentials and runs `npm run smoke:dryrun:readiness` before `npm run start`.
+
+To rehearse the automatic scheduler path without enabling live orders, copy `scripts/start-company-dryrun-scheduler.example.ps1` to `scripts/start-company-dryrun-scheduler.local.ps1`, fill in the Upbit and Telegram secrets, set:
+
+```powershell
+$DryRunSchedulerConfirmation = "I_UNDERSTAND_DRY_RUN_SCHEDULED_ORDERS"
+```
+
+Use the same `DATABASE_PATH` as the validated DRY_RUN database when you want the scheduler rehearsal to continue from that baseline. The example defaults to `./var/company-dryrun-scheduler.sqlite`, enables:
+
+```powershell
+$env:STRATEGY_SCHEDULER_ENABLED = "true"
+$env:STRATEGY_SCHEDULER_RUN_ON_START = "true"
+$env:STRATEGY_SCHEDULER_BTC_INTERVAL_MS = "3600000"
+$env:STRATEGY_SCHEDULER_ETH_INTERVAL_MS = "3600000"
+```
+
+It runs `npm run smoke:dryrun:sync` and `npm run smoke:dryrun:readiness` before `npm run start`. Startup refuses to continue if either smoke exits with `BLOCK`. Once running, inspect the automatic path with:
+
+```text
+/scheduler
+/status
+/alerts
+/readiness
+```
+
+Because this launcher keeps `APP_EXECUTION_MODE=DRY_RUN` and `ENABLE_LIVE_ORDERS=false`, scheduled cycles can persist strategy decisions and simulated DRY_RUN lifecycle records, but they must not transmit live Upbit orders.
+
+After the automatic DRY_RUN scheduler path has been inspected with `/scheduler`, `/status`, `/alerts`, and `/readiness`, run the persisted-evidence completion gate against the same `DATABASE_PATH`:
+
+```powershell
+npm run smoke:dryrun:completion
+```
+
+For repeated checks with the same DRY_RUN scheduler database, copy `scripts/smoke-dryrun-completion.example.ps1` to `scripts/smoke-dryrun-completion.local.ps1`, fill in the Upbit and Telegram secrets, keep `DATABASE_PATH` pointed at the scheduler rehearsal DB, and run:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke-dryrun-completion.local.ps1
+```
+
+This smoke forces `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, disables Telegram delivery and inbound polling, disables scheduler startup, and reads only persisted local evidence: latest balance snapshot, latest position snapshot, latest reconciliation, active orders, recent risk blocks, pending operator notifications, and latest `strategy_scheduler_runs` for `KRW-BTC` and `KRW-ETH`. It does not run `/sync`, run strategy, start the scheduler, poll Telegram, call Upbit, deliver notifications, create orders, or transmit orders.
 
 ## Local LIVE Script
 
@@ -352,7 +440,8 @@ To unregister one of the approved tasks, copy `scripts/unregister-autotrade-task
 
 ## Immediate Next Steps
 
-- run the local `DRY_RUN` script and confirm `/readiness`, `/sync`, `/balances`, `/positions`, and `/run BTC|ETH` behavior
+- run `npm run smoke:dryrun:operator`, then `npm run smoke:dryrun:readiness` or the local DRY_RUN readiness script, then `npm run smoke:dryrun:sync` or the local DRY_RUN sync script, then start the local `DRY_RUN` runtime and confirm `/readiness`, `/sync`, `/balances`, `/positions`, and `/run BTC|ETH` behavior against the intended local DB and credentials
+- after the manual DRY_RUN path is reviewed, use the local DRY_RUN scheduler launcher to confirm scheduler `RUN_ON_START` behavior through `/scheduler`, `/status`, `/alerts`, and `/readiness`, then run `npm run smoke:dryrun:completion` or the local completion script against the same DB
 - only then run `npm run smoke:live:readiness`, followed by the local `LIVE` script with scheduler disabled
 - after a clean live validation run, run `npm run smoke:live:scheduler-preflight`
 - only after reviewing that output, use the local LIVE scheduler script if automatic scheduled operation is intended

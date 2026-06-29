@@ -42,6 +42,43 @@ test("createApp wires the live adapter only when live mode, live gate, and Upbit
   }
 });
 
+test("createApp wires scheduler ticks through live before-run preflight", async () => {
+  const databasePath = await createTempDatabasePath("live-scheduler-preflight");
+  const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
+  const previousSecretKey = process.env.UPBIT_SECRET_KEY;
+  let app: ReturnType<typeof createApp> | null = null;
+  process.env.UPBIT_ACCESS_KEY = "test-access-key";
+  process.env.UPBIT_SECRET_KEY = "test-secret-key";
+
+  try {
+    app = createApp(createConfig({
+      databasePath,
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      strategySchedulerEnabled: true,
+    }));
+
+    const result = await app.strategyScheduler.runMarketNow("KRW-BTC");
+    await app.notificationDelivery.deliverPending("primary");
+    const latestDecision = await app.repositories.getLatestStrategyDecision(
+      "primary",
+      "KRW-BTC",
+    );
+
+    assert.equal(app.liveSendPath, "LIVE_ADAPTER");
+    assert.equal(result.status, "FAILED");
+    assert.match(result.detail, /balance_snapshot,position_snapshot,latest_reconciliation/);
+    assert.equal(latestDecision, null);
+  } finally {
+    app?.telegramInboundPolling.stop();
+    app?.strategyScheduler.stop();
+    app?.persistence.close();
+    restoreOptionalEnv("UPBIT_ACCESS_KEY", previousAccessKey);
+    restoreOptionalEnv("UPBIT_SECRET_KEY", previousSecretKey);
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
 function createConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   return {
     serviceName: "AutoTrade_Upbit",
@@ -89,7 +126,26 @@ async function createTempDatabasePath(label: string): Promise<string> {
 }
 
 async function cleanupTempDatabase(databasePath: string): Promise<void> {
-  await rm(databasePath, { force: true });
+  await Promise.all([
+    rmWithRetry(databasePath),
+    rmWithRetry(`${databasePath}-wal`),
+    rmWithRetry(`${databasePath}-shm`),
+  ]);
+}
+
+async function rmWithRetry(filePath: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rm(filePath, { force: true });
+      return;
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? error.code : null;
+      if (code !== "EBUSY" || attempt === 4) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
 }
 
 function restoreOptionalEnv(name: string, value: string | undefined): void {
