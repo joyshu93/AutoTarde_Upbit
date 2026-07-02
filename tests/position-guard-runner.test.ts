@@ -57,6 +57,42 @@ test("position guard runner persists a strategy decision without submitting when
   assert.equal(createOrderCallCount, 0);
 });
 
+test("position guard preview computes a decision without persisting or submitting", async () => {
+  let createOrderCallCount = 0;
+  const repositories = new InMemoryExecutionRepository();
+  const executionService = createExecutionService(repositories, {
+    async createOrder(request) {
+      createOrderCallCount += 1;
+      return new DryRunExchangeAdapter().createOrder(request);
+    },
+  });
+  await seedEmptyPortfolio(repositories);
+
+  const runner = new PositionGuardStrategyRunner({
+    repositories,
+    executionService,
+    marketDataReader: createFlatMarketReader(),
+    config: createDefaultPositionGuardRunnerConfig("primary"),
+  });
+
+  const result = await runner.previewOnce({
+    market: "KRW-BTC",
+    generatedAt: "2026-04-20T01:05:00.000Z",
+  });
+  const latestDecision = await repositories.getLatestStrategyDecision(
+    "primary",
+    "KRW-BTC",
+    result.strategyDecision.strategyKey,
+  );
+  const orders = await repositories.listOrders("primary");
+
+  assert.equal(result.strategyDecision.action, "HOLD");
+  assert.equal(result.orderPreview, null);
+  assert.equal(latestDecision, null);
+  assert.equal(orders.length, 0);
+  assert.equal(createOrderCallCount, 0);
+});
+
 test("position guard runner maps buy and sell decisions to Upbit spot order requests", () => {
   const enterDecision: StrategyDecision = {
     strategyKey: "position_guard.paper_core.v1",

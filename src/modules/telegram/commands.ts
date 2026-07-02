@@ -21,6 +21,7 @@ import {
   formatRuntimeConfigMessage,
   formatStateHistoryMessage,
   formatStrategySchedulerRunsMessage,
+  formatStrategyPreviewMessage,
   formatStrategyRunMessage,
   formatStatusMessage,
   formatSyncMessage,
@@ -31,6 +32,7 @@ import type {
   SupportedTelegramCommand,
   TelegramResponse,
   TelegramRouterDependencies,
+  TelegramStrategyPreviewResult,
   TelegramStrategyRunResult,
   TelegramSyncResult,
 } from "./interfaces.js";
@@ -119,6 +121,10 @@ export class TelegramCommandRouter {
         return {
           text: formatSyncMessage(await this.requestSync(exchangeAccountId)),
         };
+      case "/preview":
+        return {
+          text: formatStrategyPreviewMessage(await this.requestStrategyPreview(parsed.args, exchangeAccountId)),
+        };
       case "/run":
         return {
           text: formatStrategyRunMessage(await this.requestStrategyRun(parsed.args, exchangeAccountId)),
@@ -144,6 +150,60 @@ export class TelegramCommandRouter {
       exchangeAccountId,
       requestedBy: "TELEGRAM",
       requestedCommand: "/sync",
+    });
+  }
+
+  private async requestStrategyPreview(
+    args: readonly string[],
+    exchangeAccountId: string,
+  ): Promise<TelegramStrategyPreviewResult> {
+    const requestedAt = this.dependencies.now?.() ?? new Date().toISOString();
+    const asset = parseTelegramAssetArg(args);
+
+    if (!asset) {
+      return {
+        status: "FAILED",
+        requestedAt,
+        market: null,
+        action: null,
+        executionDisposition: null,
+        referencePrice: null,
+        requestedNotionalKrw: null,
+        requestedQuantity: null,
+        orderSide: null,
+        orderType: null,
+        orderPrice: null,
+        orderVolume: null,
+        detail: "Invalid strategy preview request. Use /preview BTC or /preview ETH.",
+      };
+    }
+
+    const market = getMarketForAsset(asset);
+
+    if (!this.dependencies.strategyRunController) {
+      return {
+        status: "NOT_CONNECTED",
+        requestedAt,
+        market,
+        action: null,
+        executionDisposition: null,
+        referencePrice: null,
+        requestedNotionalKrw: null,
+        requestedQuantity: null,
+        orderSide: null,
+        orderType: null,
+        orderPrice: null,
+        orderVolume: null,
+        detail:
+          "PositionGuard strategy runner is not wired in this process yet. No preview was computed.",
+      };
+    }
+
+    return this.dependencies.strategyRunController.requestPreview({
+      exchangeAccountId,
+      market,
+      requestedBy: "TELEGRAM",
+      requestedCommand: "/preview",
     });
   }
 

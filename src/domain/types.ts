@@ -515,6 +515,7 @@ export interface OperatorCommand {
     | "/resume"
     | "/killswitch"
     | "/sync"
+    | "/preview"
     | "/run";
   args: string[];
 }

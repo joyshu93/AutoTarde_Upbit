@@ -62,7 +62,7 @@ export class ExecutionService {
     const requestedNotionalKrw =
       typeof decision.requestedNotionalKrw === "number"
         ? decision.requestedNotionalKrw
-        : deriveRequestedNotionalKrw(input.price, input.volume);
+        : deriveRequestedNotionalKrw(decision, input.price, input.volume);
 
     const requestedQuantity =
       typeof decision.requestedQuantity === "number"
@@ -651,12 +651,23 @@ function createRiskEvent(
   };
 }
 
-function deriveRequestedNotionalKrw(price: string | null, volume: string | null): number | null {
+function deriveRequestedNotionalKrw(
+  decision: StrategyDecision,
+  price: string | null,
+  volume: string | null,
+): number | null {
   if (price && volume) {
     const priceNumber = Number(price);
     const volumeNumber = Number(volume);
     if (Number.isFinite(priceNumber) && Number.isFinite(volumeNumber)) {
       return priceNumber * volumeNumber;
+    }
+  }
+
+  if (volume) {
+    const volumeNumber = Number(volume);
+    if (Number.isFinite(volumeNumber) && Number.isFinite(decision.referencePrice)) {
+      return decision.referencePrice * volumeNumber;
     }
   }
 

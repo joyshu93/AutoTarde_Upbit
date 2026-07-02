@@ -10,6 +10,7 @@ await import("./startup-recovery.test.js");
 await import("./runtime-lifecycle.test.js");
 await import("./sync-controller.test.js");
 await import("./scheduler-preflight.test.js");
+await import("./strategy-run-controller.test.js");
 await import("./strategy-scheduler.test.js");
 await import("./upbit-public-client.test.js");
 await import("./upbit-private-client.test.js");

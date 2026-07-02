@@ -83,6 +83,7 @@ test("telegram router parses supported operator commands only", () => {
   const schedulerParsed = router.parse("/scheduler");
   const inboundParsed = router.parse("/inbound");
   const orderParsed = router.parse("/order order-1");
+  const previewParsed = router.parse("/preview BTC");
   const runParsed = router.parse("/run BTC");
   assert.equal(helpParsed?.command, "/help");
   assert.deepEqual(helpParsed?.args, []);
@@ -115,6 +116,9 @@ test("telegram router parses supported operator commands only", () => {
   assert.equal(orderParsed?.command, "/order");
   assert.deepEqual(orderParsed?.args, ["order-1"]);
   assert.equal(orderParsed?.contract.category, "inspection");
+  assert.equal(previewParsed?.command, "/preview");
+  assert.deepEqual(previewParsed?.args, ["BTC"]);
+  assert.equal(previewParsed?.contract.category, "control");
   assert.equal(runParsed?.command, "/run");
   assert.deepEqual(runParsed?.args, ["BTC"]);
   assert.equal(runParsed?.contract.category, "control");
@@ -717,6 +721,9 @@ test("telegram router readiness blocks unhealthy execution state without trigger
       async requestRun() {
         throw new Error("/readiness must not call strategyRunController");
       },
+      async requestPreview() {
+        throw new Error("/readiness must not call strategyRunController");
+      },
     },
     telegramInboundOffsetStore: {
       async getTelegramInboundOffset() {
@@ -785,6 +792,9 @@ test("telegram router exposes static operator help without touching runtime stat
       async requestRun() {
         throw new Error("/help must not call strategyRunController");
       },
+      async requestPreview() {
+        throw new Error("/help must not call strategyRunController");
+      },
     },
     schedulerStatus: () => {
       throw new Error("/help must not read scheduler runtime status");
@@ -798,11 +808,12 @@ test("telegram router exposes static operator help without touching runtime stat
 
   assert.match(response.text, /Operator Help/);
   assert.match(response.text, /state_source: static telegram command contracts/);
-  assert.match(response.text, /command_count: 20/);
+  assert.match(response.text, /command_count: 21/);
   assert.match(response.text, /inspection_commands:/);
   assert.match(response.text, /- \/help \| \/help \| Show supported Telegram operator commands and safety boundaries\./);
   assert.match(response.text, /- \/order \| \/order <order-id\|identifier> \| Show one persisted order with lifecycle events and fills\./);
   assert.match(response.text, /control_commands:/);
+  assert.match(response.text, /- \/preview \| \/preview BTC\|ETH \| Preview one deterministic PositionGuard strategy decision and order intent without persistence or order submission\./);
   assert.match(response.text, /- \/run \| \/run BTC\|ETH \| Run one deterministic PositionGuard strategy cycle for a supported asset through the safe execution path\./);
   assert.match(response.text, /read_only_boundary: \/help never triggers sync, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission\./);
   assert.match(response.text, /live_boundary: Live order transmission requires APP_EXECUTION_MODE=LIVE and ENABLE_LIVE_ORDERS=true; the default path remains DRY_RUN\./);
@@ -1786,21 +1797,33 @@ test("telegram router exposes strategy run trigger without manual portfolio inpu
   const router = createRouter();
 
   const missingController = await router.route("/run BTC");
+  const missingPreviewController = await router.route("/preview BTC");
   const invalidAsset = await router.route("/run DOGE");
+  const invalidPreviewAsset = await router.route("/preview DOGE");
 
   assert.match(missingController.text, /Strategy Run/);
   assert.match(missingController.text, /status: NOT_CONNECTED/);
   assert.match(missingController.text, /market: KRW-BTC/);
   assert.match(missingController.text, /PositionGuard strategy runner is not wired/);
   assert.match(missingController.text, /operator_boundary: Telegram does not accept manual cash or position input\./);
+  assert.match(missingPreviewController.text, /Strategy Preview/);
+  assert.match(missingPreviewController.text, /status: NOT_CONNECTED/);
+  assert.match(missingPreviewController.text, /market: KRW-BTC/);
+  assert.match(missingPreviewController.text, /No preview was computed/);
+  assert.match(missingPreviewController.text, /no_mutation_boundary: \/preview never persists strategy decisions, creates orders, sends orders, or triggers reconciliation\./);
   assert.equal(
     invalidAsset.text,
     "Usage: /run BTC|ETH\nRun one deterministic PositionGuard strategy cycle for a supported asset through the safe execution path.",
+  );
+  assert.equal(
+    invalidPreviewAsset.text,
+    "Usage: /preview BTC|ETH\nPreview one deterministic PositionGuard strategy decision and order intent without persistence or order submission.",
   );
 });
 
 test("telegram router calls a wired strategy run controller for supported assets", async () => {
   const runRequests: string[] = [];
+  const previewRequests: string[] = [];
   const router = new TelegramCommandRouter({
     repositories: new InMemoryExecutionRepository(),
     operatorState: new InMemoryOperatorStateStore({
@@ -1830,12 +1853,39 @@ test("telegram router calls a wired strategy run controller for supported assets
           detail: "Decision HOLD persisted; no order submission was requested.",
         };
       },
+      async requestPreview(request) {
+        previewRequests.push(`${request.exchangeAccountId}:${request.market}:${request.requestedCommand}`);
+        return {
+          status: "COMPLETED",
+          requestedAt: "2026-04-20T00:14:00.000Z",
+          market: request.market,
+          action: "ENTER",
+          executionDisposition: "READY",
+          referencePrice: 100_000_000,
+          requestedNotionalKrw: 150_000,
+          requestedQuantity: null,
+          orderSide: "bid",
+          orderType: "price",
+          orderPrice: "150000",
+          orderVolume: null,
+          detail: "Decision ENTER computed; order intent bid price would require /run to persist and submit through the configured path.",
+        };
+      },
     },
   });
 
+  const preview = await router.route("/preview BTC");
   const response = await router.route("/run ETH");
 
+  assert.deepEqual(previewRequests, ["primary:KRW-BTC:/preview"]);
   assert.deepEqual(runRequests, ["primary:KRW-ETH:/run"]);
+  assert.match(preview.text, /Strategy Preview/);
+  assert.match(preview.text, /status: COMPLETED/);
+  assert.match(preview.text, /market: KRW-BTC/);
+  assert.match(preview.text, /action: ENTER/);
+  assert.match(preview.text, /order_side: bid/);
+  assert.match(preview.text, /order_type: price/);
+  assert.match(preview.text, /order_price: 150000/);
   assert.match(response.text, /status: COMPLETED/);
   assert.match(response.text, /market: KRW-ETH/);
   assert.match(response.text, /strategy_decision_id: strategy-decision-1/);

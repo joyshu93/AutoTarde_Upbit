@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { StrategyScheduler } from "../src/app/strategy-scheduler.js";
 import { InMemoryExecutionRepository } from "../src/modules/db/repositories/in-memory-repositories.js";
 import type {
+  TelegramStrategyPreviewResult,
   TelegramStrategyRunController,
   TelegramStrategyRunRequest,
   TelegramStrategyRunResult,
@@ -607,6 +608,23 @@ function createController(
         orderStatus: null,
         submissionAccepted: null,
         detail: "Decision HOLD persisted; no order submission was requested.",
+      };
+    },
+    async requestPreview(request): Promise<TelegramStrategyPreviewResult> {
+      return {
+        status: "COMPLETED",
+        requestedAt: "2026-04-20T00:00:00.000Z",
+        market: request.market,
+        action: "HOLD",
+        executionDisposition: "SKIPPED",
+        referencePrice: 100_000_000,
+        requestedNotionalKrw: null,
+        requestedQuantity: null,
+        orderSide: null,
+        orderType: null,
+        orderPrice: null,
+        orderVolume: null,
+        detail: "Decision HOLD computed; no order submission would be requested.",
       };
     },
     ...overrides,

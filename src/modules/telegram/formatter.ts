@@ -25,6 +25,7 @@ import type {
   SupportedTelegramCommand,
   TelegramCommandContract,
   TelegramRuntimeConfigSnapshot,
+  TelegramStrategyPreviewResult,
   TelegramStrategyRunResult,
   TelegramSyncResult,
 } from "./interfaces.js";
@@ -42,7 +43,8 @@ export function formatHelpMessage(contracts: readonly TelegramCommandContract[])
     ...formatHelpCommandGroup("inspection_commands", inspectionContracts),
     ...formatHelpCommandGroup("control_commands", controlContracts),
     "read_only_boundary: /help never triggers sync, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission.",
-    "execution_boundary: /run BTC|ETH is a deterministic strategy trigger and still inherits execution-state, risk, DRY_RUN, and live-send gates.",
+    "preview_boundary: /preview BTC|ETH computes the deterministic decision and order intent without persisting decisions, mutating orders, or submitting an order.",
+    "execution_boundary: /run BTC|ETH is a deterministic strategy trigger and still inherits preflight, execution-state, risk, DRY_RUN, and live-send gates.",
     "live_boundary: Live order transmission requires APP_EXECUTION_MODE=LIVE and ENABLE_LIVE_ORDERS=true; the default path remains DRY_RUN.",
     `operator_boundary: ${MANUAL_INPUT_NOTE}`,
   ].join("\n");
@@ -916,6 +918,27 @@ export function formatStrategyRunMessage(result: TelegramStrategyRunResult): str
     `order_id: ${result.orderId ?? "none"}`,
     `order_status: ${result.orderStatus ?? "none"}`,
     `detail: ${result.detail}`,
+    `operator_boundary: ${MANUAL_INPUT_NOTE}`,
+  ].join("\n");
+}
+
+export function formatStrategyPreviewMessage(result: TelegramStrategyPreviewResult): string {
+  return [
+    "Strategy Preview",
+    `status: ${result.status}`,
+    `requested_at: ${result.requestedAt}`,
+    `market: ${result.market ?? "none"}`,
+    `action: ${result.action ?? "none"}`,
+    `execution_disposition: ${result.executionDisposition ?? "none"}`,
+    `reference_price: ${result.referencePrice ?? "none"}`,
+    `requested_notional_krw: ${result.requestedNotionalKrw ?? "none"}`,
+    `requested_quantity: ${result.requestedQuantity ?? "none"}`,
+    `order_side: ${result.orderSide ?? "none"}`,
+    `order_type: ${result.orderType ?? "none"}`,
+    `order_price: ${result.orderPrice ?? "none"}`,
+    `order_volume: ${result.orderVolume ?? "none"}`,
+    `detail: ${result.detail}`,
+    "no_mutation_boundary: /preview never persists strategy decisions, creates orders, sends orders, or triggers reconciliation.",
     `operator_boundary: ${MANUAL_INPUT_NOTE}`,
   ].join("\n");
 }

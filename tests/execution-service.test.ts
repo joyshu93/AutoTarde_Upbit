@@ -154,6 +154,82 @@ test("execution service settles dry-run price bids with a synthetic fill derived
   assert.match(fills[0]?.rawPayloadJson ?? "", /SIMULATED_IMMEDIATE_FILL/);
 });
 
+test("execution service applies minimum order value to market asks using reference price and volume", async () => {
+  let createOrderCalled = false;
+  const baseAdapter = new DryRunExchangeAdapter();
+  const exchangeAdapter: ExchangeAdapter = {
+    getBalances: baseAdapter.getBalances.bind(baseAdapter),
+    getOrderChance: baseAdapter.getOrderChance.bind(baseAdapter),
+    testOrder: baseAdapter.testOrder.bind(baseAdapter),
+    cancelOrder: baseAdapter.cancelOrder.bind(baseAdapter),
+    getOrder: baseAdapter.getOrder.bind(baseAdapter),
+    listOpenOrders: baseAdapter.listOpenOrders.bind(baseAdapter),
+    listClosedOrders: baseAdapter.listClosedOrders.bind(baseAdapter),
+    async createOrder(request) {
+      createOrderCalled = true;
+      return baseAdapter.createOrder(request);
+    },
+  };
+  const { service, repositories } = createExecutionService({
+    exchangeAdapter,
+  });
+  await repositories.saveBalanceSnapshot({
+    id: "balance-small-ask",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:00:00.000Z",
+    source: "EXCHANGE_POLL",
+    totalKrwValue: "10000000",
+    balancesJson: "[]",
+  });
+  await repositories.savePositionSnapshot({
+    id: "position-small-ask",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:00:00.000Z",
+    source: "EXCHANGE_POLL",
+    positionsJson: JSON.stringify([
+      {
+        asset: "BTC",
+        market: "KRW-BTC",
+        quantity: "0.00001000",
+        averageEntryPrice: "100000000",
+        markPrice: "100000000",
+        marketValue: "1000",
+        exposureRatio: "0.0001",
+        capturedAt: "2026-04-20T00:00:00.000Z",
+      },
+    ]),
+  });
+
+  const result = await service.submitOrderFromDecision({
+    exchangeAccountId: "primary",
+    strategyDecisionId: "decision-small-ask",
+    decision: {
+      strategyKey: "deterministic.stub.v1",
+      market: "KRW-BTC",
+      action: "EXIT",
+      reasonCodes: ["SMALL_EXIT"],
+      referencePrice: 100_000_000,
+      requestedNotionalKrw: null,
+      requestedQuantity: 0.00001,
+      metadata: {},
+    },
+    side: "ask",
+    ordType: "market",
+    price: null,
+    volume: "0.00001",
+  });
+
+  const orders = await repositories.listOrders("primary");
+  const riskEvents = await repositories.listRiskEvents("primary");
+
+  assert.equal(result.accepted, false);
+  assert.match(result.reason ?? "", /below the configured minimum/);
+  assert.equal(createOrderCalled, false);
+  assert.equal(orders.length, 0);
+  assert.equal(riskEvents.length, 1);
+  assert.equal(riskEvents[0]?.ruleCode, "MINIMUM_ORDER_VALUE_GUARD");
+});
+
 test("execution service blocks new orders when startup recovery has left the system DEGRADED", async () => {
   const { service, repositories } = createExecutionService({
     initialState: {

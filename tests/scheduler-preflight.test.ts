@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { buildStrategySchedulerStartupPreflight } from "../src/app/scheduler-preflight.js";
+import { buildManualStrategyRunPreflight, buildStrategySchedulerStartupPreflight } from "../src/app/scheduler-preflight.js";
 import type { AppConfig } from "../src/app/env.js";
 import type { ExecutionStateRecord, OrderRecord, ReconciliationRunRecord } from "../src/domain/types.js";
 import { InMemoryExecutionRepository } from "../src/modules/db/repositories/in-memory-repositories.js";
@@ -145,6 +145,34 @@ test("scheduler startup preflight blocks live scheduler when persisted health is
   assert.equal(preflight.checks.find((check) => check.name === "position_snapshot")?.status, "BLOCK");
   assert.equal(preflight.checks.find((check) => check.name === "latest_reconciliation")?.status, "BLOCK");
   assert.match(preflight.detail, /balance_snapshot/);
+});
+
+test("manual strategy run preflight blocks live run even when scheduler is disabled", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await seedReadyPortfolio(repository);
+  await repository.saveOrder(createOrder({ status: "OPEN" }));
+
+  const preflight = await buildManualStrategyRunPreflight({
+    config: createConfig({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      strategySchedulerEnabled: false,
+    }),
+    exchangeAccountId: "primary",
+    executionState: createExecutionState({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+    }),
+    repositories: repository,
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    checkedAt: "2026-05-08T00:00:00.000Z",
+  });
+
+  assert.equal(preflight.scope, "LIVE");
+  assert.equal(preflight.status, "BLOCK");
+  assert.match(preflight.detail, /Live manual \/run blocked by active_orders/);
+  assert.equal(preflight.checks.find((check) => check.name === "active_orders")?.status, "BLOCK");
 });
 
 async function seedReadyPortfolio(

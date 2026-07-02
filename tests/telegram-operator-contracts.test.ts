@@ -27,6 +27,7 @@ import {
   formatRiskEventsMessage,
   formatRuntimeConfigMessage,
   formatStrategySchedulerRunsMessage,
+  formatStrategyPreviewMessage,
   formatTelegramInboundMessage,
 } from "../src/modules/telegram/formatter.js";
 import type { TelegramSyncResult } from "../src/modules/telegram/interfaces.js";
@@ -45,6 +46,7 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   const schedulerParsed = parseTelegramCommand("/SCHEDULER@autotrade_upbit_bot");
   const inboundParsed = parseTelegramCommand("/INBOUND@autotrade_upbit_bot");
   const orderParsed = parseTelegramCommand("/ORDER@autotrade_upbit_bot order-1");
+  const previewParsed = parseTelegramCommand("/PREVIEW@autotrade_upbit_bot BTC");
   const runParsed = parseTelegramCommand("/RUN@autotrade_upbit_bot BTC");
 
   assert.ok(helpParsed);
@@ -91,6 +93,13 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.equal(orderParsed.command, "/order");
   assert.deepEqual(orderParsed.args, ["order-1"]);
   assert.equal(orderParsed.contract.summary, "Show one persisted order with lifecycle events and fills.");
+  assert.ok(previewParsed);
+  assert.equal(previewParsed.command, "/preview");
+  assert.deepEqual(previewParsed.args, ["BTC"]);
+  assert.equal(
+    previewParsed.contract.summary,
+    "Preview one deterministic PositionGuard strategy decision and order intent without persistence or order submission.",
+  );
   assert.ok(runParsed);
   assert.equal(runParsed.command, "/run");
   assert.deepEqual(runParsed.args, ["BTC"]);
@@ -101,7 +110,7 @@ test("manual input commands are rejected by the operator contract", () => {
   const message = buildUnsupportedCommandMessage("/setposition BTC 0.25 95000000");
 
   assert.match(message, /Manual cash and position input is not supported in Telegram\./);
-  assert.match(message, /\/help \/config \/readiness \/status \/statehistory \/synchistory \/recovery \/alerts \/risks \/balances \/positions \/orders \/order \/scheduler \/inbound \/pause \/resume \/killswitch \/sync \/run/);
+  assert.match(message, /\/help \/config \/readiness \/status \/statehistory \/synchistory \/recovery \/alerts \/risks \/balances \/positions \/orders \/order \/scheduler \/inbound \/pause \/resume \/killswitch \/sync \/preview \/run/);
 });
 
 test("no-argument commands return usage guidance when extra arguments are supplied", () => {
@@ -118,6 +127,9 @@ test("no-argument commands return usage guidance when extra arguments are suppli
   const inboundParsed = parseTelegramCommand("/inbound now");
   const missingOrderParsed = parseTelegramCommand("/order");
   const extraOrderParsed = parseTelegramCommand("/order order-1 now");
+  const missingPreviewAssetParsed = parseTelegramCommand("/preview");
+  const unsupportedPreviewAssetParsed = parseTelegramCommand("/preview DOGE");
+  const extraPreviewArgParsed = parseTelegramCommand("/preview BTC now");
   const missingRunAssetParsed = parseTelegramCommand("/run");
   const unsupportedRunAssetParsed = parseTelegramCommand("/run DOGE");
   const extraRunArgParsed = parseTelegramCommand("/run BTC now");
@@ -186,6 +198,21 @@ test("no-argument commands return usage guidance when extra arguments are suppli
   assert.equal(
     validateTelegramCommand(extraOrderParsed),
     buildUsageMessage("/order"),
+  );
+  assert.ok(missingPreviewAssetParsed);
+  assert.equal(
+    validateTelegramCommand(missingPreviewAssetParsed),
+    buildUsageMessage("/preview"),
+  );
+  assert.ok(unsupportedPreviewAssetParsed);
+  assert.equal(
+    validateTelegramCommand(unsupportedPreviewAssetParsed),
+    buildUsageMessage("/preview"),
+  );
+  assert.ok(extraPreviewArgParsed);
+  assert.equal(
+    validateTelegramCommand(extraPreviewArgParsed),
+    buildUsageMessage("/preview"),
   );
   assert.ok(missingRunAssetParsed);
   assert.equal(
@@ -421,6 +448,21 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
       createdAt: "2026-04-20T00:10:00.000Z",
     },
   ]);
+  const strategyPreviewMessage = formatStrategyPreviewMessage({
+    status: "COMPLETED",
+    requestedAt: "2026-04-20T00:11:00.000Z",
+    market: "KRW-BTC",
+    action: "ENTER",
+    executionDisposition: "READY",
+    referencePrice: 100_000_000,
+    requestedNotionalKrw: 150_000,
+    requestedQuantity: null,
+    orderSide: "bid",
+    orderType: "price",
+    orderPrice: "150000",
+    orderVolume: null,
+    detail: "Decision ENTER computed; order intent bid price would require /run to persist and submit through the configured path.",
+  });
 
   assert.match(balancesMessage, /Balances Snapshot/);
   assert.match(balancesMessage, /- BTC free=0\.01000000 locked=0 avg_buy_price=100000000 KRW/);
@@ -498,6 +540,11 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
   assert.match(risksMessage, /count: 1/);
   assert.match(risksMessage, /state_source: persisted risk_events/);
   assert.match(risksMessage, /MINIMUM_ORDER_VALUE_GUARD/);
+
+  assert.match(strategyPreviewMessage, /Strategy Preview/);
+  assert.match(strategyPreviewMessage, /action: ENTER/);
+  assert.match(strategyPreviewMessage, /order_side: bid/);
+  assert.match(strategyPreviewMessage, /no_mutation_boundary: \/preview never persists strategy decisions, creates orders, sends orders, or triggers reconciliation\./);
 });
 
 test("router applies control commands, blocks invalid arguments, and advertises sync wiring state", async () => {
@@ -792,6 +839,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   const invalidRisksResponse = await router.route("/risks now");
   const unsupportedInputResponse = await router.route("/setcash 100000");
   const syncResponse = await router.route("/sync");
+  const invalidPreviewResponse = await router.route("/preview ETH now");
   const invalidRunResponse = await router.route("/run ETH now");
 
   assert.match(statusResponse.text, /exchange_account_id: primary/);
@@ -891,6 +939,10 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   assert.match(unsupportedInputResponse.text, /Manual cash and position input is not supported in Telegram\./);
   assert.match(syncResponse.text, /status: NOT_CONNECTED/);
   assert.match(syncResponse.text, /requested_at: 2026-04-20T00:04:00.000Z/);
+  assert.equal(
+    invalidPreviewResponse.text,
+    "Usage: /preview BTC|ETH\nPreview one deterministic PositionGuard strategy decision and order intent without persistence or order submission.",
+  );
   assert.equal(
     invalidRunResponse.text,
     "Usage: /run BTC|ETH\nRun one deterministic PositionGuard strategy cycle for a supported asset through the safe execution path.",

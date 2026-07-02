@@ -67,6 +67,7 @@ Telegram may expose:
 - `/resume`
 - `/killswitch`
 - `/sync`
+- `/preview BTC|ETH`
 - `/run BTC|ETH`
 
 Telegram commands are operational controls and inspection requests, not portfolio data entry.
@@ -74,6 +75,7 @@ Telegram commands are operational controls and inspection requests, not portfoli
 `/config` may inspect non-secret runtime configuration, explicit risk limits, ignored deprecated environment variables, and live-send blockers, but it must render only configured/not-configured booleans for secrets and must not mutate runtime or exchange state.
 `/readiness` may summarize read-only operator readiness from runtime configuration, persisted execution state, runtime worker status, latest persisted health records, active-order counts, recent risk-block counts, and pending notification counts, but it must not perform active probes, poll Telegram, call Upbit, trigger sync, run strategies, tick schedulers, mutate offsets, submit/cancel orders, or deliver notifications.
 Telegram inbound polling is a transport for those commands only; it is disabled by default, accepts only the configured operator chat, and persists only update-offset transport progress.
+Long inbound command replies may be split into multiple Telegram messages for transport limits; reply splitting must not alter execution, reconciliation, order, balance, or position truth.
 Telegram `/start` is treated as a `/help` alias for first-run bot UX and does not add a separate execution command.
 `/inbound` may inspect runtime inbound polling status and persisted offset progress, but it must not poll Telegram or route commands by itself.
 `npm run smoke:telegram:inbound` may perform one bounded Telegram `getUpdates` poll for operator validation, but it forcibly uses `DRY_RUN`, disables live-send and scheduler paths, and never starts the long-running polling loop.
@@ -84,7 +86,8 @@ The local DRY_RUN scheduler launcher may enable `STRATEGY_SCHEDULER_ENABLED=true
 `npm run smoke:dryrun:completion` may inspect persisted DRY_RUN completion evidence after the automatic scheduler rehearsal, including latest snapshots, latest reconciliation, recent risk and notification state, and latest `strategy_scheduler_runs` for `KRW-BTC` and `KRW-ETH`, but it must force live-send disabled, Telegram transport disabled, scheduler startup disabled, and must not run `/sync`, run strategies, poll Telegram, start the scheduler, call Upbit, deliver notifications, create orders, or transmit orders.
 `/alerts` may summarize persisted operator notifications, recent delivery-run rows, recent delivery-attempt audit rows, and derived delivery-worker queue metrics, but none of them become trading truth sources.
 `/order <order-id|identifier>` may inspect one persisted order, its local lifecycle events, and its fills, but it must not query Telegram as truth or trigger exchange-side mutation.
-`/run BTC|ETH` may request one deterministic PositionGuard strategy cycle for a supported asset, but it must route through the configured execution path and inherits the default `DRY_RUN` live-send blockers.
+`/preview BTC|ETH` may compute one deterministic PositionGuard strategy decision and order intent for a supported asset, but it must not persist a strategy decision, create an order, run reconciliation, or submit an order.
+`/run BTC|ETH` may request one deterministic PositionGuard strategy cycle for a supported asset, but it must route through the configured execution path and inherits the default `DRY_RUN` live-send blockers. In `LIVE` mode, a manual `/run` must first pass the same persisted-health preflight family used for live scheduled ticks before any strategy decision or order intent is created.
 `/scheduler` may inspect current in-memory scheduler status plus persisted `strategy_scheduler_runs`, but it must not trigger execution or mutate portfolio truth.
 The strategy scheduler may run the same deterministic cycle automatically only when `STRATEGY_SCHEDULER_ENABLED=true`; it is disabled by default and does not bypass execution-state, risk, or live-send gates.
 When the strategy scheduler is enabled in `LIVE` mode, startup safety must require persisted balance snapshots, position snapshots, and the latest reconciliation run to be fresh enough for the configured scheduler cadence; stale persisted health is not acceptable evidence for automatic trading.

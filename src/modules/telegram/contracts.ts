@@ -140,6 +140,13 @@ const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
     argumentPolicy: "none",
   },
   {
+    command: "/preview",
+    category: "control",
+    usage: "/preview BTC|ETH",
+    summary: "Preview one deterministic PositionGuard strategy decision and order intent without persistence or order submission.",
+    argumentPolicy: "asset_required",
+  },
+  {
     command: "/run",
     category: "control",
     usage: "/run BTC|ETH",

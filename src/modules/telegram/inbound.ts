@@ -8,6 +8,7 @@ const DEFAULT_TELEGRAM_INBOUND_TIMEOUT_MS = 30_000;
 const DEFAULT_TELEGRAM_INBOUND_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_TELEGRAM_INBOUND_LONG_POLL_TIMEOUT_SECONDS = 25;
 const DEFAULT_TELEGRAM_INBOUND_LIMIT = 20;
+const MAX_INBOUND_REPLY_TEXT_LENGTH = 3_500;
 const MAX_INBOUND_ERROR_LENGTH = 240;
 
 export interface TelegramInboundUpdate {
@@ -235,10 +236,12 @@ export class TelegramInboundPollingService {
             text,
             this.dependencies.exchangeAccountId ?? "primary",
           );
-          await this.dependencies.messageClient?.sendMessage({
-            chatId: this.dependencies.operatorChatId ?? "",
-            text: response.text,
-          });
+          for (const replyText of splitTelegramReplyText(response.text)) {
+            await this.dependencies.messageClient?.sendMessage({
+              chatId: this.dependencies.operatorChatId ?? "",
+              text: replyText,
+            });
+          }
           processed += 1;
         } catch (error) {
           failed += 1;
@@ -358,6 +361,37 @@ export class TelegramInboundPollingService {
   private now(): string {
     return this.dependencies.now?.() ?? new Date().toISOString();
   }
+}
+
+export function splitTelegramReplyText(
+  text: string,
+  maxLength = MAX_INBOUND_REPLY_TEXT_LENGTH,
+): string[] {
+  const normalizedMaxLength = Math.max(1, Math.trunc(maxLength));
+  if (text.length <= normalizedMaxLength) {
+    return [text];
+  }
+
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > normalizedMaxLength) {
+    let splitAt = remaining.lastIndexOf("\n", normalizedMaxLength);
+    const earliestUsefulBoundary = Math.floor(normalizedMaxLength / 2);
+    if (splitAt <= earliestUsefulBoundary) {
+      splitAt = normalizedMaxLength;
+    }
+
+    const chunk = remaining.slice(0, splitAt).trimEnd();
+    chunks.push(chunk.length === 0 ? remaining.slice(0, normalizedMaxLength) : chunk);
+    remaining = remaining.slice(splitAt).replace(/^\n/u, "");
+  }
+
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+
+  return chunks;
 }
 
 function buildTelegramGetUpdatesUrl(dependencies: {

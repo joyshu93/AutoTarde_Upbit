@@ -41,8 +41,11 @@ Current strategy direction:
 - `position-guard-snapshot` now normalizes Upbit public ticker and 1h/4h/1d candle responses into the analyzer input shape
 - `position-guard-context` now assembles persisted balances, positions, latest compatible strategy decisions, and recent filled sell context into the core decision input shape
 - `position-guard-runner` now performs one explicit market cycle: public snapshot read, structure analysis, persisted context assembly, core decision, durable strategy-decision persistence, and optional `DRY_RUN` execution submission
+- `position-guard-runner` also supports a non-mutating preview path that computes the same decision and order intent without persisting strategy decisions or submitting orders
 - the port preserves invalidation-first exits, no-chase entries, staged entry/add sizing, soft reduce logic, and borderline hourly confirmation semantics
 - Telegram `/run BTC|ETH` now exposes a controlled operator trigger for one runner cycle without enabling live order transmission
+- Telegram `/preview BTC|ETH` exposes the same deterministic decision and order intent without persistence or order submission
+- Telegram `/run BTC|ETH` runs a manual live persisted-health preflight before invoking the runner when the runtime is in `LIVE`
 - the disabled-by-default strategy scheduler now uses the same runner/controller path and still inherits the default live-order blockers
 - scheduler `RUN_ON_START` runs configured markets sequentially so the account-scoped strategy runner lock does not skip the second market at startup
 - live-mode scheduler startup now has an automatic preflight gate before timers are installed
@@ -79,6 +82,7 @@ Owns:
 
 The execution layer is where `DRY_RUN` and `LIVE` diverge operationally, while still preserving the same durable order model.
 The runtime wires the live Upbit adapter only when execution mode is `LIVE`, the live gate is enabled, and Upbit credentials are present; otherwise the send path remains the dry-run adapter.
+For market sell intents where Upbit order input carries volume but no price, execution derives notional value from the strategy reference price and requested volume before applying local and exchange minimum-total guards.
 
 ### `exchange`
 
@@ -138,6 +142,7 @@ It provides:
 - `/alerts` now derives delivery-worker queue metrics including pending totals, due/scheduled counts, active/expired leases, abandoned-lease candidates, recent delivery-run summaries, and recent attempt outcome counts
 - `/risks` for read-only persisted risk_events inspection
 - `/sync` for reconciliation-triggered snapshot and reconciliation record persistence with read-only public ticker valuation
+- `/preview BTC|ETH` for one non-mutating PositionGuard decision and order-intent preview
 - `/run BTC|ETH` for one deterministic PositionGuard strategy runner cycle through the configured safe execution path
 - `/status` strategy-scheduler lines for disabled/enabled state, configured intervals, next run timestamps, recent in-memory scheduler outcomes, and persisted recent scheduler run history
 - `/status` strategy-scheduler lines also expose startup preflight status, scope, detail, and check results
@@ -154,6 +159,7 @@ It provides:
 - execution_state transition history inspection from persisted state
 - outbox-based Telegram delivery that persists first, then attempts best-effort send behind `ENABLE_TELEGRAM_DELIVERY`
 - disabled-by-default inbound polling that accepts only `TELEGRAM_OPERATOR_CHAT_ID` messages and routes them through the existing command router
+- inbound polling splits long routed replies into bounded Telegram messages so large inspection views such as `/alerts` do not fail the command update
 - a bounded `smoke:telegram:inbound` operator validation script that forces `DRY_RUN`, disables live orders and scheduler ticks, and calls only one inbound `pollOnce()` without starting the runtime loop
 - a non-mutating `smoke:dryrun:readiness` local preflight that forces DRY_RUN/live-disabled/scheduler-disabled startup settings, reads local readiness evidence, and reports next actions before the local DRY_RUN runtime starts
 - an exchange-backed `smoke:dryrun:sync` local rehearsal that forces DRY_RUN/live-disabled/Telegram-disabled/scheduler-disabled settings, runs `/sync`, then inspects balances, positions, readiness, and sync history without running strategy or transmitting orders

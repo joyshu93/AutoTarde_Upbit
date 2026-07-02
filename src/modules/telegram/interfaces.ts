@@ -4,6 +4,8 @@ import type {
   LiveExecutionGate,
   OperatorCommand,
   OrderLifecycleStatus,
+  OrderSide,
+  OrderType,
   StrategySchedulerStatus,
   StrategyDecisionAction,
   SupportedAsset,
@@ -72,6 +74,30 @@ export interface TelegramStrategyRunResult {
 
 export interface TelegramStrategyRunController {
   requestRun(request: TelegramStrategyRunRequest): Promise<TelegramStrategyRunResult>;
+  requestPreview(request: TelegramStrategyPreviewRequest): Promise<TelegramStrategyPreviewResult>;
+}
+
+export interface TelegramStrategyPreviewRequest {
+  readonly exchangeAccountId: string;
+  readonly market: SupportedMarket;
+  readonly requestedBy: "TELEGRAM";
+  readonly requestedCommand: "/preview";
+}
+
+export interface TelegramStrategyPreviewResult {
+  readonly status: "COMPLETED" | "ALREADY_RUNNING" | "NOT_CONNECTED" | "FAILED";
+  readonly requestedAt: string;
+  readonly market: SupportedMarket | null;
+  readonly action: StrategyDecisionAction | null;
+  readonly executionDisposition: string | null;
+  readonly referencePrice: number | null;
+  readonly requestedNotionalKrw: number | null;
+  readonly requestedQuantity: number | null;
+  readonly orderSide: OrderSide | null;
+  readonly orderType: OrderType | null;
+  readonly orderPrice: string | null;
+  readonly orderVolume: string | null;
+  readonly detail: string;
 }
 
 export interface TelegramRuntimeConfigSnapshot {

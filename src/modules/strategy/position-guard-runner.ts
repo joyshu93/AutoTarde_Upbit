@@ -1,5 +1,6 @@
 import {
   type OrderRecord,
+  type OrderSide,
   type OrderType,
   type StrategyDecision,
   type StrategyDecisionRecord,
@@ -48,6 +49,22 @@ export interface PositionGuardRunResult {
   submission: SubmitOrderFromDecisionResult | null;
 }
 
+export interface PositionGuardOrderPreview {
+  side: OrderSide;
+  ordType: OrderType;
+  price: string | null;
+  volume: string | null;
+  requestedNotionalKrw: number | null;
+  requestedQuantity: number | null;
+}
+
+export interface PositionGuardPreviewResult {
+  strategyDecision: StrategyDecision;
+  engineDecision: PositionGuardEngineDecision;
+  context: PositionGuardStrategyContext;
+  orderPreview: PositionGuardOrderPreview | null;
+}
+
 export class PositionGuardStrategyRunner {
   constructor(
     private readonly dependencies: {
@@ -59,6 +76,54 @@ export class PositionGuardStrategyRunner {
   ) {}
 
   async runOnce(input: PositionGuardRunInput): Promise<PositionGuardRunResult> {
+    const decision = await this.buildDecision(input);
+    const strategyDecisionRecord = createStrategyDecisionRecord({
+      exchangeAccountId: this.dependencies.config.exchangeAccountId,
+      generatedAt: input.generatedAt,
+      strategyDecision: decision.strategyDecision,
+      engineDecision: decision.engineDecision,
+      context: decision.context,
+    });
+
+    await this.dependencies.repositories.saveStrategyDecision(strategyDecisionRecord);
+
+    const orderInput = toOrderSubmissionInput({
+      exchangeAccountId: this.dependencies.config.exchangeAccountId,
+      strategyDecisionId: strategyDecisionRecord.id,
+      decision: decision.strategyDecision,
+    });
+    const submission = orderInput === null
+      ? null
+      : await this.dependencies.executionService.submitOrderFromDecision(orderInput);
+
+    return {
+      strategyDecisionRecord,
+      strategyDecision: decision.strategyDecision,
+      engineDecision: decision.engineDecision,
+      context: decision.context,
+      submission,
+    };
+  }
+
+  async previewOnce(input: PositionGuardRunInput): Promise<PositionGuardPreviewResult> {
+    const decision = await this.buildDecision(input);
+    const orderInput = toOrderSubmissionInput({
+      exchangeAccountId: this.dependencies.config.exchangeAccountId,
+      strategyDecisionId: "preview",
+      decision: decision.strategyDecision,
+    });
+
+    return {
+      ...decision,
+      orderPreview: orderInput === null ? null : toOrderPreview(orderInput),
+    };
+  }
+
+  private async buildDecision(input: PositionGuardRunInput): Promise<{
+    strategyDecision: StrategyDecision;
+    engineDecision: PositionGuardEngineDecision;
+    context: PositionGuardStrategyContext;
+  }> {
     const marketSnapshot = await fetchPositionGuardMarketSnapshot(this.dependencies.marketDataReader, {
       market: input.market,
       fetchedAt: input.generatedAt,
@@ -75,31 +140,11 @@ export class PositionGuardStrategyRunner {
     });
     const engineDecision = decidePositionGuardCore(context);
     const strategyDecision = toStrategyDecision(context, engineDecision);
-    const strategyDecisionRecord = createStrategyDecisionRecord({
-      exchangeAccountId: this.dependencies.config.exchangeAccountId,
-      generatedAt: input.generatedAt,
-      strategyDecision,
-      engineDecision,
-      context,
-    });
-
-    await this.dependencies.repositories.saveStrategyDecision(strategyDecisionRecord);
-
-    const orderInput = toOrderSubmissionInput({
-      exchangeAccountId: this.dependencies.config.exchangeAccountId,
-      strategyDecisionId: strategyDecisionRecord.id,
-      decision: strategyDecision,
-    });
-    const submission = orderInput === null
-      ? null
-      : await this.dependencies.executionService.submitOrderFromDecision(orderInput);
 
     return {
-      strategyDecisionRecord,
       strategyDecision,
       engineDecision,
       context,
-      submission,
     };
   }
 }
@@ -201,4 +246,43 @@ export function createDefaultPositionGuardRunnerConfig(
 
 function formatDecimal(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(12).replace(/0+$/u, "").replace(/\.$/u, "");
+}
+
+function toOrderPreview(input: SubmitOrderFromDecisionInput): PositionGuardOrderPreview {
+  return {
+    side: input.side,
+    ordType: input.ordType,
+    price: input.price,
+    volume: input.volume,
+    requestedNotionalKrw: derivePreviewNotionalKrw(input.decision, input.price, input.volume),
+    requestedQuantity: typeof input.decision.requestedQuantity === "number"
+      ? input.decision.requestedQuantity
+      : input.volume
+        ? Number(input.volume)
+        : null,
+  };
+}
+
+function derivePreviewNotionalKrw(
+  decision: StrategyDecision,
+  price: string | null,
+  volume: string | null,
+): number | null {
+  if (typeof decision.requestedNotionalKrw === "number") {
+    return decision.requestedNotionalKrw;
+  }
+
+  if (volume) {
+    const volumeNumber = Number(volume);
+    if (Number.isFinite(volumeNumber)) {
+      return decision.referencePrice * volumeNumber;
+    }
+  }
+
+  if (price) {
+    const priceNumber = Number(price);
+    return Number.isFinite(priceNumber) ? priceNumber : null;
+  }
+
+  return null;
 }

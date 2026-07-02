@@ -96,6 +96,72 @@ export async function buildStrategySchedulerStartupPreflight(input: {
   };
 }
 
+export async function buildManualStrategyRunPreflight(input: {
+  config: AppConfig;
+  exchangeAccountId: string;
+  executionState: ExecutionStateRecord;
+  repositories: Pick<
+    ExecutionRepository,
+    "getLatestBalanceSnapshot" | "getLatestPositionSnapshot" | "listActiveOrders" | "listReconciliationRuns"
+  >;
+  exchangeBackedReadEnabled: boolean;
+  liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
+  checkedAt?: string;
+}): Promise<StrategySchedulerStartupPreflight> {
+  const checkedAt = input.checkedAt ?? new Date().toISOString();
+
+  if (input.config.executionMode !== "LIVE") {
+    return {
+      checkedAt,
+      scope: "DRY_RUN",
+      status: "PASS",
+      detail: "Live manual run preflight is not required in DRY_RUN; /run remains on the dry-run adapter.",
+      checks: [
+        {
+          name: "dry_run_boundary",
+          status: "PASS",
+          detail: "APP_EXECUTION_MODE is DRY_RUN, so manual strategy runs cannot transmit live orders.",
+        },
+      ],
+    };
+  }
+
+  const [latestBalanceSnapshot, latestPositionSnapshot, activeOrders, reconciliationRuns] = await Promise.all([
+    input.repositories.getLatestBalanceSnapshot(input.exchangeAccountId),
+    input.repositories.getLatestPositionSnapshot(input.exchangeAccountId),
+    input.repositories.listActiveOrders(input.exchangeAccountId, undefined, 20),
+    input.repositories.listReconciliationRuns(input.exchangeAccountId, 1),
+  ]);
+  const latestReconciliationRun = reconciliationRuns[0] ?? null;
+  const checks = buildLiveSchedulerChecks({
+    config: input.config,
+    executionState: input.executionState,
+    exchangeBackedReadEnabled: input.exchangeBackedReadEnabled,
+    liveSendPath: input.liveSendPath,
+    checkedAt,
+    latestBalanceSnapshot,
+    latestPositionSnapshot,
+    latestReconciliationRun,
+    activeOrders,
+  });
+  const status = checks.some((check) => check.status === "BLOCK")
+    ? "BLOCK"
+    : checks.some((check) => check.status === "WARN")
+      ? "WARN"
+      : "PASS";
+  const blockingChecks = checks.filter((check) => check.status === "BLOCK");
+
+  return {
+    checkedAt,
+    scope: "LIVE",
+    status,
+    detail: blockingChecks.length === 0
+      ? "Live manual /run preflight passed."
+      : `Live manual /run blocked by ${blockingChecks.map((check) => check.name).join(",")}.`,
+    checks,
+  };
+}
+
 function buildLiveSchedulerChecks(input: {
   config: AppConfig;
   executionState: ExecutionStateRecord;

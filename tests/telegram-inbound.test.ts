@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 
 import type { TelegramInboundOffsetRecord } from "../src/domain/types.js";
-import { TelegramBotUpdateClient, TelegramInboundPollingService, type TelegramInboundUpdate } from "../src/modules/telegram/inbound.js";
+import {
+  splitTelegramReplyText,
+  TelegramBotUpdateClient,
+  TelegramInboundPollingService,
+  type TelegramInboundUpdate,
+} from "../src/modules/telegram/inbound.js";
 import { test } from "./harness.js";
 
 test("telegram inbound polling stays skipped when disabled or not configured", async () => {
@@ -102,6 +107,50 @@ test("telegram inbound polling filters unauthorized chats and advances offset", 
   assert.equal(service.getStatus().ignoredCount, 2);
   assert.equal(service.getStatus().lastUpdateId, 13);
   assert.equal(service.getStatus().offsetStorage, "DURABLE");
+});
+
+test("telegram inbound polling splits long routed replies before sending", async () => {
+  const sent: string[] = [];
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: createUpdateClient([], [
+      [
+        createUpdate(14, "123", "/alerts"),
+      ],
+    ]),
+    messageClient: {
+      async sendMessage(input) {
+        sent.push(input.text);
+      },
+    },
+    router: {
+      async route() {
+        return {
+          text: [
+            "Operator Alerts",
+            "x".repeat(3_700),
+            "tail",
+          ].join("\n"),
+        };
+      },
+    },
+    operatorChatId: "123",
+  });
+
+  const summary = await service.pollOnce();
+
+  assert.equal(summary.status, "COMPLETED");
+  assert.equal(summary.processedCount, 1);
+  assert.equal(sent.length, 2);
+  assert.ok(sent.every((message) => message.length <= 3_500));
+  assert.match(sent[0] ?? "", /Operator Alerts/);
+  assert.match(sent[1] ?? "", /tail/);
+});
+
+test("splitTelegramReplyText prefers newline boundaries and hard-splits long lines", () => {
+  assert.deepEqual(splitTelegramReplyText("short", 10), ["short"]);
+  assert.deepEqual(splitTelegramReplyText("aaa\nbbb\nccc", 7), ["aaa\nbbb", "ccc"]);
+  assert.deepEqual(splitTelegramReplyText("abcdefghij", 4), ["abcd", "efgh", "ij"]);
 });
 
 test("telegram inbound polling records route or reply failures without retrying the same update", async () => {

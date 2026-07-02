@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { buildExecutionRiskLimits, loadAppConfig, type AppConfig } from "./env.js";
-import { buildStrategySchedulerStartupPreflight } from "./scheduler-preflight.js";
+import { buildManualStrategyRunPreflight, buildStrategySchedulerStartupPreflight } from "./scheduler-preflight.js";
 import {
   createDefaultStrategySchedulerConfig,
   StrategyScheduler,
@@ -128,6 +128,15 @@ export function createApp(
   });
   const strategyRunController = new InlineTelegramStrategyRunController({
     runner: positionGuardRunner,
+    beforeManualRunPreflight: async () =>
+      buildManualStrategyRunPreflight({
+        config,
+        exchangeAccountId: "primary",
+        executionState: await operatorState.getState(),
+        repositories,
+        exchangeBackedReadEnabled,
+        liveSendPath,
+      }),
   });
   const strategyScheduler = new StrategyScheduler({
     config: createDefaultStrategySchedulerConfig({
