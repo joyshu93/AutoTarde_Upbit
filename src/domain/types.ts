@@ -40,6 +40,7 @@ export type StrategySchedulerLastStatus =
   | "NEVER_RUN"
   | "COMPLETED"
   | "FAILED"
+  | "SKIPPED"
   | "NOT_CONNECTED"
   | "ALREADY_RUNNING"
   | "STARTUP_BLOCKED";

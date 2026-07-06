@@ -86,6 +86,7 @@ The dry-run path must still use the real order tables so that the operational sh
 Dry-run settlement must never mutate exchange state and must remain visibly marked as simulated evidence.
 If an older dry-run adapter artifact remains active or `RECONCILIATION_REQUIRED`, reconciliation must repair it locally instead of querying Upbit for its `dryrun_*` UUID. When price and volume evidence are available, the repair records a synthetic local fill and moves the order to `FILLED`; otherwise it moves the local dry-run artifact to `CANCELED` with explicit repair evidence.
 Synthetic dry-run fills are lifecycle evidence only and must be excluded from exchange-backed portfolio drift explanation.
+Exchange-backed fill windows used for portfolio drift explanation compare parsed instants rather than raw timestamp strings, because Upbit fill timestamps may include explicit timezone offsets.
 
 ## Live Path
 
@@ -131,6 +132,7 @@ The current scaffold now uses both process startup recovery and operator-trigger
 If scheduler startup is requested in `LIVE` mode, an automatic preflight runs before scheduler timers are installed. It requires fresh persisted account-health evidence, including balance snapshot, position snapshot, and latest reconciliation data, using the shortest configured scheduler interval as the maximum acceptable age. A blocked startup is scheduler runtime state, not an order lifecycle transition; no order is created unless a later deterministic runner cycle passes preflight, risk, validation, and persistence.
 Each `LIVE` scheduled tick first runs an exchange-backed account-health refresh that may persist fresh snapshots and reconciliation evidence with source `SCHEDULER_PREFLIGHT`. It then re-runs that persisted-health preflight before invoking the strategy runner. A blocked tick is recorded as scheduler audit state and operator notification only; it must not create a strategy decision, order intent, cancellation, or order lifecycle mutation by itself.
 If multiple scheduled market timers become due together, the scheduler queues those market cycles for the exchange account before invoking the strategy runner, so a healthy second market does not become a skipped lifecycle-adjacent audit record solely due to the account-scoped runner lock.
+In `LIVE`, if a scheduled market cycle submits an order, remaining market cycles from that same scheduler batch are persisted as `SKIPPED` and deferred to the next interval. This is scheduler audit state, not an order lifecycle transition, and it prevents another strategy decision from being created before account health is refreshed after the exchange mutation.
 Each manual `LIVE` `/run BTC|ETH` also runs persisted-health preflight before invoking the strategy runner. A blocked manual run is an operator response only; it must not create a strategy decision, order intent, cancellation, or reconciliation mutation by itself.
 `/preview BTC|ETH` may compute a strategy decision and order-intent preview, but because it does not persist the decision or create an order intent, it is not a reconciliation trigger.
 
@@ -152,6 +154,7 @@ Telegram should report lifecycle outcomes, such as:
 - one-shot strategy runner outcomes from `/run BTC|ETH`, including HOLD/no-order decisions and risk-blocked submissions
 - non-mutating strategy previews from `/preview BTC|ETH`, including computed action and order intent when present
 - scheduled strategy runner outcomes when `STRATEGY_SCHEDULER_ENABLED=true`
+- same-batch scheduled market deferrals after a live scheduled order submission
 - live scheduler startup preflight blocks before automatic timers are installed
 - scheduler-triggered failures, overlapping-run skips, and scheduler-triggered order submission/rejection outcomes
 - static operator command help through `/help`

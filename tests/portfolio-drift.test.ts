@@ -219,6 +219,86 @@ test("portfolio drift ignores dry-run synthetic fills because they do not mutate
   assert.deepEqual(evaluation.findings, []);
 });
 
+test("portfolio drift compares fill and snapshot timestamps by instant instead of text", () => {
+  const evaluation = detectPortfolioDrift({
+    previousBalanceSnapshot: {
+      id: "balance-prev-upbit-timezone",
+      exchangeAccountId: "primary",
+      capturedAt: "2026-07-06T09:27:39.442Z",
+      source: "RECONCILIATION",
+      totalKrwValue: "1011907.38",
+      balancesJson: JSON.stringify([
+        { currency: "KRW", balance: "1011907.38", locked: "0", avgBuyPrice: "0", unitCurrency: "KRW" },
+        { currency: "BTC", balance: "0.009874", locked: "0", avgBuyPrice: "90000000", unitCurrency: "KRW" },
+      ]),
+    },
+    currentBalanceSnapshot: {
+      id: "balance-current-upbit-timezone",
+      exchangeAccountId: "primary",
+      capturedAt: "2026-07-06T09:29:46.309Z",
+      source: "RECONCILIATION",
+      totalKrwValue: "1011907.38",
+      balancesJson: JSON.stringify([
+        { currency: "KRW", balance: "1011907.38", locked: "0", avgBuyPrice: "0", unitCurrency: "KRW" },
+        { currency: "BTC", balance: "0.009874", locked: "0", avgBuyPrice: "90000000", unitCurrency: "KRW" },
+      ]),
+    },
+    previousPositionSnapshot: {
+      id: "position-prev-upbit-timezone",
+      exchangeAccountId: "primary",
+      capturedAt: "2026-07-06T09:27:39.442Z",
+      source: "RECONCILIATION",
+      positionsJson: JSON.stringify([
+        {
+          asset: "BTC",
+          market: "KRW-BTC",
+          quantity: "0.009874",
+          averageEntryPrice: "90000000",
+          markPrice: "94503000",
+          marketValue: "933137.922",
+          exposureRatio: null,
+          capturedAt: "2026-07-06T09:27:39.442Z",
+        },
+      ]),
+    },
+    currentPositionSnapshot: {
+      id: "position-current-upbit-timezone",
+      exchangeAccountId: "primary",
+      capturedAt: "2026-07-06T09:29:46.309Z",
+      source: "RECONCILIATION",
+      positionsJson: JSON.stringify([
+        {
+          asset: "BTC",
+          market: "KRW-BTC",
+          quantity: "0.009874",
+          averageEntryPrice: "90000000",
+          markPrice: "94503000",
+          marketValue: "933137.922",
+          exposureRatio: null,
+          capturedAt: "2026-07-06T09:29:46.309Z",
+        },
+      ]),
+    },
+    fills: [
+      {
+        id: "fill-upbit-timezone",
+        orderId: "order-upbit-timezone",
+        exchangeFillId: "trade-upbit-timezone",
+        market: "KRW-BTC",
+        side: "ask",
+        price: "94503000",
+        volume: "0.000126",
+        feeCurrency: null,
+        feeAmount: "0",
+        filledAt: "2026-07-06T18:27:39.360311+09:00",
+        rawPayloadJson: "{}",
+      },
+    ],
+  });
+
+  assert.deepEqual(evaluation.findings, []);
+});
+
 test("portfolio drift flags unexplained cash and quantity changes", () => {
   const evaluation = detectPortfolioDrift({
     previousBalanceSnapshot: {

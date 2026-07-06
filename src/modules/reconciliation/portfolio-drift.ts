@@ -66,7 +66,13 @@ function detectBalanceDrift(input: {
   }
 
   const fillsSincePrevious = input.fills.filter(
-    (fill) => fill.filledAt > input.previousBalanceSnapshot!.capturedAt && isExchangeBackedFill(fill),
+    (fill) =>
+      isExchangeBackedFill(fill) &&
+      isTimestampWithinSnapshotWindow(
+        fill.filledAt,
+        input.previousBalanceSnapshot!.capturedAt,
+        input.currentBalanceSnapshot!.capturedAt,
+      ),
   );
   const explained = aggregateFillDeltas(fillsSincePrevious);
   const actualKrwDelta = current.KRW - previous.KRW;
@@ -117,7 +123,13 @@ function detectPositionDrift(input: {
   }
 
   const fillsSincePrevious = input.fills.filter(
-    (fill) => fill.filledAt > input.previousPositionSnapshot!.capturedAt && isExchangeBackedFill(fill),
+    (fill) =>
+      isExchangeBackedFill(fill) &&
+      isTimestampWithinSnapshotWindow(
+        fill.filledAt,
+        input.previousPositionSnapshot!.capturedAt,
+        input.currentPositionSnapshot!.capturedAt,
+      ),
   );
   const explained = aggregateFillDeltas(fillsSincePrevious);
   const residualByAsset = MANAGED_ASSETS.reduce<Record<SupportedAsset, number>>(
@@ -252,6 +264,22 @@ function isExchangeBackedFill(fill: FillRecord): boolean {
 
   const parsed = tryParseJson<Record<string, unknown>>(fill.rawPayloadJson);
   return parsed?.mode !== "DRY_RUN";
+}
+
+function isTimestampWithinSnapshotWindow(
+  timestamp: string,
+  previousCapturedAt: string,
+  currentCapturedAt: string,
+): boolean {
+  const instant = Date.parse(timestamp);
+  const previous = Date.parse(previousCapturedAt);
+  const current = Date.parse(currentCapturedAt);
+
+  if (!Number.isFinite(instant) || !Number.isFinite(previous) || !Number.isFinite(current)) {
+    return false;
+  }
+
+  return instant > previous && instant <= current;
 }
 
 function tryParseJson<T>(rawJson: string): T | null {

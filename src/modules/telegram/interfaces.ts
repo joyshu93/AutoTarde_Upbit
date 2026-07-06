@@ -61,7 +61,7 @@ export interface TelegramStrategyRunRequest {
 }
 
 export interface TelegramStrategyRunResult {
-  readonly status: "COMPLETED" | "ALREADY_RUNNING" | "NOT_CONNECTED" | "FAILED";
+  readonly status: "COMPLETED" | "ALREADY_RUNNING" | "SKIPPED" | "NOT_CONNECTED" | "FAILED";
   readonly requestedAt: string;
   readonly market: SupportedMarket | null;
   readonly strategyDecisionId: string | null;

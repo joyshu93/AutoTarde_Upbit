@@ -43,6 +43,7 @@ export class StrategyScheduler {
   private startupPreflight: StrategySchedulerStartupPreflight | null;
   private accountRefreshInFlight: Promise<StrategySchedulerAccountRefreshResult | null> | null = null;
   private scheduledRunQueue: Promise<void> = Promise.resolve();
+  private orderSubmittedBatchKey: string | null = null;
 
   constructor(
     private readonly dependencies: {
@@ -404,7 +405,7 @@ export class StrategyScheduler {
     this.updateMarketStatus(config.market, { nextRunAt });
     const timer = (this.dependencies.setTimer ?? setTimeout)(() => {
       this.timers.delete(config.market);
-      void this.enqueueScheduledMarketRun(config)
+      void this.enqueueScheduledMarketRun(config, nextRunAt)
         .finally(() => this.scheduleMarket(config, config.intervalMs));
     }, delayMs);
 
@@ -422,9 +423,9 @@ export class StrategyScheduler {
     }
   }
 
-  private async runScheduledMarket(config: StrategySchedulerMarketConfig): Promise<void> {
+  private async runScheduledMarket(config: StrategySchedulerMarketConfig): Promise<TelegramStrategyRunResult> {
     try {
-      await this.runMarketNow(config.market);
+      return await this.runMarketNow(config.market);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const completedAt = this.now();
@@ -447,19 +448,81 @@ export class StrategyScheduler {
         intervalMs: config.intervalMs,
         runOnStart: this.dependencies.config.runOnStart,
       });
+      return result;
     }
   }
 
-  private enqueueScheduledMarketRun(config: StrategySchedulerMarketConfig): Promise<void> {
+  private enqueueScheduledMarketRun(config: StrategySchedulerMarketConfig, batchKey: string): Promise<void> {
     const queuedRun = this.scheduledRunQueue.then(async () => {
       if (!this.started || !this.dependencies.config.enabled) {
         return;
       }
 
-      await this.runScheduledMarket(config);
+      if (this.orderSubmittedBatchKey === batchKey) {
+        await this.recordSkippedScheduledRun(
+          config,
+          `A scheduled order was submitted earlier in the same scheduler batch; deferring ${config.market} until its next scheduled interval.`,
+        );
+        return;
+      }
+
+      const result = await this.runScheduledMarket(config);
+      if (this.wasLiveOrderSubmitted(result)) {
+        this.orderSubmittedBatchKey = batchKey;
+      }
     });
     this.scheduledRunQueue = queuedRun.catch(() => undefined);
     return queuedRun;
+  }
+
+  private async recordSkippedScheduledRun(
+    config: StrategySchedulerMarketConfig,
+    detail: string,
+  ): Promise<TelegramStrategyRunResult> {
+    const skippedAt = this.now();
+    const result: TelegramStrategyRunResult = {
+      status: "SKIPPED",
+      requestedAt: skippedAt,
+      market: config.market,
+      strategyDecisionId: null,
+      action: null,
+      orderId: null,
+      orderStatus: null,
+      submissionAccepted: null,
+      detail,
+    };
+
+    this.applyRunResult(config.market, result, skippedAt, skippedAt);
+    await this.persistSchedulerRun({
+      run: createSchedulerRunRecord({
+        exchangeAccountId: this.dependencies.config.exchangeAccountId,
+        market: config.market,
+        intervalMs: config.intervalMs,
+        runOnStart: this.dependencies.config.runOnStart,
+        status: "SKIPPED",
+        startedAt: skippedAt,
+        completedAt: skippedAt,
+        result,
+      }),
+      update: false,
+    });
+    await this.reportSchedulerResult({
+      market: config.market,
+      result,
+      intervalMs: config.intervalMs,
+      runOnStart: this.dependencies.config.runOnStart,
+    });
+
+    return result;
+  }
+
+  private wasLiveOrderSubmitted(result: TelegramStrategyRunResult): boolean {
+    return (
+      this.dependencies.config.liveSendPath === "LIVE_ADAPTER" &&
+      result.status === "COMPLETED" &&
+      Boolean(result.orderId) &&
+      result.submissionAccepted === true
+    );
   }
 
   private async persistSchedulerRun(input: {
@@ -496,7 +559,7 @@ export class StrategyScheduler {
     }
 
     const success = result.status === "COMPLETED";
-    const skipped = result.status === "ALREADY_RUNNING";
+    const skipped = result.status === "ALREADY_RUNNING" || result.status === "SKIPPED";
     this.statusByMarket.set(market, {
       ...current,
       running: false,
@@ -632,7 +695,7 @@ function buildSchedulerNotification(input: {
     };
   }
 
-  if (input.result.status === "ALREADY_RUNNING") {
+  if (input.result.status === "ALREADY_RUNNING" || input.result.status === "SKIPPED") {
     return {
       exchangeAccountId: input.exchangeAccountId,
       notificationType: "SCHEDULER_RUN_SKIPPED",
@@ -712,9 +775,7 @@ function createSchedulerRunRecord(input: {
     orderStatus: input.result?.orderStatus ?? null,
     submissionAccepted: input.result?.submissionAccepted ?? null,
     detail: input.result?.detail ?? null,
-    errorMessage: input.result && input.result.status !== "COMPLETED" && input.result.status !== "ALREADY_RUNNING"
-      ? input.result.detail
-      : null,
+    errorMessage: isSchedulerRunError(input.result) ? input.result.detail : null,
     summaryJson: JSON.stringify({
       status: input.status,
       market: input.market,
@@ -759,11 +820,20 @@ function mapSchedulerRunStatus(
     return "COMPLETED";
   }
 
-  if (status === "ALREADY_RUNNING") {
+  if (status === "ALREADY_RUNNING" || status === "SKIPPED") {
     return "SKIPPED";
   }
 
   return "FAILED";
+}
+
+function isSchedulerRunError(result: TelegramStrategyRunResult | null): result is TelegramStrategyRunResult {
+  return Boolean(
+    result &&
+      result.status !== "COMPLETED" &&
+      result.status !== "ALREADY_RUNNING" &&
+      result.status !== "SKIPPED",
+  );
 }
 
 export function createDefaultStrategySchedulerConfig(input: {
