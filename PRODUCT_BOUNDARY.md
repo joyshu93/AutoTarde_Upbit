@@ -93,6 +93,7 @@ The strategy scheduler may run the same deterministic cycle automatically only w
 When the strategy scheduler is enabled in `LIVE` mode, startup safety must require persisted balance snapshots, position snapshots, and the latest reconciliation run to be fresh enough for the configured scheduler cadence; stale persisted health is not acceptable evidence for automatic trading.
 Before each `LIVE` scheduled cycle, the scheduler must first run an exchange-backed account-health refresh that may persist balance snapshots, position snapshots, and reconciliation evidence with source `SCHEDULER_PREFLIGHT`; it must not create strategy decisions, order intents, or order lifecycle records.
 After that refresh, the scheduler must re-run the same persisted-health preflight and block the strategy cycle before any order intent is created if account health is stale or unsafe.
+If multiple configured market timers fire at the same time, scheduler-triggered market cycles must be serialized for the exchange account so the account-scoped strategy runner lock does not skip a market solely because another scheduled market started first.
 Any local script that enables the live scheduler must keep automatic startup execution disabled by default and require a separate explicit confirmation that scheduled live orders are understood.
 Any local script that starts LIVE mode must run the matching non-mutating live smoke first and refuse runtime startup when that smoke exits with a blocking failure.
 Windows Task Scheduler helper scripts may register manual-only launch entries for local operation, but they must not add startup/logon triggers, store secrets in the task definition, or bypass application-level live gates.
@@ -104,6 +105,7 @@ When startup recovery confirms unresolved portfolio drift against persisted stat
 - every fill must be recoverable from reconciliation
 - every exchange-history recovery uncertainty must remain explicit through coverage, retention-assumption, and confidence metadata
 - every risk rejection must be persisted
+- exposure caps must not block risk-reducing sell orders solely because current exposure is already above cap
 - every unexplained balance or position drift must be persisted as both reconciliation evidence and risk evidence
 - every transition into pause or kill-switch state must be explicit and inspectable
 - every transition into or out of `DEGRADED` must be explicit and inspectable

@@ -50,6 +50,7 @@ Current strategy direction:
 - scheduler `RUN_ON_START` runs configured markets sequentially so the account-scoped strategy runner lock does not skip the second market at startup
 - live-mode scheduler startup now has an automatic preflight gate before timers are installed
 - live-mode scheduled ticks first refresh exchange-backed account-health evidence with reconciliation source `SCHEDULER_PREFLIGHT`, then re-run the persisted-health preflight before invoking the strategy runner
+- regular scheduler timer ticks are queued across configured markets for the exchange account, so simultaneous BTC/ETH timers do not produce account-lock `ALREADY_RUNNING` skips
 
 ### `risk`
 
@@ -69,6 +70,7 @@ The intended policy framing is budget-first:
 - total exposure cap is the primary reserve control
 - per-asset allocation caps are concentration backstops
 - future strategy sizing should key off total equity / exposure budgets rather than a simplistic equal-slot asset count rule
+- exposure cap checks apply to exposure-increasing orders; `ask` orders are modeled as risk-reducing exposure decreases for cap projection
 
 ### `execution`
 
@@ -252,22 +254,23 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 5. If the scheduler is enabled, build a scheduler startup preflight; in `LIVE` scope, block timer installation unless live-send configuration, execution state, fresh persisted snapshots, fresh latest reconciliation, and active-order state are safe.
 6. Before each `LIVE` scheduled tick, run an exchange-backed account-health refresh that persists balance snapshots, position snapshots, and reconciliation evidence with source `SCHEDULER_PREFLIGHT`.
 7. After that refresh, re-run the same persisted-health preflight and fail the scheduler run without creating a strategy decision if the account-health evidence is stale or unsafe.
-8. Build a deterministic strategy decision, either from an explicit operator `/run BTC|ETH` request or the disabled-by-default scheduler.
-9. Convert the decision into an order intent with an idempotency key.
-10. Run risk guards.
-11. Run exchange pre-trade validation through `orders/chance` and `orders/test`.
-12. Persist the order record and append an order event.
-13. Call the exchange adapter.
-14. Persist the updated order state.
-15. Persist operator_notifications for significant operator-facing outcomes.
-16. Kick best-effort Telegram delivery without letting network delivery alter execution outcomes.
-17. Due notifications are claimed with a lease token so concurrent workers do not finalize the same row blindly.
-18. Delivery attempt outcomes are also written to `operator_notification_delivery_attempts` so operators can inspect recent send behavior separately from the summary row.
-19. Delivery worker executions are written to `operator_notification_delivery_runs` with completed, skipped, or failed status.
-20. Retryable Telegram delivery failures stay `PENDING` with future `next_attempt_at`, while permanent failures become `FAILED`.
-21. Expose inspection and reconciliation surfaces.
-22. If scheduler or inbound polling background timers are started, install signal handlers that stop Telegram inbound polling, stop scheduler timers, and close SQLite persistence on `SIGINT` / `SIGTERM`.
-23. If no background runtime is started, close SQLite persistence immediately after the startup banner is printed.
+8. If multiple configured market timers become due together, queue their scheduled strategy cycles for the exchange account instead of letting the account-scoped runner lock skip one market.
+9. Build a deterministic strategy decision, either from an explicit operator `/run BTC|ETH` request or the disabled-by-default scheduler.
+10. Convert the decision into an order intent with an idempotency key.
+11. Run risk guards.
+12. Run exchange pre-trade validation through `orders/chance` and `orders/test`.
+13. Persist the order record and append an order event.
+14. Call the exchange adapter.
+15. Persist the updated order state.
+16. Persist operator_notifications for significant operator-facing outcomes.
+17. Kick best-effort Telegram delivery without letting network delivery alter execution outcomes.
+18. Due notifications are claimed with a lease token so concurrent workers do not finalize the same row blindly.
+19. Delivery attempt outcomes are also written to `operator_notification_delivery_attempts` so operators can inspect recent send behavior separately from the summary row.
+20. Delivery worker executions are written to `operator_notification_delivery_runs` with completed, skipped, or failed status.
+21. Retryable Telegram delivery failures stay `PENDING` with future `next_attempt_at`, while permanent failures become `FAILED`.
+22. Expose inspection and reconciliation surfaces.
+23. If scheduler or inbound polling background timers are started, install signal handlers that stop Telegram inbound polling, stop scheduler timers, and close SQLite persistence on `SIGINT` / `SIGTERM`.
+24. If no background runtime is started, close SQLite persistence immediately after the startup banner is printed.
 
 ## Failure Posture
 

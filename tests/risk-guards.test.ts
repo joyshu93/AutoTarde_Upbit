@@ -107,6 +107,29 @@ test("risk guards enforce the minimum order value", () => {
   );
 });
 
+test("risk guards allow risk-reducing asks even when current exposure is above caps", () => {
+  const result = evaluateRiskGuards(
+    createRiskContext({
+      portfolio: {
+        totalEquityKrw: 10_000_000,
+        totalExposureKrw: 8_000_000,
+        assetExposureKrw: {
+          BTC: 6_500_000,
+          ETH: 1_500_000,
+        },
+      },
+      requestedSide: "ask",
+      requestedPrice: null,
+      requestedVolume: "0.005",
+      requestedNotionalKrw: 500_000,
+      requestedQuantity: 0.005,
+    }),
+  );
+
+  assert.equal(result.accepted, true);
+  assert.deepEqual(result.triggeredRules, []);
+});
+
 function createRiskContext(
   overrides: Partial<RiskEvaluationContext> = {},
 ): RiskEvaluationContext {

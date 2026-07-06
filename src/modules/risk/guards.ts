@@ -58,22 +58,33 @@ export function evaluateRiskGuards(context: RiskEvaluationContext): RiskEvaluati
 
   if (typeof context.requestedNotionalKrw === "number") {
     const asset = getAssetForMarket(context.market);
-    const assetExposureCap = context.portfolio.totalEquityKrw * context.policy.maxAllocationByAsset[asset];
-    const projectedAssetExposure = context.portfolio.assetExposureKrw[asset] + context.requestedNotionalKrw;
+    const exposureDeltaKrw = context.requestedSide === "ask"
+      ? -context.requestedNotionalKrw
+      : context.requestedNotionalKrw;
+    const projectedAssetExposure = Math.max(
+      0,
+      context.portfolio.assetExposureKrw[asset] + exposureDeltaKrw,
+    );
+    const projectedTotalExposure = Math.max(
+      0,
+      context.portfolio.totalExposureKrw + exposureDeltaKrw,
+    );
 
-    if (projectedAssetExposure > assetExposureCap) {
-      triggeredRules.push(
-        block(
-          "PER_ASSET_MAX_ALLOCATION",
-          `Projected ${asset} exposure exceeds configured max allocation.`,
-        ),
-      );
-    }
+    if (exposureDeltaKrw > 0) {
+      const assetExposureCap = context.portfolio.totalEquityKrw * context.policy.maxAllocationByAsset[asset];
+      if (projectedAssetExposure > assetExposureCap) {
+        triggeredRules.push(
+          block(
+            "PER_ASSET_MAX_ALLOCATION",
+            `Projected ${asset} exposure exceeds configured max allocation.`,
+          ),
+        );
+      }
 
-    const projectedTotalExposure = context.portfolio.totalExposureKrw + context.requestedNotionalKrw;
-    const totalExposureCap = context.portfolio.totalEquityKrw * context.policy.totalExposureCap;
-    if (projectedTotalExposure > totalExposureCap) {
-      triggeredRules.push(block("TOTAL_EXPOSURE_CAP", "Projected total exposure exceeds configured cap."));
+      const totalExposureCap = context.portfolio.totalEquityKrw * context.policy.totalExposureCap;
+      if (projectedTotalExposure > totalExposureCap) {
+        triggeredRules.push(block("TOTAL_EXPOSURE_CAP", "Projected total exposure exceeds configured cap."));
+      }
     }
   }
 

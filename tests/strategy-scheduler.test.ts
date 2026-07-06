@@ -533,6 +533,115 @@ test("strategy scheduler shares one account refresh across simultaneous market t
   );
 });
 
+test("strategy scheduler serializes simultaneous scheduled market ticks", async () => {
+  let accountRunning = false;
+  let firstRunHeld = false;
+  let releaseFirstRun: (() => void) | undefined;
+  const scheduledCallbacks: Array<() => void> = [];
+  const requests: string[] = [];
+  const repository = new InMemoryExecutionRepository();
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [
+        {
+          market: "KRW-BTC",
+          intervalMs: 3_600_000,
+        },
+        {
+          market: "KRW-ETH",
+          intervalMs: 3_600_000,
+        },
+      ],
+    },
+    controller: createController({
+      async requestRun(request) {
+        requests.push(request.market);
+        if (accountRunning) {
+          return {
+            status: "ALREADY_RUNNING",
+            requestedAt: "2026-04-20T01:00:00.000Z",
+            market: request.market,
+            strategyDecisionId: null,
+            action: null,
+            orderId: null,
+            orderStatus: null,
+            submissionAccepted: null,
+            detail: "A strategy run is already running for primary.",
+          };
+        }
+
+        accountRunning = true;
+        if (!firstRunHeld) {
+          firstRunHeld = true;
+          await new Promise<void>((resolve) => {
+            releaseFirstRun = resolve;
+          });
+        }
+        accountRunning = false;
+        return {
+          status: "COMPLETED",
+          requestedAt: "2026-04-20T01:00:00.000Z",
+          market: request.market,
+          strategyDecisionId: `strategy-decision-${request.market}`,
+          action: "HOLD",
+          orderId: null,
+          orderStatus: null,
+          submissionAccepted: null,
+          detail: "Decision HOLD persisted; no order submission was requested.",
+        };
+      },
+    }),
+    repositories: repository,
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T01:00:00.000Z",
+      "2026-04-20T01:00:00.000Z",
+      "2026-04-20T01:00:01.000Z",
+      "2026-04-20T01:00:02.000Z",
+      "2026-04-20T01:00:03.000Z",
+      "2026-04-20T01:00:04.000Z",
+    ]),
+    setTimer: (callback) => {
+      scheduledCallbacks.push(callback);
+      const timer = setTimeout(callback, 0);
+      clearTimeout(timer);
+      return timer;
+    },
+  });
+
+  scheduler.start();
+  assert.equal(scheduledCallbacks.length, 2);
+
+  scheduledCallbacks[0]?.();
+  scheduledCallbacks[1]?.();
+  await waitForMicrotasks();
+
+  assert.deepEqual(requests, ["KRW-BTC"]);
+  const release = releaseFirstRun;
+  assert.ok(release);
+  release();
+  await waitForMicrotasks();
+  await waitForMicrotasks();
+
+  const status = scheduler.getStatus();
+  const persistedRuns = await repository.listStrategySchedulerRuns("primary", 5);
+
+  assert.deepEqual(requests, ["KRW-BTC", "KRW-ETH"]);
+  assert.equal(status.markets[0]?.lastStatus, "COMPLETED");
+  assert.equal(status.markets[1]?.lastStatus, "COMPLETED");
+  assert.equal(status.markets[0]?.skippedCount, 0);
+  assert.equal(status.markets[1]?.skippedCount, 0);
+  assert.deepEqual(
+    persistedRuns.map((run) => `${run.market}:${run.status}`).sort(),
+    ["KRW-BTC:COMPLETED", "KRW-ETH:COMPLETED"],
+  );
+});
+
 test("strategy scheduler blocks a market run when before-run preflight blocks it", async () => {
   let controllerCalled = false;
   const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];

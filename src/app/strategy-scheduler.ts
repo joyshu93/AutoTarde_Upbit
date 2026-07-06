@@ -42,6 +42,7 @@ export class StrategyScheduler {
   private readonly statusByMarket = new Map<SupportedMarket, StrategySchedulerMarketStatus>();
   private startupPreflight: StrategySchedulerStartupPreflight | null;
   private accountRefreshInFlight: Promise<StrategySchedulerAccountRefreshResult | null> | null = null;
+  private scheduledRunQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly dependencies: {
@@ -403,7 +404,7 @@ export class StrategyScheduler {
     this.updateMarketStatus(config.market, { nextRunAt });
     const timer = (this.dependencies.setTimer ?? setTimeout)(() => {
       this.timers.delete(config.market);
-      void this.runScheduledMarket(config)
+      void this.enqueueScheduledMarketRun(config)
         .finally(() => this.scheduleMarket(config, config.intervalMs));
     }, delayMs);
 
@@ -447,6 +448,18 @@ export class StrategyScheduler {
         runOnStart: this.dependencies.config.runOnStart,
       });
     }
+  }
+
+  private enqueueScheduledMarketRun(config: StrategySchedulerMarketConfig): Promise<void> {
+    const queuedRun = this.scheduledRunQueue.then(async () => {
+      if (!this.started || !this.dependencies.config.enabled) {
+        return;
+      }
+
+      await this.runScheduledMarket(config);
+    });
+    this.scheduledRunQueue = queuedRun.catch(() => undefined);
+    return queuedRun;
   }
 
   private async persistSchedulerRun(input: {
