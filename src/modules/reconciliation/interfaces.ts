@@ -1,6 +1,10 @@
 import type { ReconciliationStatus, SupportedMarket } from "../../domain/types.js";
 
-export type ReconciliationTrigger = "DIRECT_RUN" | "OPERATOR_SYNC" | "STARTUP_RECOVERY";
+export type ReconciliationTrigger =
+  | "DIRECT_RUN"
+  | "OPERATOR_SYNC"
+  | "STARTUP_RECOVERY"
+  | "SCHEDULER_PREFLIGHT";
 
 export interface ReconciliationIssue {
   code:

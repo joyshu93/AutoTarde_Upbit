@@ -397,6 +397,142 @@ test("strategy scheduler treats async before-run preflight as an in-flight run",
   );
 });
 
+test("strategy scheduler refreshes account health before live run preflight", async () => {
+  let refreshed = false;
+  let controllerCalled = false;
+  const repository = new InMemoryExecutionRepository();
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [
+        {
+          market: "KRW-BTC",
+          intervalMs: 3_600_000,
+        },
+      ],
+    },
+    controller: createController({
+      async requestRun(request) {
+        controllerCalled = true;
+        return createController().requestRun(request);
+      },
+    }),
+    repositories: repository,
+    beforeRunAccountRefresh: async () => {
+      refreshed = true;
+      return {
+        status: "COMPLETED",
+        requestedAt: "2026-04-20T00:00:00.500Z",
+        detail: "Scheduler preflight sync completed.",
+      };
+    },
+    beforeRunPreflight: async () => ({
+      checkedAt: "2026-04-20T00:00:01.000Z",
+      scope: "LIVE",
+      status: refreshed ? "PASS" : "BLOCK",
+      detail: refreshed
+        ? "Live scheduler startup preflight passed."
+        : "Live scheduler startup blocked by balance_snapshot.",
+      checks: [
+        {
+          name: "balance_snapshot",
+          status: refreshed ? "PASS" : "BLOCK",
+          detail: refreshed ? "fresh account evidence" : "stale account evidence",
+        },
+      ],
+    }),
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:02.000Z",
+    ]),
+  });
+
+  const result = await scheduler.runMarketNow("KRW-BTC");
+  const persistedRuns = await repository.listStrategySchedulerRuns("primary", 5);
+
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(controllerCalled, true);
+  assert.equal(persistedRuns[0]?.status, "COMPLETED");
+});
+
+test("strategy scheduler shares one account refresh across simultaneous market ticks", async () => {
+  let releaseRefresh: (() => void) | undefined;
+  let refreshCalls = 0;
+  const requests: string[] = [];
+  const repository = new InMemoryExecutionRepository();
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [
+        {
+          market: "KRW-BTC",
+          intervalMs: 3_600_000,
+        },
+        {
+          market: "KRW-ETH",
+          intervalMs: 3_600_000,
+        },
+      ],
+    },
+    controller: createController({
+      async requestRun(request) {
+        requests.push(request.market);
+        return createController().requestRun(request);
+      },
+    }),
+    repositories: repository,
+    beforeRunAccountRefresh: async () => {
+      refreshCalls += 1;
+      await new Promise<void>((resolve) => {
+        releaseRefresh = resolve;
+      });
+      return {
+        status: "COMPLETED",
+        requestedAt: "2026-04-20T00:00:00.500Z",
+        detail: "Scheduler preflight sync completed.",
+      };
+    },
+    beforeRunPreflight: async () => ({
+      checkedAt: "2026-04-20T00:00:01.000Z",
+      scope: "LIVE",
+      status: "PASS",
+      detail: "Live scheduler startup preflight passed.",
+      checks: [],
+    }),
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:02.000Z",
+      "2026-04-20T00:00:02.000Z",
+    ]),
+  });
+
+  const firstRun = scheduler.runMarketNow("KRW-BTC");
+  const secondRun = scheduler.runMarketNow("KRW-ETH");
+  await waitForMicrotasks();
+
+  assert.equal(refreshCalls, 1);
+  const release = releaseRefresh;
+  assert.ok(release);
+  release();
+
+  const results = await Promise.all([firstRun, secondRun]);
+  const persistedRuns = await repository.listStrategySchedulerRuns("primary", 5);
+
+  assert.deepEqual(results.map((result) => result.status), ["COMPLETED", "COMPLETED"]);
+  assert.deepEqual(requests.sort(), ["KRW-BTC", "KRW-ETH"]);
+  assert.deepEqual(
+    persistedRuns.map((run) => run.status).sort(),
+    ["COMPLETED", "COMPLETED"],
+  );
+});
+
 test("strategy scheduler blocks a market run when before-run preflight blocks it", async () => {
   let controllerCalled = false;
   const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];

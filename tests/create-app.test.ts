@@ -4,6 +4,8 @@ import path from "node:path";
 
 import { createApp } from "../src/app/create-app.js";
 import type { AppConfig } from "../src/app/env.js";
+import { DryRunExchangeAdapter } from "../src/modules/exchange/interfaces.js";
+import { createDryRunOperatorMarketDataReader } from "../src/smoke/dryrun-operator.js";
 import { test } from "./harness.js";
 
 test("createApp keeps dry-run adapter as the default live send path", async () => {
@@ -42,7 +44,7 @@ test("createApp wires the live adapter only when live mode, live gate, and Upbit
   }
 });
 
-test("createApp wires scheduler ticks through live before-run preflight", async () => {
+test("createApp refreshes live scheduler account health before before-run preflight", async () => {
   const databasePath = await createTempDatabasePath("live-scheduler-preflight");
   const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
   const previousSecretKey = process.env.UPBIT_SECRET_KEY;
@@ -51,12 +53,18 @@ test("createApp wires scheduler ticks through live before-run preflight", async 
   process.env.UPBIT_SECRET_KEY = "test-secret-key";
 
   try {
-    app = createApp(createConfig({
-      databasePath,
-      executionMode: "LIVE",
-      liveExecutionGate: "ENABLED",
-      strategySchedulerEnabled: true,
-    }));
+    app = createApp(
+      createConfig({
+        databasePath,
+        executionMode: "LIVE",
+        liveExecutionGate: "ENABLED",
+        strategySchedulerEnabled: true,
+      }),
+      {
+        privateExchangeAdapter: new DryRunExchangeAdapter(),
+        publicMarketDataReader: createDryRunOperatorMarketDataReader(),
+      },
+    );
 
     const result = await app.strategyScheduler.runMarketNow("KRW-BTC");
     await app.notificationDelivery.deliverPending("primary");
@@ -64,11 +72,16 @@ test("createApp wires scheduler ticks through live before-run preflight", async 
       "primary",
       "KRW-BTC",
     );
+    const reconciliationRuns = await app.repositories.listReconciliationRuns("primary", 1);
+    const latestReconciliationMeta = JSON.parse(
+      reconciliationRuns[0]?.summaryJson ?? "{}",
+    ) as { source?: string };
 
     assert.equal(app.liveSendPath, "LIVE_ADAPTER");
-    assert.equal(result.status, "FAILED");
-    assert.match(result.detail, /balance_snapshot,position_snapshot,latest_reconciliation/);
-    assert.equal(latestDecision, null);
+    assert.equal(result.status, "COMPLETED");
+    assert.equal(result.action, "HOLD");
+    assert.notEqual(latestDecision, null);
+    assert.equal(latestReconciliationMeta.source, "SCHEDULER_PREFLIGHT");
   } finally {
     app?.telegramInboundPolling.stop();
     app?.strategyScheduler.stop();

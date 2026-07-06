@@ -11,7 +11,7 @@ import type { ExecutionRepository, OperatorStateStore } from "../modules/db/inte
 import type { SqlitePersistenceBundle } from "../modules/db/repositories/contracts.js";
 import { createSqlitePersistence } from "../modules/db/repositories/sqlite-repositories.js";
 import { ExecutionService } from "../modules/execution/execution-service.js";
-import { DryRunExchangeAdapter } from "../modules/exchange/interfaces.js";
+import { DryRunExchangeAdapter, type ExchangeAdapter } from "../modules/exchange/interfaces.js";
 import { UpbitPublicTickerClient } from "../modules/exchange/upbit/public-client.js";
 import { UpbitPrivateClient } from "../modules/exchange/upbit/private-client.js";
 import { PortfolioSyncService } from "../modules/reconciliation/portfolio-sync-service.js";
@@ -54,6 +54,7 @@ export interface AppServices {
 
 export interface CreateAppOverrides {
   publicMarketDataReader?: PositionGuardPublicMarketDataReader;
+  privateExchangeAdapter?: ExchangeAdapter;
 }
 
 export function createApp(
@@ -80,18 +81,19 @@ export function createApp(
     secretKey: process.env.UPBIT_SECRET_KEY ?? "",
     baseUrl: config.upbitBaseUrl,
   });
+  const privateExchangeAdapter = overrides.privateExchangeAdapter ?? liveExchangeClient;
   const publicMarketDataReader = overrides.publicMarketDataReader ?? new UpbitPublicTickerClient({
     baseUrl: config.upbitBaseUrl,
   });
   const dryRunExchangeAdapter = new DryRunExchangeAdapter();
   const exchangeBackedReadEnabled = Boolean(process.env.UPBIT_ACCESS_KEY && process.env.UPBIT_SECRET_KEY);
-  const syncExchangeAdapter = exchangeBackedReadEnabled ? liveExchangeClient : dryRunExchangeAdapter;
+  const syncExchangeAdapter = exchangeBackedReadEnabled ? privateExchangeAdapter : dryRunExchangeAdapter;
   const liveSendEnabled =
     config.executionMode === "LIVE" &&
     config.liveExecutionGate === "ENABLED" &&
     exchangeBackedReadEnabled;
   const liveSendPath = liveSendEnabled ? "LIVE_ADAPTER" : "DRY_RUN_ADAPTER";
-  const executionExchangeAdapter = liveSendEnabled ? liveExchangeClient : dryRunExchangeAdapter;
+  const executionExchangeAdapter = liveSendEnabled ? privateExchangeAdapter : dryRunExchangeAdapter;
   const telegramMessageClient = config.telegramBotToken
     ? new TelegramBotApiClient({
         botToken: config.telegramBotToken,
@@ -138,6 +140,27 @@ export function createApp(
         liveSendPath,
       }),
   });
+  const reconciliationDependencies = {
+    repositories,
+    operatorState,
+    reporter,
+    maxOrderLookupsPerRun: config.reconciliationMaxOrderLookupsPerRun,
+    historyMaxPagesPerMarket: config.reconciliationHistoryMaxPagesPerMarket,
+    closedOrderLookbackDays: config.reconciliationClosedOrderLookbackDays,
+    historyStopBeforeDays: config.reconciliationHistoryStopBeforeDays,
+    historyRetentionAssumptionDays: config.reconciliationHistoryRetentionAssumptionDays,
+    ...(exchangeBackedReadEnabled ? {
+      orderReader: privateExchangeAdapter,
+      orderHistoryReader: privateExchangeAdapter,
+    } : {}),
+  };
+  const reconciliationService = new ReconciliationService(reconciliationDependencies);
+  const portfolioSyncService = new PortfolioSyncService({
+    exchangeAdapter: syncExchangeAdapter,
+    marketPriceReader: publicMarketDataReader,
+    repositories,
+    reconciliationService,
+  });
   const strategyScheduler = new StrategyScheduler({
     config: createDefaultStrategySchedulerConfig({
       enabled: config.strategySchedulerEnabled,
@@ -150,6 +173,31 @@ export function createApp(
     controller: strategyRunController,
     repositories,
     reporter,
+    ...(config.executionMode === "LIVE" && config.strategySchedulerEnabled
+      ? {
+          beforeRunAccountRefresh: async () => {
+            try {
+              const result = await portfolioSyncService.run({
+                exchangeAccountId: "primary",
+                source: "SCHEDULER_PREFLIGHT",
+              });
+              return {
+                status: "COMPLETED" as const,
+                requestedAt: result.requestedAt,
+                detail:
+                  `Scheduler preflight sync completed; reconciliation_status=${result.reconciliationSummary.status} ` +
+                  `issues=${result.reconciliationSummary.issues.length}.`,
+              };
+            } catch (error) {
+              return {
+                status: "FAILED" as const,
+                requestedAt: new Date().toISOString(),
+                detail: error instanceof Error ? error.message : String(error),
+              };
+            }
+          },
+        }
+      : {}),
     beforeRunPreflight: async () =>
       buildStrategySchedulerStartupPreflight({
         config,
@@ -159,25 +207,6 @@ export function createApp(
         exchangeBackedReadEnabled,
         liveSendPath,
       }),
-  });
-
-  const reconciliationDependencies = {
-    repositories,
-    operatorState,
-    reporter,
-    maxOrderLookupsPerRun: config.reconciliationMaxOrderLookupsPerRun,
-    historyMaxPagesPerMarket: config.reconciliationHistoryMaxPagesPerMarket,
-    closedOrderLookbackDays: config.reconciliationClosedOrderLookbackDays,
-    historyStopBeforeDays: config.reconciliationHistoryStopBeforeDays,
-    historyRetentionAssumptionDays: config.reconciliationHistoryRetentionAssumptionDays,
-    ...(exchangeBackedReadEnabled ? { orderReader: liveExchangeClient, orderHistoryReader: liveExchangeClient } : {}),
-  };
-  const reconciliationService = new ReconciliationService(reconciliationDependencies);
-  const portfolioSyncService = new PortfolioSyncService({
-    exchangeAdapter: syncExchangeAdapter,
-    marketPriceReader: publicMarketDataReader,
-    repositories,
-    reconciliationService,
   });
 
   let telegramInboundPolling: TelegramInboundPollingService | null = null;

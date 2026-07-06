@@ -49,7 +49,7 @@ Current strategy direction:
 - the disabled-by-default strategy scheduler now uses the same runner/controller path and still inherits the default live-order blockers
 - scheduler `RUN_ON_START` runs configured markets sequentially so the account-scoped strategy runner lock does not skip the second market at startup
 - live-mode scheduler startup now has an automatic preflight gate before timers are installed
-- live-mode scheduled ticks also re-run the persisted-health preflight before invoking the strategy runner
+- live-mode scheduled ticks first refresh exchange-backed account-health evidence with reconciliation source `SCHEDULER_PREFLIGHT`, then re-run the persisted-health preflight before invoking the strategy runner
 
 ### `risk`
 
@@ -148,7 +148,7 @@ It provides:
 - `/status` strategy-scheduler lines also expose startup preflight status, scope, detail, and check results
 - `/readiness` warns when a `LIVE` scheduler is running while the latest persisted balance snapshot, position snapshot, or reconciliation run is older than the shortest configured scheduler interval
 - live scheduler startup preflight blocks are persisted as operator notifications before startup can close local persistence
-- live scheduler per-run preflight blocks are persisted as failed `strategy_scheduler_runs` plus operator notifications before any strategy decision or order intent is created
+- live scheduler per-run account-refresh or preflight blocks are persisted as failed `strategy_scheduler_runs` plus operator notifications before any strategy decision or order intent is created
 - scheduler-triggered failures, overlapping-run skips, and scheduler-triggered order submission/rejection outcomes are persisted as operator notifications so automatic operation does not fail silently
 - Windows Task Scheduler helpers register manual-only launch wrappers around ignored local startup scripts; they never store secrets in task definitions or add startup/logon triggers
 - `/order <order-id|identifier>` for one persisted order plus order-event and fill detail without exchange mutation
@@ -250,23 +250,24 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 3. During startup recovery, persist fresh balance and position snapshots, reconcile orders/fills, detect unexplained portfolio drift, then apply the bootstrap-only `DEGRADED` policy if needed.
 4. Load execution policy and operator state.
 5. If the scheduler is enabled, build a scheduler startup preflight; in `LIVE` scope, block timer installation unless live-send configuration, execution state, fresh persisted snapshots, fresh latest reconciliation, and active-order state are safe.
-6. Before each `LIVE` scheduled tick, re-run the same persisted-health preflight and fail the scheduler run without creating a strategy decision if the account-health evidence is stale or unsafe.
-7. Build a deterministic strategy decision, either from an explicit operator `/run BTC|ETH` request or the disabled-by-default scheduler.
-8. Convert the decision into an order intent with an idempotency key.
-9. Run risk guards.
-10. Run exchange pre-trade validation through `orders/chance` and `orders/test`.
-11. Persist the order record and append an order event.
-12. Call the exchange adapter.
-13. Persist the updated order state.
-14. Persist operator_notifications for significant operator-facing outcomes.
-15. Kick best-effort Telegram delivery without letting network delivery alter execution outcomes.
-16. Due notifications are claimed with a lease token so concurrent workers do not finalize the same row blindly.
-17. Delivery attempt outcomes are also written to `operator_notification_delivery_attempts` so operators can inspect recent send behavior separately from the summary row.
-18. Delivery worker executions are written to `operator_notification_delivery_runs` with completed, skipped, or failed status.
-19. Retryable Telegram delivery failures stay `PENDING` with future `next_attempt_at`, while permanent failures become `FAILED`.
-20. Expose inspection and reconciliation surfaces.
-21. If scheduler or inbound polling background timers are started, install signal handlers that stop Telegram inbound polling, stop scheduler timers, and close SQLite persistence on `SIGINT` / `SIGTERM`.
-22. If no background runtime is started, close SQLite persistence immediately after the startup banner is printed.
+6. Before each `LIVE` scheduled tick, run an exchange-backed account-health refresh that persists balance snapshots, position snapshots, and reconciliation evidence with source `SCHEDULER_PREFLIGHT`.
+7. After that refresh, re-run the same persisted-health preflight and fail the scheduler run without creating a strategy decision if the account-health evidence is stale or unsafe.
+8. Build a deterministic strategy decision, either from an explicit operator `/run BTC|ETH` request or the disabled-by-default scheduler.
+9. Convert the decision into an order intent with an idempotency key.
+10. Run risk guards.
+11. Run exchange pre-trade validation through `orders/chance` and `orders/test`.
+12. Persist the order record and append an order event.
+13. Call the exchange adapter.
+14. Persist the updated order state.
+15. Persist operator_notifications for significant operator-facing outcomes.
+16. Kick best-effort Telegram delivery without letting network delivery alter execution outcomes.
+17. Due notifications are claimed with a lease token so concurrent workers do not finalize the same row blindly.
+18. Delivery attempt outcomes are also written to `operator_notification_delivery_attempts` so operators can inspect recent send behavior separately from the summary row.
+19. Delivery worker executions are written to `operator_notification_delivery_runs` with completed, skipped, or failed status.
+20. Retryable Telegram delivery failures stay `PENDING` with future `next_attempt_at`, while permanent failures become `FAILED`.
+21. Expose inspection and reconciliation surfaces.
+22. If scheduler or inbound polling background timers are started, install signal handlers that stop Telegram inbound polling, stop scheduler timers, and close SQLite persistence on `SIGINT` / `SIGTERM`.
+23. If no background runtime is started, close SQLite persistence immediately after the startup banner is printed.
 
 ## Failure Posture
 
@@ -289,7 +290,7 @@ Examples:
 - if live scheduler startup is requested while live-send configuration or persisted account health is unsafe, block scheduler timers and expose the startup preflight detail
 - if live scheduler startup preflight blocks timers, persist an operator notification with the preflight detail and failed checks before startup shutdown can close persistence
 - if live scheduler startup preflight is checked by a smoke command, report the same preflight result without starting timers, polling Telegram, calling Upbit, running `/sync`, running strategy, or submitting orders
-- if live scheduler per-run preflight blocks a tick, persist a failed scheduler run and operator notification without creating a strategy decision or order intent
+- if live scheduler per-run account refresh or preflight blocks a tick, persist a failed scheduler run and operator notification without creating a strategy decision or order intent
 - if a scheduled strategy run fails, overlaps a still-running market cycle, submits an order, or has its order rejected, persist an operator notification without changing the scheduler run outcome
 - if runtime shutdown cleanup fails, report a partial shutdown failure instead of silently skipping resource cleanup
 

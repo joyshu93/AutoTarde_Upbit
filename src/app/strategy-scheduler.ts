@@ -27,6 +27,12 @@ export interface StrategySchedulerConfig {
   markets: StrategySchedulerMarketConfig[];
 }
 
+export interface StrategySchedulerAccountRefreshResult {
+  status: "COMPLETED" | "FAILED";
+  requestedAt: string;
+  detail: string;
+}
+
 type SchedulerTimer = ReturnType<typeof setTimeout>;
 
 export class StrategyScheduler {
@@ -35,6 +41,7 @@ export class StrategyScheduler {
   private readonly timers = new Map<SupportedMarket, SchedulerTimer>();
   private readonly statusByMarket = new Map<SupportedMarket, StrategySchedulerMarketStatus>();
   private startupPreflight: StrategySchedulerStartupPreflight | null;
+  private accountRefreshInFlight: Promise<StrategySchedulerAccountRefreshResult | null> | null = null;
 
   constructor(
     private readonly dependencies: {
@@ -42,6 +49,7 @@ export class StrategyScheduler {
       controller: TelegramStrategyRunController;
       repositories?: Pick<ExecutionRepository, "saveStrategySchedulerRun" | "updateStrategySchedulerRun">;
       reporter?: OperatorNotificationReporter;
+      beforeRunAccountRefresh?: () => Promise<StrategySchedulerAccountRefreshResult | null>;
       beforeRunPreflight?: () => Promise<StrategySchedulerStartupPreflight | null>;
       now?: () => string;
       setTimer?: (callback: () => void, delayMs: number) => SchedulerTimer;
@@ -180,6 +188,73 @@ export class StrategyScheduler {
       lastError: null,
     });
 
+    if (this.dependencies.beforeRunAccountRefresh) {
+      let refresh: StrategySchedulerAccountRefreshResult | null = null;
+      try {
+        refresh = await this.runBeforeRunAccountRefresh();
+      } catch (error) {
+        const failedAt = this.now();
+        const failed = createFailedRunResult({
+          requestedAt: startedAt,
+          market,
+          detail: `Strategy scheduler account refresh failed before run: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        });
+        this.applyRunResult(market, failed, startedAt, failedAt);
+        await this.persistSchedulerRun({
+          run: createSchedulerRunRecord({
+            exchangeAccountId: this.dependencies.config.exchangeAccountId,
+            market,
+            intervalMs: config.intervalMs,
+            runOnStart: this.dependencies.config.runOnStart,
+            status: "FAILED",
+            startedAt,
+            completedAt: failedAt,
+            result: failed,
+          }),
+          update: false,
+        });
+        await this.reportSchedulerResult({
+          market,
+          result: failed,
+          intervalMs: config.intervalMs,
+          runOnStart: this.dependencies.config.runOnStart,
+        });
+        return failed;
+      }
+
+      if (refresh?.status === "FAILED") {
+        const failedAt = this.now();
+        const failed = createFailedRunResult({
+          requestedAt: startedAt,
+          market,
+          detail: `Strategy scheduler account refresh failed before run: ${refresh.detail}`,
+        });
+        this.applyRunResult(market, failed, startedAt, failedAt);
+        await this.persistSchedulerRun({
+          run: createSchedulerRunRecord({
+            exchangeAccountId: this.dependencies.config.exchangeAccountId,
+            market,
+            intervalMs: config.intervalMs,
+            runOnStart: this.dependencies.config.runOnStart,
+            status: "FAILED",
+            startedAt,
+            completedAt: failedAt,
+            result: failed,
+          }),
+          update: false,
+        });
+        await this.reportSchedulerResult({
+          market,
+          result: failed,
+          intervalMs: config.intervalMs,
+          runOnStart: this.dependencies.config.runOnStart,
+        });
+        return failed;
+      }
+    }
+
     const beforeRunPreflight = this.dependencies.beforeRunPreflight;
     if (beforeRunPreflight) {
       let preflight: StrategySchedulerStartupPreflight | null = null;
@@ -302,6 +377,21 @@ export class StrategyScheduler {
       runOnStart: this.dependencies.config.runOnStart,
     });
     return result;
+  }
+
+  private async runBeforeRunAccountRefresh(): Promise<StrategySchedulerAccountRefreshResult | null> {
+    if (!this.dependencies.beforeRunAccountRefresh) {
+      return null;
+    }
+
+    if (!this.accountRefreshInFlight) {
+      this.accountRefreshInFlight = this.dependencies.beforeRunAccountRefresh()
+        .finally(() => {
+          this.accountRefreshInFlight = null;
+        });
+    }
+
+    return this.accountRefreshInFlight;
   }
 
   private scheduleMarket(config: StrategySchedulerMarketConfig, delayMs: number): void {
