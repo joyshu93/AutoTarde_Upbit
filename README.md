@@ -92,6 +92,7 @@ Current remaining gaps:
 - execution minimum-value checks now derive market-sell notional from strategy reference price and requested quantity when the Upbit order shape carries volume but no order price
 - exposure cap projection now treats `ask` orders as risk-reducing instead of adding sell notional to current exposure
 - the runtime can now derive `LIVE_ADAPTER` send wiring only when mode, live gate, and Upbit credentials are all explicitly configured; otherwise it remains on `DRY_RUN_ADAPTER`
+- PositionGuard REDUCE decisions now require independent weakening evidence when `weakeningStage` is still `NONE`; a losing range position with only borderline bearish momentum remains `HOLD` instead of creating a sell intent
 
 Current risk-policy framing is budget-first rather than asset-count-first:
 - total exposure cap is the main reserve control

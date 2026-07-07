@@ -633,7 +633,6 @@ function computeBullishScore(analysis: PositionGuardStructureAnalysis): number {
 function computeWeaknessScore(analysis: PositionGuardStructureAnalysis): number {
   let score = 0;
 
-  if (analysis.riskLevel === "ELEVATED") score += 2;
   if (analysis.failedReclaim) score += 2;
   if (analysis.bearishMomentumExpansion) score += 2;
   if (analysis.breakdown4h) score += 2;
@@ -722,6 +721,17 @@ function isHealthyHoldState(analysis: PositionGuardStructureAnalysis): boolean {
     analysis.regime !== "WEAK_DOWNTREND";
 }
 
+function hasIndependentReduceEvidence(analysis: PositionGuardStructureAnalysis): boolean {
+  return analysis.failedReclaim ||
+    analysis.breakdown4h ||
+    analysis.breakdownPressureScore >= 2 ||
+    analysis.atrShock ||
+    analysis.upperRangeChase ||
+    analysis.regime === "WEAK_DOWNTREND" ||
+    analysis.weakeningStage === "CLEAR" ||
+    analysis.weakeningStage === "FAILURE";
+}
+
 function getStructuredReducePlan(
   context: PositionGuardStrategyContext,
   weaknessScore: number,
@@ -732,9 +742,10 @@ function getStructuredReducePlan(
 } | null {
   const analysis = context.analysis;
   const hasProfitBuffer = analysis.pnlPct >= 0.02;
+  const hasIndependentEvidence = hasIndependentReduceEvidence(analysis);
 
   if (analysis.weakeningStage === "SOFT") {
-    if (!hasProfitBuffer || (!analysis.failedReclaim && !analysis.upperRangeChase && analysis.breakdownPressureScore < 2)) {
+    if (!hasProfitBuffer || !hasIndependentEvidence) {
       return null;
     }
 
@@ -743,6 +754,10 @@ function getStructuredReducePlan(
       qualityBucket: "BORDERLINE",
       reasons: ["Weakening is still soft, so any reduction stays modest and mainly protects open gains."],
     };
+  }
+
+  if (analysis.weakeningStage === "NONE" && !hasIndependentEvidence) {
+    return null;
   }
 
   const reduceThreshold = analysis.weakeningStage === "CLEAR"

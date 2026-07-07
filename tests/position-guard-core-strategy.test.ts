@@ -145,6 +145,49 @@ test("position guard core reduces a profitable position on soft weakening", () =
   assert.ok((strategyDecision.requestedQuantity ?? 0) > 0);
 });
 
+test("position guard core holds a losing range position on borderline momentum weakness alone", () => {
+  const context = createContext({
+    positionQuantity: 0.00046145,
+    averageEntryPrice: 99_852_064.85658354,
+    portfolio: {
+      totalEquityKrw: 2_000_000,
+      assetMarketValueKrw: 43_589.4467,
+      totalExposureKrw: 43_589.4467,
+    },
+    analysis: {
+      regime: "RANGE",
+      riskLevel: "ELEVATED",
+      invalidationState: "CLEAR",
+      invalidationLevel: 92_513_000,
+      pullbackZone: true,
+      currentPrice: 94_466_000,
+      entryPath: "PULLBACK",
+      trendAlignmentScore: 2,
+      recoveryQualityScore: 0,
+      breakdownPressureScore: 1,
+      weakeningStage: "NONE",
+      breakdown1d: false,
+      breakdown4h: false,
+      failedReclaim: false,
+      bearishMomentumExpansion: true,
+      macdImproving: false,
+      atrShock: false,
+      upperRangeChase: false,
+      pnlPct: -0.05394044544115821,
+      oneHourLocation: "MIDDLE",
+      fourHourLocation: "MIDDLE",
+    },
+  });
+
+  const decision = decidePositionGuardCore(context);
+  const strategyDecision = toStrategyDecision(context, decision);
+
+  assert.equal(decision.action, "HOLD");
+  assert.equal(decision.executionDisposition, "SKIPPED");
+  assert.equal(strategyDecision.action, "HOLD");
+  assert.equal(strategyDecision.requestedQuantity, null);
+});
+
 function createContext(
   overrides: Omit<Partial<PositionGuardStrategyContext>, "analysis"> & {
     analysis?: Partial<PositionGuardStructureAnalysis>;
