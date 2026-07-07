@@ -61,6 +61,7 @@ export interface PositionGuardBacktestTrade {
 export interface PositionGuardBacktestFrameResult {
   generatedAt: string;
   regime: StrategyMarketRegime;
+  source?: PositionGuardBacktestFrame["source"];
   decision: PositionGuardEngineDecision;
   startingState: PositionGuardBacktestState;
   endingState: PositionGuardBacktestState;
@@ -163,6 +164,7 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
     results.push({
       generatedAt: frame.generatedAt,
       regime: frame.analysis.regime,
+      source: frame.source,
       decision,
       startingState,
       endingState: cloneState(state),
