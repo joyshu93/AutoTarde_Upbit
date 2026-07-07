@@ -9,10 +9,15 @@ import {
   type PreviousPositionGuardDecision,
   type StrategyMarketRegime,
 } from "./position-guard-core.js";
+import type { SupportedStrategyTimeframe } from "./market-structure.js";
 
 export interface PositionGuardBacktestFrame {
   generatedAt: string;
   analysis: PositionGuardStructureAnalysis;
+  source?: {
+    candleCounts: Record<SupportedStrategyTimeframe, number>;
+    latestCloseTime: Record<SupportedStrategyTimeframe, string | null>;
+  };
 }
 
 export interface PositionGuardBacktestExecutionModel {
