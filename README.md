@@ -93,7 +93,7 @@ Current remaining gaps:
 - exposure cap projection now treats `ask` orders as risk-reducing instead of adding sell notional to current exposure
 - the runtime can now derive `LIVE_ADAPTER` send wiring only when mode, live gate, and Upbit credentials are all explicitly configured; otherwise it remains on `DRY_RUN_ADAPTER`
 - PositionGuard REDUCE decisions now require independent weakening evidence when `weakeningStage` is still `NONE`; a losing range position with only borderline bearish momentum remains `HOLD` instead of creating a sell intent
-- PositionGuard now has a pure offline backtest/replay harness. It can convert completed historical 1h/4h/1d candle arrays into no-lookahead replay frames, reuse the core decision engine, apply configurable fee/slippage/minimum-trade assumptions, and report action counts, regime counts, turnover, fee drag, drawdown, final equity, time-in-market, skipped order intents, and source-window warnings without touching DB, Telegram, Upbit, order lifecycle records, or live-send configuration.
+- PositionGuard now has a pure offline backtest/replay harness. It can fetch paginated Upbit public 1h/4h/1d candles for a research run, convert completed historical candle arrays into no-lookahead replay frames, reuse the core decision engine, apply configurable fee/slippage/minimum-trade assumptions, and report action counts, regime counts, turnover, fee drag, drawdown, final equity, time-in-market, skipped order intents, and source-window warnings without touching DB, Telegram, Upbit private endpoints, order lifecycle records, or live-send configuration.
 
 Current risk-policy framing is budget-first rather than asset-count-first:
 - total exposure cap is the main reserve control
@@ -152,7 +152,7 @@ In intentional `LIVE` operation, `/readiness` reports the enabled live send path
 - `src/modules/execution/*`: idempotency and execution service
 - `src/modules/reconciliation/*`: reconciliation contracts and service
 - `src/modules/risk/*`: pure guardrails
-- `src/modules/strategy/*`: deterministic strategy contracts, PositionGuard analysis, runner, offline replay frame builder, replay harness, and offline replay report formatter
+- `src/modules/strategy/*`: deterministic strategy contracts, PositionGuard analysis, runner, offline replay frame builder, replay harness, offline replay report formatter, and public-candle research backtest runner
 - `src/modules/telegram/*`: operator command parsing and formatting
 - `migrations/*`: SQLite-friendly schema
 - `tests/*`: pure-logic and command-surface tests

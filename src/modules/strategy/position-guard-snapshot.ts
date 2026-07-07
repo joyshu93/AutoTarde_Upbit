@@ -103,7 +103,7 @@ export function buildPositionGuardMarketSnapshot(
   };
 }
 
-function normalizeUpbitCandles(
+export function normalizeUpbitCandles(
   candles: readonly UpbitCandleSnapshot[],
   market: SupportedMarket,
   timeframe: SupportedStrategyTimeframe,

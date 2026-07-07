@@ -34,5 +34,6 @@ await import("./position-guard-core-strategy.test.js");
 await import("./position-guard-backtest.test.js");
 await import("./position-guard-backtest-frames.test.js");
 await import("./position-guard-backtest-report.test.js");
+await import("./position-guard-public-backtest.test.js");
 const { runRegisteredTests } = await import("./harness.js");
 await runRegisteredTests();
