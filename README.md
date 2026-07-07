@@ -93,6 +93,7 @@ Current remaining gaps:
 - exposure cap projection now treats `ask` orders as risk-reducing instead of adding sell notional to current exposure
 - the runtime can now derive `LIVE_ADAPTER` send wiring only when mode, live gate, and Upbit credentials are all explicitly configured; otherwise it remains on `DRY_RUN_ADAPTER`
 - PositionGuard REDUCE decisions now require independent weakening evidence when `weakeningStage` is still `NONE`; a losing range position with only borderline bearish momentum remains `HOLD` instead of creating a sell intent
+- PositionGuard now has a pure offline backtest/replay harness for precomputed strategy-analysis frames. It reuses the core decision engine, applies configurable fee/slippage/minimum-trade assumptions, and reports action counts, regime counts, turnover, fee drag, drawdown, final equity, and skipped order intents without touching DB, Telegram, Upbit, order lifecycle records, or live-send configuration.
 
 Current risk-policy framing is budget-first rather than asset-count-first:
 - total exposure cap is the main reserve control
@@ -151,7 +152,7 @@ In intentional `LIVE` operation, `/readiness` reports the enabled live send path
 - `src/modules/execution/*`: idempotency and execution service
 - `src/modules/reconciliation/*`: reconciliation contracts and service
 - `src/modules/risk/*`: pure guardrails
-- `src/modules/strategy/*`: deterministic strategy contracts
+- `src/modules/strategy/*`: deterministic strategy contracts, PositionGuard analysis, runner, and offline replay harness
 - `src/modules/telegram/*`: operator command parsing and formatting
 - `migrations/*`: SQLite-friendly schema
 - `tests/*`: pure-logic and command-surface tests

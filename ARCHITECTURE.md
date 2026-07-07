@@ -44,6 +44,7 @@ Current strategy direction:
 - `position-guard-runner` also supports a non-mutating preview path that computes the same decision and order intent without persisting strategy decisions or submitting orders
 - the port preserves invalidation-first exits, no-chase entries, staged entry/add sizing, soft reduce logic, and borderline hourly confirmation semantics
 - REDUCE decisions avoid double-counting derived `riskLevel` summaries and require independent weakening evidence when the structure stage is still `NONE`, so borderline bearish momentum alone remains a HOLD
+- `position-guard-backtest` provides a pure offline replay harness for precomputed PositionGuard analysis frames, applying fee, slippage, minimum-trade, turnover, drawdown, and regime/action metrics without touching DB, Telegram, exchange adapters, order lifecycle records, or live-send gates
 - Telegram `/run BTC|ETH` now exposes a controlled operator trigger for one runner cycle without enabling live order transmission
 - Telegram `/preview BTC|ETH` exposes the same deterministic decision and order intent without persistence or order submission
 - Telegram `/run BTC|ETH` runs a manual live persisted-health preflight before invoking the runner when the runtime is in `LIVE`
