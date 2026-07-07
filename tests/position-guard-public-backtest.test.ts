@@ -125,6 +125,53 @@ test("position guard public backtest candle fetch paginates backward and de-dupl
   assert.equal(dataset.candleCounts["1h"], 3);
 });
 
+test("position guard public backtest fetches timeframe groups sequentially", async () => {
+  const calls: string[] = [];
+  let inFlight = 0;
+  const enterPublicCandleRequest = async (label: string): Promise<void> => {
+    if (inFlight !== 0) {
+      throw new Error(`parallel public candle fetch detected at ${label}`);
+    }
+    inFlight += 1;
+    try {
+      await Promise.resolve();
+    } finally {
+      inFlight -= 1;
+    }
+  };
+  const reader: PositionGuardBacktestCandleReader = {
+    getMinuteCandles: async (request) => {
+      const label = `minute:${request.unit}`;
+      calls.push(label);
+      await enterPublicCandleRequest(label);
+      return request.unit === 60
+        ? [createCandle("KRW-BTC", "2026-04-20T03:00:00", 103)]
+        : [createCandle("KRW-BTC", "2026-04-20T00:00:00", 102)];
+    },
+    getDayCandles: async () => {
+      const label = "day";
+      calls.push(label);
+      await enterPublicCandleRequest(label);
+      return [createCandle("KRW-BTC", "2026-04-19T00:00:00", 101)];
+    },
+  };
+
+  const dataset = await fetchPositionGuardBacktestCandles(reader, {
+    asset: "BTC",
+    historyStartAt: "2026-04-19T00:00:00.000Z",
+    endAt: "2026-04-20T04:00:00.000Z",
+    pageSize: 1,
+    pageLimit: 1,
+  });
+
+  assert.deepEqual(calls, ["minute:60", "minute:240", "day"]);
+  assert.deepEqual(dataset.candleCounts, {
+    "1h": 1,
+    "4h": 1,
+    "1d": 1,
+  });
+});
+
 function createCandle(
   market: "KRW-BTC" | "KRW-ETH",
   openTimeUtc: string,

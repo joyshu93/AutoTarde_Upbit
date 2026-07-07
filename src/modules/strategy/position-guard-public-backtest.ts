@@ -110,41 +110,39 @@ export async function fetchPositionGuardBacktestCandles(
     throw new Error("PositionGuard backtest historyStartAt must be before or equal to endAt.");
   }
 
-  const [oneHourCandles, fourHourCandles, oneDayCandles] = await Promise.all([
-    fetchTimeframeCandles({
-      reader,
-      market,
-      timeframe: "1h",
-      historyStartAt: input.historyStartAt,
-      endAt: input.endAt,
-      historyStartMs,
-      endMs,
-      pageSize,
-      pageLimit,
-    }),
-    fetchTimeframeCandles({
-      reader,
-      market,
-      timeframe: "4h",
-      historyStartAt: input.historyStartAt,
-      endAt: input.endAt,
-      historyStartMs,
-      endMs,
-      pageSize,
-      pageLimit,
-    }),
-    fetchTimeframeCandles({
-      reader,
-      market,
-      timeframe: "1d",
-      historyStartAt: input.historyStartAt,
-      endAt: input.endAt,
-      historyStartMs,
-      endMs,
-      pageSize,
-      pageLimit,
-    }),
-  ]);
+  const oneHourCandles = await fetchTimeframeCandles({
+    reader,
+    market,
+    timeframe: "1h",
+    historyStartAt: input.historyStartAt,
+    endAt: input.endAt,
+    historyStartMs,
+    endMs,
+    pageSize,
+    pageLimit,
+  });
+  const fourHourCandles = await fetchTimeframeCandles({
+    reader,
+    market,
+    timeframe: "4h",
+    historyStartAt: input.historyStartAt,
+    endAt: input.endAt,
+    historyStartMs,
+    endMs,
+    pageSize,
+    pageLimit,
+  });
+  const oneDayCandles = await fetchTimeframeCandles({
+    reader,
+    market,
+    timeframe: "1d",
+    historyStartAt: input.historyStartAt,
+    endAt: input.endAt,
+    historyStartMs,
+    endMs,
+    pageSize,
+    pageLimit,
+  });
   const candles = {
     "1h": oneHourCandles,
     "4h": fourHourCandles,

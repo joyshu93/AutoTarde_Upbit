@@ -47,7 +47,7 @@ Current strategy direction:
 - `position-guard-backtest` provides a pure offline replay harness for PositionGuard analysis frames, applying fee, slippage, minimum-trade, turnover, drawdown, and regime/action metrics without touching DB, Telegram, exchange adapters, order lifecycle records, or live-send gates
 - `position-guard-backtest-frames` converts completed historical 1h/4h/1d candle arrays into replay frames at 1h decision cutoffs, exposing source candle counts and latest close times so research runs can audit that no future candle data was used
 - `position-guard-backtest-report` turns replay results into stable offline summaries with action/regime counts, return, drawdown, turnover, fee, skipped-intent, time-in-market, and source-window warnings without touching DB, Telegram, exchange adapters, order lifecycle records, or live-send gates
-- `position-guard-public-backtest` fetches paginated Upbit public 1h/4h/1d candles, de-duplicates overlapping pages, builds no-lookahead replay frames, and formats a research report without touching DB, Telegram, private exchange endpoints, order lifecycle records, or live-send gates
+- `position-guard-public-backtest` fetches paginated Upbit public 1h/4h/1d candles sequentially, de-duplicates overlapping pages, builds no-lookahead replay frames, and formats a research report without touching DB, Telegram, private exchange endpoints, order lifecycle records, or live-send gates
 - Telegram `/run BTC|ETH` now exposes a controlled operator trigger for one runner cycle without enabling live order transmission
 - Telegram `/preview BTC|ETH` exposes the same deterministic decision and order intent without persistence or order submission
 - Telegram `/run BTC|ETH` runs a manual live persisted-health preflight before invoking the runner when the runtime is in `LIVE`
@@ -97,7 +97,7 @@ For market sell intents where Upbit order input carries volume but no price, exe
 Owns exchange-specific behavior:
 - Upbit private authentication
 - request signing
-- public ticker and candle reads for deterministic strategy inputs
+- public ticker and candle reads for deterministic strategy inputs, including bounded 429 retry/backoff for Upbit public quotation rate limits
 - balance queries
 - order chance and order test paths
 - create, cancel, and get-order methods

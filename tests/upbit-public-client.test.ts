@@ -60,16 +60,66 @@ test("upbit public ticker client requests pair tickers and maps trade prices", a
 test("upbit public ticker client throws explicit errors for non-ok responses", async () => {
   const client = new UpbitPublicTickerClient({
     fetchImpl: async () =>
-      new Response("rate limited", {
-        status: 429,
-        statusText: "Too Many Requests",
+      new Response("server error", {
+        status: 500,
+        statusText: "Internal Server Error",
       }),
   });
 
   await assert.rejects(
     () => client.getTickers(["KRW-BTC"]),
-    /Upbit public ticker request failed \(429 Too Many Requests\)\./,
+    /Upbit public ticker request failed \(500 Internal Server Error\)\./,
   );
+});
+
+test("upbit public client retries rate-limited candle requests", async () => {
+  let callCount = 0;
+  const client = new UpbitPublicTickerClient({
+    fetchImpl: async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        return new Response("rate limited", {
+          status: 429,
+          statusText: "Too Many Requests",
+          headers: {
+            "Retry-After": "0",
+          },
+        });
+      }
+
+      return new Response(
+        JSON.stringify([
+          {
+            market: "KRW-BTC",
+            candle_date_time_utc: "2026-04-20T00:00:00",
+            candle_date_time_kst: "2026-04-20T09:00:00",
+            opening_price: 100,
+            high_price: 110,
+            low_price: 90,
+            trade_price: 105,
+            timestamp: 1776630000000,
+            candle_acc_trade_price: 1000000,
+            candle_acc_trade_volume: 10,
+          },
+        ]),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      );
+    },
+  });
+
+  const candles = await client.getMinuteCandles({
+    market: "KRW-BTC",
+    unit: 60,
+    count: 1,
+  });
+
+  assert.equal(callCount, 2);
+  assert.equal(candles[0]?.unit, 60);
 });
 
 test("upbit public client requests minute and day candles", async () => {
