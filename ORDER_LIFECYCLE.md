@@ -187,4 +187,5 @@ Retryable Telegram failures may keep the notification in `PENDING` with a schedu
 Delivery workers may also claim a notification behind a lease token before transport, but that lease is still operator-notification state rather than order-lifecycle state.
 Recent delivery outcomes are now also kept in `operator_notification_delivery_attempts` so operator observability can grow without turning Telegram delivery into lifecycle truth.
 Delivery-worker executions are now also kept in `operator_notification_delivery_runs` so skipped, completed, and failed delivery kicks are inspectable without making Telegram delivery part of the order lifecycle.
+If a notification is persisted and kicked while another inline delivery worker is already running, the follow-up delivery pass is still operator-notification state and does not create or alter any order lifecycle transition.
 Derived `/alerts` queue metrics expose pending totals, active or expired leases, abandoned-lease candidates, and recent worker-run summaries without making Telegram delivery part of the order lifecycle.

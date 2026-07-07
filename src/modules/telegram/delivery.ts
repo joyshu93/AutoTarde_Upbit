@@ -103,6 +103,7 @@ export class TelegramBotApiClient implements TelegramMessageClient {
 
 export class OperatorNotificationDeliveryService {
   private readonly inFlightByExchangeAccount = new Map<string, Promise<OperatorNotificationDeliverySummary>>();
+  private readonly rerunRequestedByExchangeAccount = new Set<string>();
 
   constructor(
     private readonly dependencies: {
@@ -131,6 +132,11 @@ export class OperatorNotificationDeliveryService {
   }
 
   kick(exchangeAccountId: string, limit = DEFAULT_PENDING_DELIVERY_LIMIT): void {
+    if (this.inFlightByExchangeAccount.has(exchangeAccountId)) {
+      this.rerunRequestedByExchangeAccount.add(exchangeAccountId);
+      return;
+    }
+
     void this.deliverPending(exchangeAccountId, limit).catch(() => {
       // Delivery is best-effort and must never raise unhandled rejections into execution paths.
     });
@@ -145,14 +151,31 @@ export class OperatorNotificationDeliveryService {
       return inFlight;
     }
 
-    const deliveryRun = this.runDelivery(exchangeAccountId, limit).finally(() => {
+    const deliveryRun = this.runDeliveryUntilIdle(exchangeAccountId, limit).finally(() => {
       if (this.inFlightByExchangeAccount.get(exchangeAccountId) === deliveryRun) {
         this.inFlightByExchangeAccount.delete(exchangeAccountId);
+        if (this.rerunRequestedByExchangeAccount.delete(exchangeAccountId)) {
+          this.kick(exchangeAccountId, limit);
+        }
       }
     });
 
     this.inFlightByExchangeAccount.set(exchangeAccountId, deliveryRun);
     return deliveryRun;
+  }
+
+  private async runDeliveryUntilIdle(
+    exchangeAccountId: string,
+    limit: number,
+  ): Promise<OperatorNotificationDeliverySummary> {
+    let summary = await this.runDelivery(exchangeAccountId, limit);
+
+    while (this.rerunRequestedByExchangeAccount.delete(exchangeAccountId)) {
+      const followUpSummary = await this.runDelivery(exchangeAccountId, limit);
+      summary = mergeDeliverySummaries(summary, followUpSummary);
+    }
+
+    return summary;
   }
 
   private async runDelivery(
@@ -595,6 +618,26 @@ export class OperatorNotificationDeliveryService {
       abandonedLeaseCandidate,
     };
   }
+}
+
+function mergeDeliverySummaries(
+  previous: OperatorNotificationDeliverySummary,
+  next: OperatorNotificationDeliverySummary,
+): OperatorNotificationDeliverySummary {
+  return {
+    attempted: previous.attempted + next.attempted,
+    sent: previous.sent + next.sent,
+    retryScheduled: previous.retryScheduled + next.retryScheduled,
+    failed: previous.failed + next.failed,
+    staleLease: previous.staleLease + next.staleLease,
+    pendingTotal: next.pendingTotal,
+    pendingDue: next.pendingDue,
+    pendingScheduled: next.pendingScheduled,
+    activeLease: next.activeLease,
+    expiredLease: next.expiredLease,
+    abandonedLeaseCandidate: next.abandonedLeaseCandidate,
+    skippedReason: next.skippedReason,
+  };
 }
 
 export function formatOperatorNotificationDeliveryText(

@@ -118,6 +118,49 @@ test("delivery service marks pending notifications as sent after successful Tele
   assert.equal(pendingNotifications.length, 0);
 });
 
+test("delivery service runs a follow-up pass when kicked during an in-flight run", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const sentMessages: Array<{ chatId: string; text: string }> = [];
+  let deliveryService: OperatorNotificationDeliveryService;
+
+  await repositories.saveOperatorNotification(createNotification({
+    id: "operator-notification-follow-up-1",
+    title: "First notification",
+    message: "First notification is already claimed by the active delivery run.",
+    createdAt: "2026-04-20T00:21:00.000Z",
+  }));
+
+  deliveryService = new OperatorNotificationDeliveryService({
+    repositories,
+    client: {
+      async sendMessage(input) {
+        sentMessages.push(input);
+        if (sentMessages.length === 1) {
+          await repositories.saveOperatorNotification(createNotification({
+            id: "operator-notification-follow-up-2",
+            title: "Second notification",
+            message: "Second notification arrived while delivery was in flight.",
+            createdAt: "2026-04-20T00:21:01.000Z",
+          }));
+          deliveryService.kick("primary", 10);
+        }
+      },
+    },
+    operatorChatId: "chat-1",
+    now: () => "2026-04-20T00:21:05.000Z",
+  });
+
+  const summary = await deliveryService.deliverPending("primary", 10);
+  const pendingNotifications = await repositories.listPendingOperatorNotifications("primary");
+  const runs = await repositories.listOperatorNotificationDeliveryRuns("primary");
+
+  assert.equal(summary.attempted, 2);
+  assert.equal(summary.sent, 2);
+  assert.equal(sentMessages.length, 2);
+  assert.equal(pendingNotifications.length, 0);
+  assert.equal(runs.length, 2);
+});
+
 test("delivery service reschedules retryable Telegram delivery errors with exponential backoff", async () => {
   const repositories = new InMemoryExecutionRepository();
 

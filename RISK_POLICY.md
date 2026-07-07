@@ -163,6 +163,7 @@ Every important transition should leave a durable trail:
 - operator notification retry metadata, including `attemptCount`, `lastAttemptAt`, `nextAttemptAt`, and `failureClass`
 - operator notification lease metadata, so concurrent workers can only finalize rows they claimed
 - operator notification delivery-worker run records, including skipped, completed, and failed worker executions
+- operator notification follow-up delivery passes when new due notifications are kicked during an in-flight worker run
 - derived operator notification queue metrics, including active leases, expired leases, abandoned-lease candidates, recent delivery-run summaries, and recent delivery-attempt outcomes
 - strategy scheduler run records, including started, completed, failed, and skipped scheduler-triggered cycles
 - scheduler operator notifications for failed scheduled cycles, overlapping-run skips, and scheduler-triggered order submission or rejection
@@ -173,6 +174,7 @@ Every important transition should leave a durable trail:
 Telegram delivery failure must not alter execution, reconciliation, or risk outcomes. It is an operator-reporting concern with its own durable state.
 Retryable delivery failures should remain explicit as `PENDING` plus future `nextAttemptAt`, not silently disappear.
 Concurrent delivery workers should only finalize a notification when the persisted lease token still matches the worker claim.
+Delivery kicks requested during an active inline worker run should not strand due `PENDING` notifications; they should trigger a follow-up worker pass.
 Long-running runtime shutdown should be explicit: signal handling must stop inbound polling, clear scheduler timers, and close SQLite persistence. Cleanup failures should be visible as partial shutdown failures instead of being swallowed.
 
 ## Current Implementation Note

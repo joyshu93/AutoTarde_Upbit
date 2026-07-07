@@ -161,6 +161,7 @@ It provides:
 - `/synchistory` summaries that expose bounded archival recovery progress such as checkpoint window movement, page counts, stop-before boundary, retention-assumption boundary, coverage status, truncation flags, and confidence classification
 - execution_state transition history inspection from persisted state
 - outbox-based Telegram delivery that persists first, then attempts best-effort send behind `ENABLE_TELEGRAM_DELIVERY`
+- delivery kicks received while an inline delivery worker is already running are coalesced into a follow-up pass, so due notifications created during an in-flight pass are not stranded as `PENDING`
 - disabled-by-default inbound polling that accepts only `TELEGRAM_OPERATOR_CHAT_ID` messages and routes them through the existing command router
 - inbound polling splits long routed replies into bounded Telegram messages so large inspection views such as `/alerts` do not fail the command update
 - a bounded `smoke:telegram:inbound` operator validation script that forces `DRY_RUN`, disables live orders and scheduler ticks, and calls only one inbound `pollOnce()` without starting the runtime loop
@@ -266,13 +267,14 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 16. Persist the updated order state.
 17. Persist operator_notifications for significant operator-facing outcomes.
 18. Kick best-effort Telegram delivery without letting network delivery alter execution outcomes.
-19. Due notifications are claimed with a lease token so concurrent workers do not finalize the same row blindly.
-20. Delivery attempt outcomes are also written to `operator_notification_delivery_attempts` so operators can inspect recent send behavior separately from the summary row.
-21. Delivery worker executions are written to `operator_notification_delivery_runs` with completed, skipped, or failed status.
-22. Retryable Telegram delivery failures stay `PENDING` with future `next_attempt_at`, while permanent failures become `FAILED`.
-23. Expose inspection and reconciliation surfaces.
-24. If scheduler or inbound polling background timers are started, install signal handlers that stop Telegram inbound polling, stop scheduler timers, and close SQLite persistence on `SIGINT` / `SIGTERM`.
-25. If no background runtime is started, close SQLite persistence immediately after the startup banner is printed.
+19. If another delivery kick arrives while the inline worker is in flight, record a follow-up request and run one more delivery pass after the current pass finishes.
+20. Due notifications are claimed with a lease token so concurrent workers do not finalize the same row blindly.
+21. Delivery attempt outcomes are also written to `operator_notification_delivery_attempts` so operators can inspect recent send behavior separately from the summary row.
+22. Delivery worker executions are written to `operator_notification_delivery_runs` with completed, skipped, or failed status.
+23. Retryable Telegram delivery failures stay `PENDING` with future `next_attempt_at`, while permanent failures become `FAILED`.
+24. Expose inspection and reconciliation surfaces.
+25. If scheduler or inbound polling background timers are started, install signal handlers that stop Telegram inbound polling, stop scheduler timers, and close SQLite persistence on `SIGINT` / `SIGTERM`.
+26. If no background runtime is started, close SQLite persistence immediately after the startup banner is printed.
 
 ## Failure Posture
 
