@@ -135,6 +135,7 @@ If multiple scheduled market timers become due together, the scheduler queues th
 In `LIVE`, if a scheduled market cycle submits an order, remaining market cycles from that same scheduler batch are persisted as `SKIPPED` and deferred to the next interval. This is scheduler audit state, not an order lifecycle transition, and it prevents another strategy decision from being created before account health is refreshed after the exchange mutation.
 Each manual `LIVE` `/run BTC|ETH` also runs persisted-health preflight before invoking the strategy runner. A blocked manual run is an operator response only; it must not create a strategy decision, order intent, cancellation, or reconciliation mutation by itself.
 `/preview BTC|ETH` may compute a strategy decision and order-intent preview, but because it does not persist the decision or create an order intent, it is not a reconciliation trigger.
+If the strategy is flat for an asset, bearish invalidation evidence is represented as no-order `HOLD` rather than an `EXIT` or `REDUCE` lifecycle trigger.
 
 Restart recovery currently prioritizes persisted non-terminal orders first, then limited terminal backfill candidates, and respects a per-run exchange lookup budget.
 Exchange-history recovery advances per-market archive checkpoints only until the configured stop-before boundary, then reports that archive coverage as complete instead of continuing unbounded historical fetches.

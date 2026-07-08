@@ -34,6 +34,32 @@ test("position guard core exits immediately when invalidation is broken", () => 
   assert.equal(strategyDecision.requestedNotionalKrw, null);
 });
 
+test("position guard core does not emit exit orders while flat", () => {
+  const context = createContext({
+    positionQuantity: 0,
+    averageEntryPrice: 0,
+    analysis: {
+      invalidationState: "BROKEN",
+      breakdown1d: true,
+      breakdown4h: true,
+      bearishMomentumExpansion: true,
+      currentPrice: 90_000_000,
+      pnlPct: 0,
+    },
+  });
+
+  const decision = decidePositionGuardCore(context);
+  const strategyDecision = toStrategyDecision(context, decision);
+
+  assert.equal(decision.action, "HOLD");
+  assert.equal(decision.executionDisposition, "SKIPPED");
+  assert.equal(decision.targetQuantityFraction, null);
+  assert.match(decision.summary, /No position/);
+  assert.equal(strategyDecision.action, "HOLD");
+  assert.equal(strategyDecision.requestedQuantity, null);
+  assert.equal(strategyDecision.requestedNotionalKrw, null);
+});
+
 test("position guard core blocks no-chase entries in the upper range", () => {
   const context = createContext({
     availableKrw: 1_000_000,

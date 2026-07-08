@@ -170,11 +170,15 @@ export function decidePositionGuardCore(context: PositionGuardStrategyContext): 
   const exposureGuardrails = buildExposureGuardrails(context);
   const diagnostics = buildDiagnostics(analysis);
 
-  if (
-    analysis.invalidationState === "BROKEN" ||
-    analysis.breakdown1d ||
-    (analysis.breakdown4h && analysis.bearishMomentumExpansion)
-  ) {
+  if (quantity <= 0) {
+    if (isImmediateExitRequired(analysis)) {
+      return flatNoPositionExitHoldDecision(context, reentryPenaltyApplied, exposureGuardrails);
+    }
+
+    return decideFlatPositionAction(context, bullishScore, qualityBucket, reentryPenaltyApplied, exposureGuardrails);
+  }
+
+  if (isImmediateExitRequired(analysis)) {
     return {
       action: "EXIT",
       summary: `${context.asset} exit is required because invalidation has failed.`,
@@ -199,16 +203,18 @@ export function decidePositionGuardCore(context: PositionGuardStrategyContext): 
     };
   }
 
-  if (quantity <= 0) {
-    return decideFlatPositionAction(context, bullishScore, qualityBucket, reentryPenaltyApplied, exposureGuardrails);
-  }
-
   const reduceDecision = decideReduceAction(context, exposureGuardrails, reentryPenaltyApplied);
   if (reduceDecision) {
     return reduceDecision;
   }
 
   return decideAddOrHoldAction(context, bullishScore, qualityBucket, reentryPenaltyApplied, exposureGuardrails);
+}
+
+function isImmediateExitRequired(analysis: PositionGuardStructureAnalysis): boolean {
+  return analysis.invalidationState === "BROKEN" ||
+    analysis.breakdown1d ||
+    (analysis.breakdown4h && analysis.bearishMomentumExpansion);
 }
 
 export function toStrategyDecision(
@@ -499,6 +505,35 @@ function holdDecision(
     signalQuality: {
       score,
       bucket: qualityBucket,
+      confirmationRequired: false,
+      confirmationSatisfied: false,
+      reentryPenaltyApplied,
+    },
+    exposureGuardrails,
+    diagnostics: buildDiagnostics(context.analysis),
+  };
+}
+
+function flatNoPositionExitHoldDecision(
+  context: PositionGuardStrategyContext,
+  reentryPenaltyApplied: boolean,
+  exposureGuardrails: PositionGuardEngineDecision["exposureGuardrails"],
+): PositionGuardEngineDecision {
+  return {
+    action: "HOLD",
+    summary: `No position is open for ${context.asset}, so the strategy holds flat instead of emitting an exit.`,
+    reasons: [
+      `Regime is ${context.analysis.regime}.`,
+      "No position is open, so bearish exit evidence is treated as flat-state risk avoidance rather than a sell order.",
+      "Higher-timeframe support has broken or invalidation is already broken.",
+    ],
+    targetNotionalKrw: 0,
+    targetQuantityFraction: null,
+    referencePrice: context.analysis.currentPrice,
+    executionDisposition: "SKIPPED",
+    signalQuality: {
+      score: 0,
+      bucket: "LOW",
       confirmationRequired: false,
       confirmationSatisfied: false,
       reentryPenaltyApplied,

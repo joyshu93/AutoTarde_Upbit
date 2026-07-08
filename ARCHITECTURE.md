@@ -43,6 +43,7 @@ Current strategy direction:
 - `position-guard-runner` now performs one explicit market cycle: public snapshot read, structure analysis, persisted context assembly, core decision, durable strategy-decision persistence, and optional `DRY_RUN` execution submission
 - `position-guard-runner` also supports a non-mutating preview path that computes the same decision and order intent without persisting strategy decisions or submitting orders
 - the port preserves invalidation-first exits, no-chase entries, staged entry/add sizing, soft reduce logic, and borderline hourly confirmation semantics
+- flat portfolios treat bearish exit evidence as risk avoidance and return `HOLD` without a sell quantity, so the strategy does not emit no-position exit orders
 - REDUCE decisions avoid double-counting derived `riskLevel` summaries and require independent weakening evidence when the structure stage is still `NONE`, so borderline bearish momentum alone remains a HOLD
 - `position-guard-backtest` provides a pure offline replay harness for PositionGuard analysis frames, applying fee, slippage, minimum-trade, turnover, drawdown, and regime/action metrics without touching DB, Telegram, exchange adapters, order lifecycle records, or live-send gates
 - `position-guard-backtest-frames` converts completed historical 1h/4h/1d candle arrays into replay frames at 1h decision cutoffs, exposing source candle counts and latest close times so research runs can audit that no future candle data was used
