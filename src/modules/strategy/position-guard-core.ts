@@ -221,9 +221,7 @@ export function toStrategyDecision(
   context: PositionGuardStrategyContext,
   decision: PositionGuardEngineDecision,
 ): StrategyDecision {
-  const requestedQuantity = decision.targetQuantityFraction === null
-    ? null
-    : roundQuantity(context.positionQuantity * decision.targetQuantityFraction);
+  const requestedQuantity = getRequestedQuantity(context.positionQuantity, decision.targetQuantityFraction);
 
   return {
     strategyKey: POSITION_GUARD_STRATEGY_KEY,
@@ -767,14 +765,30 @@ function hasIndependentReduceEvidence(analysis: PositionGuardStructureAnalysis):
     analysis.weakeningStage === "FAILURE";
 }
 
-function getStructuredReducePlan(
-  context: PositionGuardStrategyContext,
-  weaknessScore: number,
-): {
+type StructuredReducePlan = {
   reduceFraction: number;
   qualityBucket: StrategySignalQualityBucket;
   reasons: string[];
-} | null {
+};
+
+function getStructuredReducePlan(
+  context: PositionGuardStrategyContext,
+  weaknessScore: number,
+): StructuredReducePlan | null {
+  const defensivePlan = getDefensiveExposureReducePlan(context, weaknessScore);
+  const legacyPlan = getLegacyStructuredReducePlan(context, weaknessScore);
+
+  if (!defensivePlan) return legacyPlan;
+  if (!legacyPlan) return defensivePlan;
+  return defensivePlan.reduceFraction > legacyPlan.reduceFraction
+    ? defensivePlan
+    : legacyPlan;
+}
+
+function getLegacyStructuredReducePlan(
+  context: PositionGuardStrategyContext,
+  weaknessScore: number,
+): StructuredReducePlan | null {
   const analysis = context.analysis;
   const hasProfitBuffer = analysis.pnlPct >= 0.02;
   const hasIndependentEvidence = hasIndependentReduceEvidence(analysis);
@@ -784,11 +798,12 @@ function getStructuredReducePlan(
       return null;
     }
 
-    return {
-      reduceFraction: Math.min(0.35, Math.max(0.15, context.settings.reduceFraction * 0.5)),
-      qualityBucket: "BORDERLINE",
-      reasons: ["Weakening is still soft, so any reduction stays modest and mainly protects open gains."],
-    };
+    return buildStructuredReducePlan(
+      context,
+      Math.min(0.35, Math.max(0.15, context.settings.reduceFraction * 0.5)),
+      "BORDERLINE",
+      ["Weakening is still soft, so any reduction stays modest and mainly protects open gains."],
+    );
   }
 
   if (analysis.weakeningStage === "NONE" && !hasIndependentEvidence) {
@@ -805,15 +820,112 @@ function getStructuredReducePlan(
     return null;
   }
 
-  return {
-    reduceFraction: getGraduatedReduceFraction(weaknessScore, context.settings.reduceFraction),
-    qualityBucket: weaknessScore >= 7 ? "HIGH" : weaknessScore >= 5 ? "MEDIUM" : "BORDERLINE",
-    reasons: [
+  return buildStructuredReducePlan(
+    context,
+    getGraduatedReduceFraction(weaknessScore, context.settings.reduceFraction),
+    weaknessScore >= 7 ? "HIGH" : weaknessScore >= 5 ? "MEDIUM" : "BORDERLINE",
+    [
       analysis.weakeningStage === "CLEAR"
         ? "Weakening has become clear enough that a larger staged reduction is now justified."
         : "Weakening evidence cleared the reduce hysteresis threshold.",
     ],
+  );
+}
+
+function getDefensiveExposureReducePlan(
+  context: PositionGuardStrategyContext,
+  weaknessScore: number,
+): StructuredReducePlan | null {
+  const analysis = context.analysis;
+
+  if (hasProfitableWeakDowntrendDeterioration(analysis)) {
+    return buildStructuredReducePlan(
+      context,
+      Math.min(0.45, Math.max(0.25, context.settings.reduceFraction * 0.9)),
+      weaknessScore >= 4 ? "MEDIUM" : "BORDERLINE",
+      ["Weak downtrend exposure is profitable and has independent deterioration, so the position shifts to defensive reduction."],
+    );
+  }
+
+  if (hasProfitableBreakdownRiskDeterioration(analysis)) {
+    return buildStructuredReducePlan(
+      context,
+      Math.min(0.55, Math.max(0.3, context.settings.reduceFraction)),
+      weaknessScore >= 5 ? "MEDIUM" : "BORDERLINE",
+      ["Breakdown risk exposure is profitable and elevated, so exposure is reduced before full invalidation is reached."],
+    );
+  }
+
+  if (hasProfitableRangeProtectionEvidence(analysis)) {
+    return buildStructuredReducePlan(
+      context,
+      Math.min(0.28, Math.max(0.15, context.settings.reduceFraction * 0.5)),
+      "BORDERLINE",
+      ["Profitable range exposure has soft deterioration, so a modest reduction protects open gains."],
+    );
+  }
+
+  return null;
+}
+
+function buildStructuredReducePlan(
+  context: PositionGuardStrategyContext,
+  reduceFraction: number,
+  qualityBucket: StrategySignalQualityBucket,
+  reasons: string[],
+): StructuredReducePlan | null {
+  if (!hasMinimumReduceOrderValue(context, reduceFraction)) {
+    return null;
+  }
+
+  return {
+    reduceFraction,
+    qualityBucket,
+    reasons,
   };
+}
+
+function hasMinimumReduceOrderValue(context: PositionGuardStrategyContext, reduceFraction: number): boolean {
+  const requestedQuantity = getRequestedQuantity(context.positionQuantity, reduceFraction);
+  return requestedQuantity !== null &&
+    requestedQuantity * context.analysis.currentPrice >= context.settings.minimumTradeValueKrw;
+}
+
+function hasProfitableWeakDowntrendDeterioration(analysis: PositionGuardStructureAnalysis): boolean {
+  return analysis.regime === "WEAK_DOWNTREND" &&
+    analysis.pnlPct >= 0.02 &&
+    (
+      analysis.failedReclaim ||
+      analysis.bearishMomentumExpansion ||
+      analysis.atrShock ||
+      analysis.breakdownPressureScore >= 2 ||
+      analysis.weakeningStage !== "NONE"
+    );
+}
+
+function hasProfitableBreakdownRiskDeterioration(analysis: PositionGuardStructureAnalysis): boolean {
+  return analysis.regime === "BREAKDOWN_RISK" &&
+    analysis.pnlPct >= 0.02 &&
+    (
+      analysis.breakdownPressureScore >= 2 ||
+      analysis.failedReclaim ||
+      analysis.bearishMomentumExpansion ||
+      analysis.atrShock ||
+      analysis.weakeningStage !== "NONE"
+    );
+}
+
+function hasProfitableRangeProtectionEvidence(analysis: PositionGuardStructureAnalysis): boolean {
+  return analysis.regime === "RANGE" &&
+    analysis.pnlPct >= 0.02 &&
+    analysis.weakeningStage === "SOFT" &&
+    (
+      analysis.failedReclaim ||
+      analysis.bearishMomentumExpansion ||
+      analysis.atrShock ||
+      analysis.upperRangeChase ||
+      analysis.breakdownPressureScore >= 1
+    );
 }
 
 function getGraduatedReduceFraction(weaknessScore: number, base: number): number {
@@ -900,4 +1012,10 @@ function roundMoney(value: number): number {
 
 function roundQuantity(value: number): number {
   return Number(value.toFixed(12));
+}
+
+function getRequestedQuantity(positionQuantity: number, targetQuantityFraction: number | null): number | null {
+  return targetQuantityFraction === null
+    ? null
+    : roundQuantity(positionQuantity * targetQuantityFraction);
 }

@@ -171,6 +171,247 @@ test("position guard core reduces a profitable position on soft weakening", () =
   assert.ok((strategyDecision.requestedQuantity ?? 0) > 0);
 });
 
+test("position guard core protects profitable weak-downtrend exposure when deterioration is confirmed", () => {
+  const context = createContext({
+    positionQuantity: 0.35,
+    averageEntryPrice: 100_000_000,
+    analysis: {
+      regime: "WEAK_DOWNTREND",
+      invalidationState: "CLEAR",
+      currentPrice: 104_000_000,
+      pnlPct: 0.04,
+      weakeningStage: "NONE",
+      failedReclaim: false,
+      bearishMomentumExpansion: true,
+      atrShock: false,
+      breakdownPressureScore: 1,
+    },
+  });
+
+  const decision = decidePositionGuardCore(context);
+  const strategyDecision = toStrategyDecision(context, decision);
+
+  assert.equal(decision.action, "REDUCE");
+  assert.equal(decision.executionDisposition, "IMMEDIATE");
+  assert.ok((decision.targetQuantityFraction ?? 0) >= 0.25);
+  assert.ok((decision.targetQuantityFraction ?? 0) <= 0.45);
+  assert.match(decision.reasons.join(" "), /Weak downtrend/);
+  assert.equal(strategyDecision.action, "REDUCE");
+  assert.ok((strategyDecision.requestedQuantity ?? 0) > 0);
+});
+
+test("position guard core holds losing weak-downtrend exposure even when deterioration is present", () => {
+  const context = createContext({
+    positionQuantity: 0.35,
+    averageEntryPrice: 100_000_000,
+    analysis: {
+      regime: "WEAK_DOWNTREND",
+      invalidationState: "CLEAR",
+      currentPrice: 94_000_000,
+      pnlPct: -0.06,
+      weakeningStage: "NONE",
+      failedReclaim: false,
+      bearishMomentumExpansion: true,
+      atrShock: false,
+      breakdownPressureScore: 1,
+    },
+  });
+
+  const decision = decidePositionGuardCore(context);
+  const strategyDecision = toStrategyDecision(context, decision);
+
+  assert.equal(decision.action, "HOLD");
+  assert.equal(decision.executionDisposition, "SKIPPED");
+  assert.equal(decision.targetQuantityFraction, null);
+  assert.equal(strategyDecision.action, "HOLD");
+  assert.equal(strategyDecision.requestedQuantity, null);
+});
+
+test("position guard core holds weak-downtrend exposure without additional deterioration", () => {
+  const context = createContext({
+    positionQuantity: 0.35,
+    averageEntryPrice: 100_000_000,
+    analysis: {
+      regime: "WEAK_DOWNTREND",
+      invalidationState: "CLEAR",
+      currentPrice: 98_500_000,
+      pnlPct: -0.015,
+      weakeningStage: "NONE",
+      failedReclaim: false,
+      bearishMomentumExpansion: false,
+      atrShock: false,
+      breakdownPressureScore: 0,
+    },
+  });
+
+  const decision = decidePositionGuardCore(context);
+  const strategyDecision = toStrategyDecision(context, decision);
+
+  assert.equal(decision.action, "HOLD");
+  assert.equal(decision.executionDisposition, "SKIPPED");
+  assert.equal(decision.targetQuantityFraction, null);
+  assert.equal(strategyDecision.action, "HOLD");
+  assert.equal(strategyDecision.requestedQuantity, null);
+});
+
+test("position guard core protects profitable breakdown-risk exposure before full invalidation", () => {
+  const context = createContext({
+    positionQuantity: 0.35,
+    averageEntryPrice: 100_000_000,
+    analysis: {
+      regime: "BREAKDOWN_RISK",
+      invalidationState: "CLEAR",
+      currentPrice: 104_000_000,
+      pnlPct: 0.04,
+      weakeningStage: "SOFT",
+      breakdown1d: false,
+      breakdown4h: false,
+      failedReclaim: true,
+      bearishMomentumExpansion: false,
+      atrShock: false,
+      breakdownPressureScore: 2,
+    },
+  });
+
+  const decision = decidePositionGuardCore(context);
+  const strategyDecision = toStrategyDecision(context, decision);
+
+  assert.equal(decision.action, "REDUCE");
+  assert.equal(decision.executionDisposition, "IMMEDIATE");
+  assert.ok((decision.targetQuantityFraction ?? 0) >= 0.3);
+  assert.ok((decision.targetQuantityFraction ?? 0) <= 0.55);
+  assert.match(decision.reasons.join(" "), /Breakdown risk/);
+  assert.equal(strategyDecision.action, "REDUCE");
+  assert.ok((strategyDecision.requestedQuantity ?? 0) > 0);
+});
+
+test("position guard core preserves the stronger legacy reduction when defensive evidence overlaps", () => {
+  const context = createContext({
+    positionQuantity: 0.35,
+    averageEntryPrice: 100_000_000,
+    analysis: {
+      regime: "BREAKDOWN_RISK",
+      invalidationState: "CLEAR",
+      currentPrice: 104_000_000,
+      pnlPct: 0.04,
+      weakeningStage: "CLEAR",
+      breakdown1d: false,
+      breakdown4h: false,
+      failedReclaim: true,
+      bearishMomentumExpansion: true,
+      atrShock: true,
+      breakdownPressureScore: 4,
+    },
+  });
+
+  const decision = decidePositionGuardCore(context);
+  const expectedReduceFraction = Math.min(
+    0.75,
+    DEFAULT_POSITION_GUARD_STRATEGY_SETTINGS.reduceFraction * 1.2,
+  );
+
+  assert.equal(decision.action, "REDUCE");
+  assert.equal(decision.targetQuantityFraction, expectedReduceFraction);
+  assert.match(decision.reasons.join(" "), /larger staged reduction/);
+});
+
+test("position guard core holds defensive reduction when the implied order is below minimum value", () => {
+  const context = createContext({
+    positionQuantity: 0.00005,
+    averageEntryPrice: 90_000_000,
+    portfolio: {
+      totalEquityKrw: 2_000_000,
+      assetMarketValueKrw: 100_000,
+      totalExposureKrw: 100_000,
+    },
+    analysis: {
+      regime: "RANGE",
+      invalidationState: "CLEAR",
+      currentPrice: 99_000_000,
+      pnlPct: 0.10,
+      weakeningStage: "SOFT",
+      failedReclaim: false,
+      bearishMomentumExpansion: true,
+      atrShock: true,
+      upperRangeChase: false,
+      breakdownPressureScore: 2,
+    },
+  });
+
+  const decision = decidePositionGuardCore(context);
+  const strategyDecision = toStrategyDecision(context, decision);
+
+  assert.equal(decision.action, "HOLD");
+  assert.equal(decision.executionDisposition, "SKIPPED");
+  assert.equal(decision.targetQuantityFraction, null);
+  assert.equal(strategyDecision.action, "HOLD");
+  assert.equal(strategyDecision.requestedQuantity, null);
+});
+
+test("position guard core allows defensive reduction exactly at minimum value despite a stale low portfolio value", () => {
+  const currentPrice = 100_000_000;
+  const expectedReduceFraction = DEFAULT_POSITION_GUARD_STRATEGY_SETTINGS.reduceFraction * 0.5;
+  const positionQuantity = 0.00005 / expectedReduceFraction;
+  const context = createContext({
+    positionQuantity,
+    averageEntryPrice: 90_000_000,
+    portfolio: {
+      totalEquityKrw: 2_000_000,
+      assetMarketValueKrw: 1_000,
+      totalExposureKrw: 1_000,
+    },
+    analysis: {
+      regime: "RANGE",
+      invalidationState: "CLEAR",
+      currentPrice,
+      pnlPct: 0.10,
+      weakeningStage: "SOFT",
+      failedReclaim: false,
+      bearishMomentumExpansion: true,
+      atrShock: true,
+      upperRangeChase: false,
+      breakdownPressureScore: 2,
+    },
+  });
+
+  const decision = decidePositionGuardCore(context);
+  const strategyDecision = toStrategyDecision(context, decision);
+
+  assert.equal(decision.action, "REDUCE");
+  assert.equal(strategyDecision.requestedQuantity, 0.00005);
+  assert.equal((strategyDecision.requestedQuantity ?? 0) * currentPrice, 5_000);
+});
+
+test("position guard core protects profitable range exposure on soft momentum deterioration", () => {
+  const context = createContext({
+    positionQuantity: 0.35,
+    averageEntryPrice: 90_000_000,
+    analysis: {
+      regime: "RANGE",
+      invalidationState: "CLEAR",
+      currentPrice: 99_000_000,
+      pnlPct: 0.10,
+      weakeningStage: "SOFT",
+      failedReclaim: false,
+      bearishMomentumExpansion: true,
+      atrShock: true,
+      upperRangeChase: false,
+      breakdownPressureScore: 2,
+    },
+  });
+
+  const decision = decidePositionGuardCore(context);
+  const strategyDecision = toStrategyDecision(context, decision);
+
+  assert.equal(decision.action, "REDUCE");
+  assert.equal(decision.executionDisposition, "IMMEDIATE");
+  assert.ok((decision.targetQuantityFraction ?? 0) >= 0.15);
+  assert.ok((decision.targetQuantityFraction ?? 0) <= 0.28);
+  assert.match(decision.reasons.join(" "), /protects open gains/);
+  assert.equal(strategyDecision.action, "REDUCE");
+  assert.ok((strategyDecision.requestedQuantity ?? 0) > 0);
+});
+
 test("position guard core holds a losing range position on borderline momentum weakness alone", () => {
   const context = createContext({
     positionQuantity: 0.00046145,

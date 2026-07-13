@@ -136,6 +136,7 @@ In `LIVE`, if a scheduled market cycle submits an order, remaining market cycles
 Each manual `LIVE` `/run BTC|ETH` also runs persisted-health preflight before invoking the strategy runner. A blocked manual run is an operator response only; it must not create a strategy decision, order intent, cancellation, or reconciliation mutation by itself.
 `/preview BTC|ETH` may compute a strategy decision and order-intent preview, but because it does not persist the decision or create an order intent, it is not a reconciliation trigger.
 If the strategy is flat for an asset, bearish invalidation evidence is represented as no-order `HOLD` rather than an `EXIT` or `REDUCE` lifecycle trigger.
+Defensive PositionGuard `REDUCE` decisions for open positions become normal order-intent candidates only after the strategy runner emits a profit-protective, above-minimum reduce intent; the regime evidence itself is not a reconciliation, scheduler, or cancellation trigger.
 
 Restart recovery currently prioritizes persisted non-terminal orders first, then limited terminal backfill candidates, and respects a per-run exchange lookup budget.
 Exchange-history recovery advances per-market archive checkpoints only until the configured stop-before boundary, then reports that archive coverage as complete instead of continuing unbounded historical fetches.
