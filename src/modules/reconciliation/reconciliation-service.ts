@@ -857,8 +857,7 @@ export class ReconciliationService {
     }
 
     let newFillCount = 0;
-    for (const fill of snapshot.fills) {
-      const fillRecord = buildFillRecord(order, fill, reconciledAt);
+    for (const fillRecord of buildFillRecords(order, snapshot, reconciledAt)) {
       if (!existingFillIds.has(fillRecord.exchangeFillId)) {
         newFillCount += 1;
         existingFillIds.add(fillRecord.exchangeFillId);
@@ -1103,14 +1102,22 @@ function mapExchangeOrderToLifecycleStatus(snapshot: ExchangeOrderSnapshot): Ord
   }
 
   if (snapshot.state === "cancel") {
+    if (snapshot.side === "bid" && snapshot.ordType === "price" && hasExecutedVolume(snapshot.executedVolume)) {
+      return "FILLED";
+    }
+
     return "CANCELED";
   }
 
-  if (snapshot.executedVolume && Number(snapshot.executedVolume) > 0) {
+  if (hasExecutedVolume(snapshot.executedVolume)) {
     return "PARTIALLY_FILLED";
   }
 
   return "OPEN";
+}
+
+function hasExecutedVolume(executedVolume: string | null): boolean {
+  return Boolean(executedVolume && Number(executedVolume) > 0);
 }
 
 function shouldReconcileTerminalOrder(order: OrderRecord, fillCount: number): boolean {
@@ -1118,13 +1125,41 @@ function shouldReconcileTerminalOrder(order: OrderRecord, fillCount: number): bo
     case "FILLED":
       return fillCount === 0 || order.exchangeResponseJson === null;
     case "CANCELED":
-      return order.exchangeResponseJson === null;
+      return order.exchangeResponseJson === null || isFilledPriceBidDustCancelCandidate(order, fillCount);
     case "REJECTED":
     case "FAILED":
       return order.exchangeResponseJson === null && order.failureCode !== "TERMINAL_ORDER_CONFIRMED_ABSENT";
     default:
       return false;
   }
+}
+
+function isFilledPriceBidDustCancelCandidate(order: OrderRecord, fillCount: number): boolean {
+  if (order.side !== "bid" || order.ordType !== "price") {
+    return false;
+  }
+
+  if (fillCount > 0) {
+    return true;
+  }
+
+  const parsed = parseJsonObject(order.exchangeResponseJson);
+  if (!parsed || parsed.state !== "cancel") {
+    return false;
+  }
+
+  return hasExecutedVolume(getStringField(parsed, "executed_volume", "executedVolume"));
+}
+
+function getStringField(value: Record<string, unknown>, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const candidate = value[key];
+    if (typeof candidate === "string") {
+      return candidate;
+    }
+  }
+
+  return null;
 }
 
 function isLocalDryRunExchangeArtifact(order: OrderRecord): boolean {
@@ -1275,11 +1310,23 @@ function isTransientLookupError(message: string): boolean {
   );
 }
 
+function buildFillRecords(
+  order: OrderRecord,
+  snapshot: ExchangeOrderSnapshot,
+  reconciledAt: string,
+): FillRecord[] {
+  const fallbackFeeAmounts = allocateMissingFillFees(snapshot);
+  return snapshot.fills.map((fill, index) =>
+    buildFillRecord(order, fill, reconciledAt, fallbackFeeAmounts[index] ?? null),
+  );
+}
+
 function buildFillRecord(
   order: OrderRecord,
   fill: ExchangeFillSnapshot,
   reconciledAt: string,
-) {
+  fallbackFeeAmount: string | null,
+): FillRecord {
   return {
     id: createId("fill"),
     orderId: order.id,
@@ -1289,10 +1336,83 @@ function buildFillRecord(
     price: fill.price,
     volume: fill.volume,
     feeCurrency: "KRW",
-    feeAmount: fill.fee,
+    feeAmount: fill.fee ?? fallbackFeeAmount,
     filledAt: fill.createdAt ?? reconciledAt,
     rawPayloadJson: JSON.stringify(fill.raw),
   };
+}
+
+function allocateMissingFillFees(snapshot: ExchangeOrderSnapshot): Array<string | null> {
+  const allocations = snapshot.fills.map(() => null as string | null);
+  const paidFee = parsePositiveNumber(snapshot.paidFee);
+  if (paidFee === null || snapshot.fills.length === 0) {
+    return allocations;
+  }
+
+  const missingFeeIndexes: number[] = [];
+  let explicitFeeTotal = 0;
+  snapshot.fills.forEach((fill, index) => {
+    const explicitFee = parsePositiveNumber(fill.fee);
+    if (explicitFee === null) {
+      missingFeeIndexes.push(index);
+      return;
+    }
+
+    explicitFeeTotal += explicitFee;
+  });
+
+  const remainingFee = paidFee - explicitFeeTotal;
+  if (remainingFee <= 0 || missingFeeIndexes.length === 0) {
+    return allocations;
+  }
+
+  if (missingFeeIndexes.length === 1) {
+    allocations[missingFeeIndexes[0]!] = formatDecimalString(remainingFee);
+    return allocations;
+  }
+
+  const weights = missingFeeIndexes.map((index) => resolveFillNotionalKrw(snapshot.fills[index]!));
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  let allocatedTotal = 0;
+
+  missingFeeIndexes.forEach((fillIndex, allocationIndex) => {
+    const isLast = allocationIndex === missingFeeIndexes.length - 1;
+    const allocation = isLast
+      ? remainingFee - allocatedTotal
+      : totalWeight > 0
+        ? remainingFee * (weights[allocationIndex]! / totalWeight)
+        : remainingFee / missingFeeIndexes.length;
+    allocatedTotal += allocation;
+    allocations[fillIndex] = formatDecimalString(allocation);
+  });
+
+  return allocations;
+}
+
+function resolveFillNotionalKrw(fill: ExchangeFillSnapshot): number {
+  const funds = parsePositiveNumber(fill.funds);
+  if (funds !== null) {
+    return funds;
+  }
+
+  const price = parsePositiveNumber(fill.price);
+  const volume = parsePositiveNumber(fill.volume);
+  if (price === null || volume === null) {
+    return 0;
+  }
+
+  return price * volume;
+}
+
+function parsePositiveNumber(value: string | null | undefined): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function formatDecimalString(value: number): string {
+  const fixed = value.toFixed(12);
+  const trimmed = fixed.replace(/(\.\d*?)0+$/u, "$1").replace(/\.$/u, "");
+  return trimmed === "-0" ? "0" : trimmed;
 }
 
 function resolveExchangeFillId(order: OrderRecord, fill: ExchangeFillSnapshot): string {

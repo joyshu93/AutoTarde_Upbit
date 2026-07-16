@@ -101,6 +101,8 @@ The intended live path is:
 7. reconcile until terminal state is consistent
 
 The live send path is selected only when mode, live gate, and credentials are explicitly configured.
+Upbit `price` market buys may return exchange state `cancel` after a successful fill when only dust-sized KRW or fee lock remains. In that specific filled `bid`/`price` case, the local lifecycle records the order as `FILLED` and preserves the raw exchange `cancel` payload plus fill and fee evidence. Ordinary canceled orders without this filled market-buy pattern remain `CANCELED`.
+If an older local row already stored that filled market-buy dust-cancel pattern as `CANCELED`, terminal reconciliation must recheck the order and repair it to local `FILLED` rather than leaving misleading operator evidence.
 
 ## Idempotency
 
@@ -132,7 +134,7 @@ The current scaffold now uses both process startup recovery and operator-trigger
 If scheduler startup is requested in `LIVE` mode, an automatic preflight runs before scheduler timers are installed. It requires fresh persisted account-health evidence, including balance snapshot, position snapshot, and latest reconciliation data, using the shortest configured scheduler interval as the maximum acceptable age. A blocked startup is scheduler runtime state, not an order lifecycle transition; no order is created unless a later deterministic runner cycle passes preflight, risk, validation, and persistence.
 Each `LIVE` scheduled tick first runs an exchange-backed account-health refresh that may persist fresh snapshots and reconciliation evidence with source `SCHEDULER_PREFLIGHT`. It then re-runs that persisted-health preflight before invoking the strategy runner. A blocked tick is recorded as scheduler audit state and operator notification only; it must not create a strategy decision, order intent, cancellation, or order lifecycle mutation by itself.
 If multiple scheduled market timers become due together, the scheduler queues those market cycles for the exchange account before invoking the strategy runner, so a healthy second market does not become a skipped lifecycle-adjacent audit record solely due to the account-scoped runner lock.
-In `LIVE`, if a scheduled market cycle submits an order, remaining market cycles from that same scheduler batch are persisted as `SKIPPED` and deferred to the next interval. This is scheduler audit state, not an order lifecycle transition, and it prevents another strategy decision from being created before account health is refreshed after the exchange mutation.
+In `LIVE`, if a scheduled market cycle submits an order, remaining market cycles from that same one-second scheduler batch are persisted as `SKIPPED` and deferred to the next interval. This is scheduler audit state, not an order lifecycle transition, and it prevents another strategy decision from being created before account health is refreshed after the exchange mutation.
 Each manual `LIVE` `/run BTC|ETH` also runs persisted-health preflight before invoking the strategy runner. A blocked manual run is an operator response only; it must not create a strategy decision, order intent, cancellation, or reconciliation mutation by itself.
 `/preview BTC|ETH` may compute a strategy decision and order-intent preview, but because it does not persist the decision or create an order intent, it is not a reconciliation trigger.
 If the strategy is flat for an asset, bearish invalidation evidence is represented as no-order `HOLD` rather than an `EXIT` or `REDUCE` lifecycle trigger.

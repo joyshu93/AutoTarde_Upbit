@@ -9,6 +9,8 @@ import type {
 
 const MANAGED_ASSETS: readonly SupportedAsset[] = ["BTC", "ETH"] as const;
 const FLOATING_POINT_EPSILON = 1e-9;
+const KRW_DUST_TOLERANCE = 1;
+const FILL_SNAPSHOT_START_GRACE_MS = 1_000;
 
 export interface PortfolioDriftFinding {
   code: "BALANCE_DRIFT_DETECTED" | "POSITION_DRIFT_DETECTED";
@@ -65,43 +67,41 @@ function detectBalanceDrift(input: {
     };
   }
 
-  const fillsSincePrevious = input.fills.filter(
-    (fill) =>
-      isExchangeBackedFill(fill) &&
-      isTimestampWithinSnapshotWindow(
-        fill.filledAt,
-        input.previousBalanceSnapshot!.capturedAt,
-        input.currentBalanceSnapshot!.capturedAt,
-      ),
+  const fillsSincePrevious = selectFillsWithinSnapshotWindow(
+    input.fills,
+    input.previousBalanceSnapshot!.capturedAt,
+    input.currentBalanceSnapshot!.capturedAt,
   );
-  const explained = aggregateFillDeltas(fillsSincePrevious);
-  const actualKrwDelta = current.KRW - previous.KRW;
-  const unexplainedKrwDelta = actualKrwDelta - explained.KRW;
-  if (isEffectivelyZero(unexplainedKrwDelta)) {
+  const finding = buildBalanceDriftFinding({
+    previous,
+    current,
+    fills: fillsSincePrevious,
+    previousCapturedAt: input.previousBalanceSnapshot!.capturedAt,
+    currentCapturedAt: input.currentBalanceSnapshot!.capturedAt,
+  });
+  if (!finding) {
     return {
       compared: true,
       finding: null,
     };
   }
 
+  const graceFinding = buildBalanceDriftFinding({
+    previous,
+    current,
+    fills: selectFillsWithinSnapshotWindow(
+      input.fills,
+      input.previousBalanceSnapshot!.capturedAt,
+      input.currentBalanceSnapshot!.capturedAt,
+      FILL_SNAPSHOT_START_GRACE_MS,
+    ),
+    previousCapturedAt: input.previousBalanceSnapshot!.capturedAt,
+    currentCapturedAt: input.currentBalanceSnapshot!.capturedAt,
+  });
+
   return {
     compared: true,
-    finding: {
-      code: "BALANCE_DRIFT_DETECTED",
-      message:
-        `KRW balance changed by ${formatSignedNumber(actualKrwDelta)} while local fills explain ${formatSignedNumber(explained.KRW)} between ` +
-        `${input.previousBalanceSnapshot!.capturedAt} and ${input.currentBalanceSnapshot!.capturedAt}.`,
-      payload: {
-        previousCapturedAt: input.previousBalanceSnapshot!.capturedAt,
-        currentCapturedAt: input.currentBalanceSnapshot!.capturedAt,
-        previousKrw: previous.KRW,
-        currentKrw: current.KRW,
-        actualKrwDelta,
-        explainedKrwDelta: explained.KRW,
-        unexplainedKrwDelta,
-        fillsConsidered: fillsSincePrevious.length,
-      },
-    },
+    finding: graceFinding,
   };
 }
 
@@ -122,19 +122,87 @@ function detectPositionDrift(input: {
     };
   }
 
-  const fillsSincePrevious = input.fills.filter(
-    (fill) =>
-      isExchangeBackedFill(fill) &&
-      isTimestampWithinSnapshotWindow(
-        fill.filledAt,
-        input.previousPositionSnapshot!.capturedAt,
-        input.currentPositionSnapshot!.capturedAt,
-      ),
+  const fillsSincePrevious = selectFillsWithinSnapshotWindow(
+    input.fills,
+    input.previousPositionSnapshot!.capturedAt,
+    input.currentPositionSnapshot!.capturedAt,
   );
-  const explained = aggregateFillDeltas(fillsSincePrevious);
+  const finding = buildPositionDriftFinding({
+    previous,
+    current,
+    fills: fillsSincePrevious,
+    previousCapturedAt: input.previousPositionSnapshot!.capturedAt,
+    currentCapturedAt: input.currentPositionSnapshot!.capturedAt,
+  });
+  if (!finding) {
+    return {
+      compared: true,
+      finding: null,
+    };
+  }
+
+  const graceFinding = buildPositionDriftFinding({
+    previous,
+    current,
+    fills: selectFillsWithinSnapshotWindow(
+      input.fills,
+      input.previousPositionSnapshot!.capturedAt,
+      input.currentPositionSnapshot!.capturedAt,
+      FILL_SNAPSHOT_START_GRACE_MS,
+    ),
+    previousCapturedAt: input.previousPositionSnapshot!.capturedAt,
+    currentCapturedAt: input.currentPositionSnapshot!.capturedAt,
+  });
+
+  return {
+    compared: true,
+    finding: graceFinding,
+  };
+}
+
+function buildBalanceDriftFinding(input: {
+  previous: { KRW: number; BTC: number; ETH: number };
+  current: { KRW: number; BTC: number; ETH: number };
+  fills: FillRecord[];
+  previousCapturedAt: string;
+  currentCapturedAt: string;
+}): PortfolioDriftFinding | null {
+  const explained = aggregateFillDeltas(input.fills);
+  const actualKrwDelta = input.current.KRW - input.previous.KRW;
+  const unexplainedKrwDelta = actualKrwDelta - explained.KRW;
+  if (isEffectivelyZero(unexplainedKrwDelta, KRW_DUST_TOLERANCE)) {
+    return null;
+  }
+
+  return {
+    code: "BALANCE_DRIFT_DETECTED",
+    message:
+      `KRW balance changed by ${formatSignedNumber(actualKrwDelta)} while local fills explain ${formatSignedNumber(explained.KRW)} between ` +
+      `${input.previousCapturedAt} and ${input.currentCapturedAt}.`,
+    payload: {
+      previousCapturedAt: input.previousCapturedAt,
+      currentCapturedAt: input.currentCapturedAt,
+      previousKrw: input.previous.KRW,
+      currentKrw: input.current.KRW,
+      actualKrwDelta,
+      explainedKrwDelta: explained.KRW,
+      unexplainedKrwDelta,
+      fillsConsidered: input.fills.length,
+    },
+  };
+}
+
+function buildPositionDriftFinding(input: {
+  previous: Record<SupportedAsset, number>;
+  current: Record<SupportedAsset, number>;
+  fills: FillRecord[];
+  previousCapturedAt: string;
+  currentCapturedAt: string;
+}): PortfolioDriftFinding | null {
+  const explained = aggregateFillDeltas(input.fills);
   const residualByAsset = MANAGED_ASSETS.reduce<Record<SupportedAsset, number>>(
     (accumulator, asset) => {
-      accumulator[asset] = current[asset] - previous[asset] - explained[asset];
+      accumulator[asset] = input.current[asset] - input.previous[asset] - explained[asset];
       return accumulator;
     },
     { BTC: 0, ETH: 0 },
@@ -142,32 +210,26 @@ function detectPositionDrift(input: {
   const driftedAssets = MANAGED_ASSETS.filter((asset) => !isEffectivelyZero(residualByAsset[asset]));
 
   if (driftedAssets.length === 0) {
-    return {
-      compared: true,
-      finding: null,
-    };
+    return null;
   }
 
   return {
-    compared: true,
-    finding: {
-      code: "POSITION_DRIFT_DETECTED",
-      message:
-        `Managed position quantities drifted for ${driftedAssets.join(",")} between ${input.previousPositionSnapshot!.capturedAt} and ` +
-        `${input.currentPositionSnapshot!.capturedAt}.`,
-      payload: {
-        previousCapturedAt: input.previousPositionSnapshot!.capturedAt,
-        currentCapturedAt: input.currentPositionSnapshot!.capturedAt,
-        fillsConsidered: fillsSincePrevious.length,
-        assets: driftedAssets.map((asset) => ({
-          asset,
-          previousQuantity: previous[asset],
-          currentQuantity: current[asset],
-          actualQuantityDelta: current[asset] - previous[asset],
-          explainedQuantityDelta: explained[asset],
-          unexplainedQuantityDelta: residualByAsset[asset],
-        })),
-      },
+    code: "POSITION_DRIFT_DETECTED",
+    message:
+      `Managed position quantities drifted for ${driftedAssets.join(",")} between ${input.previousCapturedAt} and ` +
+      `${input.currentCapturedAt}.`,
+    payload: {
+      previousCapturedAt: input.previousCapturedAt,
+      currentCapturedAt: input.currentCapturedAt,
+      fillsConsidered: input.fills.length,
+      assets: driftedAssets.map((asset) => ({
+        asset,
+        previousQuantity: input.previous[asset],
+        currentQuantity: input.current[asset],
+        actualQuantityDelta: input.current[asset] - input.previous[asset],
+        explainedQuantityDelta: explained[asset],
+        unexplainedQuantityDelta: residualByAsset[asset],
+      })),
     },
   };
 }
@@ -266,10 +328,24 @@ function isExchangeBackedFill(fill: FillRecord): boolean {
   return parsed?.mode !== "DRY_RUN";
 }
 
+function selectFillsWithinSnapshotWindow(
+  fills: FillRecord[],
+  previousCapturedAt: string,
+  currentCapturedAt: string,
+  previousStartGraceMs = 0,
+): FillRecord[] {
+  return fills.filter(
+    (fill) =>
+      isExchangeBackedFill(fill) &&
+      isTimestampWithinSnapshotWindow(fill.filledAt, previousCapturedAt, currentCapturedAt, previousStartGraceMs),
+  );
+}
+
 function isTimestampWithinSnapshotWindow(
   timestamp: string,
   previousCapturedAt: string,
   currentCapturedAt: string,
+  previousStartGraceMs = 0,
 ): boolean {
   const instant = Date.parse(timestamp);
   const previous = Date.parse(previousCapturedAt);
@@ -279,7 +355,7 @@ function isTimestampWithinSnapshotWindow(
     return false;
   }
 
-  return instant > previous && instant <= current;
+  return instant > previous - previousStartGraceMs && instant <= current;
 }
 
 function tryParseJson<T>(rawJson: string): T | null {
@@ -290,8 +366,8 @@ function tryParseJson<T>(rawJson: string): T | null {
   }
 }
 
-function isEffectivelyZero(value: number): boolean {
-  return Math.abs(value) <= FLOATING_POINT_EPSILON;
+function isEffectivelyZero(value: number, tolerance = FLOATING_POINT_EPSILON): boolean {
+  return Math.abs(value) <= tolerance + FLOATING_POINT_EPSILON;
 }
 
 function formatSignedNumber(value: number): string {

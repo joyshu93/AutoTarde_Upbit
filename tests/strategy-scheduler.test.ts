@@ -724,6 +724,82 @@ test("strategy scheduler skips remaining same-batch market ticks after an order 
   assert.equal(notifications[1]?.notificationType, "SCHEDULER_RUN_SKIPPED");
 });
 
+test("strategy scheduler treats millisecond-staggered same-second timers as one order-deferral batch", async () => {
+  const scheduledCallbacks: Array<() => void> = [];
+  const requests: string[] = [];
+  const repository = new InMemoryExecutionRepository();
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [
+        {
+          market: "KRW-BTC",
+          intervalMs: 3_600_000,
+        },
+        {
+          market: "KRW-ETH",
+          intervalMs: 3_600_000,
+        },
+      ],
+    },
+    controller: createController({
+      async requestRun(request) {
+        requests.push(request.market);
+        return {
+          status: "COMPLETED",
+          requestedAt: "2026-04-20T01:00:00.000Z",
+          market: request.market,
+          strategyDecisionId: `strategy-decision-${request.market}`,
+          action: request.market === "KRW-BTC" ? "ENTER" : "HOLD",
+          orderId: request.market === "KRW-BTC" ? "order-btc-enter" : null,
+          orderStatus: request.market === "KRW-BTC" ? "OPEN" : null,
+          submissionAccepted: request.market === "KRW-BTC" ? true : null,
+          detail: request.market === "KRW-BTC"
+            ? "Decision ENTER persisted and submitted through the configured execution path."
+            : "Decision HOLD persisted; no order submission was requested.",
+        };
+      },
+    }),
+    repositories: repository,
+    now: createNowSequence([
+      "2026-04-20T00:00:00.100Z",
+      "2026-04-20T00:00:00.700Z",
+      "2026-04-20T01:00:00.100Z",
+      "2026-04-20T01:00:00.700Z",
+      "2026-04-20T01:00:01.000Z",
+      "2026-04-20T01:00:02.000Z",
+      "2026-04-20T01:00:03.000Z",
+    ]),
+    setTimer: (callback) => {
+      scheduledCallbacks.push(callback);
+      const timer = setTimeout(callback, 0);
+      clearTimeout(timer);
+      return timer;
+    },
+  });
+
+  scheduler.start();
+  scheduledCallbacks[0]?.();
+  scheduledCallbacks[1]?.();
+  await waitForMicrotasks();
+  await waitForMicrotasks();
+  await waitForMicrotasks();
+
+  const status = scheduler.getStatus();
+  const persistedRuns = await repository.listStrategySchedulerRuns("primary", 5);
+
+  assert.deepEqual(requests, ["KRW-BTC"]);
+  assert.equal(status.markets[0]?.lastStatus, "COMPLETED");
+  assert.equal(status.markets[1]?.lastStatus, "SKIPPED");
+  assert.deepEqual(
+    persistedRuns.map((run) => `${run.market}:${run.status}`).sort(),
+    ["KRW-BTC:COMPLETED", "KRW-ETH:SKIPPED"],
+  );
+});
+
 test("strategy scheduler blocks a market run when before-run preflight blocks it", async () => {
   let controllerCalled = false;
   const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];

@@ -80,6 +80,7 @@ Current remaining gaps:
 - reconciliation now repairs older local dry-run artifacts without querying Upbit for `dryrun_*` UUIDs
 - portfolio drift detection ignores simulated `DRY_RUN` fills because those fills do not mutate Upbit balances
 - portfolio drift detection compares fill and snapshot timestamps as parsed instants, so Upbit timezone-offset fill timestamps are not reused outside their actual snapshot window
+- portfolio drift detection uses a bounded one-second start-window grace only when a nearby exchange fill explains an otherwise-drifting window, preventing false drift from Upbit whole-second trade timestamps against millisecond local snapshots
 - `/orders` now returns a bounded recent-order summary and points operators to `/order <id|identifier>` for details
 - `/readiness` treats exchange-history recovery progress as a warning instead of blocking when no portfolio drift or unresolved order recovery remains
 - Telegram `/start` is handled as a `/help` alias
@@ -87,7 +88,7 @@ Current remaining gaps:
 - live scheduler startup blocks now persist an operator notification before startup can close local persistence
 - live scheduler ticks now first refresh exchange-backed account-health evidence with reconciliation source `SCHEDULER_PREFLIGHT`, then re-run the persisted-health preflight before the strategy runner is invoked, so stale or unsafe account-health evidence blocks the scheduled cycle before any strategy decision or order intent is created
 - simultaneous scheduler timer ticks are queued across BTC/ETH for the exchange account, so one market is not skipped only because the other market is already inside the account-scoped runner
-- in `LIVE`, if one scheduled market tick submits an order, remaining market ticks from that same scheduler batch are persisted as `SKIPPED` and deferred to the next interval
+- in `LIVE`, if one scheduled market tick submits an order, remaining market ticks from that same one-second scheduler batch are persisted as `SKIPPED` and deferred to the next interval
 - manual `LIVE` `/run BTC|ETH` now also runs persisted-health preflight before the strategy runner is invoked, even when the scheduler is disabled
 - execution minimum-value checks now derive market-sell notional from strategy reference price and requested quantity when the Upbit order shape carries volume but no order price
 - exposure cap projection now treats `ask` orders as risk-reducing instead of adding sell notional to current exposure
@@ -123,7 +124,7 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 16. In `LIVE` mode, scheduler startup runs an automatic preflight before any timer is installed; this replaces a mandatory manual-first-run ritual with inspectable startup safety checks and rejects stale persisted account-health evidence.
 17. In `LIVE` mode, each scheduled tick first runs exchange-backed account-health refresh with reconciliation source `SCHEDULER_PREFLIGHT`, then re-runs persisted-health preflight before invoking the strategy runner; a refresh or preflight block is persisted as scheduler audit state without creating a strategy decision or order intent.
 18. Simultaneous configured market ticks are queued for the exchange account before strategy runner invocation so BTC/ETH timers do not collide with the account-scoped runner lock.
-19. In `LIVE`, if one scheduled tick submits an order, remaining ticks from the same scheduler batch are persisted as `SKIPPED` and deferred to the next interval.
+19. In `LIVE`, if one scheduled tick submits an order, remaining ticks from the same one-second scheduler batch are persisted as `SKIPPED` and deferred to the next interval.
 20. Manual `/run BTC|ETH` in `LIVE` re-runs persisted-health preflight before invoking the strategy runner and returns a block as an operator response without creating a strategy decision or order intent.
 21. Scheduler-triggered cycles are persisted in `strategy_scheduler_runs` before runner execution and updated on completion, failure, or skip; `/scheduler` exposes current runtime scheduler status plus a fuller read-only history than the compact `/status` summary.
 22. Reconciliation records now carry source metadata such as `STARTUP_RECOVERY`, `OPERATOR_SYNC`, and `SCHEDULER_PREFLIGHT`, compare fill windows by parsed instants, and use a per-run lookup budget to avoid unbounded private order reads.
@@ -257,7 +258,8 @@ The strategy scheduler is disabled unless `STRATEGY_SCHEDULER_ENABLED=true`.
 When enabled, `STRATEGY_SCHEDULER_BTC_INTERVAL_MS` and `STRATEGY_SCHEDULER_ETH_INTERVAL_MS` control the BTC/ETH cadence, and `STRATEGY_SCHEDULER_RUN_ON_START=true` requests an immediate first tick after startup recovery policy has completed.
 When `RUN_ON_START=true`, configured markets are run sequentially before their regular interval timers are scheduled, so BTC and ETH do not collide with the account-scoped strategy runner lock at startup.
 Regular interval timers are also queued across configured markets when they become due together, so simultaneous BTC/ETH ticks are processed one after the other instead of marking the second market `ALREADY_RUNNING`.
-In `LIVE`, if a queued scheduled tick submits an order, later ticks from the same scheduler batch are recorded as `SKIPPED` and wait for their next configured interval.
+In `LIVE`, if a queued scheduled tick submits an order, later ticks from the same one-second scheduler batch are recorded as `SKIPPED` and wait for their next configured interval.
+Upbit `price` market buys can report exchange state `cancel` after a successful fill when only dust-sized KRW or fee lock remains. The local lifecycle records those filled market-buy dust-cancel snapshots as `FILLED` while preserving the raw exchange payload, fill, and fee evidence for `/order` inspection. If an older local row already stored that pattern as `CANCELED`, terminal reconciliation rechecks and repairs it to `FILLED`.
 The scheduler still uses the same runner/controller path as `/run BTC|ETH`, so it does not enable live order transmission by itself.
 If the scheduler is enabled while `APP_EXECUTION_MODE=LIVE`, startup first runs an automatic scheduler preflight. It blocks timer installation unless the live gate is enabled, the execution service is wired to the live adapter, operator state is `RUNNING`, Upbit read credentials and fresh persisted snapshots exist, no active local orders require visibility, and the latest reconciliation is fresh and has no blocking issue codes. Freshness uses the shortest configured scheduler interval, so with the default one-hour BTC/ETH intervals a snapshot or reconciliation older than one hour blocks automatic scheduler startup. Non-blocking exchange-history recovery evidence remains a warning.
 If that live scheduler startup preflight blocks timer installation, the runtime persists a `SCHEDULER_STARTUP_BLOCKED` operator notification with the preflight detail and failed checks before local persistence can be closed.

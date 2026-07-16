@@ -109,6 +109,293 @@ test("reconciliation service updates active orders from exchange state and captu
   assert.equal(fills[0]?.exchangeFillId, "trade-1");
 });
 
+test("reconciliation service falls back to order paid fee when Upbit trade fill omits fee", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-paid-fee-fallback",
+    exchangeAccountId: "primary",
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-07-13T10:31:00.000Z",
+  });
+  await repositories.saveOrder({
+    id: "order-paid-fee-fallback",
+    strategyDecisionId: "decision-paid-fee-fallback",
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    side: "ask",
+    ordType: "market",
+    volume: "0.00036247",
+    price: null,
+    timeInForce: null,
+    smpType: null,
+    identifier: "KRW-BTC-ask-paid-fee",
+    idempotencyKey: "idem-paid-fee-fallback",
+    origin: "STRATEGY",
+    requestedAt: "2026-07-13T10:31:00.000Z",
+    upbitUuid: "uuid-paid-fee-fallback",
+    status: "OPEN",
+    executionMode: "LIVE",
+    exchangeResponseJson: null,
+    failureCode: null,
+    failureMessage: null,
+    createdAt: "2026-07-13T10:31:00.000Z",
+    updatedAt: "2026-07-13T10:31:00.000Z",
+  });
+
+  const service = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: {
+      async getOrder() {
+        return {
+          uuid: "uuid-paid-fee-fallback",
+          identifier: "KRW-BTC-ask-paid-fee",
+          market: "KRW-BTC",
+          side: "ask",
+          ordType: "market",
+          state: "done",
+          price: null,
+          volume: "0.00036247",
+          remainingVolume: "0",
+          executedVolume: "0.00036247",
+          paidFee: "16.94148533",
+          createdAt: "2026-07-13T19:31:57+09:00",
+          fills: [
+            {
+              tradeUuid: "trade-paid-fee-fallback",
+              side: "ask",
+              price: "93478000",
+              volume: "0.00036247",
+              funds: "33882.97066",
+              fee: null,
+              createdAt: "2026-07-13T19:31:57+09:00",
+              raw: {
+                uuid: "trade-paid-fee-fallback",
+                funds: "33882.97066",
+              },
+            },
+          ],
+          raw: {
+            state: "done",
+            paid_fee: "16.94148533",
+          },
+        };
+      },
+    },
+  });
+
+  await service.run("primary");
+  const fills = await repositories.listFills("order-paid-fee-fallback");
+
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0]?.feeCurrency, "KRW");
+  assert.equal(fills[0]?.feeAmount, "16.94148533");
+});
+
+test("reconciliation service treats filled Upbit price bids with canceled dust as filled", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-price-bid-dust-cancel",
+    exchangeAccountId: "primary",
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-07-14T16:51:00.000Z",
+  });
+  await repositories.saveOrder({
+    id: "order-price-bid-dust-cancel",
+    strategyDecisionId: "decision-price-bid-dust-cancel",
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    side: "bid",
+    ordType: "price",
+    volume: null,
+    price: "18069.657320999999",
+    timeInForce: null,
+    smpType: null,
+    identifier: "KRW-BTC-bid-dust-cancel",
+    idempotencyKey: "idem-price-bid-dust-cancel",
+    origin: "STRATEGY",
+    requestedAt: "2026-07-14T16:51:10.532Z",
+    upbitUuid: "uuid-price-bid-dust-cancel",
+    status: "OPEN",
+    executionMode: "LIVE",
+    exchangeResponseJson: null,
+    failureCode: null,
+    failureMessage: null,
+    createdAt: "2026-07-14T16:51:10.532Z",
+    updatedAt: "2026-07-14T16:51:10.532Z",
+  });
+
+  const service = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: {
+      async getOrder() {
+        return {
+          uuid: "uuid-price-bid-dust-cancel",
+          identifier: "KRW-BTC-bid-dust-cancel",
+          market: "KRW-BTC",
+          side: "bid",
+          ordType: "price",
+          state: "cancel",
+          price: "18069.657320999999",
+          volume: null,
+          remainingVolume: null,
+          executedVolume: "0.00018945",
+          paidFee: "9.034586325",
+          createdAt: "2026-07-15T01:51:10+09:00",
+          fills: [
+            {
+              tradeUuid: "trade-price-bid-dust-cancel",
+              side: "bid",
+              price: "95377000",
+              volume: "0.00018945",
+              funds: "18069.17265",
+              fee: null,
+              createdAt: "2026-07-15T01:51:10.745053+09:00",
+              raw: {
+                uuid: "trade-price-bid-dust-cancel",
+                funds: "18069.17265",
+              },
+            },
+          ],
+          raw: {
+            state: "cancel",
+            ord_type: "price",
+            executed_volume: "0.00018945",
+            paid_fee: "9.034586325",
+            locked: "0.484913325495",
+          },
+        };
+      },
+    },
+  });
+
+  await service.run("primary");
+  const orders = await repositories.listOrders("primary");
+  const activeOrders = await repositories.listActiveOrders("primary");
+  const fills = await repositories.listFills("order-price-bid-dust-cancel");
+
+  assert.equal(orders[0]?.status, "FILLED");
+  assert.equal(activeOrders.length, 0);
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0]?.feeAmount, "9.034586325");
+});
+
+test("reconciliation service rechecks stored canceled price bids with fill evidence", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-stored-canceled-price-bid",
+    exchangeAccountId: "primary",
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-07-14T16:51:00.000Z",
+  });
+  await repositories.saveOrder({
+    id: "order-stored-canceled-price-bid",
+    strategyDecisionId: "decision-stored-canceled-price-bid",
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    side: "bid",
+    ordType: "price",
+    volume: null,
+    price: "18069.657320999999",
+    timeInForce: null,
+    smpType: null,
+    identifier: "KRW-BTC-bid-stored-cancel",
+    idempotencyKey: "idem-stored-canceled-price-bid",
+    origin: "STRATEGY",
+    requestedAt: "2026-07-14T16:51:10.532Z",
+    upbitUuid: "uuid-stored-canceled-price-bid",
+    status: "CANCELED",
+    executionMode: "LIVE",
+    exchangeResponseJson: JSON.stringify({
+      state: "cancel",
+      ord_type: "price",
+      executed_volume: "0.00018945",
+      paid_fee: "9.034586325",
+      locked: "0.484913325495",
+    }),
+    failureCode: null,
+    failureMessage: null,
+    createdAt: "2026-07-14T16:51:10.532Z",
+    updatedAt: "2026-07-14T16:51:11.000Z",
+  });
+
+  const service = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: {
+      async getOrder() {
+        return {
+          uuid: "uuid-stored-canceled-price-bid",
+          identifier: "KRW-BTC-bid-stored-cancel",
+          market: "KRW-BTC",
+          side: "bid",
+          ordType: "price",
+          state: "cancel",
+          price: "18069.657320999999",
+          volume: null,
+          remainingVolume: null,
+          executedVolume: "0.00018945",
+          paidFee: "9.034586325",
+          createdAt: "2026-07-15T01:51:10+09:00",
+          fills: [
+            {
+              tradeUuid: "trade-stored-canceled-price-bid",
+              side: "bid",
+              price: "95377000",
+              volume: "0.00018945",
+              funds: "18069.17265",
+              fee: null,
+              createdAt: "2026-07-15T01:51:10.745053+09:00",
+              raw: {
+                uuid: "trade-stored-canceled-price-bid",
+                funds: "18069.17265",
+              },
+            },
+          ],
+          raw: {
+            state: "cancel",
+            ord_type: "price",
+            executed_volume: "0.00018945",
+            paid_fee: "9.034586325",
+          },
+        };
+      },
+    },
+  });
+
+  const summary = await service.run("primary");
+  const orders = await repositories.listOrders("primary");
+  const fills = await repositories.listFills("order-stored-canceled-price-bid");
+
+  assert.equal(summary.candidateCount, 1);
+  assert.deepEqual(
+    summary.issues.map((issue) => issue.code),
+    ["TERMINAL_ORDER_RECHECKED", "ORDER_STATUS_RECONCILED", "ORDER_FILLS_BACKFILLED"],
+  );
+  assert.equal(orders[0]?.status, "FILLED");
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0]?.feeAmount, "9.034586325");
+});
+
 test("reconciliation service repairs local dry-run orders without querying Upbit", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = new InMemoryOperatorStateStore({

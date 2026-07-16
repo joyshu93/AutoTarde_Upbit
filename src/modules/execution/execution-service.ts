@@ -227,7 +227,7 @@ export class ExecutionService {
       const updatedOrder: OrderRecord = {
         ...order,
         upbitUuid: exchangeOrder.uuid,
-        status: mapExchangeOrderStatus(exchangeOrder.state, exchangeOrder.executedVolume),
+        status: mapExchangeOrderStatus(exchangeOrder.state, exchangeOrder.executedVolume, exchangeOrder.ordType, exchangeOrder.side),
         exchangeResponseJson: JSON.stringify(exchangeOrder.raw),
         updatedAt: submittedAt,
       };
@@ -565,15 +565,24 @@ function composeExecutionPolicy(
 function mapExchangeOrderStatus(
   exchangeState: string,
   executedVolume: string | null,
+  ordType?: string,
+  side?: string,
 ): OrderRecord["status"] {
   if (exchangeState === "done") {
     return "FILLED";
   }
   if (exchangeState === "cancel") {
+    if (side === "bid" && ordType === "price" && hasExecutedVolume(executedVolume)) {
+      return "FILLED";
+    }
     return "CANCELED";
   }
 
-  return executedVolume && Number(executedVolume) > 0 ? "PARTIALLY_FILLED" : "OPEN";
+  return hasExecutedVolume(executedVolume) ? "PARTIALLY_FILLED" : "OPEN";
+}
+
+function hasExecutedVolume(executedVolume: string | null): boolean {
+  return Boolean(executedVolume && Number(executedVolume) > 0);
 }
 
 function createDryRunSyntheticFill(input: {

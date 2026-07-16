@@ -58,7 +58,7 @@ Current strategy direction:
 - live-mode scheduler startup now has an automatic preflight gate before timers are installed
 - live-mode scheduled ticks first refresh exchange-backed account-health evidence with reconciliation source `SCHEDULER_PREFLIGHT`, then re-run the persisted-health preflight before invoking the strategy runner
 - regular scheduler timer ticks are queued across configured markets for the exchange account, so simultaneous BTC/ETH timers do not produce account-lock `ALREADY_RUNNING` skips
-- in `LIVE`, once a scheduled market tick submits an order, remaining market ticks from that same scheduler batch are persisted as `SKIPPED` and deferred to the next interval
+- in `LIVE`, once a scheduled market tick submits an order, remaining market ticks from that same scheduler batch are persisted as `SKIPPED` and deferred to the next interval; scheduler batches use one-second granularity so millisecond-staggered BTC/ETH timers from the same cadence still share the same batch
 
 ### `risk`
 
@@ -115,6 +115,9 @@ Current slice:
 - local dry-run order repair during reconciliation, so `dryrun_*` UUIDs are never queried against Upbit as real exchange orders
 - terminal-order fill backfill during `/sync`
 - balance and position drift detection by comparing new exchange-backed snapshots against the prior persisted snapshots plus local fill history, using parsed timestamp instants rather than raw timestamp text
+- fill backfill preserves Upbit order-level `paid_fee` as KRW fill-fee evidence when individual trade rows omit fee data, and KRW balance drift detection tolerates only explicit 1 KRW rounding dust after fee-adjusted fills
+- portfolio drift detection re-evaluates otherwise-drifting windows with a bounded one-second fill-start grace so Upbit trade timestamps rounded to whole seconds do not create false drift when the fill explains the later snapshot
+- terminal reconciliation rechecks stored canceled `bid`/`price` orders when the local raw payload or fill ledger shows executed volume, repairing filled Upbit market-buy dust-cancel records to local `FILLED`
 - portfolio drift detection excludes simulated `DRY_RUN` fills because they do not mutate exchange balances
 - startup recovery sweep when exchange-backed Upbit reads are configured
 - per-run reconciliation lookup budgeting with oldest-first processing inside each priority tier
@@ -253,6 +256,7 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 - requires both `APP_EXECUTION_MODE=LIVE` and `ENABLE_LIVE_ORDERS=true`
 - requires configured Upbit credentials before the live adapter can become the send path
 - must still use the same order lifecycle tables and risk gates
+- Upbit `price` market buys can return exchange state `cancel` after a successful fill when only dust-sized KRW or fee lock remains; filled `bid`/`price` snapshots are treated as local `FILLED` while preserving the raw exchange response, fill, and fee evidence
 
 ## Runtime Flow
 
@@ -264,7 +268,7 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 6. Before each `LIVE` scheduled tick, run an exchange-backed account-health refresh that persists balance snapshots, position snapshots, and reconciliation evidence with source `SCHEDULER_PREFLIGHT`.
 7. After that refresh, re-run the same persisted-health preflight and fail the scheduler run without creating a strategy decision if the account-health evidence is stale or unsafe.
 8. If multiple configured market timers become due together, queue their scheduled strategy cycles for the exchange account instead of letting the account-scoped runner lock skip one market.
-9. If a `LIVE` scheduled tick submits an order, record remaining ticks from the same scheduler batch as `SKIPPED` and defer them to the next interval.
+9. If a `LIVE` scheduled tick submits an order, record remaining ticks from the same one-second scheduler batch as `SKIPPED` and defer them to the next interval.
 10. Build a deterministic strategy decision, either from an explicit operator `/run BTC|ETH` request or the disabled-by-default scheduler.
 11. Convert the decision into an order intent with an idempotency key.
 12. Run risk guards.

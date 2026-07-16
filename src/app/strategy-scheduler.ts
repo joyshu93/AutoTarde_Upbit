@@ -34,6 +34,7 @@ export interface StrategySchedulerAccountRefreshResult {
 }
 
 type SchedulerTimer = ReturnType<typeof setTimeout>;
+const SCHEDULER_BATCH_KEY_GRANULARITY_MS = 1_000;
 
 export class StrategyScheduler {
   private started = false;
@@ -402,10 +403,11 @@ export class StrategyScheduler {
     }
 
     const nextRunAt = new Date(Date.parse(this.now()) + delayMs).toISOString();
+    const batchKey = buildSchedulerBatchKey(nextRunAt);
     this.updateMarketStatus(config.market, { nextRunAt });
     const timer = (this.dependencies.setTimer ?? setTimeout)(() => {
       this.timers.delete(config.market);
-      void this.enqueueScheduledMarketRun(config, nextRunAt)
+      void this.enqueueScheduledMarketRun(config, batchKey)
         .finally(() => this.scheduleMarket(config, config.intervalMs));
     }, delayMs);
 
@@ -834,6 +836,17 @@ function isSchedulerRunError(result: TelegramStrategyRunResult | null): result i
       result.status !== "ALREADY_RUNNING" &&
       result.status !== "SKIPPED",
   );
+}
+
+function buildSchedulerBatchKey(nextRunAt: string): string {
+  const timestamp = Date.parse(nextRunAt);
+  if (!Number.isFinite(timestamp)) {
+    return nextRunAt;
+  }
+
+  return new Date(
+    Math.floor(timestamp / SCHEDULER_BATCH_KEY_GRANULARITY_MS) * SCHEDULER_BATCH_KEY_GRANULARITY_MS,
+  ).toISOString();
 }
 
 export function createDefaultStrategySchedulerConfig(input: {
