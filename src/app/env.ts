@@ -4,6 +4,10 @@ import type {
   LiveExecutionGate,
   SupportedAsset,
 } from "../domain/types.js";
+import {
+  normalizeTelegramLocale,
+  type TelegramLocale,
+} from "../modules/telegram/presentation/locale.js";
 
 export interface AppConfig {
   serviceName: string;
@@ -12,6 +16,7 @@ export interface AppConfig {
   globalKillSwitch: boolean;
   upbitBaseUrl: string;
   databasePath: string;
+  telegramLocale: TelegramLocale;
   telegramDeliveryEnabled: boolean;
   telegramBotToken: string | null;
   telegramOperatorChatId: string | null;
@@ -75,6 +80,7 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     globalKillSwitch: parseBoolean(env.GLOBAL_KILL_SWITCH),
     upbitBaseUrl: env.UPBIT_BASE_URL?.trim() || DEFAULT_UPBIT_BASE_URL,
     databasePath: env.DATABASE_PATH?.trim() || DEFAULT_DATABASE_PATH,
+    telegramLocale: normalizeTelegramLocale(env.TELEGRAM_LOCALE),
     telegramDeliveryEnabled: parseBoolean(env.ENABLE_TELEGRAM_DELIVERY),
     telegramBotToken: env.TELEGRAM_BOT_TOKEN?.trim() || null,
     telegramOperatorChatId: env.TELEGRAM_OPERATOR_CHAT_ID?.trim() || null,

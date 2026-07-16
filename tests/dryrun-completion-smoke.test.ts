@@ -176,6 +176,7 @@ function createConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     globalKillSwitch: false,
     upbitBaseUrl: "https://api.upbit.com",
     databasePath: "./var/autotrade-upbit.sqlite",
+    telegramLocale: "ko-KR",
     telegramDeliveryEnabled: false,
     telegramBotToken: null,
     telegramOperatorChatId: null,

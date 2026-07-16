@@ -14,6 +14,7 @@ import type {
 } from "../../domain/types.js";
 import type { ExecutionRepository, OperatorStateStore, TelegramInboundOffsetStore } from "../db/interfaces.js";
 import type { TelegramInboundPollingStatus } from "./inbound.js";
+import type { TelegramLocale } from "./presentation/locale.js";
 
 export interface TelegramResponse {
   text: string;
@@ -107,6 +108,7 @@ export interface TelegramRuntimeConfigSnapshot {
   readonly liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
   readonly upbitBaseUrl: string;
   readonly databasePath: string;
+  readonly telegramLocale: TelegramLocale;
   readonly exchangeBackedReadEnabled: boolean;
   readonly telegramDeliveryEnabled: boolean;
   readonly telegramBotTokenConfigured: boolean;
@@ -139,6 +141,7 @@ export interface TelegramRouterDependencies {
   readonly operatorState: OperatorStateStore;
   readonly repositories: ExecutionRepository;
   readonly runtimeConfig?: TelegramRuntimeConfigSnapshot;
+  readonly locale?: TelegramLocale;
   readonly executionStateSeed?: ExecutionStateSeed;
   readonly liveSendPath?: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
   readonly syncController?: TelegramSyncController;

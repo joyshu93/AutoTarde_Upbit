@@ -390,6 +390,7 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
     liveSendPath: "DRY_RUN_ADAPTER",
     upbitBaseUrl: "https://api.upbit.com",
     databasePath: "./var/autotrade-upbit.sqlite",
+    telegramLocale: "ko-KR",
     exchangeBackedReadEnabled: false,
     telegramDeliveryEnabled: false,
     telegramBotTokenConfigured: false,

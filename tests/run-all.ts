@@ -3,6 +3,7 @@ await import("./create-app.test.js");
 await import("./db-sqlite-wiring.test.js");
 await import("./risk-guards.test.js");
 await import("./telegram-commands.test.js");
+await import("./telegram-presentation.test.js");
 await import("./snapshot-service.test.js");
 await import("./portfolio-drift.test.js");
 await import("./reconciliation-service.test.js");

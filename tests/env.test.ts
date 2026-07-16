@@ -9,6 +9,7 @@ test("loadAppConfig defaults to DRY_RUN with live gate disabled", () => {
   assert.equal(config.executionMode, "DRY_RUN");
   assert.equal(config.liveExecutionGate, "DISABLED");
   assert.equal(config.telegramDeliveryEnabled, false);
+  assert.equal(config.telegramLocale, "ko-KR");
   assert.equal(config.telegramDeliveryMaxAttempts, 5);
   assert.equal(config.telegramDeliveryBaseBackoffMs, 15_000);
   assert.equal(config.telegramDeliveryMaxBackoffMs, 300_000);
@@ -33,6 +34,15 @@ test("loadAppConfig defaults to DRY_RUN with live gate disabled", () => {
   const riskLimits = buildExecutionRiskLimits(config);
   assert.equal(riskLimits.minimumOrderValueKrw, 5_000);
   assert.equal(riskLimits.totalExposureCap, 0.75);
+});
+
+test("loadAppConfig normalizes supported Telegram locales case-insensitively", () => {
+  assert.equal(loadAppConfig({ TELEGRAM_LOCALE: "KO-kr" }).telegramLocale, "ko-KR");
+  assert.equal(loadAppConfig({ TELEGRAM_LOCALE: "en-us" }).telegramLocale, "en-US");
+});
+
+test("loadAppConfig falls back to Korean for unsupported Telegram locales", () => {
+  assert.equal(loadAppConfig({ TELEGRAM_LOCALE: "ja-JP" }).telegramLocale, "ko-KR");
 });
 
 test("loadAppConfig surfaces deprecated ignored environment variables", () => {

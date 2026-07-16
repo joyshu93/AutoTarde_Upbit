@@ -61,6 +61,7 @@ export function createApp(
   config: AppConfig = loadAppConfig(),
   overrides: CreateAppOverrides = {},
 ): AppServices {
+  const telegramLocale = config.telegramLocale;
   const persistence = createSqlitePersistence({
     databasePath: config.databasePath,
     exchangeAccountId: "primary",
@@ -213,6 +214,7 @@ export function createApp(
   const telegramRouter = new TelegramCommandRouter({
     operatorState,
     repositories,
+    locale: telegramLocale,
     runtimeConfig: {
       serviceName: config.serviceName,
       executionMode: config.executionMode,
@@ -220,6 +222,7 @@ export function createApp(
       liveSendPath,
       upbitBaseUrl: config.upbitBaseUrl,
       databasePath: config.databasePath,
+      telegramLocale,
       exchangeBackedReadEnabled,
       telegramDeliveryEnabled: config.telegramDeliveryEnabled,
       telegramBotTokenConfigured: Boolean(config.telegramBotToken),
