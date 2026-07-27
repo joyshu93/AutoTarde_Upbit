@@ -154,6 +154,8 @@ It provides:
 - `/alerts` now also shows recent rows from the separate persisted `operator_notification_delivery_attempts` audit trail
 - `/alerts` now derives delivery-worker queue metrics including pending totals, due/scheduled counts, active/expired leases, abandoned-lease candidates, recent delivery-run summaries, and recent attempt outcome counts
 - `/risks` for read-only persisted risk_events inspection
+- locale-aware `/balances` and `/positions` summaries over the latest persisted exchange snapshots
+- `/balances detail` and `/positions detail` for the canonical technical snapshot output; all four forms use the same bounded local reads and never accept manual portfolio input
 - `/sync` for reconciliation-triggered snapshot and reconciliation record persistence with read-only public ticker valuation
 - `/preview BTC|ETH` for one non-mutating PositionGuard decision and order-intent preview
 - `/run BTC|ETH` for one deterministic PositionGuard strategy runner cycle through the configured safe execution path
@@ -183,6 +185,7 @@ It provides:
 
 `/help` is intentionally contract-derived and locale-aware. Presentation defaults to `ko-KR`, supports only `ko-KR` and `en-US`, and does not read repositories, poll Telegram, inspect exchange state, start sync, start strategy runs, start scheduler ticks, mutate orders, or enable live order transmission.
 `/status` is a locale-aware, inspection-only operator summary. `/status detail` preserves the canonical technical output and uses the same bounded repository reads; neither form calls Upbit, triggers reconciliation or strategy execution, starts scheduler work, mutates orders, or enables live order transmission.
+`/balances` and `/positions` are locale-aware, inspection-only summaries of the latest persisted exchange snapshots. Their `detail` forms preserve the canonical technical output. These commands do not call Upbit, trigger sync, infer holdings from Telegram, or accept manual cash or position input.
 `/config` is intentionally non-secret and runtime-derived; it renders configured/not-configured booleans for secrets, exposes ignored deprecated environment variable names when present, and never prints raw credentials, tokens, or chat identifiers.
 `/readiness` is an inspection-only, locale-aware summary with human-readable PASS/WARN/BLOCK guidance. `/readiness detail` preserves the canonical technical checks and safety boundaries. Both forms read the same bounded local state and runtime status, including active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count, but do not poll Telegram, call Upbit, start sync, run strategies, tick schedulers, mutate offsets, deliver notifications, or mutate orders.
 

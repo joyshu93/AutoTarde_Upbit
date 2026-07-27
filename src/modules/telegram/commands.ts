@@ -8,12 +8,14 @@ import {
 } from "./contracts.js";
 import {
   formatBalanceMessage,
+  formatBalanceSummaryMessage,
   formatControlCommandMessage,
   formatHelpMessage,
   formatOperatorNotificationsMessage,
   formatOrderDetailMessage,
   formatOrdersMessage,
   formatPositionMessage,
+  formatPositionSummaryMessage,
   formatReadinessMessage,
   formatReadinessSummaryMessage,
   formatReconciliationRunsMessage,
@@ -97,9 +99,15 @@ export class TelegramCommandRouter {
       case "/risks":
         return this.buildRiskEventsResponse(exchangeAccountId);
       case "/balances":
-        return { text: formatBalanceMessage(await this.dependencies.repositories.getLatestBalanceSnapshot(exchangeAccountId)) };
+        return this.buildBalanceResponse(
+          exchangeAccountId,
+          parsed.args[0]?.toLowerCase() === "detail",
+        );
       case "/positions":
-        return { text: formatPositionMessage(await this.dependencies.repositories.getLatestPositionSnapshot(exchangeAccountId)) };
+        return this.buildPositionResponse(
+          exchangeAccountId,
+          parsed.args[0]?.toLowerCase() === "detail",
+        );
       case "/orders":
         return { text: formatOrdersMessage(await this.dependencies.repositories.listOrders(exchangeAccountId), { limit: 20 }) };
       case "/order":
@@ -143,6 +151,36 @@ export class TelegramCommandRouter {
           text: buildUnsupportedCommandMessage(input),
         };
     }
+  }
+
+  private async buildBalanceResponse(
+    exchangeAccountId: string,
+    detail: boolean,
+  ): Promise<TelegramResponse> {
+    const snapshot = await this.dependencies.repositories.getLatestBalanceSnapshot(exchangeAccountId);
+    return {
+      text: detail
+        ? formatBalanceMessage(snapshot)
+        : formatBalanceSummaryMessage(
+            snapshot,
+            normalizeTelegramLocale(this.dependencies.locale),
+          ),
+    };
+  }
+
+  private async buildPositionResponse(
+    exchangeAccountId: string,
+    detail: boolean,
+  ): Promise<TelegramResponse> {
+    const snapshot = await this.dependencies.repositories.getLatestPositionSnapshot(exchangeAccountId);
+    return {
+      text: detail
+        ? formatPositionMessage(snapshot)
+        : formatPositionSummaryMessage(
+            snapshot,
+            normalizeTelegramLocale(this.dependencies.locale),
+          ),
+    };
   }
 
   private async requestSync(exchangeAccountId: string): Promise<TelegramSyncResult> {

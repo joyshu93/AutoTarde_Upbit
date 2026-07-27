@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 
 import type {
+  BalanceSnapshotRecord,
   ExecutionStateRecord,
   OperatorNotificationRecord,
   OrderRecord,
+  PositionSnapshotRecord,
   StrategySchedulerStatus,
 } from "../src/domain/types.js";
 import {
@@ -14,6 +16,8 @@ import {
 import { TelegramCommandRouter } from "../src/modules/telegram/commands.js";
 import { listTelegramCommandContracts } from "../src/modules/telegram/contracts.js";
 import {
+  formatBalanceMessage,
+  formatPositionMessage,
   formatReadinessMessage,
   formatStatusMessage,
 } from "../src/modules/telegram/formatter.js";
@@ -1059,6 +1063,523 @@ test("telegram router exposes static operator help without touching runtime stat
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+test("telegram router renders a Korean balance summary without floating-point artifacts", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const snapshot: BalanceSnapshotRecord = {
+    id: "balance-summary-ko",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:01:02.000Z",
+    source: "RECONCILIATION",
+    totalKrwValue: "8967.627519169999",
+    balancesJson: JSON.stringify([
+      {
+        currency: "KRW",
+        balance: "0.52358917",
+        locked: "0",
+        avgBuyPrice: "0",
+        unitCurrency: "KRW",
+      },
+      {
+        currency: "BTC",
+        balance: "0.00007489",
+        locked: "0.00000001",
+        avgBuyPrice: "115950000",
+        unitCurrency: "KRW",
+      },
+    ]),
+  };
+  await repository.saveBalanceSnapshot(snapshot);
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: createRouterState(),
+  });
+
+  const response = await router.route("/balances");
+
+  assert.match(response.text, /잔고 요약/);
+  assert.match(response.text, /기준 시각: 2026-04-20 09:01:02 KST/);
+  assert.match(response.text, /출처: 거래소 동기화 \(source: RECONCILIATION\)/);
+  assert.match(response.text, /총 평가금액: 8,968원/);
+  assert.match(response.text, /KRW/);
+  assert.match(response.text, /사용 가능: 0\.52358917 KRW/);
+  assert.match(response.text, /BTC/);
+  assert.match(response.text, /사용 가능: 0\.00007489 BTC/);
+  assert.match(response.text, /주문 중: 0\.00000001 BTC/);
+  assert.match(response.text, /평균 매수가: 115,950,000원/);
+  assert.match(response.text, /기술 상세: \/balances detail/);
+  assert.match(response.text, /Telegram에서는 현금이나 보유 수량을 직접 입력할 수 없습니다/);
+  assert.doesNotMatch(response.text, /8967\.627519169999/);
+  assert.doesNotMatch(response.text, /captured_at:/);
+});
+
+test("telegram router renders equivalent English balance summary", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveBalanceSnapshot({
+    id: "balance-summary-en",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:01:02.000Z",
+    source: "EXCHANGE_POLL",
+    totalKrwValue: "1250000",
+    balancesJson: JSON.stringify([
+      {
+        currency: "ETH",
+        balance: "0.12500000",
+        locked: "0.005",
+        avgBuyPrice: "3500000",
+        unitCurrency: "KRW",
+      },
+    ]),
+  });
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: createRouterState(),
+    locale: "en-US",
+  });
+
+  const response = await router.route("/balances");
+
+  assert.match(response.text, /Balance summary/);
+  assert.match(response.text, /As of: 2026-04-20 09:01:02 KST/);
+  assert.match(response.text, /Source: exchange poll \(source: EXCHANGE_POLL\)/);
+  assert.match(response.text, /Total value: KRW 1,250,000/);
+  assert.match(response.text, /Available: 0\.125 ETH/);
+  assert.match(response.text, /Locked: 0\.005 ETH/);
+  assert.match(response.text, /Average buy price: KRW 3,500,000/);
+  assert.match(response.text, /Technical details: \/balances detail/);
+  assert.match(response.text, /Telegram does not accept manual cash or position input/);
+});
+
+test("telegram router reports unavailable balance data explicitly", async () => {
+  const router = createRouter();
+
+  const missing = await router.route("/balances");
+
+  assert.match(missing.text, /잔고 정보를 사용할 수 없습니다/);
+  assert.match(missing.text, /저장된 잔고 스냅샷이 없습니다/);
+
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveBalanceSnapshot({
+    id: "balance-malformed",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:01:02.000Z",
+    source: "RECONCILIATION",
+    totalKrwValue: "1000",
+    balancesJson: "{not-json",
+  });
+  const malformedRouter = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: createRouterState(),
+  });
+
+  const malformed = await malformedRouter.route("/balances");
+
+  assert.match(malformed.text, /잔고 정보를 사용할 수 없습니다/);
+  assert.match(malformed.text, /저장된 잔고 데이터 형식이 올바르지 않습니다/);
+  assert.doesNotMatch(malformed.text, /\{not-json/);
+});
+
+test("telegram router rejects a balance snapshot when any numeric field is not a finite decimal", async () => {
+  const invalidFields = [
+    ["balance", "NaN"],
+    ["locked", "Infinity"],
+    ["avgBuyPrice", "1e5"],
+    ["balance", "9".repeat(400)],
+  ] as const;
+
+  for (const [field, invalidValue] of invalidFields) {
+    const repository = new InMemoryExecutionRepository();
+    await repository.saveBalanceSnapshot({
+      id: `balance-invalid-${field}`,
+      exchangeAccountId: "primary",
+      capturedAt: "2026-04-20T00:01:02.000Z",
+      source: "RECONCILIATION",
+      totalKrwValue: "1000",
+      balancesJson: JSON.stringify([
+        {
+          currency: "BTC",
+          balance: "0.001",
+          locked: "0",
+          avgBuyPrice: "100000000",
+          unitCurrency: "KRW",
+          [field]: invalidValue,
+        },
+      ]),
+    });
+    const router = new TelegramCommandRouter({
+      repositories: repository,
+      operatorState: createRouterState(),
+    });
+
+    const response = await router.route("/balances");
+
+    assert.match(response.text, /잔고 정보를 사용할 수 없습니다/);
+    assert.match(response.text, /저장된 잔고 데이터 형식이 올바르지 않습니다/);
+    assert.doesNotMatch(response.text, new RegExp(invalidValue));
+  }
+});
+
+test("telegram router rejects a non-null total KRW value that is not a finite decimal string", async () => {
+  for (const invalidTotal of ["0x10", "Infinity", "NaN"]) {
+    const repository = new InMemoryExecutionRepository();
+    await repository.saveBalanceSnapshot({
+      id: `balance-invalid-total-${invalidTotal}`,
+      exchangeAccountId: "primary",
+      capturedAt: "2026-04-20T00:01:02.000Z",
+      source: "RECONCILIATION",
+      totalKrwValue: invalidTotal,
+      balancesJson: JSON.stringify([
+        {
+          currency: "KRW",
+          balance: "1000",
+          locked: "0",
+          avgBuyPrice: "0",
+          unitCurrency: "KRW",
+        },
+      ]),
+    });
+    const router = new TelegramCommandRouter({
+      repositories: repository,
+      operatorState: createRouterState(),
+    });
+
+    const response = await router.route("/balances");
+
+    assert.match(response.text, /잔고 정보를 사용할 수 없습니다/);
+    assert.match(response.text, /저장된 잔고 데이터 형식이 올바르지 않습니다/);
+    assert.doesNotMatch(response.text, new RegExp(escapeRegExp(invalidTotal)));
+  }
+});
+
+test("telegram router uses the balance currency as the quantity unit for unsupported assets", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveBalanceSnapshot({
+    id: "balance-xrp",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:01:02.000Z",
+    source: "RECONCILIATION",
+    totalKrwValue: "1000",
+    balancesJson: JSON.stringify([
+      {
+        currency: "XRP",
+        balance: "1.50000000",
+        locked: "0.25000000",
+        avgBuyPrice: "700",
+        unitCurrency: "KRW",
+      },
+    ]),
+  });
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: createRouterState(),
+  });
+
+  const response = await router.route("/balances");
+
+  assert.match(response.text, /사용 가능: 1\.5 XRP/);
+  assert.match(response.text, /주문 중: 0\.25 XRP/);
+  assert.doesNotMatch(response.text, /사용 가능: 1\.5 KRW/);
+});
+
+test("telegram router explicitly reports an empty stored balance list in Korean and English", async () => {
+  for (const locale of ["ko-KR", "en-US"] as const) {
+    const repository = new InMemoryExecutionRepository();
+    await repository.saveBalanceSnapshot({
+      id: `balance-empty-${locale}`,
+      exchangeAccountId: "primary",
+      capturedAt: "2026-04-20T00:01:02.000Z",
+      source: "RECONCILIATION",
+      totalKrwValue: "0",
+      balancesJson: "[]",
+    });
+    const router = new TelegramCommandRouter({
+      repositories: repository,
+      operatorState: createRouterState(),
+      locale,
+    });
+
+    const response = await router.route("/balances");
+
+    assert.match(
+      response.text,
+      locale === "ko-KR" ? /저장된 잔고가 없습니다/ : /No stored balances/,
+    );
+    assert.match(response.text, /\/balances detail/);
+  }
+});
+
+test("telegram router renders position summaries and explicit empty state", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const snapshot: PositionSnapshotRecord = {
+    id: "position-summary-ko",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:05:00.000Z",
+    source: "RECONCILIATION",
+    positionsJson: JSON.stringify([
+      {
+        asset: "BTC",
+        market: "KRW-BTC",
+        quantity: "0.00007489",
+        averageEntryPrice: "115950000",
+        markPrice: "119737000",
+        marketValue: "8967.10393",
+        exposureRatio: "0.8",
+        capturedAt: "2026-04-20T00:05:00.000Z",
+      },
+    ]),
+  };
+  await repository.savePositionSnapshot(snapshot);
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: createRouterState(),
+  });
+
+  const response = await router.route("/positions");
+
+  assert.match(response.text, /보유 현황 요약/);
+  assert.match(response.text, /기준 시각: 2026-04-20 09:05:00 KST/);
+  assert.match(response.text, /출처: 거래소 동기화 \(source: RECONCILIATION\)/);
+  assert.match(response.text, /KRW-BTC/);
+  assert.match(response.text, /보유 수량: 0\.00007489 BTC/);
+  assert.match(response.text, /평균 매수가: 115,950,000원/);
+  assert.match(response.text, /현재가: 119,737,000원/);
+  assert.match(response.text, /평가금액: 8,967원/);
+  assert.match(response.text, /노출 비율: 80%/);
+  assert.match(response.text, /기술 상세: \/positions detail/);
+  assert.match(response.text, /Telegram에서는 현금이나 보유 수량을 직접 입력할 수 없습니다/);
+
+  await repository.savePositionSnapshot({
+    ...snapshot,
+    id: "position-empty",
+    capturedAt: "2026-04-20T00:06:00.000Z",
+    positionsJson: "[]",
+  });
+  const empty = await router.route("/positions");
+
+  assert.match(empty.text, /저장된 보유 포지션이 없습니다/);
+  assert.match(empty.text, /기술 상세: \/positions detail/);
+});
+
+test("telegram router explicitly reports no stored positions when the snapshot is missing", async () => {
+  const router = createRouter();
+
+  const response = await router.route("/positions");
+
+  assert.match(response.text, /저장된 보유 포지션이 없습니다/);
+  assert.match(response.text, /\/sync 후 다시 확인하세요/);
+  assert.match(response.text, /기술 상세: \/positions detail/);
+  assert.match(response.text, /Telegram에서는 현금이나 보유 수량을 직접 입력할 수 없습니다/);
+});
+
+test("telegram router rejects a position snapshot when any numeric field is not a finite decimal", async () => {
+  const invalidFields = [
+    ["quantity", "NaN"],
+    ["averageEntryPrice", "Infinity"],
+    ["markPrice", "1e8"],
+    ["marketValue", "--1"],
+    ["exposureRatio", "not-a-number"],
+    ["quantity", "9".repeat(400)],
+  ] as const;
+
+  for (const [field, invalidValue] of invalidFields) {
+    const repository = new InMemoryExecutionRepository();
+    await repository.savePositionSnapshot({
+      id: `position-invalid-${field}`,
+      exchangeAccountId: "primary",
+      capturedAt: "2026-04-20T00:05:00.000Z",
+      source: "RECONCILIATION",
+      positionsJson: JSON.stringify([
+        {
+          asset: "BTC",
+          market: "KRW-BTC",
+          quantity: "0.001",
+          averageEntryPrice: "100000000",
+          markPrice: "101000000",
+          marketValue: "101000",
+          exposureRatio: "0.5",
+          capturedAt: "2026-04-20T00:05:00.000Z",
+          [field]: invalidValue,
+        },
+      ]),
+    });
+    const router = new TelegramCommandRouter({
+      repositories: repository,
+      operatorState: createRouterState(),
+    });
+
+    const response = await router.route("/positions");
+
+    assert.match(response.text, /보유 현황 정보를 사용할 수 없습니다/);
+    assert.match(response.text, /저장된 포지션 데이터 형식이 올바르지 않습니다/);
+    assert.doesNotMatch(response.text, new RegExp(escapeRegExp(invalidValue)));
+  }
+});
+
+test("telegram router rejects position snapshots whose asset and market do not match", async () => {
+  const mismatches = [
+    ["BTC", "KRW-ETH"],
+    ["ETH", "KRW-BTC"],
+  ] as const;
+
+  for (const [asset, market] of mismatches) {
+    const repository = new InMemoryExecutionRepository();
+    await repository.savePositionSnapshot({
+      id: `position-mismatch-${asset}`,
+      exchangeAccountId: "primary",
+      capturedAt: "2026-04-20T00:05:00.000Z",
+      source: "RECONCILIATION",
+      positionsJson: JSON.stringify([
+        {
+          asset,
+          market,
+          quantity: "0.001",
+          averageEntryPrice: "100000000",
+          markPrice: "101000000",
+          marketValue: "101000",
+          exposureRatio: "0.5",
+          capturedAt: "2026-04-20T00:05:00.000Z",
+        },
+      ]),
+    });
+    const router = new TelegramCommandRouter({
+      repositories: repository,
+      operatorState: createRouterState(),
+    });
+
+    const response = await router.route("/positions");
+
+    assert.match(response.text, /보유 현황 정보를 사용할 수 없습니다/);
+    assert.match(response.text, /저장된 포지션 데이터 형식이 올바르지 않습니다/);
+    assert.doesNotMatch(response.text, new RegExp(`${asset}.*${market}`));
+  }
+});
+
+test("telegram router renders equivalent English position summary", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.savePositionSnapshot({
+    id: "position-summary-en",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:05:00.000Z",
+    source: "EXCHANGE_POLL",
+    positionsJson: JSON.stringify([
+      {
+        asset: "ETH",
+        market: "KRW-ETH",
+        quantity: "0.12500000",
+        averageEntryPrice: "3500000",
+        markPrice: "3600000",
+        marketValue: "450000",
+        exposureRatio: null,
+        capturedAt: "2026-04-20T00:05:00.000Z",
+      },
+    ]),
+  });
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: createRouterState(),
+    locale: "en-US",
+  });
+
+  const response = await router.route("/positions");
+
+  assert.match(response.text, /Position summary/);
+  assert.match(response.text, /As of: 2026-04-20 09:05:00 KST/);
+  assert.match(response.text, /Source: exchange poll \(source: EXCHANGE_POLL\)/);
+  assert.match(response.text, /Quantity: 0\.125 ETH/);
+  assert.match(response.text, /Average entry: KRW 3,500,000/);
+  assert.match(response.text, /Mark price: KRW 3,600,000/);
+  assert.match(response.text, /Market value: KRW 450,000/);
+  assert.doesNotMatch(response.text, /Exposure:/);
+  assert.match(response.text, /Technical details: \/positions detail/);
+});
+
+test("portfolio summaries keep equivalent Korean and English structure without duplicate source rows", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveBalanceSnapshot({
+    id: "balance-structure",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:01:02.000Z",
+    source: "RECONCILIATION",
+    totalKrwValue: "1000",
+    balancesJson: JSON.stringify([
+      {
+        currency: "KRW",
+        balance: "1000",
+        locked: "0",
+        avgBuyPrice: "0",
+        unitCurrency: "KRW",
+      },
+    ]),
+  });
+  const koreanRouter = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: createRouterState(),
+    locale: "ko-KR",
+  });
+  const englishRouter = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: createRouterState(),
+    locale: "en-US",
+  });
+
+  const korean = (await koreanRouter.route("/balances")).text;
+  const english = (await englishRouter.route("/balances")).text;
+
+  assert.equal(korean.split("\n").length, english.split("\n").length);
+  assert.equal(korean.match(/source: RECONCILIATION/g)?.length, 1);
+  assert.equal(english.match(/source: RECONCILIATION/g)?.length, 1);
+  assert.doesNotMatch(korean, /^source:/mu);
+  assert.doesNotMatch(english, /^source:/mu);
+});
+
+test("balance and position detail output exactly preserve canonical formatters", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const balanceSnapshot: BalanceSnapshotRecord = {
+    id: "balance-detail",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:01:02.000Z",
+    source: "RECONCILIATION",
+    totalKrwValue: "8967.627519169999",
+    balancesJson: JSON.stringify([]),
+  };
+  const positionSnapshot: PositionSnapshotRecord = {
+    id: "position-detail",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:05:00.000Z",
+    source: "RECONCILIATION",
+    positionsJson: JSON.stringify([]),
+  };
+  await repository.saveBalanceSnapshot(balanceSnapshot);
+  await repository.savePositionSnapshot(positionSnapshot);
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: createRouterState(),
+  });
+
+  assert.equal(
+    (await router.route("/balances DETAIL")).text,
+    formatBalanceMessage(balanceSnapshot),
+  );
+  assert.equal(
+    (await router.route("/positions detail")).text,
+    formatPositionMessage(positionSnapshot),
+  );
+});
+
+function createRouterState(): InMemoryOperatorStateStore {
+  return new InMemoryOperatorStateStore({
+    id: "state-portfolio-summary",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  });
 }
 
 test("telegram router exposes a read-only order lifecycle detail", async () => {

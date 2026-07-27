@@ -72,16 +72,16 @@ const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
   {
     command: "/balances",
     category: "inspection",
-    usage: "/balances",
-    summary: "Show the latest stored exchange balance snapshot.",
-    argumentPolicy: "none",
+    usage: "/balances [detail]",
+    summary: "Show a concise balance summary or the complete stored balance snapshot detail.",
+    argumentPolicy: "optional_detail",
   },
   {
     command: "/positions",
     category: "inspection",
-    usage: "/positions",
-    summary: "Show the latest stored exchange position snapshot.",
-    argumentPolicy: "none",
+    usage: "/positions [detail]",
+    summary: "Show a concise position summary or the complete stored position snapshot detail.",
+    argumentPolicy: "optional_detail",
   },
   {
     command: "/orders",

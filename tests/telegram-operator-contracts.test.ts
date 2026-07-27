@@ -110,6 +110,32 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.equal(runParsed.contract.summary, "Run one deterministic PositionGuard strategy cycle for a supported asset through the safe execution path.");
 });
 
+test("balance and position commands accept only optional detail arguments", () => {
+  const balancesDetail = parseTelegramCommand("/balances DETAIL");
+  const positionsDetail = parseTelegramCommand("/positions detail");
+  const balancesExtra = parseTelegramCommand("/balances detail now");
+  const positionsExtra = parseTelegramCommand("/positions summary");
+
+  assert.ok(balancesDetail);
+  assert.ok(positionsDetail);
+  assert.ok(balancesExtra);
+  assert.ok(positionsExtra);
+  assert.equal(validateTelegramCommand(balancesDetail), null);
+  assert.equal(validateTelegramCommand(positionsDetail), null);
+  assert.equal(validateTelegramCommand(balancesExtra), buildUsageMessage("/balances"));
+  assert.equal(validateTelegramCommand(positionsExtra), buildUsageMessage("/positions"));
+
+  const contracts = listTelegramCommandContracts();
+  assert.equal(
+    contracts.find((contract) => contract.command === "/balances")?.usage,
+    "/balances [detail]",
+  );
+  assert.equal(
+    contracts.find((contract) => contract.command === "/positions")?.usage,
+    "/positions [detail]",
+  );
+});
+
 test("manual input commands are rejected by the operator contract", () => {
   const message = buildUnsupportedCommandMessage("/setposition BTC 0.25 95000000");
 

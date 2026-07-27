@@ -40,6 +40,10 @@ import {
   type ReadinessStatus,
 } from "./presentation/readiness.js";
 import {
+  formatBalancePresentation,
+  formatPositionPresentation,
+} from "./presentation/portfolio.js";
+import {
   describeLiveOrderBlockers,
   formatStatusPresentation,
   type LiveSendPath,
@@ -260,6 +264,13 @@ export function formatBalanceMessage(snapshot: BalanceSnapshotRecord | null): st
   ].join("\n");
 }
 
+export function formatBalanceSummaryMessage(
+  snapshot: BalanceSnapshotRecord | null,
+  locale: TelegramLocale = DEFAULT_TELEGRAM_LOCALE,
+): string {
+  return formatBalancePresentation(snapshot, locale);
+}
+
 export function formatStateHistoryMessage(
   transitions: ExecutionStateTransitionRecord[],
 ): string {
@@ -427,6 +438,13 @@ export function formatPositionMessage(snapshot: PositionSnapshotRecord | null): 
     ...formatPositionLines(positions, snapshot.positionsJson),
     `operator_boundary: ${MANUAL_INPUT_NOTE}`,
   ].join("\n");
+}
+
+export function formatPositionSummaryMessage(
+  snapshot: PositionSnapshotRecord | null,
+  locale: TelegramLocale = DEFAULT_TELEGRAM_LOCALE,
+): string {
+  return formatPositionPresentation(snapshot, locale);
 }
 
 export function formatOrdersMessage(orders: OrderRecord[], options?: { limit?: number }): string {
