@@ -515,12 +515,11 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
   assert.match(orderDetailMessage, /fill_count: 0/);
   assert.match(orderDetailMessage, /fills: none/);
 
-  assert.match(helpMessage, /Operator Help/);
-  assert.match(helpMessage, /state_source: static telegram command contracts/);
-  assert.match(helpMessage, /- \/help \| \/help \| Show supported Telegram operator commands and safety boundaries\./);
-  assert.match(helpMessage, /- \/sync \| \/sync \| Request a reconciliation sync through the operator control plane\./);
-  assert.match(helpMessage, /read_only_boundary: \/help never triggers sync, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission\./);
-  assert.match(helpMessage, /operator_boundary: Telegram does not accept manual cash or position input\./);
+  assert.match(helpMessage, /AutoTrade Upbit 도움말/);
+  assert.match(helpMessage, /- \/help/);
+  assert.match(helpMessage, /사용법: \/sync/);
+  assert.match(helpMessage, /도움말 조회는 동기화, 전략 실행, 스케줄러 실행, 거래소 조회, 주문 변경 또는 실주문 전송을 수행하지 않습니다\./);
+  assert.match(helpMessage, /텔레그램에서는 원화 잔고나 코인 보유 수량을 직접 입력할 수 없습니다\./);
 
   assert.match(runtimeConfigMessage, /Runtime Config/);
   assert.match(runtimeConfigMessage, /state_source: runtime app configuration/);

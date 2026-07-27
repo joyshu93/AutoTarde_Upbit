@@ -29,25 +29,19 @@ import type {
   TelegramStrategyRunResult,
   TelegramSyncResult,
 } from "./interfaces.js";
+import { formatHelpPresentation } from "./presentation/help.js";
+import {
+  DEFAULT_TELEGRAM_LOCALE,
+  type TelegramLocale,
+} from "./presentation/locale.js";
 
 const MANUAL_INPUT_NOTE = "Telegram does not accept manual cash or position input.";
 
-export function formatHelpMessage(contracts: readonly TelegramCommandContract[]): string {
-  const inspectionContracts = contracts.filter((contract) => contract.category === "inspection");
-  const controlContracts = contracts.filter((contract) => contract.category === "control");
-
-  return [
-    "Operator Help",
-    "state_source: static telegram command contracts",
-    `command_count: ${contracts.length}`,
-    ...formatHelpCommandGroup("inspection_commands", inspectionContracts),
-    ...formatHelpCommandGroup("control_commands", controlContracts),
-    "read_only_boundary: /help never triggers sync, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission.",
-    "preview_boundary: /preview BTC|ETH computes the deterministic decision and order intent without persisting decisions, mutating orders, or submitting an order.",
-    "execution_boundary: /run BTC|ETH is a deterministic strategy trigger and still inherits preflight, execution-state, risk, DRY_RUN, and live-send gates.",
-    "live_boundary: Live order transmission requires APP_EXECUTION_MODE=LIVE and ENABLE_LIVE_ORDERS=true; the default path remains DRY_RUN.",
-    `operator_boundary: ${MANUAL_INPUT_NOTE}`,
-  ].join("\n");
+export function formatHelpMessage(
+  contracts: readonly TelegramCommandContract[],
+  locale: TelegramLocale = DEFAULT_TELEGRAM_LOCALE,
+): string {
+  return formatHelpPresentation(contracts, locale);
 }
 
 export function formatRuntimeConfigMessage(config: TelegramRuntimeConfigSnapshot | null): string {
@@ -469,22 +463,6 @@ export function formatOrderDetailMessage(
     ...formatFillLines(sortedFills),
     `operator_boundary: ${MANUAL_INPUT_NOTE}`,
   ].join("\n");
-}
-
-function formatHelpCommandGroup(
-  label: string,
-  contracts: readonly TelegramCommandContract[],
-): string[] {
-  if (contracts.length === 0) {
-    return [`${label}: none`];
-  }
-
-  return [
-    `${label}:`,
-    ...contracts.map(
-      (contract) => `- ${contract.command} | ${contract.usage} | ${contract.summary}`,
-    ),
-  ];
 }
 
 function describeRuntimeConfigLiveBlockers(config: TelegramRuntimeConfigSnapshot): string[] {

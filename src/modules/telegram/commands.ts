@@ -39,6 +39,7 @@ import type {
 import { getMarketForAsset } from "../../domain/types.js";
 import type { ReconciliationRunRecord, StrategySchedulerRunRecord } from "../../domain/types.js";
 import type { OperatorStateStore } from "../db/interfaces.js";
+import { normalizeTelegramLocale } from "./presentation/locale.js";
 
 export class TelegramCommandRouter {
   constructor(private readonly dependencies: TelegramRouterDependencies) {}
@@ -67,7 +68,10 @@ export class TelegramCommandRouter {
     switch (parsed.command) {
       case "/help":
         return {
-          text: formatHelpMessage(listTelegramCommandContracts()),
+          text: formatHelpMessage(
+            listTelegramCommandContracts(),
+            normalizeTelegramLocale(this.dependencies.locale),
+          ),
         };
       case "/config":
         return {

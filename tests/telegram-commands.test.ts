@@ -7,6 +7,7 @@ import {
   InMemoryTelegramInboundOffsetStore,
 } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { TelegramCommandRouter } from "../src/modules/telegram/commands.js";
+import { listTelegramCommandContracts } from "../src/modules/telegram/contracts.js";
 import { test } from "./harness.js";
 
 function createRouter(): TelegramCommandRouter {
@@ -125,6 +126,82 @@ test("telegram router parses supported operator commands only", () => {
   assert.equal(runParsed?.contract.category, "control");
   assert.equal(router.parse("/setcash 1000000"), null);
   assert.equal(router.parse("status"), null);
+});
+
+test("telegram help defaults to Korean and preserves every command usage", async () => {
+  const router = createRouter();
+  const response = await router.route("/help");
+  const startResponse = await router.route("/start");
+
+  assert.equal(startResponse.text, response.text);
+  assert.match(response.text, /AutoTrade Upbit 도움말/);
+  assert.match(response.text, /조회 명령/);
+  assert.match(response.text, /운영 명령/);
+  assert.match(response.text, /텔레그램에서는 원화 잔고나 코인 보유 수량을 직접 입력할 수 없습니다\./);
+  assert.match(response.text, /실제 주문은 실행 상태, 리스크 정책, 실주문 전송 안전장치를 모두 통과해야 합니다\./);
+  for (const contract of listTelegramCommandContracts()) {
+    assert.match(response.text, new RegExp(escapeRegExp(contract.usage)));
+  }
+});
+
+test("telegram help supports English and start is an exact help alias", async () => {
+  const router = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    locale: "en-US",
+  });
+
+  const helpResponse = await router.route("/help");
+  const startResponse = await router.route("/start");
+
+  assert.equal(startResponse.text, helpResponse.text);
+  assert.match(helpResponse.text, /AutoTrade Upbit Help/);
+  assert.match(helpResponse.text, /Inspection commands/);
+  assert.match(helpResponse.text, /Operator controls/);
+  assert.match(helpResponse.text, /Telegram does not accept manual cash or position input\./);
+  assert.match(helpResponse.text, /Live orders remain subject to execution state, risk policy, and live-send safety gates\./);
+  for (const contract of listTelegramCommandContracts()) {
+    assert.match(helpResponse.text, new RegExp(escapeRegExp(contract.usage)));
+  }
+});
+
+test("telegram help dependency locale wins over a differing runtime config locale", async () => {
+  const router = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    locale: "en-US",
+    runtimeConfig: {
+      ...createRuntimeConfig(),
+      telegramLocale: "ko-KR",
+    },
+  });
+
+  const response = await router.route("/help");
+
+  assert.match(response.text, /AutoTrade Upbit Help/);
+  assert.doesNotMatch(response.text, /AutoTrade Upbit 도움말/);
 });
 
 test("telegram router exposes non-secret runtime config inspection", async () => {
@@ -810,19 +887,14 @@ test("telegram router exposes static operator help without touching runtime stat
 
   const response = await router.route("/help");
 
-  assert.match(response.text, /Operator Help/);
-  assert.match(response.text, /state_source: static telegram command contracts/);
-  assert.match(response.text, /command_count: 21/);
-  assert.match(response.text, /inspection_commands:/);
-  assert.match(response.text, /- \/help \| \/help \| Show supported Telegram operator commands and safety boundaries\./);
-  assert.match(response.text, /- \/order \| \/order <order-id\|identifier> \| Show one persisted order with lifecycle events and fills\./);
-  assert.match(response.text, /control_commands:/);
-  assert.match(response.text, /- \/preview \| \/preview BTC\|ETH \| Preview one deterministic PositionGuard strategy decision and order intent without persistence or order submission\./);
-  assert.match(response.text, /- \/run \| \/run BTC\|ETH \| Run one deterministic PositionGuard strategy cycle for a supported asset through the safe execution path\./);
-  assert.match(response.text, /read_only_boundary: \/help never triggers sync, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission\./);
-  assert.match(response.text, /live_boundary: Live order transmission requires APP_EXECUTION_MODE=LIVE and ENABLE_LIVE_ORDERS=true; the default path remains DRY_RUN\./);
-  assert.match(response.text, /operator_boundary: Telegram does not accept manual cash or position input\./);
+  assert.match(response.text, /AutoTrade Upbit 도움말/);
+  assert.match(response.text, /명령 수: 21/);
+  assert.match(response.text, /도움말 조회는 동기화, 전략 실행, 스케줄러 실행, 거래소 조회, 주문 변경 또는 실주문 전송을 수행하지 않습니다\./);
 });
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 test("telegram router exposes a read-only order lifecycle detail", async () => {
   const repository = new InMemoryExecutionRepository();

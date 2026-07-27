@@ -84,6 +84,7 @@ Current remaining gaps:
 - `/orders` now returns a bounded recent-order summary and points operators to `/order <id|identifier>` for details
 - `/readiness` treats exchange-history recovery progress as a warning instead of blocking when no portfolio drift or unresolved order recovery remains
 - Telegram `/start` is handled as a `/help` alias
+- Telegram `/help` and `/start` use `TELEGRAM_LOCALE`; the explicit default is `ko-KR`, and `en-US` is the only alternative.
 - scheduler startup now records an automatic `strategySchedulerStartupPreflight`; in `LIVE` mode it blocks scheduler timers unless live gate, live adapter wiring, execution state, fresh exchange-backed snapshots, fresh reconciliation health, and active-order state are safe
 - live scheduler startup blocks now persist an operator notification before startup can close local persistence
 - live scheduler ticks now first refresh exchange-backed account-health evidence with reconciliation source `SCHEDULER_PREFLIGHT`, then re-run the persisted-health preflight before the strategy runner is invoked, so stale or unsafe account-health evidence blocks the scheduled cycle before any strategy decision or order intent is created
@@ -139,7 +140,7 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 31. Reconciliation and Telegram inspection surfaces operate on persisted state.
 32. When scheduler or inbound polling starts background timers, runtime signal handlers stop polling, stop the scheduler, and close SQLite persistence on `SIGINT` / `SIGTERM`; when no background runtime starts, startup closes persistence after printing the banner.
 
-`/help` is static command-contract inspection. It does not read exchange state, query repositories, trigger `/sync`, run strategy cycles, tick the scheduler, mutate orders, or enable live order transmission.
+`/help` is a locale-aware, static command-contract summary. It defaults to Korean, preserves every command usage string and safety boundary, and does not read exchange state, query repositories, trigger `/sync`, run strategy cycles, tick the scheduler, mutate orders, or enable live order transmission.
 `/config` is non-secret runtime configuration inspection. It shows configured/not-configured booleans for credentials and Telegram identifiers instead of raw secret values, and it lists ignored deprecated environment variable names when stale local scripts still set them.
 `/readiness` is read-only operator readiness inspection. It summarizes runtime config, persisted execution state, worker status, latest snapshots, latest reconciliation, and bounded local persistence health: active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count. It does this without active Upbit or Telegram probes, without triggering sync, strategy, or scheduler work, and without mutating offsets, orders, or notification delivery state.
 In intentional `LIVE` operation, `/readiness` reports the enabled live send path as a warning so operators remember that `/run` is real-order capable, while true health blockers still produce `BLOCK`. When the `LIVE` scheduler is enabled, `/readiness` also warns if the latest balance snapshot, position snapshot, or reconciliation run is older than the shortest configured scheduler interval.
