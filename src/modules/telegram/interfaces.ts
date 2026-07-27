@@ -22,7 +22,12 @@ export interface TelegramResponse {
 
 export type SupportedTelegramCommand = OperatorCommand["command"];
 export type TelegramCommandCategory = "inspection" | "control";
-export type TelegramCommandArgumentPolicy = "none" | "optional_reason" | "asset_required" | "order_reference_required";
+export type TelegramCommandArgumentPolicy =
+  | "none"
+  | "optional_reason"
+  | "optional_detail"
+  | "asset_required"
+  | "order_reference_required";
 
 export interface TelegramCommandContract {
   readonly command: SupportedTelegramCommand;

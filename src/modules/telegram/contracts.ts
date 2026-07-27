@@ -30,9 +30,9 @@ const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
   {
     command: "/status",
     category: "inspection",
-    usage: "/status",
-    summary: "Show persisted execution_state, live-order blockers, and operator control state.",
-    argumentPolicy: "none",
+    usage: "/status [detail]",
+    summary: "Show a concise execution summary or the persisted technical execution detail.",
+    argumentPolicy: "optional_detail",
   },
   {
     command: "/statehistory",
@@ -196,6 +196,13 @@ export function parseTelegramCommand(input: string): ParsedTelegramCommand | nul
 export function validateTelegramCommand(parsed: ParsedTelegramCommand): string | null {
   if (parsed.contract.argumentPolicy === "optional_reason") {
     return null;
+  }
+
+  if (parsed.contract.argumentPolicy === "optional_detail") {
+    return parsed.args.length === 0
+      || (parsed.args.length === 1 && parsed.args[0]?.toLowerCase() === "detail")
+      ? null
+      : buildUsageMessage(parsed.command);
   }
 
   if (parsed.contract.argumentPolicy === "asset_required") {

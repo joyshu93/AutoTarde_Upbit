@@ -64,7 +64,7 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.ok(parsed);
   assert.equal(parsed.command, "/status");
   assert.deepEqual(parsed.args, []);
-  assert.equal(parsed.contract.summary, "Show persisted execution_state, live-order blockers, and operator control state.");
+  assert.equal(parsed.contract.summary, "Show a concise execution summary or the persisted technical execution detail.");
   assert.ok(historyParsed);
   assert.equal(historyParsed.command, "/statehistory");
   assert.equal(historyParsed.contract.summary, "Show recent persisted execution_state transition history.");
@@ -117,7 +117,14 @@ test("no-argument commands return usage guidance when extra arguments are suppli
   const helpParsed = parseTelegramCommand("/help now");
   const configParsed = parseTelegramCommand("/config now");
   const readinessParsed = parseTelegramCommand("/readiness now");
+  const statusDetailParsed = parseTelegramCommand("/status detail");
+  const statusDetailCaseParsed = parseTelegramCommand("/status DETAIL");
+  const invalidStatusParsed = parseTelegramCommand("/status verbose");
+  const extraStatusParsed = parseTelegramCommand("/status detail now");
   const parsed = parseTelegramCommand("/resume now");
+  const resumeDetailParsed = parseTelegramCommand("/resume detail");
+  const syncDetailParsed = parseTelegramCommand("/sync detail");
+  const runDetailParsed = parseTelegramCommand("/run BTC detail");
   const historyParsed = parseTelegramCommand("/statehistory now");
   const syncHistoryParsed = parseTelegramCommand("/synchistory now");
   const recoveryParsed = parseTelegramCommand("/recovery now");
@@ -149,11 +156,25 @@ test("no-argument commands return usage guidance when extra arguments are suppli
     validateTelegramCommand(readinessParsed),
     buildUsageMessage("/readiness"),
   );
+  assert.ok(statusDetailParsed);
+  assert.equal(validateTelegramCommand(statusDetailParsed), null);
+  assert.ok(statusDetailCaseParsed);
+  assert.equal(validateTelegramCommand(statusDetailCaseParsed), null);
+  assert.ok(invalidStatusParsed);
+  assert.equal(validateTelegramCommand(invalidStatusParsed), buildUsageMessage("/status"));
+  assert.ok(extraStatusParsed);
+  assert.equal(validateTelegramCommand(extraStatusParsed), buildUsageMessage("/status"));
   assert.ok(parsed);
   assert.equal(
     validateTelegramCommand(parsed),
     buildUsageMessage("/resume"),
   );
+  assert.ok(resumeDetailParsed);
+  assert.equal(validateTelegramCommand(resumeDetailParsed), buildUsageMessage("/resume"));
+  assert.ok(syncDetailParsed);
+  assert.equal(validateTelegramCommand(syncDetailParsed), buildUsageMessage("/sync"));
+  assert.ok(runDetailParsed);
+  assert.equal(validateTelegramCommand(runDetailParsed), buildUsageMessage("/run"));
   assert.ok(historyParsed);
   assert.equal(
     validateTelegramCommand(historyParsed),
@@ -822,7 +843,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
     now: () => "2026-04-20T00:04:00.000Z",
   });
 
-  const statusResponse = await router.route("/status");
+  const statusResponse = await router.route("/status detail");
   const historyResponse = await router.route("/statehistory");
   const syncHistoryResponse = await router.route("/synchistory");
   const recoveryResponse = await router.route("/recovery");

@@ -34,6 +34,11 @@ import {
   DEFAULT_TELEGRAM_LOCALE,
   type TelegramLocale,
 } from "./presentation/locale.js";
+import {
+  describeLiveOrderBlockers,
+  formatStatusPresentation,
+  type LiveSendPath,
+} from "./presentation/status.js";
 
 const MANUAL_INPUT_NOTE = "Telegram does not accept manual cash or position input.";
 
@@ -189,6 +194,26 @@ export function formatStatusMessage(
     ...formatTransitionLines(transitions),
     `updated_at: ${state.updatedAt}`,
   ].join("\n");
+}
+
+export function formatStatusSummaryMessage(
+  state: ExecutionStateRecord,
+  options: {
+    liveSendPath?: LiveSendPath;
+    latestReconciliationRun?: ReconciliationRunRecord | null;
+    schedulerStatus?: StrategySchedulerStatus | null;
+  },
+  locale: TelegramLocale = DEFAULT_TELEGRAM_LOCALE,
+): string {
+  return formatStatusPresentation(
+    {
+      state,
+      liveSendPath: options.liveSendPath ?? "DRY_RUN_ADAPTER",
+      schedulerStatus: options.schedulerStatus ?? null,
+      latestReconciliationRun: options.latestReconciliationRun ?? null,
+    },
+    locale,
+  );
 }
 
 export function formatBalanceMessage(snapshot: BalanceSnapshotRecord | null): string {
@@ -1664,33 +1689,4 @@ function formatHistoryRecoveryConfidence(
   }
 
   return `${historyRecovery.confidenceLevel ?? "unknown"}:${historyRecovery.confidenceReason ?? "unknown"} failure=${historyRecovery.failureMessage ?? "none"}`;
-}
-
-function describeLiveOrderBlockers(
-  state: ExecutionStateRecord,
-  liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER",
-): string[] {
-  const blockers: string[] = [];
-
-  if (state.executionMode !== "LIVE") {
-    blockers.push("DRY_RUN");
-  }
-
-  if (state.liveExecutionGate !== "ENABLED") {
-    blockers.push("LIVE_GATE_DISABLED");
-  }
-
-  if (state.killSwitchActive || state.systemStatus === "KILL_SWITCHED") {
-    blockers.push("KILL_SWITCHED");
-  } else if (state.systemStatus === "PAUSED") {
-    blockers.push("PAUSED");
-  } else if (state.systemStatus === "DEGRADED") {
-    blockers.push("DEGRADED");
-  }
-
-  if (liveSendPath === "DRY_RUN_ADAPTER") {
-    blockers.push("DRY_RUN_ADAPTER");
-  }
-
-  return blockers;
 }

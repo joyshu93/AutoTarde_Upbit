@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 
-import type { OperatorNotificationRecord, OrderRecord } from "../src/domain/types.js";
+import type {
+  ExecutionStateRecord,
+  OperatorNotificationRecord,
+  OrderRecord,
+  StrategySchedulerStatus,
+} from "../src/domain/types.js";
 import {
   InMemoryExecutionRepository,
   InMemoryOperatorStateStore,
@@ -8,6 +13,7 @@ import {
 } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { TelegramCommandRouter } from "../src/modules/telegram/commands.js";
 import { listTelegramCommandContracts } from "../src/modules/telegram/contracts.js";
+import { formatStatusMessage } from "../src/modules/telegram/formatter.js";
 import { test } from "./harness.js";
 
 function createRouter(): TelegramCommandRouter {
@@ -1045,10 +1051,147 @@ test("telegram router bounds /orders output for delivery-safe summaries", async 
   assert.match(response.text, /Use \/order <id\|identifier> for details\./);
 });
 
-test("telegram router exposes persisted execution status with explicit blockers", async () => {
+test("telegram router renders a concise Korean execution status by default", async () => {
   const router = createRouter();
 
   const status = await router.route("/status");
+
+  assert.match(status.text, /운영 상태/);
+  assert.match(status.text, /시스템: 실행 중/);
+  assert.match(status.text, /실행 모드: 모의 실행/);
+  assert.match(status.text, /실주문: 차단됨/);
+  assert.match(status.text, /차단 사유: 모의 실행 모드, 실주문 게이트 비활성화, 모의 주문 어댑터/);
+  assert.match(status.text, /킬 스위치: 꺼짐/);
+  assert.match(status.text, /스케줄러: 상태 정보 없음/);
+  assert.match(status.text, /최근 동기화: 기록 없음/);
+  assert.match(status.text, /업데이트: 2026-04-20 09:00:00 KST/);
+  assert.match(status.text, /\/status detail/);
+  assert.doesNotMatch(status.text, /state_source:/);
+  assert.doesNotMatch(status.text, /blocked_by:/);
+});
+
+test("telegram router renders equivalent English blockers, degraded reason, scheduler, and reconciliation", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveReconciliationRun({
+    id: "recon-english-summary-1",
+    exchangeAccountId: "primary",
+    status: "DRIFT_DETECTED",
+    startedAt: "2026-04-20T00:02:00.000Z",
+    completedAt: "2026-04-20T00:02:03.000Z",
+    summaryJson: JSON.stringify({ source: "OPERATOR_SYNC", issues: [] }),
+    errorMessage: null,
+  });
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      systemStatus: "DEGRADED",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: "portfolio_drift_detected",
+      degradedAt: "2026-04-20T00:01:00.000Z",
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    liveSendPath: "LIVE_ADAPTER",
+    locale: "en-US",
+    schedulerStatus: () => ({
+      enabled: true,
+      started: true,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      startupPreflight: null,
+      markets: [
+        {
+          market: "KRW-BTC",
+          intervalMs: 3_600_000,
+          running: false,
+          runCount: 0,
+          successCount: 0,
+          failureCount: 0,
+          skippedCount: 0,
+          lastStartedAt: null,
+          lastCompletedAt: null,
+          lastStatus: "NEVER_RUN",
+          lastStrategyDecisionId: null,
+          lastAction: null,
+          lastOrderId: null,
+          lastOrderStatus: null,
+          lastError: null,
+          nextRunAt: "2026-04-20T01:00:00.000Z",
+        },
+        {
+          market: "KRW-ETH",
+          intervalMs: 3_600_000,
+          running: false,
+          runCount: 0,
+          successCount: 0,
+          failureCount: 0,
+          skippedCount: 0,
+          lastStartedAt: null,
+          lastCompletedAt: null,
+          lastStatus: "NEVER_RUN",
+          lastStrategyDecisionId: null,
+          lastAction: null,
+          lastOrderId: null,
+          lastOrderStatus: null,
+          lastError: null,
+          nextRunAt: null,
+        },
+      ],
+    }),
+  });
+
+  const status = await router.route("/status");
+
+  assert.match(status.text, /Execution status/);
+  assert.match(status.text, /System: degraded/);
+  assert.match(status.text, /Execution mode: live/);
+  assert.match(status.text, /Real orders: blocked/);
+  assert.match(status.text, /Blocking reasons: system degraded/);
+  assert.match(status.text, /Kill switch: off/);
+  assert.match(status.text, /Degraded reason: portfolio_drift_detected/);
+  assert.match(status.text, /Scheduler: enabled \(started\)/);
+  assert.match(status.text, /KRW-BTC next run: 2026-04-20 10:00:00 KST/);
+  assert.match(status.text, /KRW-ETH next run: none/);
+  assert.match(status.text, /Latest reconciliation: drift detected \(2026-04-20 09:02:03 KST\)/);
+  assert.match(status.text, /Updated: 2026-04-20 09:00:00 KST/);
+  assert.match(status.text, /\/status detail/);
+});
+
+test("telegram router renders the English pause reason and paused blocker", async () => {
+  const router = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      systemStatus: "PAUSED",
+      killSwitchActive: false,
+      pauseReason: "operator_maintenance",
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    liveSendPath: "LIVE_ADAPTER",
+    locale: "en-US",
+  });
+
+  const status = await router.route("/status");
+
+  assert.match(status.text, /System: paused/);
+  assert.match(status.text, /Real orders: blocked/);
+  assert.match(status.text, /Blocking reasons: system paused/);
+  assert.match(status.text, /Pause reason: operator_maintenance/);
+});
+
+test("telegram router preserves canonical technical status behind /status detail", async () => {
+  const router = createRouter();
+
+  const status = await router.route("/status detail");
 
   assert.match(status.text, /state_source: persisted execution_state/);
   assert.match(status.text, /live_orders_allowed: false/);
@@ -1067,6 +1210,261 @@ test("telegram router exposes persisted execution status with explicit blockers"
   assert.match(status.text, /recent_sync_history_archive_progress: none/);
   assert.match(status.text, /recent_transitions: 1/);
   assert.match(status.text, /\| BOOTSTRAP \| none -> RUNNING \| mode none -> DRY_RUN \| gate none -> DISABLED \|/);
+});
+
+test("/status detail exactly equals the canonical formatStatusMessage output", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveReconciliationRun({
+    id: "recon-canonical-status-1",
+    exchangeAccountId: "primary",
+    status: "DRIFT_DETECTED",
+    startedAt: "2026-04-20T00:02:00.000Z",
+    completedAt: "2026-04-20T00:02:03.000Z",
+    summaryJson: JSON.stringify({
+      source: "OPERATOR_SYNC",
+      issues: [{ code: "ORDER_FILLS_BACKFILLED", message: "Backfilled one fill." }],
+    }),
+    errorMessage: null,
+  });
+  await repository.saveStrategySchedulerRun({
+    id: "scheduler-canonical-status-1",
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    triggerSource: "SCHEDULER",
+    status: "COMPLETED",
+    startedAt: "2026-04-20T00:03:00.000Z",
+    completedAt: "2026-04-20T00:03:01.000Z",
+    intervalMs: 3_600_000,
+    runOnStart: false,
+    strategyDecisionId: "decision-canonical-1",
+    action: "HOLD",
+    orderId: null,
+    orderStatus: null,
+    submissionAccepted: null,
+    detail: "No order requested.",
+    errorMessage: null,
+    summaryJson: JSON.stringify({ status: "COMPLETED" }),
+  });
+  const state = {
+    id: "state-canonical-1",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  } satisfies ExecutionStateRecord;
+  const operatorState = new InMemoryOperatorStateStore(state);
+  const schedulerStatus = {
+    enabled: true,
+    started: true,
+    exchangeAccountId: "primary",
+    liveSendPath: "DRY_RUN_ADAPTER",
+    startupPreflight: null,
+    markets: [
+      {
+        market: "KRW-BTC",
+        intervalMs: 3_600_000,
+        running: false,
+        runCount: 1,
+        successCount: 1,
+        failureCount: 0,
+        skippedCount: 0,
+        lastStartedAt: "2026-04-20T00:03:00.000Z",
+        lastCompletedAt: "2026-04-20T00:03:01.000Z",
+        lastStatus: "COMPLETED",
+        lastStrategyDecisionId: "decision-canonical-1",
+        lastAction: "HOLD",
+        lastOrderId: null,
+        lastOrderStatus: null,
+        lastError: null,
+        nextRunAt: "2026-04-20T01:00:00.000Z",
+      },
+    ],
+  } satisfies StrategySchedulerStatus;
+  const executionStateSeed = {
+    executionMode: "DRY_RUN" as const,
+    liveExecutionGate: "DISABLED" as const,
+    killSwitchActive: false,
+  };
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState,
+    executionStateSeed,
+    liveSendPath: "DRY_RUN_ADAPTER",
+    schedulerStatus: () => schedulerStatus,
+  });
+
+  const actual = await router.route("/status detail");
+  const [transitions, reconciliationRuns, schedulerRuns] = await Promise.all([
+    operatorState.listTransitions(3),
+    repository.listReconciliationRuns("primary", 1),
+    repository.listStrategySchedulerRuns("primary", 5),
+  ]);
+  const expected = formatStatusMessage(state, {
+    executionStateSeed,
+    liveSendPath: "DRY_RUN_ADAPTER",
+    transitions,
+    latestReconciliationRun: reconciliationRuns[0] ?? null,
+    schedulerStatus,
+    schedulerRuns,
+  });
+
+  assert.equal(actual.text, expected);
+});
+
+test("telegram status summary explains degraded state and scheduler next runs", async () => {
+  const router = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      systemStatus: "DEGRADED",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: "portfolio_drift_detected",
+      degradedAt: "2026-04-20T00:01:00.000Z",
+      updatedAt: "2026-04-20T00:02:00.000Z",
+    }),
+    liveSendPath: "LIVE_ADAPTER",
+    schedulerStatus: () => ({
+      enabled: true,
+      started: true,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      startupPreflight: null,
+      markets: [
+        {
+          market: "KRW-BTC",
+          intervalMs: 3_600_000,
+          running: false,
+          runCount: 0,
+          successCount: 0,
+          failureCount: 0,
+          skippedCount: 0,
+          lastStartedAt: null,
+          lastCompletedAt: null,
+          lastStatus: "NEVER_RUN",
+          lastStrategyDecisionId: null,
+          lastAction: null,
+          lastOrderId: null,
+          lastOrderStatus: null,
+          lastError: null,
+          nextRunAt: "2026-04-20T01:00:00.000Z",
+        },
+        {
+          market: "KRW-ETH",
+          intervalMs: 3_600_000,
+          running: false,
+          runCount: 0,
+          successCount: 0,
+          failureCount: 0,
+          skippedCount: 0,
+          lastStartedAt: null,
+          lastCompletedAt: null,
+          lastStatus: "NEVER_RUN",
+          lastStrategyDecisionId: null,
+          lastAction: null,
+          lastOrderId: null,
+          lastOrderStatus: null,
+          lastError: null,
+          nextRunAt: null,
+        },
+      ],
+    }),
+  });
+
+  const status = await router.route("/status");
+
+  assert.match(status.text, /시스템: 점검 필요/);
+  assert.match(status.text, /실주문: 차단됨/);
+  assert.match(status.text, /차단 사유: 시스템 성능 저하 상태/);
+  assert.match(status.text, /점검 사유: portfolio_drift_detected/);
+  assert.match(status.text, /스케줄러: 사용 중 \(시작됨\)/);
+  assert.match(status.text, /KRW-BTC 다음 실행: 2026-04-20 10:00:00 KST/);
+  assert.match(status.text, /KRW-ETH 다음 실행: 없음/);
+});
+
+test("telegram status summary explains paused and kill-switched blockers", async () => {
+  for (const scenario of [
+    {
+      systemStatus: "PAUSED" as const,
+      killSwitchActive: false,
+      pauseReason: "operator_maintenance",
+      expectedStatus: /시스템: 일시정지/,
+      expectedBlocker: /차단 사유: 운영 일시정지/,
+      expectedReason: /일시정지 사유: operator_maintenance/,
+    },
+    {
+      systemStatus: "KILL_SWITCHED" as const,
+      killSwitchActive: true,
+      pauseReason: "emergency_stop",
+      expectedStatus: /시스템: 긴급 중지/,
+      expectedBlocker: /차단 사유: 킬 스위치 활성화/,
+      expectedReason: /일시정지 사유: emergency_stop/,
+    },
+  ]) {
+    const router = new TelegramCommandRouter({
+      repositories: new InMemoryExecutionRepository(),
+      operatorState: new InMemoryOperatorStateStore({
+        id: "state-1",
+        exchangeAccountId: "primary",
+        executionMode: "LIVE",
+        liveExecutionGate: "ENABLED",
+        systemStatus: scenario.systemStatus,
+        killSwitchActive: scenario.killSwitchActive,
+        pauseReason: scenario.pauseReason,
+        degradedReason: null,
+        degradedAt: null,
+        updatedAt: "2026-04-20T00:00:00.000Z",
+      }),
+      liveSendPath: "LIVE_ADAPTER",
+    });
+
+    const status = await router.route("/status");
+
+    assert.match(status.text, scenario.expectedStatus);
+    assert.match(status.text, /실주문: 차단됨/);
+    assert.match(status.text, scenario.expectedBlocker);
+    assert.match(status.text, scenario.expectedReason);
+  }
+});
+
+test("telegram status summary includes the latest reconciliation status in KST", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveReconciliationRun({
+    id: "recon-summary-1",
+    exchangeAccountId: "primary",
+    status: "DRIFT_DETECTED",
+    startedAt: "2026-04-20T00:02:00.000Z",
+    completedAt: "2026-04-20T00:02:03.000Z",
+    summaryJson: JSON.stringify({ source: "OPERATOR_SYNC", issues: [] }),
+    errorMessage: null,
+  });
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+  });
+
+  const status = await router.route("/status");
+
+  assert.match(status.text, /최근 동기화: 차이 감지 \(2026-04-20 09:02:03 KST\)/);
 });
 
 test("telegram router includes strategy scheduler state in /status when wired", async () => {
@@ -1133,7 +1531,7 @@ test("telegram router includes strategy scheduler state in /status when wired", 
     }),
   });
 
-  const status = await router.route("/status");
+  const status = await router.route("/status detail");
 
   assert.match(status.text, /strategy_scheduler_enabled: true/);
   assert.match(status.text, /strategy_scheduler_started: true/);
@@ -1413,7 +1811,7 @@ test("telegram router includes recent reconciliation summary in /status when ava
     }),
   });
 
-  const status = await router.route("/status");
+  const status = await router.route("/status detail");
 
   assert.match(status.text, /recent_sync_source: OPERATOR_SYNC/);
   assert.match(status.text, /recent_sync_status: DRIFT_DETECTED/);

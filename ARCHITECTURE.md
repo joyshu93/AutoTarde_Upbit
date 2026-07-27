@@ -145,8 +145,8 @@ It provides:
 - pause/resume/killswitch controls
 - reporting-friendly formatters
 - persisted-status inspection that can summarize recent operator-state transitions
-- `/status` summary that includes the latest persisted reconciliation run health
-- `/status` summary that now also includes checkpointed exchange-history recovery progress, retention-assumption status, coverage status, and confidence classification from the latest persisted reconciliation run
+- locale-aware `/status` operator summary for execution mode, live-order availability and blockers, kill-switch and degraded state, scheduler timing, and latest persisted reconciliation health
+- `/status detail` for the canonical technical execution view, including checkpointed exchange-history recovery progress, retention-assumption status, coverage status, confidence classification, scheduler counters, and recent state transitions
 - `/statehistory` for read-only execution_state transition history
 - `/synchistory` for read-only persisted reconciliation_runs inspection
 - `/recovery` for read-only checkpointed exchange-history recovery progress inspection
@@ -157,8 +157,8 @@ It provides:
 - `/sync` for reconciliation-triggered snapshot and reconciliation record persistence with read-only public ticker valuation
 - `/preview BTC|ETH` for one non-mutating PositionGuard decision and order-intent preview
 - `/run BTC|ETH` for one deterministic PositionGuard strategy runner cycle through the configured safe execution path
-- `/status` strategy-scheduler lines for disabled/enabled state, configured intervals, next run timestamps, recent in-memory scheduler outcomes, and persisted recent scheduler run history
-- `/status` strategy-scheduler lines also expose startup preflight status, scope, detail, and check results
+- `/status` concise strategy-scheduler state and per-market next-run timestamps
+- `/status detail` strategy-scheduler lines for configured intervals, recent in-memory outcomes, persisted recent scheduler run history, startup preflight scope, detail, and check results
 - `/readiness` warns when a `LIVE` scheduler is running while the latest persisted balance snapshot, position snapshot, or reconciliation run is older than the shortest configured scheduler interval
 - live scheduler startup preflight blocks are persisted as operator notifications before startup can close local persistence
 - live scheduler per-run account-refresh or preflight blocks are persisted as failed `strategy_scheduler_runs` plus operator notifications before any strategy decision or order intent is created
@@ -182,6 +182,7 @@ It provides:
 - a persisted-evidence `smoke:dryrun:completion` gate that forces live-send, Telegram transport, and scheduler startup disabled, then reads local snapshots, reconciliation, risk, notification, and `strategy_scheduler_runs` evidence to decide whether the DRY_RUN automatic scheduler rehearsal is complete without mutating execution state
 
 `/help` is intentionally contract-derived and locale-aware. Presentation defaults to `ko-KR`, supports only `ko-KR` and `en-US`, and does not read repositories, poll Telegram, inspect exchange state, start sync, start strategy runs, start scheduler ticks, mutate orders, or enable live order transmission.
+`/status` is a locale-aware, inspection-only operator summary. `/status detail` preserves the canonical technical output and uses the same bounded repository reads; neither form calls Upbit, triggers reconciliation or strategy execution, starts scheduler work, mutates orders, or enables live order transmission.
 `/config` is intentionally non-secret and runtime-derived; it renders configured/not-configured booleans for secrets, exposes ignored deprecated environment variable names when present, and never prints raw credentials, tokens, or chat identifiers.
 `/readiness` is intentionally inspection-only; it reads bounded local state and runtime status, including active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count, but does not poll Telegram, call Upbit, start sync, run strategies, tick schedulers, mutate offsets, deliver notifications, or mutate orders.
 

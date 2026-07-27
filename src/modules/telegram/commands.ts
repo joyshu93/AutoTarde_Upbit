@@ -24,6 +24,7 @@ import {
   formatStrategyPreviewMessage,
   formatStrategyRunMessage,
   formatStatusMessage,
+  formatStatusSummaryMessage,
   formatSyncMessage,
   formatTelegramInboundMessage,
 } from "./formatter.js";
@@ -80,7 +81,7 @@ export class TelegramCommandRouter {
       case "/readiness":
         return this.buildReadinessResponse(exchangeAccountId);
       case "/status":
-        return this.buildStatusResponse(exchangeAccountId);
+        return this.buildStatusResponse(exchangeAccountId, parsed.args[0]?.toLowerCase() === "detail");
       case "/statehistory":
         return this.buildStateHistoryResponse();
       case "/synchistory":
@@ -257,7 +258,7 @@ export class TelegramCommandRouter {
     });
   }
 
-  private async buildStatusResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+  private async buildStatusResponse(exchangeAccountId: string, detail: boolean): Promise<TelegramResponse> {
     const [state, transitions, runs, schedulerRuns] = await Promise.all([
       this.dependencies.operatorState.getState(),
       this.dependencies.operatorState.listTransitions(3),
@@ -265,12 +266,28 @@ export class TelegramCommandRouter {
       this.dependencies.repositories.listStrategySchedulerRuns(exchangeAccountId, 5),
     ]);
 
-    return {
-      text: formatStatusMessage(
-        state,
-        buildStatusFormatOptions(this.dependencies, transitions, runs[0] ?? null, schedulerRuns),
-      ),
-    };
+    const options = buildStatusFormatOptions(
+      this.dependencies,
+      transitions,
+      runs[0] ?? null,
+      schedulerRuns,
+    );
+
+    return detail
+      ? {
+          text: formatStatusMessage(state, options),
+        }
+      : {
+          text: formatStatusSummaryMessage(
+            state,
+            {
+              liveSendPath: options?.liveSendPath ?? "DRY_RUN_ADAPTER",
+              latestReconciliationRun: options?.latestReconciliationRun ?? null,
+              schedulerStatus: options?.schedulerStatus ?? null,
+            },
+            normalizeTelegramLocale(this.dependencies.locale),
+          ),
+        };
   }
 
   private async buildReadinessResponse(exchangeAccountId: string): Promise<TelegramResponse> {
