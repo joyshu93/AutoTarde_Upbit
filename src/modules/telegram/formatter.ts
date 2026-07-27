@@ -35,6 +35,11 @@ import {
   type TelegramLocale,
 } from "./presentation/locale.js";
 import {
+  formatReadinessPresentation,
+  type ReadinessPresentationCheck,
+  type ReadinessStatus,
+} from "./presentation/readiness.js";
+import {
   describeLiveOrderBlockers,
   formatStatusPresentation,
   type LiveSendPath,
@@ -109,7 +114,7 @@ function formatStringList(values: readonly string[]): string {
   return values.length === 0 ? "none" : values.join(",");
 }
 
-export function formatReadinessMessage(input: {
+export interface ReadinessMessageInput {
   runtimeConfig: TelegramRuntimeConfigSnapshot | null;
   executionState: ExecutionStateRecord;
   latestBalanceSnapshot: BalanceSnapshotRecord | null;
@@ -121,13 +126,11 @@ export function formatReadinessMessage(input: {
   schedulerStatus: StrategySchedulerStatus | null;
   inboundStatus: TelegramInboundPollingStatus | null;
   now?: string;
-}): string {
+}
+
+export function formatReadinessMessage(input: ReadinessMessageInput): string {
   const checks = buildReadinessChecks(input);
-  const overallStatus = checks.some((check) => check.status === "BLOCK")
-    ? "BLOCK"
-    : checks.some((check) => check.status === "WARN")
-      ? "WARN"
-      : "PASS";
+  const overallStatus = getReadinessOverallStatus(checks);
 
   return [
     "Operator Readiness",
@@ -194,6 +197,25 @@ export function formatStatusMessage(
     ...formatTransitionLines(transitions),
     `updated_at: ${state.updatedAt}`,
   ].join("\n");
+}
+
+export function formatReadinessSummaryMessage(
+  input: ReadinessMessageInput,
+  locale: TelegramLocale = DEFAULT_TELEGRAM_LOCALE,
+): string {
+  const checks = buildReadinessChecks(input);
+  return formatReadinessPresentation({
+    overallStatus: getReadinessOverallStatus(checks),
+    executionState: input.executionState,
+    schedulerStatus: input.schedulerStatus,
+    latestBalanceSnapshot: input.latestBalanceSnapshot,
+    latestPositionSnapshot: input.latestPositionSnapshot,
+    latestReconciliationRun: input.latestReconciliationRun,
+    activeOrderCount: input.activeOrders.length,
+    recentRiskBlockCount: countRiskBlocks(input.recentRiskEvents),
+    pendingNotificationCount: input.pendingNotifications.length,
+    checks,
+  }, locale);
 }
 
 export function formatStatusSummaryMessage(
@@ -508,19 +530,9 @@ function describeRuntimeConfigLiveBlockers(config: TelegramRuntimeConfigSnapshot
   return blockers;
 }
 
-function buildReadinessChecks(input: {
-  runtimeConfig: TelegramRuntimeConfigSnapshot | null;
-  executionState: ExecutionStateRecord;
-  latestBalanceSnapshot: BalanceSnapshotRecord | null;
-  latestPositionSnapshot: PositionSnapshotRecord | null;
-  latestReconciliationRun: ReconciliationRunRecord | null;
-  activeOrders: OrderRecord[];
-  recentRiskEvents: RiskEventRecord[];
-  pendingNotifications: OperatorNotificationRecord[];
-  schedulerStatus: StrategySchedulerStatus | null;
-  inboundStatus: TelegramInboundPollingStatus | null;
-  now?: string;
-}): Array<{ name: string; status: "PASS" | "WARN" | "BLOCK"; detail: string }> {
+function buildReadinessChecks(
+  input: ReadinessMessageInput,
+): ReadinessPresentationCheck[] {
   const config = input.runtimeConfig;
   const liveBlockers = config ? describeRuntimeConfigLiveBlockers(config) : ["CONFIG_UNAVAILABLE"];
   const stateBlockers = describeLiveOrderBlockers(input.executionState, config?.liveSendPath ?? "DRY_RUN_ADAPTER");
@@ -654,6 +666,16 @@ function buildReadinessChecks(input: {
         : `${input.pendingNotifications.length} pending operator notification(s) in bounded sample`,
     },
   ];
+}
+
+function getReadinessOverallStatus(
+  checks: readonly ReadinessPresentationCheck[],
+): ReadinessStatus {
+  return checks.some((check) => check.status === "BLOCK")
+    ? "BLOCK"
+    : checks.some((check) => check.status === "WARN")
+      ? "WARN"
+      : "PASS";
 }
 
 function describeReadinessTimestampFreshness(

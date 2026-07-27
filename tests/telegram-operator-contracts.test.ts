@@ -60,7 +60,11 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.ok(readinessParsed);
   assert.equal(readinessParsed.command, "/readiness");
   assert.deepEqual(readinessParsed.args, []);
-  assert.equal(readinessParsed.contract.summary, "Show read-only operator readiness checks for DRY_RUN operations.");
+  assert.equal(
+    readinessParsed.contract.summary,
+    "Show a concise operator readiness summary or the complete technical readiness detail.",
+  );
+  assert.equal(readinessParsed.contract.usage, "/readiness [detail]");
   assert.ok(parsed);
   assert.equal(parsed.command, "/status");
   assert.deepEqual(parsed.args, []);
@@ -117,6 +121,9 @@ test("no-argument commands return usage guidance when extra arguments are suppli
   const helpParsed = parseTelegramCommand("/help now");
   const configParsed = parseTelegramCommand("/config now");
   const readinessParsed = parseTelegramCommand("/readiness now");
+  const readinessDetailParsed = parseTelegramCommand("/readiness detail");
+  const readinessDetailCaseParsed = parseTelegramCommand("/readiness DETAIL");
+  const readinessExtraParsed = parseTelegramCommand("/readiness detail now");
   const statusDetailParsed = parseTelegramCommand("/status detail");
   const statusDetailCaseParsed = parseTelegramCommand("/status DETAIL");
   const invalidStatusParsed = parseTelegramCommand("/status verbose");
@@ -156,6 +163,12 @@ test("no-argument commands return usage guidance when extra arguments are suppli
     validateTelegramCommand(readinessParsed),
     buildUsageMessage("/readiness"),
   );
+  assert.ok(readinessDetailParsed);
+  assert.equal(validateTelegramCommand(readinessDetailParsed), null);
+  assert.ok(readinessDetailCaseParsed);
+  assert.equal(validateTelegramCommand(readinessDetailCaseParsed), null);
+  assert.ok(readinessExtraParsed);
+  assert.equal(validateTelegramCommand(readinessExtraParsed), buildUsageMessage("/readiness"));
   assert.ok(statusDetailParsed);
   assert.equal(validateTelegramCommand(statusDetailParsed), null);
   assert.ok(statusDetailCaseParsed);

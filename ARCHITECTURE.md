@@ -139,8 +139,8 @@ It provides:
 - `/help` for static command-contract inspection and operator safety boundaries
 - `/start` as a transport-friendly alias to `/help`
 - `/config` for non-secret runtime configuration, ignored deprecated environment variables, live blockers, and explicit risk-limit inspection
-- `/readiness` for read-only operator readiness over runtime config, execution state, worker status, latest persisted health records, and bounded local persistence health
-- `/readiness` classifies reconciliation recovery progress as warnings while keeping portfolio drift and unresolved order recovery as blockers
+- locale-aware `/readiness` operator summary over runtime config, execution state, worker status, latest persisted health records, and bounded local persistence health
+- `/readiness detail` for the canonical technical check list; both forms classify reconciliation recovery progress as warnings while keeping portfolio drift and unresolved order recovery as blockers
 - inspection commands
 - pause/resume/killswitch controls
 - reporting-friendly formatters
@@ -184,7 +184,7 @@ It provides:
 `/help` is intentionally contract-derived and locale-aware. Presentation defaults to `ko-KR`, supports only `ko-KR` and `en-US`, and does not read repositories, poll Telegram, inspect exchange state, start sync, start strategy runs, start scheduler ticks, mutate orders, or enable live order transmission.
 `/status` is a locale-aware, inspection-only operator summary. `/status detail` preserves the canonical technical output and uses the same bounded repository reads; neither form calls Upbit, triggers reconciliation or strategy execution, starts scheduler work, mutates orders, or enables live order transmission.
 `/config` is intentionally non-secret and runtime-derived; it renders configured/not-configured booleans for secrets, exposes ignored deprecated environment variable names when present, and never prints raw credentials, tokens, or chat identifiers.
-`/readiness` is intentionally inspection-only; it reads bounded local state and runtime status, including active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count, but does not poll Telegram, call Upbit, start sync, run strategies, tick schedulers, mutate offsets, deliver notifications, or mutate orders.
+`/readiness` is an inspection-only, locale-aware summary with human-readable PASS/WARN/BLOCK guidance. `/readiness detail` preserves the canonical technical checks and safety boundaries. Both forms read the same bounded local state and runtime status, including active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count, but do not poll Telegram, call Upbit, start sync, run strategies, tick schedulers, mutate offsets, deliver notifications, or mutate orders.
 
 It does not provide:
 - portfolio truth entry

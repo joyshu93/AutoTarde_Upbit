@@ -15,6 +15,7 @@ import {
   formatOrdersMessage,
   formatPositionMessage,
   formatReadinessMessage,
+  formatReadinessSummaryMessage,
   formatReconciliationRunsMessage,
   formatRecoveryProgressMessage,
   formatRiskEventsMessage,
@@ -79,7 +80,10 @@ export class TelegramCommandRouter {
           text: formatRuntimeConfigMessage(this.dependencies.runtimeConfig ?? null),
         };
       case "/readiness":
-        return this.buildReadinessResponse(exchangeAccountId);
+        return this.buildReadinessResponse(
+          exchangeAccountId,
+          parsed.args[0]?.toLowerCase() === "detail",
+        );
       case "/status":
         return this.buildStatusResponse(exchangeAccountId, parsed.args[0]?.toLowerCase() === "detail");
       case "/statehistory":
@@ -290,7 +294,10 @@ export class TelegramCommandRouter {
         };
   }
 
-  private async buildReadinessResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+  private async buildReadinessResponse(
+    exchangeAccountId: string,
+    detail: boolean,
+  ): Promise<TelegramResponse> {
     const [
       executionState,
       latestBalanceSnapshot,
@@ -309,20 +316,27 @@ export class TelegramCommandRouter {
       this.dependencies.repositories.listPendingOperatorNotifications(exchangeAccountId, { limit: 20 }),
     ]);
 
+    const readinessInput = {
+      runtimeConfig: this.dependencies.runtimeConfig ?? null,
+      executionState,
+      latestBalanceSnapshot,
+      latestPositionSnapshot,
+      latestReconciliationRun: reconciliationRuns[0] ?? null,
+      activeOrders,
+      recentRiskEvents,
+      pendingNotifications,
+      schedulerStatus: this.dependencies.schedulerStatus?.() ?? null,
+      inboundStatus: this.dependencies.telegramInboundStatus?.() ?? null,
+      now: this.dependencies.now?.() ?? new Date().toISOString(),
+    };
+
     return {
-      text: formatReadinessMessage({
-        runtimeConfig: this.dependencies.runtimeConfig ?? null,
-        executionState,
-        latestBalanceSnapshot,
-        latestPositionSnapshot,
-        latestReconciliationRun: reconciliationRuns[0] ?? null,
-        activeOrders,
-        recentRiskEvents,
-        pendingNotifications,
-        schedulerStatus: this.dependencies.schedulerStatus?.() ?? null,
-        inboundStatus: this.dependencies.telegramInboundStatus?.() ?? null,
-        now: this.dependencies.now?.() ?? new Date().toISOString(),
-      }),
+      text: detail
+        ? formatReadinessMessage(readinessInput)
+        : formatReadinessSummaryMessage(
+            readinessInput,
+            normalizeTelegramLocale(this.dependencies.locale),
+          ),
     };
   }
 

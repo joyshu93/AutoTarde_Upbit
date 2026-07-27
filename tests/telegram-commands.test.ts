@@ -13,7 +13,10 @@ import {
 } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { TelegramCommandRouter } from "../src/modules/telegram/commands.js";
 import { listTelegramCommandContracts } from "../src/modules/telegram/contracts.js";
-import { formatStatusMessage } from "../src/modules/telegram/formatter.js";
+import {
+  formatReadinessMessage,
+  formatStatusMessage,
+} from "../src/modules/telegram/formatter.js";
 import { test } from "./harness.js";
 
 function createRouter(): TelegramCommandRouter {
@@ -395,23 +398,179 @@ test("telegram router exposes read-only operator readiness", async () => {
   const response = await router.route("/readiness");
 
   assert.match(response.text, /Operator Readiness/);
-  assert.match(response.text, /state_source: runtime config \+ persisted execution_state \+ latest persisted snapshots/);
   assert.match(response.text, /overall_status: PASS/);
-  assert.match(response.text, /live_gate: DISABLED/);
-  assert.match(response.text, /latest_balance_snapshot_at: 2026-04-20T00:01:00.000Z/);
-  assert.match(response.text, /latest_position_snapshot_at: 2026-04-20T00:02:00.000Z/);
-  assert.match(response.text, /latest_reconciliation_status: SUCCESS/);
-  assert.match(response.text, /active_order_count: 0/);
-  assert.match(response.text, /recent_risk_block_count: 0/);
-  assert.match(response.text, /pending_notification_count: 0/);
-  assert.match(response.text, /- live_send_safety: PASS \| live order path blocked by DRY_RUN,LIVE_GATE_DISABLED,DRY_RUN_ADAPTER/);
-  assert.match(response.text, /- telegram_inbound: PASS \| inbound configured running=true offset_storage=DURABLE/);
-  assert.match(response.text, /- strategy_scheduler: PASS \| scheduler enabled started=true/);
-  assert.match(response.text, /- active_orders: PASS \| no active or reconciliation-required orders are currently stored/);
-  assert.match(response.text, /- recent_risk_blocks: PASS \| no BLOCK risk events in recent sample size=0/);
-  assert.match(response.text, /- pending_notifications: PASS \| no pending operator notifications in recent bounded sample/);
-  assert.match(response.text, /read_only_boundary: \/readiness never triggers sync, Telegram polling, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission\./);
-  assert.match(response.text, /secret_boundary: secret values are never rendered/);
+  assert.match(response.text, /운영 준비 상태: 통과/);
+  assert.match(response.text, /실행 모드: 모의 실행 \(DRY_RUN\)/);
+  assert.match(response.text, /시스템 상태: 실행 중 \(RUNNING\)/);
+  assert.match(response.text, /스케줄러: 사용 중 \(시작됨\)/);
+  assert.match(response.text, /잔고 스냅샷: 2026-04-20 09:01:00 KST/);
+  assert.match(response.text, /포지션 스냅샷: 2026-04-20 09:02:00 KST/);
+  assert.match(response.text, /최근 동기화: 정상 \(2026-04-20 09:03:02 KST\)/);
+  assert.match(response.text, /활성 주문: 0건/);
+  assert.match(response.text, /최근 위험 차단: 0건/);
+  assert.match(response.text, /대기 알림: 0건/);
+  assert.match(response.text, /주의\/차단 점검: 없음/);
+  assert.match(response.text, /기술 상세: \/readiness detail/);
+  assert.doesNotMatch(response.text, /state_source:/);
+  assert.doesNotMatch(response.text, /read_only_boundary:/);
+});
+
+test("telegram router renders equivalent English readiness summary with actionable blockers", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveBalanceSnapshot({
+    id: "balance-readiness-en",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:01:00.000Z",
+    source: "RECONCILIATION",
+    totalKrwValue: "1000000",
+    balancesJson: "[]",
+  });
+  await repository.savePositionSnapshot({
+    id: "position-readiness-en",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:02:00.000Z",
+    source: "RECONCILIATION",
+    positionsJson: "[]",
+  });
+  await repository.saveReconciliationRun({
+    id: "reconciliation-readiness-en",
+    exchangeAccountId: "primary",
+    status: "DRIFT_DETECTED",
+    startedAt: "2026-04-20T00:03:00.000Z",
+    completedAt: "2026-04-20T00:03:02.000Z",
+    summaryJson: JSON.stringify({
+      source: "OPERATOR_SYNC",
+      issues: [
+        {
+          code: "EXCHANGE_ORDER_RECOVERED",
+          message: "Recovered exchange order.",
+        },
+      ],
+    }),
+    errorMessage: null,
+  });
+  await repository.saveOrder(createOrder({
+    id: "active-order-readiness-en",
+    status: "OPEN",
+    updatedAt: "2026-04-20T00:04:00.000Z",
+  }));
+  await repository.saveRiskEvent({
+    id: "risk-readiness-en",
+    exchangeAccountId: "primary",
+    strategyDecisionId: null,
+    orderId: "active-order-readiness-en",
+    level: "BLOCK",
+    ruleCode: "DUPLICATE_ORDER_GUARD",
+    message: "Duplicate active order.",
+    payloadJson: "{}",
+    createdAt: "2026-04-20T00:04:30.000Z",
+  });
+  await repository.saveOperatorNotification(createNotification({
+    id: "notification-readiness-en",
+    createdAt: "2026-04-20T00:04:45.000Z",
+  }));
+  const executionState: ExecutionStateRecord = {
+    id: "state-readiness-en",
+    exchangeAccountId: "primary",
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "DEGRADED",
+    killSwitchActive: true,
+    pauseReason: null,
+    degradedReason: "startup_portfolio_drift_detected",
+    degradedAt: "2026-04-20T00:00:00.000Z",
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  };
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore(executionState),
+    locale: "en-US",
+    schedulerStatus: () => ({
+      enabled: false,
+      started: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      startupPreflight: null,
+      markets: [],
+    }),
+    syncController: {
+      async requestSync() {
+        throw new Error("/readiness must not call syncController");
+      },
+    },
+    strategyRunController: {
+      async requestRun() {
+        throw new Error("/readiness must not call strategyRunController");
+      },
+      async requestPreview() {
+        throw new Error("/readiness must not call strategyRunController");
+      },
+    },
+    now: () => "2026-04-20T00:05:00.000Z",
+  });
+
+  const response = await router.route("/readiness");
+
+  assert.match(response.text, /Operator Readiness/);
+  assert.match(response.text, /overall_status: BLOCK/);
+  assert.match(response.text, /Operator readiness: blocked/);
+  assert.match(response.text, /Next action: Resolve the blocking checks before running or scheduling orders\./);
+  assert.match(response.text, /Execution mode: live \(LIVE\)/);
+  assert.match(response.text, /System status: degraded \(DEGRADED\)/);
+  assert.match(response.text, /Kill switch: on/);
+  assert.match(response.text, /Degraded reason: startup_portfolio_drift_detected/);
+  assert.match(response.text, /Scheduler: disabled/);
+  assert.match(response.text, /Balance snapshot: 2026-04-20 09:01:00 KST/);
+  assert.match(response.text, /Position snapshot: 2026-04-20 09:02:00 KST/);
+  assert.match(response.text, /Latest reconciliation: drift detected \(2026-04-20 09:03:02 KST\)/);
+  assert.match(response.text, /Active orders: 1/);
+  assert.match(response.text, /Recent risk blocks: 1/);
+  assert.match(response.text, /Pending notifications: 1/);
+  assert.match(response.text, /Warnings\/blocks:/);
+  assert.match(response.text, /runtime_config \[BLOCK\]: runtime configuration is unavailable/);
+  assert.match(response.text, /execution_state \[BLOCK\]: execution is blocked by the current operator state/);
+  assert.match(response.text, /Technical details: \/readiness detail/);
+  assert.doesNotMatch(response.text, /- live_send_safety: PASS/);
+});
+
+test("telegram router preserves canonical readiness detail output exactly", async () => {
+  const executionState: ExecutionStateRecord = {
+    id: "state-readiness-detail",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  };
+  const repository = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore(executionState);
+  const now = "2026-04-20T00:05:00.000Z";
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState,
+    now: () => now,
+  });
+
+  const response = await router.route("/readiness DETAIL");
+  const expected = formatReadinessMessage({
+    runtimeConfig: null,
+    executionState,
+    latestBalanceSnapshot: null,
+    latestPositionSnapshot: null,
+    latestReconciliationRun: null,
+    activeOrders: [],
+    recentRiskEvents: [],
+    pendingNotifications: [],
+    schedulerStatus: null,
+    inboundStatus: null,
+    now,
+  });
+
+  assert.equal(response.text, expected);
 });
 
 test("telegram router readiness warns when live send path is intentionally enabled", async () => {
@@ -498,7 +657,7 @@ test("telegram router readiness warns when live send path is intentionally enabl
     }),
   });
 
-  const response = await router.route("/readiness");
+  const response = await router.route("/readiness detail");
 
   assert.match(response.text, /overall_status: WARN/);
   assert.match(response.text, /execution_mode: LIVE/);
@@ -576,7 +735,7 @@ test("telegram router readiness warns when live scheduler health snapshots are s
     now: () => "2026-05-13T09:00:01.000Z",
   });
 
-  const response = await router.route("/readiness");
+  const response = await router.route("/readiness detail");
 
   assert.match(response.text, /overall_status: WARN/);
   assert.match(response.text, /- balance_snapshot: WARN \| latest balance snapshot captured_at=2026-05-13T07:00:00.000Z stale_age_ms=7201000 max_age_ms=3600000/);
@@ -660,7 +819,7 @@ test("telegram router readiness summarizes persistence health warnings", async (
     },
   });
 
-  const response = await router.route("/readiness");
+  const response = await router.route("/readiness detail");
 
   assert.match(response.text, /overall_status: WARN/);
   assert.match(response.text, /active_order_count: 1/);
@@ -722,7 +881,7 @@ test("telegram router readiness warns for non-blocking reconciliation recovery p
     runtimeConfig: createRuntimeConfig(),
   });
 
-  const response = await router.route("/readiness");
+  const response = await router.route("/readiness detail");
 
   assert.match(response.text, /overall_status: WARN/);
   assert.match(response.text, /latest_reconciliation_status: DRIFT_DETECTED/);
@@ -778,7 +937,7 @@ test("telegram router readiness blocks for portfolio drift reconciliation issues
     runtimeConfig: createRuntimeConfig(),
   });
 
-  const response = await router.route("/readiness");
+  const response = await router.route("/readiness detail");
 
   assert.match(response.text, /overall_status: BLOCK/);
   assert.match(response.text, /- latest_reconciliation: BLOCK \| latest reconciliation status=DRIFT_DETECTED completed_at=2026-04-20T00:03:01.000Z blocking_issue_codes=BALANCE_DRIFT_DETECTED issue_codes=BALANCE_DRIFT_DETECTED/);
@@ -822,7 +981,7 @@ test("telegram router readiness blocks unhealthy execution state without trigger
     },
   });
 
-  const response = await router.route("/readiness");
+  const response = await router.route("/readiness detail");
 
   assert.match(response.text, /overall_status: BLOCK/);
   assert.match(response.text, /system_status: DEGRADED/);
