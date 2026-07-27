@@ -27,7 +27,7 @@ export type TelegramCommandArgumentPolicy =
   | "optional_reason"
   | "optional_detail"
   | "asset_required"
-  | "order_reference_required";
+  | "order_reference_optional_detail";
 
 export interface TelegramCommandContract {
   readonly command: SupportedTelegramCommand;

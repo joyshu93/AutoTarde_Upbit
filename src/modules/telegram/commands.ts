@@ -13,6 +13,7 @@ import {
   formatHelpMessage,
   formatOperatorNotificationsMessage,
   formatOrderDetailMessage,
+  formatOrderDetailSummaryMessage,
   formatOrdersMessage,
   formatOrdersSummaryMessage,
   formatPositionMessage,
@@ -115,7 +116,11 @@ export class TelegramCommandRouter {
           parsed.args[0]?.toLowerCase() === "detail",
         );
       case "/order":
-        return this.buildOrderDetailResponse(exchangeAccountId, parsed.args[0] ?? "");
+        return this.buildOrderDetailResponse(
+          exchangeAccountId,
+          parsed.args[0] ?? "",
+          parsed.args[1]?.toLowerCase() === "detail",
+        );
       case "/scheduler":
         return this.buildSchedulerResponse(exchangeAccountId);
       case "/inbound":
@@ -426,11 +431,20 @@ export class TelegramCommandRouter {
   private async buildOrderDetailResponse(
     exchangeAccountId: string,
     reference: string,
+    detail: boolean,
   ): Promise<TelegramResponse> {
     const order = await this.dependencies.repositories.findOrderByReference(exchangeAccountId, reference);
     if (!order) {
       return {
-        text: formatOrderDetailMessage(null, [], [], reference),
+        text: detail
+          ? formatOrderDetailMessage(null, [], [], reference)
+          : formatOrderDetailSummaryMessage(
+              null,
+              [],
+              [],
+              reference,
+              normalizeTelegramLocale(this.dependencies.locale),
+            ),
       };
     }
 
@@ -440,7 +454,15 @@ export class TelegramCommandRouter {
     ]);
 
     return {
-      text: formatOrderDetailMessage(order, events, fills, reference),
+      text: detail
+        ? formatOrderDetailMessage(order, events, fills, reference)
+        : formatOrderDetailSummaryMessage(
+            order,
+            events,
+            fills,
+            reference,
+            normalizeTelegramLocale(this.dependencies.locale),
+          ),
     };
   }
 

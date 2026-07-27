@@ -44,6 +44,7 @@ import {
   formatPositionPresentation,
 } from "./presentation/portfolio.js";
 import { formatOrdersPresentation } from "./presentation/orders.js";
+import { formatOrderDetailPresentation } from "./presentation/order-detail.js";
 import {
   describeLiveOrderBlockers,
   formatStatusPresentation,
@@ -692,6 +693,16 @@ function buildReadinessChecks(
         : `${input.pendingNotifications.length} pending operator notification(s) in bounded sample`,
     },
   ];
+}
+
+export function formatOrderDetailSummaryMessage(
+  order: OrderRecord | null,
+  events: readonly OrderEventRecord[],
+  fills: readonly FillRecord[],
+  reference: string,
+  locale: TelegramLocale = DEFAULT_TELEGRAM_LOCALE,
+): string {
+  return formatOrderDetailPresentation(order, events, fills, reference, locale);
 }
 
 function getReadinessOverallStatus(

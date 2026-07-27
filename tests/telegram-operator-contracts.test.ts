@@ -96,7 +96,10 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.ok(orderParsed);
   assert.equal(orderParsed.command, "/order");
   assert.deepEqual(orderParsed.args, ["order-1"]);
-  assert.equal(orderParsed.contract.summary, "Show one persisted order with lifecycle events and fills.");
+  assert.equal(
+    orderParsed.contract.summary,
+    "Show a concise persisted order lifecycle summary or the canonical technical detail.",
+  );
   assert.ok(previewParsed);
   assert.equal(previewParsed.command, "/preview");
   assert.deepEqual(previewParsed.args, ["BTC"]);
@@ -154,6 +157,33 @@ test("orders command accepts only an optional detail argument", () => {
   assert.equal(
     contract?.summary,
     "Show a concise recent-order summary or the canonical stored order list.",
+  );
+});
+
+test("order command accepts a reference with an optional detail argument only", () => {
+  const summary = parseTelegramCommand("/order order-1");
+  const detail = parseTelegramCommand("/order order-1 DETAIL");
+  const missing = parseTelegramCommand("/order");
+  const unsupported = parseTelegramCommand("/order order-1 summary");
+  const extra = parseTelegramCommand("/order order-1 detail now");
+
+  assert.ok(summary);
+  assert.ok(detail);
+  assert.ok(missing);
+  assert.ok(unsupported);
+  assert.ok(extra);
+  assert.equal(validateTelegramCommand(summary), null);
+  assert.equal(validateTelegramCommand(detail), null);
+  assert.equal(validateTelegramCommand(missing), buildUsageMessage("/order"));
+  assert.equal(validateTelegramCommand(unsupported), buildUsageMessage("/order"));
+  assert.equal(validateTelegramCommand(extra), buildUsageMessage("/order"));
+
+  const contract = listTelegramCommandContracts()
+    .find((candidate) => candidate.command === "/order");
+  assert.equal(contract?.usage, "/order <order-id|identifier> [detail]");
+  assert.equal(
+    contract?.summary,
+    "Show a concise persisted order lifecycle summary or the canonical technical detail.",
   );
 });
 

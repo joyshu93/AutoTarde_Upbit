@@ -93,9 +93,9 @@ const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
   {
     command: "/order",
     category: "inspection",
-    usage: "/order <order-id|identifier>",
-    summary: "Show one persisted order with lifecycle events and fills.",
-    argumentPolicy: "order_reference_required",
+    usage: "/order <order-id|identifier> [detail]",
+    summary: "Show a concise persisted order lifecycle summary or the canonical technical detail.",
+    argumentPolicy: "order_reference_optional_detail",
   },
   {
     command: "/scheduler",
@@ -209,8 +209,17 @@ export function validateTelegramCommand(parsed: ParsedTelegramCommand): string |
     return parseTelegramAssetArg(parsed.args) === null ? buildUsageMessage(parsed.command) : null;
   }
 
-  if (parsed.contract.argumentPolicy === "order_reference_required") {
-    return parsed.args.length === 1 && parsed.args[0]?.trim() ? null : buildUsageMessage(parsed.command);
+  if (parsed.contract.argumentPolicy === "order_reference_optional_detail") {
+    const validSummary =
+      parsed.args.length === 1
+      && Boolean(parsed.args[0]?.trim());
+    const validDetail =
+        parsed.args.length === 2
+        && Boolean(parsed.args[0]?.trim())
+        && parsed.args[1]?.toLowerCase() === "detail";
+    return validSummary || validDetail
+      ? null
+      : buildUsageMessage(parsed.command);
   }
 
   if (parsed.args.length > 0) {

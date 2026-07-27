@@ -60,7 +60,7 @@ Telegram may expose:
 - `/balances`
 - `/positions`
 - `/orders`
-- `/order <order-id|identifier>`
+- `/order <order-id|identifier> [detail]`
 - `/scheduler`
 - `/inbound`
 - `/pause`
@@ -80,6 +80,7 @@ Telegram `/start` is treated as an exact locale-aware `/help` alias for first-ru
 Telegram `/status` is a locale-aware concise operator summary by default. `/status detail` preserves the canonical technical execution, scheduler, reconciliation, recovery, and transition fields; both forms are read-only and must not trigger exchange calls, sync, strategy execution, scheduler ticks, order mutation, or live order transmission.
 Telegram `/balances` and `/positions` may present locale-aware summaries of the latest persisted exchange snapshots. `/balances detail` and `/positions detail` preserve canonical technical fields. These commands must not call Upbit, trigger sync, infer holdings from Telegram messages, or accept manual cash or position input.
 Telegram `/orders` may present a locale-aware recent-order lifecycle summary with exact `/order <id>` inspection hints. `/orders detail` preserves the canonical bounded technical list. Both forms are read-only and must not submit, cancel, retry, reconcile, or mutate orders.
+Telegram `/order <reference>` may present a locale-aware lifecycle summary with bounded recent event and fill history. `/order <reference> detail` preserves canonical complete order, event payload, fill, and identifier fields. Both forms are read-only and must not query Upbit or mutate exchange or local order state.
 `/inbound` may inspect runtime inbound polling status and persisted offset progress, but it must not poll Telegram or route commands by itself.
 `npm run smoke:telegram:inbound` may perform one bounded Telegram `getUpdates` poll for operator validation, but it forcibly uses `DRY_RUN`, disables live-send and scheduler paths, and never starts the long-running polling loop.
 `npm run smoke:dryrun:readiness` may inspect local DRY_RUN runtime configuration and persisted readiness evidence before the local runtime starts, but it must not run `/sync`, run strategies, poll Telegram, start the scheduler, call Upbit, deliver notifications, or transmit orders.
@@ -88,7 +89,7 @@ Telegram `/orders` may present a locale-aware recent-order lifecycle summary wit
 The local DRY_RUN scheduler launcher may enable `STRATEGY_SCHEDULER_ENABLED=true` and `STRATEGY_SCHEDULER_RUN_ON_START=true` only while `APP_EXECUTION_MODE=DRY_RUN` and `ENABLE_LIVE_ORDERS=false`; it must require an explicit local DRY_RUN scheduler confirmation, run exchange-backed DRY_RUN sync/readiness checks before startup, and never enable live order transmission.
 `npm run smoke:dryrun:completion` may inspect persisted DRY_RUN completion evidence after the automatic scheduler rehearsal, including latest snapshots, latest reconciliation, recent risk and notification state, and latest `strategy_scheduler_runs` for `KRW-BTC` and `KRW-ETH`, but it must force live-send disabled, Telegram transport disabled, scheduler startup disabled, and must not run `/sync`, run strategies, poll Telegram, start the scheduler, call Upbit, deliver notifications, create orders, or transmit orders.
 `/alerts` may summarize persisted operator notifications, recent delivery-run rows, recent delivery-attempt audit rows, and derived delivery-worker queue metrics, but none of them become trading truth sources.
-`/order <order-id|identifier>` may inspect one persisted order, its local lifecycle events, and its fills, but it must not query Telegram as truth or trigger exchange-side mutation.
+`/order <order-id|identifier> [detail]` may inspect one persisted order, its local lifecycle events, and its fills, but it must not query Telegram as truth or trigger exchange-side mutation.
 `/preview BTC|ETH` may compute one deterministic PositionGuard strategy decision and order intent for a supported asset, but it must not persist a strategy decision, create an order, run reconciliation, or submit an order.
 `/run BTC|ETH` may request one deterministic PositionGuard strategy cycle for a supported asset, but it must route through the configured execution path and inherits the default `DRY_RUN` live-send blockers. In `LIVE` mode, a manual `/run` must first pass the same persisted-health preflight family used for live scheduled ticks before any strategy decision or order intent is created.
 `/scheduler` may inspect current in-memory scheduler status plus persisted `strategy_scheduler_runs`, but it must not trigger execution or mutate portfolio truth.

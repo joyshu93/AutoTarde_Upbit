@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import type {
   BalanceSnapshotRecord,
   ExecutionStateRecord,
+  FillRecord,
   OperatorNotificationRecord,
+  OrderEventRecord,
   OrderRecord,
   PositionSnapshotRecord,
   StrategySchedulerStatus,
@@ -17,6 +19,8 @@ import { TelegramCommandRouter } from "../src/modules/telegram/commands.js";
 import { listTelegramCommandContracts } from "../src/modules/telegram/contracts.js";
 import {
   formatBalanceMessage,
+  formatOrderDetailMessage,
+  formatOrderDetailSummaryMessage,
   formatOrdersMessage,
   formatOrdersSummaryMessage,
   formatPositionMessage,
@@ -1584,7 +1588,7 @@ function createRouterState(): InMemoryOperatorStateStore {
   });
 }
 
-test("telegram router exposes a read-only order lifecycle detail", async () => {
+test("telegram router exposes a concise Korean order lifecycle summary", async () => {
   const repository = new InMemoryExecutionRepository();
   await repository.saveOrder(createOrder({
     id: "order-1",
@@ -1641,29 +1645,36 @@ test("telegram router exposes a read-only order lifecycle detail", async () => {
 
   const response = await router.route("/order order-identifier-1");
 
-  assert.match(response.text, /Order Detail/);
-  assert.match(response.text, /query: order-identifier-1/);
-  assert.match(response.text, /state_source: persisted orders \+ order_events \+ fills/);
-  assert.match(response.text, /id: order-1/);
-  assert.match(response.text, /identifier: order-identifier-1/);
-  assert.match(response.text, /upbit_uuid: upbit-uuid-1/);
-  assert.match(response.text, /status: PARTIALLY_FILLED/);
-  assert.match(response.text, /idempotency_key: idempotency-1/);
-  assert.match(response.text, /exchange_response_available: true/);
-  assert.match(response.text, /event_count: 2/);
-  assert.match(response.text, /\| LOCAL \| ORDER_PERSISTED \| payload=\{"status":"PERSISTED"\}/);
-  assert.match(response.text, /\| RECONCILIATION \| RECONCILIATION_STATUS_UPDATED \| payload=\{"status":"PARTIALLY_FILLED"\}/);
-  assert.match(response.text, /fill_count: 1/);
-  assert.match(response.text, /\| KRW-BTC \| bid \| price=500000 \| volume=0\.005 \| fee=250 KRW \| exchange_fill_id=exchange-fill-1/);
-  assert.match(response.text, /operator_boundary: Telegram does not accept manual cash or position input\./);
+  assert.match(response.text, /주문 상세 \(Order\)/);
+  assert.match(response.text, /부분 체결/);
+  assert.match(response.text, /아직 완료되지 않았으며 남은 수량의 체결 또는 취소를 기다립니다\./);
+  assert.match(response.text, /KRW-BTC · 매수 · price · DRY_RUN · 전략/);
+  assert.match(response.text, /요청: 2026-04-20 09:00:00 KST/);
+  assert.match(response.text, /갱신: 2026-04-20 09:02:00 KST/);
+  assert.match(response.text, /내부 주문 ID: order-1/);
+  assert.match(response.text, /식별자: order-identifier-1/);
+  assert.match(response.text, /주문금액: 500,000원/);
+  assert.match(response.text, /최근 이벤트 \(2건\)/);
+  assert.match(response.text, /RECONCILIATION_STATUS_UPDATED · RECONCILIATION · 2026-04-20 09:02:00 KST/);
+  assert.doesNotMatch(response.text, /payload=/);
+  assert.match(response.text, /최근 체결 \(1건\)/);
+  assert.match(response.text, /2026-04-20 09:01:00 KST · 500,000원 · 0\.005 BTC · 수수료 250원/);
+  assert.match(response.text, /전체 기술 상세: \/order order-1 detail/);
+  assert.match(response.text, /텔레그램에서는 현금이나 포지션을 수동 입력할 수 없습니다\./);
 });
 
 test("telegram router reports missing order detail without reading events or fills", async () => {
+  let orderLookupCount = 0;
   let eventLookupCount = 0;
   let fillLookupCount = 0;
   const repository = new InMemoryExecutionRepository();
+  const findOrderByReference = repository.findOrderByReference.bind(repository);
   const listOrderEvents = repository.listOrderEvents.bind(repository);
   const listFills = repository.listFills.bind(repository);
+  repository.findOrderByReference = async (exchangeAccountId, reference) => {
+    orderLookupCount += 1;
+    return findOrderByReference(exchangeAccountId, reference);
+  };
   repository.listOrderEvents = async (orderId) => {
     eventLookupCount += 1;
     return listOrderEvents(orderId);
@@ -1690,11 +1701,444 @@ test("telegram router reports missing order detail without reading events or fil
 
   const response = await router.route("/order unknown-order");
 
-  assert.match(response.text, /Order Detail/);
-  assert.match(response.text, /status: not_found/);
-  assert.match(response.text, /query: unknown-order/);
+  assert.match(response.text, /주문을 찾을 수 없습니다\./);
+  assert.match(response.text, /조회값: unknown-order/);
+  assert.equal(orderLookupCount, 1);
   assert.equal(eventLookupCount, 0);
   assert.equal(fillLookupCount, 0);
+});
+
+test("telegram /order renders equivalent English lifecycle information", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveOrder(createOrder({
+    id: "order-en",
+    identifier: "order-en-identifier",
+    status: "RECONCILIATION_REQUIRED",
+    side: "ask",
+    ordType: "best",
+    price: null,
+    volume: "0.125",
+    failureCode: "LOOKUP_FAILED",
+    failureMessage: "Exchange lookup timed out.",
+    requestedAt: "2026-04-20T00:00:00.000Z",
+    updatedAt: "2026-04-20T00:05:00.000Z",
+  }));
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: createRouterState(),
+    locale: "en-US",
+  });
+
+  const response = await router.route("/order order-en");
+
+  assert.match(response.text, /Order detail/);
+  assert.match(response.text, /Reconciliation required/);
+  assert.match(response.text, /This order is not complete; verify it against persisted exchange reconciliation evidence\./);
+  assert.match(response.text, /KRW-BTC · Sell · best · DRY_RUN · Strategy/);
+  assert.match(response.text, /Volume: 0\.125 BTC/);
+  assert.match(response.text, /Failure: LOOKUP_FAILED · Exchange lookup timed out\./);
+  assert.match(response.text, /Full technical detail: \/order order-en detail/);
+});
+
+test("telegram /order shows only the newest three events and fills without inferring state", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const order = createOrder({
+    id: "order-latest-three",
+    identifier: "order-latest-three-identifier",
+    status: "OPEN",
+    price: "100000000",
+    volume: "0.0001",
+  });
+  await repository.saveOrder(order);
+
+  for (let index = 0; index < 5; index += 1) {
+    await repository.appendOrderEvent({
+      id: `event-${index}`,
+      orderId: order.id,
+      eventType: `EVENT_${index}`,
+      eventSource: index % 2 === 0 ? "LOCAL" : "EXCHANGE",
+      payloadJson: JSON.stringify({ index }),
+      createdAt: `2026-04-20T00:0${index}:00.000Z`,
+    });
+    await repository.saveFill({
+      id: `fill-${index}`,
+      orderId: order.id,
+      exchangeFillId: `exchange-fill-${index}`,
+      market: "KRW-BTC",
+      side: "bid",
+      price: `${100000000 + index}`,
+      volume: "0.00001",
+      feeCurrency: "KRW",
+      feeAmount: `${index}`,
+      filledAt: `2026-04-20T00:0${index}:30.000Z`,
+      rawPayloadJson: JSON.stringify({ index }),
+    });
+  }
+
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: createRouterState(),
+  });
+  const response = await router.route("/order order-latest-three");
+
+  assert.match(response.text, /미체결/);
+  assert.match(response.text, /아직 완료되지 않았으며 거래소 체결 또는 취소를 기다립니다\./);
+  assert.match(response.text, /최근 이벤트 \(전체 5건 중 3건\)/);
+  assert.match(response.text, /EVENT_4/);
+  assert.match(response.text, /EVENT_3/);
+  assert.match(response.text, /EVENT_2/);
+  assert.doesNotMatch(response.text, /EVENT_1/);
+  assert.match(response.text, /최근 체결 \(전체 5건 중 3건\)/);
+  assert.match(response.text, /2026-04-20 09:04:30 KST/);
+  assert.doesNotMatch(response.text, /2026-04-20 09:01:30 KST/);
+});
+
+test("telegram order detail sorts mixed-offset event and fill timestamps by instant", () => {
+  const order = createOrder({ id: "order-mixed-offset" });
+  const events: OrderEventRecord[] = [
+    {
+      id: "event-offset",
+      orderId: order.id,
+      eventType: "OFFSET_EVENT",
+      eventSource: "LOCAL",
+      payloadJson: "{}",
+      createdAt: "2026-04-20T09:00:00+09:00",
+    },
+    {
+      id: "event-z-newer",
+      orderId: order.id,
+      eventType: "NEWER_Z_EVENT",
+      eventSource: "EXCHANGE",
+      payloadJson: "{}",
+      createdAt: "2026-04-20T00:30:00.000Z",
+    },
+  ];
+  const fills: FillRecord[] = [
+    {
+      id: "fill-offset",
+      orderId: order.id,
+      exchangeFillId: "fill-offset",
+      market: "KRW-BTC",
+      side: "bid",
+      price: "100000000",
+      volume: "0.00001",
+      feeCurrency: "KRW",
+      feeAmount: "0.1",
+      filledAt: "2026-04-20T09:00:00+09:00",
+      rawPayloadJson: "{}",
+    },
+    {
+      id: "fill-z-newer",
+      orderId: order.id,
+      exchangeFillId: "fill-z-newer",
+      market: "KRW-BTC",
+      side: "bid",
+      price: "100000001",
+      volume: "0.00002",
+      feeCurrency: "KRW",
+      feeAmount: "0.2",
+      filledAt: "2026-04-20T00:30:00.000Z",
+      rawPayloadJson: "{}",
+    },
+  ];
+
+  const message = formatOrderDetailSummaryMessage(order, events, fills, order.id, "en-US");
+
+  assert.ok(message.indexOf("NEWER_Z_EVENT") < message.indexOf("OFFSET_EVENT"));
+  assert.ok(message.indexOf("KRW 100,000,001") < message.indexOf("KRW 100,000,000"));
+});
+
+test("telegram order detail puts invalid timestamps last and labels them as data errors", () => {
+  const order = createOrder({ id: "order-invalid-time" });
+  const events: OrderEventRecord[] = [
+    {
+      id: "event-invalid",
+      orderId: order.id,
+      eventType: "INVALID_TIME_EVENT",
+      eventSource: "LOCAL",
+      payloadJson: "{}",
+      createdAt: "not-an-instant",
+    },
+    {
+      id: "event-valid",
+      orderId: order.id,
+      eventType: "VALID_TIME_EVENT",
+      eventSource: "EXCHANGE",
+      payloadJson: "{}",
+      createdAt: "2026-04-20T00:30:00.000Z",
+    },
+  ];
+  const fills: FillRecord[] = [
+    {
+      id: "fill-invalid",
+      orderId: order.id,
+      exchangeFillId: "fill-invalid",
+      market: "KRW-BTC",
+      side: "bid",
+      price: "100000000",
+      volume: "0.00001",
+      feeCurrency: "KRW",
+      feeAmount: "0.1",
+      filledAt: "invalid-fill-time",
+      rawPayloadJson: "{}",
+    },
+    {
+      id: "fill-valid",
+      orderId: order.id,
+      exchangeFillId: "fill-valid",
+      market: "KRW-BTC",
+      side: "bid",
+      price: "100000001",
+      volume: "0.00002",
+      feeCurrency: "KRW",
+      feeAmount: "0.2",
+      filledAt: "2026-04-20T00:30:00.000Z",
+      rawPayloadJson: "{}",
+    },
+  ];
+
+  const message = formatOrderDetailSummaryMessage(order, events, fills, order.id, "ko-KR");
+
+  assert.ok(message.indexOf("VALID_TIME_EVENT") < message.indexOf("INVALID_TIME_EVENT"));
+  assert.ok(message.indexOf("100,000,001원") < message.indexOf("100,000,000원"));
+  assert.match(message, /INVALID_TIME_EVENT · LOCAL · 시간 데이터 오류 \(not-an-instant\)/);
+  assert.match(message, /시간 데이터 오류 \(invalid-fill-time\) · 100,000,000원/);
+});
+
+test("telegram order detail preserves fee decimal precision and reports unknown fee currency", () => {
+  const order = createOrder({ id: "order-fee-precision" });
+  const fills: FillRecord[] = [
+    {
+      id: "fill-krw-decimal",
+      orderId: order.id,
+      exchangeFillId: "fill-krw-decimal",
+      market: "KRW-BTC",
+      side: "bid",
+      price: "100000000",
+      volume: "0.00001",
+      feeCurrency: "KRW",
+      feeAmount: "0.00000001",
+      filledAt: "2026-04-20T00:02:00.000Z",
+      rawPayloadJson: "{}",
+    },
+    {
+      id: "fill-unknown-currency",
+      orderId: order.id,
+      exchangeFillId: "fill-unknown-currency",
+      market: "KRW-BTC",
+      side: "bid",
+      price: "100000000",
+      volume: "0.00001",
+      feeCurrency: null,
+      feeAmount: "0.12345678",
+      filledAt: "2026-04-20T00:01:00.000Z",
+      rawPayloadJson: "{}",
+    },
+  ];
+
+  const korean = formatOrderDetailSummaryMessage(order, [], fills, order.id, "ko-KR");
+  const english = formatOrderDetailSummaryMessage(order, [], fills, order.id, "en-US");
+
+  assert.match(korean, /수수료 0\.00000001원/);
+  assert.match(korean, /수수료 0\.12345678 \(통화 미상\)/);
+  assert.match(english, /Fee KRW 0\.00000001/);
+  assert.match(english, /Fee 0\.12345678 \(currency unknown\)/);
+});
+
+test("telegram order detail distinguishes unavailable fee information from a real zero fee", () => {
+  const order = createOrder({ id: "order-fee-availability" });
+  const fills: FillRecord[] = [
+    {
+      id: "fill-fee-unavailable",
+      orderId: order.id,
+      exchangeFillId: "fill-fee-unavailable",
+      market: "KRW-BTC",
+      side: "bid",
+      price: "100000000",
+      volume: "0.00001",
+      feeCurrency: "KRW",
+      feeAmount: null,
+      filledAt: "2026-04-20T00:02:00.000Z",
+      rawPayloadJson: "{}",
+    },
+    {
+      id: "fill-zero-fee",
+      orderId: order.id,
+      exchangeFillId: "fill-zero-fee",
+      market: "KRW-BTC",
+      side: "bid",
+      price: "100000000",
+      volume: "0.00001",
+      feeCurrency: "KRW",
+      feeAmount: "0",
+      filledAt: "2026-04-20T00:01:00.000Z",
+      rawPayloadJson: "{}",
+    },
+  ];
+
+  const korean = formatOrderDetailSummaryMessage(order, [], fills, order.id, "ko-KR");
+  const english = formatOrderDetailSummaryMessage(order, [], fills, order.id, "en-US");
+
+  assert.match(korean, /수수료 정보 없음/);
+  assert.match(korean, /수수료 0원/);
+  assert.doesNotMatch(korean, /수수료 없음/);
+  assert.match(english, /Fee unavailable/);
+  assert.match(english, /Fee KRW 0/);
+  assert.doesNotMatch(english, /no fee/);
+});
+
+test("telegram order detail labels malformed order and fill decimals as data errors", () => {
+  const order = createOrder({
+    id: "order-malformed-decimals",
+    ordType: "limit",
+    price: "bad-order-price",
+    volume: "bad-order-volume",
+  });
+  const fills: FillRecord[] = [{
+    id: "fill-malformed-decimals",
+    orderId: order.id,
+    exchangeFillId: "fill-malformed-decimals",
+    market: "KRW-BTC",
+    side: "bid",
+    price: "bad-fill-price",
+    volume: "bad-fill-volume",
+    feeCurrency: "KRW",
+    feeAmount: "bad-fee",
+    filledAt: "2026-04-20T00:01:00.000Z",
+    rawPayloadJson: "{}",
+  }];
+
+  const korean = formatOrderDetailSummaryMessage(order, [], fills, order.id, "ko-KR");
+  const english = formatOrderDetailSummaryMessage(order, [], fills, order.id, "en-US");
+
+  assert.match(korean, /주문 단가: 데이터 오류 \(bad-order-price\)/);
+  assert.match(korean, /수량: 데이터 오류 \(bad-order-volume\)/);
+  assert.match(korean, /가격 데이터 오류 \(bad-fill-price\)/);
+  assert.match(korean, /수량 데이터 오류 \(bad-fill-volume\)/);
+  assert.match(korean, /수수료 데이터 오류 \(bad-fee\)/);
+  assert.doesNotMatch(korean, /주문 단가: 없음|수량: 없음/);
+  assert.match(english, /Unit price: data error \(bad-order-price\)/);
+  assert.match(english, /Volume: data error \(bad-order-volume\)/);
+  assert.match(english, /Price data error \(bad-fill-price\)/);
+  assert.match(english, /Volume data error \(bad-fill-volume\)/);
+  assert.match(english, /Fee data error \(bad-fee\)/);
+});
+
+test("telegram /order detail preserves the canonical technical output exactly", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const order = createOrder({
+    id: "order-canonical",
+    identifier: "order-canonical-identifier",
+    status: "FILLED",
+  });
+  const events: OrderEventRecord[] = [{
+    id: "canonical-event",
+    orderId: order.id,
+    eventType: "ORDER_FILLED",
+    eventSource: "EXCHANGE",
+    payloadJson: JSON.stringify({ raw: true }),
+    createdAt: "2026-04-20T00:02:00.000Z",
+  }];
+  const fills: FillRecord[] = [{
+    id: "canonical-fill",
+    orderId: order.id,
+    exchangeFillId: "canonical-exchange-fill",
+    market: "KRW-BTC",
+    side: "bid",
+    price: "500000",
+    volume: "0.005",
+    feeCurrency: "KRW",
+    feeAmount: "250",
+    filledAt: "2026-04-20T00:01:00.000Z",
+    rawPayloadJson: JSON.stringify({ fill: true }),
+  }];
+  await repository.saveOrder(order);
+  await repository.appendOrderEvent(events[0]!);
+  await repository.saveFill(fills[0]!);
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: createRouterState(),
+  });
+
+  const response = await router.route("/order order-canonical-identifier DETAIL");
+
+  assert.equal(
+    response.text,
+    formatOrderDetailMessage(order, events, fills, "order-canonical-identifier"),
+  );
+});
+
+test("telegram order detail summary gives every persisted lifecycle state an honest meaning", () => {
+  const statuses: OrderRecord["status"][] = [
+    "INTENT_CREATED",
+    "RISK_REJECTED",
+    "PERSISTED",
+    "SUBMITTING",
+    "OPEN",
+    "PARTIALLY_FILLED",
+    "FILLED",
+    "CANCEL_REQUESTED",
+    "CANCELED",
+    "REJECTED",
+    "FAILED",
+    "RECONCILIATION_REQUIRED",
+  ];
+
+  for (const status of statuses) {
+    const message = formatOrderDetailSummaryMessage(
+      createOrder({ id: `order-${status}`, status }),
+      [],
+      [],
+      `order-${status}`,
+      "en-US",
+    );
+    assert.match(message, /Meaning: /);
+    if (["OPEN", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "RECONCILIATION_REQUIRED"].includes(status)) {
+      assert.match(message, /not complete/);
+      assert.doesNotMatch(message, /records this order as filled|records this order as canceled/);
+    }
+  }
+});
+
+test("telegram order detail summary preserves Upbit price and volume semantics", () => {
+  const cases: Array<{
+    order: OrderRecord;
+    expected: RegExp;
+    absent?: RegExp;
+  }> = [
+    {
+      order: createOrder({ id: "order-limit", ordType: "limit", side: "bid", price: "100000000", volume: "0.001" }),
+      expected: /Unit price: KRW 100,000,000[\s\S]*Volume: 0\.001 BTC/,
+    },
+    {
+      order: createOrder({ id: "order-price-bid", ordType: "price", side: "bid", price: "6000", volume: null }),
+      expected: /Order amount: KRW 6,000/,
+      absent: /Volume:/,
+    },
+    {
+      order: createOrder({ id: "order-market-ask", ordType: "market", side: "ask", price: null, volume: "0.001" }),
+      expected: /Volume: 0\.001 BTC/,
+      absent: /Unit price:|Order amount:|Order price:/,
+    },
+    {
+      order: createOrder({ id: "order-best-bid", ordType: "best", side: "bid", price: "6000", volume: null }),
+      expected: /Order amount: KRW 6,000/,
+      absent: /Volume:/,
+    },
+    {
+      order: createOrder({ id: "order-best-ask", ordType: "best", side: "ask", price: null, volume: "0.001" }),
+      expected: /Volume: 0\.001 BTC/,
+      absent: /Unit price:|Order amount:|Order price:/,
+    },
+  ];
+
+  for (const { order, expected, absent } of cases) {
+    const message = formatOrderDetailSummaryMessage(order, [], [], order.id, "en-US");
+    assert.match(message, expected);
+    if (absent) {
+      assert.doesNotMatch(message, absent);
+    }
+  }
 });
 
 test("telegram router renders a concise Korean orders summary with lifecycle counts and recent-order hints", async () => {
