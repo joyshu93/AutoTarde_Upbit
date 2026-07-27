@@ -23,6 +23,7 @@ import {
   formatReconciliationRunsMessage,
   formatRecoveryProgressMessage,
   formatRiskEventsMessage,
+  formatRiskEventsSummaryMessage,
   formatRuntimeConfigMessage,
   formatStateHistoryMessage,
   formatStrategySchedulerRunsMessage,
@@ -99,7 +100,10 @@ export class TelegramCommandRouter {
       case "/alerts":
         return this.buildAlertsResponse(exchangeAccountId);
       case "/risks":
-        return this.buildRiskEventsResponse(exchangeAccountId);
+        return this.buildRiskEventsResponse(
+          exchangeAccountId,
+          parsed.args[0]?.toLowerCase() === "detail",
+        );
       case "/balances":
         return this.buildBalanceResponse(
           exchangeAccountId,
@@ -410,11 +414,19 @@ export class TelegramCommandRouter {
     };
   }
 
-  private async buildRiskEventsResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+  private async buildRiskEventsResponse(
+    exchangeAccountId: string,
+    detail: boolean,
+  ): Promise<TelegramResponse> {
     const events = await this.dependencies.repositories.listRiskEvents(exchangeAccountId, 10);
 
     return {
-      text: formatRiskEventsMessage(events),
+      text: detail
+        ? formatRiskEventsMessage(events)
+        : formatRiskEventsSummaryMessage(
+            events,
+            normalizeTelegramLocale(this.dependencies.locale),
+          ),
     };
   }
 

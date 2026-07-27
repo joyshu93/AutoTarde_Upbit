@@ -56,7 +56,7 @@ Telegram may expose:
 - `/synchistory`
 - `/recovery`
 - `/alerts`
-- `/risks`
+- `/risks [detail]`
 - `/balances`
 - `/positions`
 - `/orders`
@@ -81,6 +81,7 @@ Telegram `/status` is a locale-aware concise operator summary by default. `/stat
 Telegram `/balances` and `/positions` may present locale-aware summaries of the latest persisted exchange snapshots. `/balances detail` and `/positions detail` preserve canonical technical fields. These commands must not call Upbit, trigger sync, infer holdings from Telegram messages, or accept manual cash or position input.
 Telegram `/orders` may present a locale-aware recent-order lifecycle summary with exact `/order <id>` inspection hints. `/orders detail` preserves the canonical bounded technical list. Both forms are read-only and must not submit, cancel, retry, reconcile, or mutate orders.
 Telegram `/order <reference>` may present a locale-aware lifecycle summary with bounded recent event and fill history. `/order <reference> detail` preserves canonical complete order, event payload, fill, and identifier fields. Both forms are read-only and must not query Upbit or mutate exchange or local order state.
+Telegram `/risks` may present a locale-aware summary of recent persisted risk-event history, including severity counts, explanations, original messages, and linked order or strategy-decision references. `/risks detail` preserves the canonical technical list. Historical rows are not proof of a currently active risk block, and both forms must use the same bounded local read without evaluating risk, clearing or creating events, calling Upbit, mutating orders, or changing execution state.
 `/inbound` may inspect runtime inbound polling status and persisted offset progress, but it must not poll Telegram or route commands by itself.
 `npm run smoke:telegram:inbound` may perform one bounded Telegram `getUpdates` poll for operator validation, but it forcibly uses `DRY_RUN`, disables live-send and scheduler paths, and never starts the long-running polling loop.
 `npm run smoke:dryrun:readiness` may inspect local DRY_RUN runtime configuration and persisted readiness evidence before the local runtime starts, but it must not run `/sync`, run strategies, poll Telegram, start the scheduler, call Upbit, deliver notifications, or transmit orders.

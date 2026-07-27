@@ -65,9 +65,9 @@ const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
   {
     command: "/risks",
     category: "inspection",
-    usage: "/risks",
-    summary: "Show recent persisted risk_events for operator inspection.",
-    argumentPolicy: "none",
+    usage: "/risks [detail]",
+    summary: "Show a concise persisted risk-history summary or the canonical technical list.",
+    argumentPolicy: "optional_detail",
   },
   {
     command: "/balances",

@@ -8,6 +8,8 @@ import type {
   OrderEventRecord,
   OrderRecord,
   PositionSnapshotRecord,
+  RiskEventRecord,
+  RiskRuleCode,
   StrategySchedulerStatus,
 } from "../src/domain/types.js";
 import {
@@ -25,6 +27,8 @@ import {
   formatOrdersSummaryMessage,
   formatPositionMessage,
   formatReadinessMessage,
+  formatRiskEventsMessage,
+  formatRiskEventsSummaryMessage,
   formatStatusMessage,
 } from "../src/modules/telegram/formatter.js";
 import { test } from "./harness.js";
@@ -3668,19 +3672,46 @@ test("telegram router exposes delivery worker queue metrics in /alerts", async (
   assert.match(alerts.text, /latest_delivery_attempt_at: 2026-04-20T00:04:50.000Z/);
 });
 
-test("telegram router exposes dedicated persisted risk-event inspection", async () => {
+test("telegram router presents persisted risk history in Korean without claiming current blockers", async () => {
   const repository = new InMemoryExecutionRepository();
-  await repository.saveRiskEvent({
-    id: "risk-event-1",
-    exchangeAccountId: "primary",
-    strategyDecisionId: "decision-1",
-    orderId: null,
-    level: "BLOCK",
-    ruleCode: "DUPLICATE_ORDER_GUARD",
-    message: "A matching active order already exists.",
-    payloadJson: JSON.stringify({ idempotencyKey: "duplicate-key" }),
-    createdAt: "2026-04-20T00:01:00.000Z",
-  });
+  const events: RiskEventRecord[] = [
+    {
+      id: "risk-event-invalid",
+      exchangeAccountId: "primary",
+      strategyDecisionId: null,
+      orderId: null,
+      level: "INFO",
+      ruleCode: "LIVE_EXECUTION_DISABLED",
+      message: "Invalid time evidence.",
+      payloadJson: "{}",
+      createdAt: "not-a-timestamp",
+    },
+    {
+      id: "risk-event-offset",
+      exchangeAccountId: "primary",
+      strategyDecisionId: "decision-2",
+      orderId: "order-2",
+      level: "WARN",
+      ruleCode: "STALE_PRICE_GUARD",
+      message: "Market price is stale.",
+      payloadJson: "{}",
+      createdAt: "2026-04-20T09:30:00+09:00",
+    },
+    {
+      id: "risk-event-latest",
+      exchangeAccountId: "primary",
+      strategyDecisionId: null,
+      orderId: null,
+      level: "BLOCK",
+      ruleCode: "DUPLICATE_ORDER_GUARD",
+      message: "A matching active order already exists.",
+      payloadJson: JSON.stringify({ idempotencyKey: "duplicate-key" }),
+      createdAt: "2026-04-20T00:31:00.000Z",
+    },
+  ];
+  for (const event of events) {
+    await repository.saveRiskEvent(event);
+  }
 
   const router = new TelegramCommandRouter({
     repositories: repository,
@@ -3700,10 +3731,199 @@ test("telegram router exposes dedicated persisted risk-event inspection", async 
 
   const risks = await router.route("/risks");
 
-  assert.match(risks.text, /Risk Events/);
-  assert.match(risks.text, /count: 1/);
-  assert.match(risks.text, /state_source: persisted risk_events/);
-  assert.match(risks.text, /\| BLOCK \| DUPLICATE_ORDER_GUARD \| A matching active order already exists\./);
+  assert.match(risks.text, /최근 리스크 이력/);
+  assert.match(risks.text, /저장된 최근 이력이며 현재 활성 차단 상태가 아닙니다/);
+  assert.match(risks.text, /조회 건수: 3건/);
+  assert.match(risks.text, /정보 1.*주의 1.*차단 1/);
+  assert.ok(risks.text.indexOf("2026-04-20 09:31:00 KST") < risks.text.indexOf("2026-04-20 09:30:00 KST"));
+  assert.ok(risks.text.indexOf("2026-04-20 09:30:00 KST") < risks.text.indexOf("데이터 오류"));
+  assert.match(risks.text, /중복 주문 차단/);
+  assert.match(risks.text, /동일한 활성 주문/);
+  assert.match(risks.text, /원문: A matching active order already exists\./);
+  assert.match(risks.text, /주문 확인: \/order order-2/);
+  assert.match(risks.text, /전략 결정 ID: decision-2/);
+  assert.match(risks.text, /전체 기술 이력: \/risks detail/);
+});
+
+test("telegram risk summary maps every rule code exhaustively in English", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const events: RiskEventRecord[] = [];
+  const expectedTitles: Readonly<Record<RiskRuleCode, string>> = {
+    GLOBAL_KILL_SWITCH: "Global kill switch",
+    EXECUTION_PAUSED: "Execution paused",
+    SYSTEM_DEGRADED: "System degraded",
+    PER_ASSET_MAX_ALLOCATION: "Per-asset allocation limit",
+    TOTAL_EXPOSURE_CAP: "Total exposure cap",
+    STALE_PRICE_GUARD: "Stale price guard",
+    DUPLICATE_ORDER_GUARD: "Duplicate order guard",
+    MINIMUM_ORDER_VALUE_GUARD: "Minimum order value",
+    LIVE_EXECUTION_DISABLED: "Live execution disabled",
+    UNSUPPORTED_MARKET: "Unsupported market",
+    UNSUPPORTED_ORDER_TYPE: "Unsupported order type",
+    EXCHANGE_MIN_TOTAL_GUARD: "Exchange minimum order value",
+    EXCHANGE_MAX_TOTAL_GUARD: "Exchange maximum order value",
+    MARKET_OFFLINE: "Market offline",
+    EXCHANGE_ORDER_CHANCE_FAILED: "Order availability check failed",
+    EXCHANGE_ORDER_TEST_FAILED: "Exchange order test failed",
+    ORDER_RECOVERY_REQUIRED: "Order recovery required",
+    BALANCE_DRIFT_DETECTED: "Balance drift detected",
+    POSITION_DRIFT_DETECTED: "Position drift detected",
+  };
+
+  let offset = 0;
+  for (const ruleCode of Object.keys(expectedTitles) as RiskRuleCode[]) {
+    const event: RiskEventRecord = {
+      id: `risk-${offset}`,
+      exchangeAccountId: "primary",
+      strategyDecisionId: null,
+      orderId: null,
+      level: "INFO",
+      ruleCode,
+      message: `persisted message ${ruleCode}`,
+      payloadJson: "{}",
+      createdAt: new Date(Date.UTC(2026, 3, 20, 0, 0, offset)).toISOString(),
+    };
+    events.push(event);
+    await repository.saveRiskEvent(event);
+    offset += 1;
+  }
+
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    locale: "en-US",
+  });
+
+  const response = await router.route("/risks");
+  const exhaustivePresentation = formatRiskEventsSummaryMessage(events, "en-US");
+
+  assert.match(response.text, /Recent risk history/);
+  assert.match(response.text, /persisted recent history, not the current active blocker state/);
+  for (const title of Object.values(expectedTitles)) {
+    assert.match(exhaustivePresentation, new RegExp(escapeRegExp(title)));
+  }
+  assert.match(response.text, /Original: persisted message POSITION_DRIFT_DETECTED/);
+  assert.match(response.text, /Full technical history: \/risks detail/);
+});
+
+test("telegram risk summary explains stale-price evidence and degraded safety state precisely", () => {
+  const events: RiskEventRecord[] = [
+    {
+      id: "risk-stale-price",
+      exchangeAccountId: "primary",
+      strategyDecisionId: null,
+      orderId: null,
+      level: "BLOCK",
+      ruleCode: "STALE_PRICE_GUARD",
+      message: "Market reference is missing or stale.",
+      payloadJson: "{}",
+      createdAt: "2026-04-20T00:01:00.000Z",
+    },
+    {
+      id: "risk-degraded",
+      exchangeAccountId: "primary",
+      strategyDecisionId: null,
+      orderId: null,
+      level: "BLOCK",
+      ruleCode: "SYSTEM_DEGRADED",
+      message: "System recovery is required.",
+      payloadJson: "{}",
+      createdAt: "2026-04-20T00:02:00.000Z",
+    },
+  ];
+
+  const korean = formatRiskEventsSummaryMessage(events, "ko-KR");
+  const english = formatRiskEventsSummaryMessage(events, "en-US");
+
+  assert.match(korean, /시스템 복구 필요/);
+  assert.match(
+    korean,
+    /가격 스냅샷이 없거나 주문 판단에 사용된 가격이 허용 시간을 초과했습니다\./,
+  );
+  assert.match(
+    english,
+    /The price snapshot was missing or the price used for the order decision exceeded the allowed age\./,
+  );
+});
+
+test("telegram risks detail preserves canonical output and uses one bounded read", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const event: RiskEventRecord = {
+    id: "risk-detail",
+    exchangeAccountId: "primary",
+    strategyDecisionId: "decision-detail",
+    orderId: "order-detail",
+    level: "BLOCK",
+    ruleCode: "ORDER_RECOVERY_REQUIRED",
+    message: "Order state requires recovery.",
+    payloadJson: "{}",
+    createdAt: "2026-04-20T00:10:00.000Z",
+  };
+  await repository.saveRiskEvent(event);
+  const originalListRiskEvents = repository.listRiskEvents.bind(repository);
+  const reads: Array<[string, number | undefined]> = [];
+  repository.listRiskEvents = async (exchangeAccountId, limit) => {
+    reads.push([exchangeAccountId, limit]);
+    return originalListRiskEvents(exchangeAccountId, limit);
+  };
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+  });
+
+  const response = await router.route("/risks DETAIL");
+
+  assert.equal(response.text, formatRiskEventsMessage([event]));
+  assert.deepEqual(reads, [["primary", 10]]);
+  assert.equal(
+    (await router.route("/risks now")).text,
+    "Usage: /risks [detail]\nShow a concise persisted risk-history summary or the canonical technical list.",
+  );
+});
+
+test("telegram risks summary has explicit Korean and English empty states", async () => {
+  const korean = createRouter();
+  const english = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    locale: "en-US",
+  });
+
+  assert.match((await korean.route("/risks")).text, /저장된 최근 리스크 기록이 없습니다/);
+  assert.match((await english.route("/risks")).text, /No persisted recent risk records/);
 });
 
 test("telegram router pauses and resumes operator state", async () => {

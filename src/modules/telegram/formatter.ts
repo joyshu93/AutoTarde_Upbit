@@ -45,6 +45,7 @@ import {
 } from "./presentation/portfolio.js";
 import { formatOrdersPresentation } from "./presentation/orders.js";
 import { formatOrderDetailPresentation } from "./presentation/order-detail.js";
+import { formatRiskEventsPresentation } from "./presentation/risks.js";
 import {
   describeLiveOrderBlockers,
   formatStatusPresentation,
@@ -1748,4 +1749,11 @@ function formatHistoryRecoveryConfidence(
   }
 
   return `${historyRecovery.confidenceLevel ?? "unknown"}:${historyRecovery.confidenceReason ?? "unknown"} failure=${historyRecovery.failureMessage ?? "none"}`;
+}
+
+export function formatRiskEventsSummaryMessage(
+  events: readonly RiskEventRecord[],
+  locale: TelegramLocale = DEFAULT_TELEGRAM_LOCALE,
+): string {
+  return formatRiskEventsPresentation(events, locale);
 }

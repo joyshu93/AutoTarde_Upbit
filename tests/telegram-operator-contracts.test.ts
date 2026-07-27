@@ -83,7 +83,11 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.equal(alertsParsed.contract.summary, "Show recent persisted operator_notifications, delivery attempts, retry schedule, and Telegram delivery states.");
   assert.ok(risksParsed);
   assert.equal(risksParsed.command, "/risks");
-  assert.equal(risksParsed.contract.summary, "Show recent persisted risk_events for operator inspection.");
+  assert.equal(
+    risksParsed.contract.summary,
+    "Show a concise persisted risk-history summary or the canonical technical list.",
+  );
+  assert.equal(risksParsed.contract.usage, "/risks [detail]");
   assert.ok(schedulerParsed);
   assert.equal(schedulerParsed.command, "/scheduler");
   assert.equal(
@@ -213,6 +217,8 @@ test("no-argument commands return usage guidance when extra arguments are suppli
   const syncHistoryParsed = parseTelegramCommand("/synchistory now");
   const recoveryParsed = parseTelegramCommand("/recovery now");
   const alertsParsed = parseTelegramCommand("/alerts now");
+  const risksDetailParsed = parseTelegramCommand("/risks detail");
+  const risksDetailCaseParsed = parseTelegramCommand("/risks DETAIL");
   const risksParsed = parseTelegramCommand("/risks now");
   const schedulerParsed = parseTelegramCommand("/scheduler now");
   const inboundParsed = parseTelegramCommand("/inbound now");
@@ -286,6 +292,10 @@ test("no-argument commands return usage guidance when extra arguments are suppli
     buildUsageMessage("/alerts"),
   );
   assert.ok(risksParsed);
+  assert.ok(risksDetailParsed);
+  assert.equal(validateTelegramCommand(risksDetailParsed), null);
+  assert.ok(risksDetailCaseParsed);
+  assert.equal(validateTelegramCommand(risksDetailCaseParsed), null);
   assert.equal(
     validateTelegramCommand(risksParsed),
     buildUsageMessage("/risks"),
@@ -938,7 +948,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   const syncHistoryResponse = await router.route("/synchistory");
   const recoveryResponse = await router.route("/recovery");
   const alertsResponse = await router.route("/alerts");
-  const risksResponse = await router.route("/risks");
+  const risksResponse = await router.route("/risks detail");
   const schedulerResponse = await router.route("/scheduler");
   const inboundResponse = await router.route("/inbound");
   const pauseResponse = await router.route("/pause maintenance window");
@@ -1033,7 +1043,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   );
   assert.equal(
     invalidRisksResponse.text,
-    "Usage: /risks\nShow recent persisted risk_events for operator inspection.",
+    "Usage: /risks [detail]\nShow a concise persisted risk-history summary or the canonical technical list.",
   );
   const invalidSchedulerResponse = await router.route("/scheduler now");
   assert.equal(
