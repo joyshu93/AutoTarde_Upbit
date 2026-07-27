@@ -66,7 +66,7 @@ const COMMAND_EXPECTATIONS = [
   },
   {
     command: "/scheduler",
-    requiredPatterns: [/Strategy Scheduler History/u],
+    requiredPatterns: [/전략 스케줄러/u],
   },
   {
     command: "/alerts",

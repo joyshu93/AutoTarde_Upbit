@@ -100,9 +100,9 @@ const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
   {
     command: "/scheduler",
     category: "inspection",
-    usage: "/scheduler",
-    summary: "Show runtime scheduler status and recent persisted strategy_scheduler_runs for operator inspection.",
-    argumentPolicy: "none",
+    usage: "/scheduler [detail]",
+    summary: "Show a concise runtime scheduler and persisted-run summary or the canonical technical detail.",
+    argumentPolicy: "optional_detail",
   },
   {
     command: "/inbound",

@@ -96,8 +96,9 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.equal(schedulerParsed.command, "/scheduler");
   assert.equal(
     schedulerParsed.contract.summary,
-    "Show runtime scheduler status and recent persisted strategy_scheduler_runs for operator inspection.",
+    "Show a concise runtime scheduler and persisted-run summary or the canonical technical detail.",
   );
+  assert.equal(schedulerParsed.contract.usage, "/scheduler [detail]");
   assert.ok(inboundParsed);
   assert.equal(inboundParsed.command, "/inbound");
   assert.equal(inboundParsed.contract.summary, "Show Telegram inbound polling status and persisted update offset.");
@@ -226,6 +227,7 @@ test("no-argument commands return usage guidance when extra arguments are suppli
   const risksDetailParsed = parseTelegramCommand("/risks detail");
   const risksDetailCaseParsed = parseTelegramCommand("/risks DETAIL");
   const risksParsed = parseTelegramCommand("/risks now");
+  const schedulerDetailParsed = parseTelegramCommand("/scheduler DETAIL");
   const schedulerParsed = parseTelegramCommand("/scheduler now");
   const inboundParsed = parseTelegramCommand("/inbound now");
   const missingOrderParsed = parseTelegramCommand("/order");
@@ -310,6 +312,8 @@ test("no-argument commands return usage guidance when extra arguments are suppli
     validateTelegramCommand(risksParsed),
     buildUsageMessage("/risks"),
   );
+  assert.ok(schedulerDetailParsed);
+  assert.equal(validateTelegramCommand(schedulerDetailParsed), null);
   assert.ok(schedulerParsed);
   assert.equal(
     validateTelegramCommand(schedulerParsed),
@@ -959,7 +963,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   const recoveryResponse = await router.route("/recovery");
   const alertsResponse = await router.route("/alerts detail");
   const risksResponse = await router.route("/risks detail");
-  const schedulerResponse = await router.route("/scheduler");
+  const schedulerResponse = await router.route("/scheduler detail");
   const inboundResponse = await router.route("/inbound");
   const pauseResponse = await router.route("/pause maintenance window");
   const invalidResumeResponse = await router.route("/resume now");
@@ -1058,7 +1062,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   const invalidSchedulerResponse = await router.route("/scheduler now");
   assert.equal(
     invalidSchedulerResponse.text,
-    "Usage: /scheduler\nShow runtime scheduler status and recent persisted strategy_scheduler_runs for operator inspection.",
+    "Usage: /scheduler [detail]\nShow a concise runtime scheduler and persisted-run summary or the canonical technical detail.",
   );
   const invalidInboundResponse = await router.route("/inbound now");
   assert.equal(

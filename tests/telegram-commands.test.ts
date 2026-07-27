@@ -13,6 +13,7 @@ import type {
   PositionSnapshotRecord,
   RiskEventRecord,
   RiskRuleCode,
+  StrategySchedulerRunRecord,
   StrategySchedulerStatus,
 } from "../src/domain/types.js";
 import {
@@ -35,6 +36,8 @@ import {
   formatRiskEventsMessage,
   formatRiskEventsSummaryMessage,
   formatStatusMessage,
+  formatStrategySchedulerRunsMessage,
+  formatStrategySchedulerRunsSummaryMessage,
 } from "../src/modules/telegram/formatter.js";
 import { test } from "./harness.js";
 
@@ -3105,7 +3108,7 @@ test("telegram router exposes dedicated strategy scheduler inspection", async ()
     }),
   });
 
-  const scheduler = await router.route("/scheduler");
+  const scheduler = await router.route("/scheduler detail");
 
   assert.match(scheduler.text, /Strategy Scheduler History/);
   assert.match(scheduler.text, /count: 2/);
@@ -3132,13 +3135,264 @@ test("telegram router exposes empty strategy scheduler history", async () => {
 
   const scheduler = await router.route("/scheduler");
 
-  assert.match(scheduler.text, /Strategy Scheduler History/);
-  assert.match(scheduler.text, /count: 0/);
-  assert.match(scheduler.text, /state_source: runtime scheduler status \+ persisted strategy_scheduler_runs/);
-  assert.match(scheduler.text, /runtime_status_source: unavailable/);
-  assert.match(scheduler.text, /runtime_startup_preflight_checks: none/);
-  assert.match(scheduler.text, /note: No strategy scheduler runs are stored yet\./);
+  assert.equal(scheduler.text.split("\n")[0], "전략 스케줄러");
+  assert.match(scheduler.text, /전략 스케줄러/);
+  assert.match(scheduler.text, /현재 런타임 상태를 확인할 수 없습니다/);
+  assert.match(scheduler.text, /최근 저장된 실행 이력이 없습니다/);
+  assert.match(scheduler.text, /\/scheduler detail/);
 });
+
+test("telegram scheduler summary directly reports a disabled runtime in Korean and English", () => {
+  const disabledStatus: StrategySchedulerStatus = {
+    enabled: false,
+    started: false,
+    exchangeAccountId: "primary",
+    liveSendPath: "DRY_RUN_ADAPTER",
+    startupPreflight: null,
+    markets: [],
+  };
+
+  const korean = formatStrategySchedulerRunsSummaryMessage([], disabledStatus, "ko-KR");
+  const english = formatStrategySchedulerRunsSummaryMessage([], disabledStatus, "en-US");
+
+  assert.match(korean, /상태: 비활성/);
+  assert.match(english, /State: disabled/);
+  assert.doesNotMatch(korean, /시작되지 않음/);
+  assert.doesNotMatch(english, /enabled but not started/);
+});
+
+test("telegram scheduler summary separates runtime memory from bounded persisted history", async () => {
+  const runs: StrategySchedulerRunRecord[] = [
+    createSchedulerRun({
+      id: "scheduler-invalid",
+      market: "KRW-BTC",
+      status: "STARTED",
+      startedAt: "invalid-timestamp",
+      completedAt: null,
+      action: "ENTER",
+      detail: "Invalid timestamp row",
+    }),
+    createSchedulerRun({
+      id: "scheduler-offset-newest",
+      market: "KRW-ETH",
+      status: "COMPLETED",
+      startedAt: "2026-04-20T09:05:00+09:00",
+      completedAt: "2026-04-20T09:06:00+09:00",
+      action: "ADD",
+      orderId: "order-newest",
+      orderStatus: "FILLED",
+      submissionAccepted: true,
+      detail: "Order completed",
+    }),
+    createSchedulerRun({
+      id: "scheduler-zulu-older",
+      market: "KRW-BTC",
+      status: "FAILED",
+      startedAt: "2026-04-20T00:04:00.000Z",
+      completedAt: "2026-04-20T00:04:30.000Z",
+      action: "REDUCE",
+      errorMessage: "upbit timeout",
+    }),
+    createSchedulerRun({
+      id: "scheduler-skipped",
+      market: "KRW-ETH",
+      status: "SKIPPED",
+      startedAt: "2026-04-20T00:03:00.000Z",
+      completedAt: "2026-04-20T00:03:01.000Z",
+      action: "EXIT",
+      detail: "Deferred after another order",
+    }),
+  ];
+  let historyReads = 0;
+  let runtimeReads = 0;
+  const repository = new InMemoryExecutionRepository();
+  for (const run of runs) {
+    await repository.saveStrategySchedulerRun(run);
+  }
+  const listSchedulerRuns = repository.listStrategySchedulerRuns.bind(repository);
+  repository.listStrategySchedulerRuns = async (exchangeAccountId, limit) => {
+    historyReads += 1;
+    assert.equal(limit, 20);
+    return listSchedulerRuns(exchangeAccountId, limit);
+  };
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore(createSchedulerExecutionState()),
+    locale: "ko-KR",
+    schedulerStatus: () => {
+      runtimeReads += 1;
+      return {
+        enabled: true,
+        started: true,
+        exchangeAccountId: "primary",
+        liveSendPath: "LIVE_ADAPTER",
+        startupPreflight: {
+          checkedAt: "2026-04-20T00:00:00.000Z",
+          scope: "LIVE",
+          status: "WARN",
+          detail: "History recovery remains in progress.",
+          checks: [
+            { name: "live_gate", status: "PASS", detail: "enabled" },
+            { name: "latest_reconciliation", status: "WARN", detail: "archive in progress" },
+            { name: "active_orders", status: "BLOCK", detail: "one active order" },
+          ],
+        },
+        markets: [
+          {
+            market: "KRW-BTC",
+            intervalMs: 3_600_000,
+            running: false,
+            runCount: 4,
+            successCount: 2,
+            failureCount: 1,
+            skippedCount: 1,
+            lastStartedAt: "2026-04-20T00:00:00.000Z",
+            lastCompletedAt: "2026-04-20T00:00:02.000Z",
+            lastStatus: "COMPLETED",
+            lastStrategyDecisionId: "decision-runtime",
+            lastAction: "EXIT",
+            lastOrderId: "order-runtime",
+            lastOrderStatus: "OPEN",
+            lastError: null,
+            nextRunAt: "2026-04-20T01:00:00.000Z",
+          },
+        ],
+      };
+    },
+  });
+
+  const response = await router.route("/scheduler");
+
+  assert.equal(historyReads, 1);
+  assert.equal(runtimeReads, 1);
+  assert.match(response.text, /현재 메모리 상태/);
+  assert.match(response.text, /최근 저장 이력.*최대 20건/);
+  assert.match(response.text, /연결 경로.*LIVE_ADAPTER.*주문 허용을 뜻하지 않습니다/);
+  assert.match(response.text, /PASS 1.*주의 1.*차단 1/);
+  assert.match(response.text, /latest_reconciliation.*archive in progress/);
+  assert.match(response.text, /active_orders.*one active order/);
+  assert.match(response.text, /KRW-BTC.*1시간/);
+  assert.match(response.text, /2026-04-20 10:00:00 KST/);
+  assert.match(response.text, /\/order order-runtime/);
+  assert.match(response.text, /시작 1.*완료 1.*실패 1.*건너뜀 1/);
+  assert.ok(response.text.indexOf("order-newest") < response.text.indexOf("upbit timeout"));
+  assert.match(response.text, /표시 3건.*생략 1건/);
+  assert.doesNotMatch(response.text, /Invalid timestamp row/);
+  assert.match(response.text, /\/scheduler detail/);
+});
+
+test("telegram scheduler summary puts an invalid persisted timestamp last and labels it", () => {
+  const message = formatStrategySchedulerRunsSummaryMessage(
+    [
+      createSchedulerRun({
+        id: "scheduler-invalid-visible",
+        startedAt: "not-a-time",
+        detail: "Invalid timestamp row",
+      }),
+      createSchedulerRun({
+        id: "scheduler-valid",
+        startedAt: "2026-04-20T00:00:00.000Z",
+        detail: "Valid timestamp row",
+      }),
+    ],
+    null,
+    "ko-KR",
+  );
+
+  assert.ok(message.indexOf("Valid timestamp row") < message.indexOf("Invalid timestamp row"));
+  assert.match(message, /잘못된 시각 \(not-a-time\)/);
+});
+
+test("telegram scheduler summary supports English and preserves canonical detail exactly", async () => {
+  const runs = [
+    createSchedulerRun({
+      id: "scheduler-en",
+      status: "COMPLETED",
+      action: "HOLD",
+      startedAt: "2026-04-20T00:00:00.000Z",
+      completedAt: "2026-04-20T00:00:01.000Z",
+      detail: "Held position",
+    }),
+  ];
+  const schedulerStatus: StrategySchedulerStatus = {
+    enabled: true,
+    started: false,
+    exchangeAccountId: "primary",
+    liveSendPath: "DRY_RUN_ADAPTER",
+    startupPreflight: {
+      checkedAt: "2026-04-20T00:00:00.000Z",
+      scope: "DRY_RUN",
+      status: "PASS",
+      detail: "Dry-run preflight passed.",
+      checks: [],
+    },
+    markets: [],
+  };
+  const repository = new InMemoryExecutionRepository();
+  for (const run of runs) {
+    await repository.saveStrategySchedulerRun(run);
+  }
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore(createSchedulerExecutionState()),
+    locale: "en-US",
+    schedulerStatus: () => schedulerStatus,
+  });
+
+  const summary = await router.route("/scheduler");
+  const detail = await router.route("/scheduler DETAIL");
+
+  assert.match(summary.text, /Strategy scheduler/);
+  assert.match(summary.text, /enabled but not started/);
+  assert.match(summary.text, /Current in-memory runtime status/);
+  assert.match(summary.text, /Recent persisted history/);
+  assert.match(summary.text, /Started 0.*Completed 1.*Failed 0.*Skipped 0/);
+  assert.equal(detail.text, formatStrategySchedulerRunsMessage(runs, { schedulerStatus }));
+  assert.equal(
+    formatStrategySchedulerRunsSummaryMessage(runs, schedulerStatus, "en-US"),
+    summary.text,
+  );
+});
+
+function createSchedulerRun(
+  overrides: Partial<StrategySchedulerRunRecord>,
+): StrategySchedulerRunRecord {
+  return {
+    id: "scheduler-run",
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    triggerSource: "SCHEDULER",
+    status: "COMPLETED",
+    startedAt: "2026-04-20T00:00:00.000Z",
+    completedAt: "2026-04-20T00:00:01.000Z",
+    intervalMs: 3_600_000,
+    runOnStart: false,
+    strategyDecisionId: null,
+    action: null,
+    orderId: null,
+    orderStatus: null,
+    submissionAccepted: null,
+    detail: null,
+    errorMessage: null,
+    summaryJson: "{}",
+    ...overrides,
+  };
+}
+
+function createSchedulerExecutionState(): ExecutionStateRecord {
+  return {
+    id: "scheduler-state",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  };
+}
 
 test("telegram router exposes dedicated telegram inbound inspection", async () => {
   const offsetStore = new InMemoryTelegramInboundOffsetStore();

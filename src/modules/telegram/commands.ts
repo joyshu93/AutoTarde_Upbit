@@ -28,6 +28,7 @@ import {
   formatRuntimeConfigMessage,
   formatStateHistoryMessage,
   formatStrategySchedulerRunsMessage,
+  formatStrategySchedulerRunsSummaryMessage,
   formatStrategyPreviewMessage,
   formatStrategyRunMessage,
   formatStatusMessage,
@@ -130,7 +131,10 @@ export class TelegramCommandRouter {
           parsed.args[1]?.toLowerCase() === "detail",
         );
       case "/scheduler":
-        return this.buildSchedulerResponse(exchangeAccountId);
+        return this.buildSchedulerResponse(
+          exchangeAccountId,
+          parsed.args[0]?.toLowerCase() === "detail",
+        );
       case "/inbound":
         return this.buildInboundResponse(exchangeAccountId);
       case "/pause":
@@ -434,13 +438,21 @@ export class TelegramCommandRouter {
     };
   }
 
-  private async buildSchedulerResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+  private async buildSchedulerResponse(
+    exchangeAccountId: string,
+    detail: boolean,
+  ): Promise<TelegramResponse> {
     const runs = await this.dependencies.repositories.listStrategySchedulerRuns(exchangeAccountId, 20);
+    const schedulerStatus = this.dependencies.schedulerStatus?.() ?? null;
 
     return {
-      text: formatStrategySchedulerRunsMessage(runs, {
-        schedulerStatus: this.dependencies.schedulerStatus?.() ?? null,
-      }),
+      text: detail
+        ? formatStrategySchedulerRunsMessage(runs, { schedulerStatus })
+        : formatStrategySchedulerRunsSummaryMessage(
+            runs,
+            schedulerStatus,
+            normalizeTelegramLocale(this.dependencies.locale),
+          ),
     };
   }
 

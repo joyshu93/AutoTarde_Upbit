@@ -29,6 +29,7 @@ import type {
   TelegramStrategyRunResult,
   TelegramSyncResult,
 } from "./interfaces.js";
+import { formatStrategySchedulerPresentation } from "./presentation/scheduler.js";
 import { formatHelpPresentation } from "./presentation/help.js";
 import {
   formatOperatorNotificationsPresentation,
@@ -1782,6 +1783,14 @@ function formatHistoryRecoveryConfidence(
   }
 
   return `${historyRecovery.confidenceLevel ?? "unknown"}:${historyRecovery.confidenceReason ?? "unknown"} failure=${historyRecovery.failureMessage ?? "none"}`;
+}
+
+export function formatStrategySchedulerRunsSummaryMessage(
+  runs: readonly StrategySchedulerRunRecord[],
+  schedulerStatus: StrategySchedulerStatus | null,
+  locale: TelegramLocale,
+): string {
+  return formatStrategySchedulerPresentation(runs, schedulerStatus, locale);
 }
 
 export function formatRiskEventsSummaryMessage(
