@@ -80,7 +80,11 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.equal(recoveryParsed.contract.summary, "Show checkpointed exchange-history recovery progress for operator inspection.");
   assert.ok(alertsParsed);
   assert.equal(alertsParsed.command, "/alerts");
-  assert.equal(alertsParsed.contract.summary, "Show recent persisted operator_notifications, delivery attempts, retry schedule, and Telegram delivery states.");
+  assert.equal(
+    alertsParsed.contract.summary,
+    "Show a concise persisted alert and delivery-health summary or the canonical technical list.",
+  );
+  assert.equal(alertsParsed.contract.usage, "/alerts [detail]");
   assert.ok(risksParsed);
   assert.equal(risksParsed.command, "/risks");
   assert.equal(
@@ -216,6 +220,8 @@ test("no-argument commands return usage guidance when extra arguments are suppli
   const historyParsed = parseTelegramCommand("/statehistory now");
   const syncHistoryParsed = parseTelegramCommand("/synchistory now");
   const recoveryParsed = parseTelegramCommand("/recovery now");
+  const alertsDetailParsed = parseTelegramCommand("/alerts detail");
+  const alertsDetailCaseParsed = parseTelegramCommand("/alerts DETAIL");
   const alertsParsed = parseTelegramCommand("/alerts now");
   const risksDetailParsed = parseTelegramCommand("/risks detail");
   const risksDetailCaseParsed = parseTelegramCommand("/risks DETAIL");
@@ -286,6 +292,10 @@ test("no-argument commands return usage guidance when extra arguments are suppli
     validateTelegramCommand(recoveryParsed),
     buildUsageMessage("/recovery"),
   );
+  assert.ok(alertsDetailParsed);
+  assert.equal(validateTelegramCommand(alertsDetailParsed), null);
+  assert.ok(alertsDetailCaseParsed);
+  assert.equal(validateTelegramCommand(alertsDetailCaseParsed), null);
   assert.ok(alertsParsed);
   assert.equal(
     validateTelegramCommand(alertsParsed),
@@ -947,7 +957,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   const historyResponse = await router.route("/statehistory");
   const syncHistoryResponse = await router.route("/synchistory");
   const recoveryResponse = await router.route("/recovery");
-  const alertsResponse = await router.route("/alerts");
+  const alertsResponse = await router.route("/alerts detail");
   const risksResponse = await router.route("/risks detail");
   const schedulerResponse = await router.route("/scheduler");
   const inboundResponse = await router.route("/inbound");
@@ -1039,7 +1049,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   );
   assert.equal(
     invalidAlertsResponse.text,
-    "Usage: /alerts\nShow recent persisted operator_notifications, delivery attempts, retry schedule, and Telegram delivery states.",
+    "Usage: /alerts [detail]\nShow a concise persisted alert and delivery-health summary or the canonical technical list.",
   );
   assert.equal(
     invalidRisksResponse.text,

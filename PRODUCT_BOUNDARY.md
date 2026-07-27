@@ -55,7 +55,7 @@ Telegram may expose:
 - `/statehistory`
 - `/synchistory`
 - `/recovery`
-- `/alerts`
+- `/alerts [detail]`
 - `/risks [detail]`
 - `/balances`
 - `/positions`
@@ -82,6 +82,7 @@ Telegram `/balances` and `/positions` may present locale-aware summaries of the 
 Telegram `/orders` may present a locale-aware recent-order lifecycle summary with exact `/order <id>` inspection hints. `/orders detail` preserves the canonical bounded technical list. Both forms are read-only and must not submit, cancel, retry, reconcile, or mutate orders.
 Telegram `/order <reference>` may present a locale-aware lifecycle summary with bounded recent event and fill history. `/order <reference> detail` preserves canonical complete order, event payload, fill, and identifier fields. Both forms are read-only and must not query Upbit or mutate exchange or local order state.
 Telegram `/risks` may present a locale-aware summary of recent persisted risk-event history, including severity counts, explanations, original messages, and linked order or strategy-decision references. `/risks detail` preserves the canonical technical list. Historical rows are not proof of a currently active risk block, and both forms must use the same bounded local read without evaluating risk, clearing or creating events, calling Upbit, mutating orders, or changing execution state.
+Telegram `/alerts` may present a locale-aware summary of the bounded recent operator-notification and delivery sample, with repository-read limits stated explicitly and only the newest three notifications, one delivery run, and one delivery attempt displayed. `/alerts detail` preserves the canonical technical notification, delivery-run, delivery-attempt, retry, and queue output. Both forms must use the same three bounded local reads and must not claim, send, retry, finalize, or mutate notifications, poll Telegram, call Upbit, run sync or strategy, mutate orders, or change execution state.
 `/inbound` may inspect runtime inbound polling status and persisted offset progress, but it must not poll Telegram or route commands by itself.
 `npm run smoke:telegram:inbound` may perform one bounded Telegram `getUpdates` poll for operator validation, but it forcibly uses `DRY_RUN`, disables live-send and scheduler paths, and never starts the long-running polling loop.
 `npm run smoke:dryrun:readiness` may inspect local DRY_RUN runtime configuration and persisted readiness evidence before the local runtime starts, but it must not run `/sync`, run strategies, poll Telegram, start the scheduler, call Upbit, deliver notifications, or transmit orders.

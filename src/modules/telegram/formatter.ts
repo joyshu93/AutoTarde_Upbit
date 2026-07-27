@@ -31,6 +31,10 @@ import type {
 } from "./interfaces.js";
 import { formatHelpPresentation } from "./presentation/help.js";
 import {
+  formatOperatorNotificationsPresentation,
+  type OperatorNotificationDeliveryHealth,
+} from "./presentation/alerts.js";
+import {
   DEFAULT_TELEGRAM_LOCALE,
   type TelegramLocale,
 } from "./presentation/locale.js";
@@ -441,6 +445,35 @@ export function formatPositionMessage(snapshot: PositionSnapshotRecord | null): 
     ...formatPositionLines(positions, snapshot.positionsJson),
     `operator_boundary: ${MANUAL_INPUT_NOTE}`,
   ].join("\n");
+}
+
+export function formatOperatorNotificationsSummaryMessage(
+  notifications: OperatorNotificationRecord[],
+  attempts: OperatorNotificationDeliveryAttemptRecord[] = [],
+  runs: OperatorNotificationDeliveryRunRecord[] = [],
+  locale: TelegramLocale = DEFAULT_TELEGRAM_LOCALE,
+  options?: {
+    now?: string;
+  },
+): string {
+  const metrics = summarizeNotificationDeliveryMetrics(notifications, attempts, options?.now ?? null);
+  const health: OperatorNotificationDeliveryHealth = {
+    pendingTotalCount: metrics.pendingTotalCount,
+    pendingDueCount: metrics.pendingDueCount,
+    pendingScheduledCount: metrics.pendingScheduledCount,
+    failedNotificationCount: notifications.filter(
+      (notification) => notification.deliveryStatus === "FAILED",
+    ).length,
+    activeLeaseCount: metrics.activeLeaseCount,
+    expiredLeaseCount: metrics.expiredLeaseCount,
+    abandonedLeaseCandidateCount: metrics.abandonedLeaseCandidateCount,
+    recentStaleLeaseCount: metrics.recentStaleLeaseCount,
+    recentSentAttemptCount: metrics.recentSentAttemptCount,
+    recentRetryScheduledAttemptCount: metrics.recentRetryScheduledAttemptCount,
+    recentFailedAttemptCount: metrics.recentFailedAttemptCount,
+  };
+
+  return formatOperatorNotificationsPresentation(notifications, attempts, runs, health, locale);
 }
 
 export function formatPositionSummaryMessage(

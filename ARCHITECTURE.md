@@ -150,9 +150,8 @@ It provides:
 - `/statehistory` for read-only execution_state transition history
 - `/synchistory` for read-only persisted reconciliation_runs inspection
 - `/recovery` for read-only checkpointed exchange-history recovery progress inspection
-- `/alerts` for read-only persisted operator_notifications inspection, including `PENDING` / `SENT` / `FAILED` plus retry metadata such as `attempt_count`, `next_attempt_at`, and `failure_class`
-- `/alerts` now also shows recent rows from the separate persisted `operator_notification_delivery_attempts` audit trail
-- `/alerts` now derives delivery-worker queue metrics including pending totals, due/scheduled counts, active/expired leases, abandoned-lease candidates, recent delivery-run summaries, and recent attempt outcome counts
+- locale-aware `/alerts` summary for the bounded recent notification and delivery sample, including pending, due, scheduled retry, failed, lease, and recent attempt counts with the sample limits stated explicitly
+- `/alerts detail` for the canonical technical notification, delivery-run, delivery-attempt, retry, and queue-metric output
 - locale-aware `/risks` summary for recent persisted `risk_events`, including severity counts, rule explanations, original messages, and linked order or strategy-decision references
 - `/risks detail` for the canonical technical risk-event list; both forms use the same single bounded local read
 - locale-aware `/balances` and `/positions` summaries over the latest persisted exchange snapshots
@@ -192,6 +191,7 @@ It provides:
 `/orders` is a locale-aware, inspection-only summary of recent persisted order lifecycle records. `/orders detail` preserves the canonical technical list. Neither form submits, cancels, retries, reconciles, or otherwise mutates an order.
 `/order <reference>` is a locale-aware, inspection-only lifecycle summary with bounded recent event and fill history. `/order <reference> detail` preserves the canonical technical order, full event payload, fill, and identifier output. Missing references do not trigger event or fill reads, and neither form calls Upbit or mutates orders.
 `/risks` is a locale-aware, inspection-only summary of recent persisted risk history. `/risks detail` preserves the canonical technical risk-event list. Historical rows do not by themselves mean that a risk block is currently active; both forms use the same bounded repository read and do not evaluate risk, clear or create events, call Upbit, mutate orders, or change execution state.
+`/alerts` is a locale-aware, inspection-only summary of a bounded recent notification and delivery sample. It displays at most three recent notifications, one delivery run, and one delivery attempt, states the underlying repository-read limits, and points to `/alerts detail` for the canonical technical output. Both forms use the same three bounded local reads and do not claim, send, retry, finalize, or mutate notifications; they also do not poll Telegram, call Upbit, run sync or strategy, mutate orders, or change execution state.
 `/config` is intentionally non-secret and runtime-derived; it renders configured/not-configured booleans for secrets, exposes ignored deprecated environment variable names when present, and never prints raw credentials, tokens, or chat identifiers.
 `/readiness` is an inspection-only, locale-aware summary with human-readable PASS/WARN/BLOCK guidance. `/readiness detail` preserves the canonical technical checks and safety boundaries. Both forms read the same bounded local state and runtime status, including active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count, but do not poll Telegram, call Upbit, start sync, run strategies, tick schedulers, mutate offsets, deliver notifications, or mutate orders.
 

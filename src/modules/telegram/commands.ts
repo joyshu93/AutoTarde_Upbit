@@ -12,6 +12,7 @@ import {
   formatControlCommandMessage,
   formatHelpMessage,
   formatOperatorNotificationsMessage,
+  formatOperatorNotificationsSummaryMessage,
   formatOrderDetailMessage,
   formatOrderDetailSummaryMessage,
   formatOrdersMessage,
@@ -98,7 +99,10 @@ export class TelegramCommandRouter {
       case "/recovery":
         return this.buildRecoveryProgressResponse(exchangeAccountId);
       case "/alerts":
-        return this.buildAlertsResponse(exchangeAccountId);
+        return this.buildAlertsResponse(
+          exchangeAccountId,
+          parsed.args[0]?.toLowerCase() === "detail",
+        );
       case "/risks":
         return this.buildRiskEventsResponse(
           exchangeAccountId,
@@ -492,17 +496,27 @@ export class TelegramCommandRouter {
     };
   }
 
-  private async buildAlertsResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+  private async buildAlertsResponse(
+    exchangeAccountId: string,
+    detail: boolean,
+  ): Promise<TelegramResponse> {
     const [notifications, attempts, runs] = await Promise.all([
       this.dependencies.repositories.listOperatorNotifications(exchangeAccountId, 10),
       this.dependencies.repositories.listOperatorNotificationDeliveryAttempts(exchangeAccountId, 5),
       this.dependencies.repositories.listOperatorNotificationDeliveryRuns(exchangeAccountId, 5),
     ]);
 
+    const now = this.dependencies.now?.() ?? new Date().toISOString();
     return {
-      text: formatOperatorNotificationsMessage(notifications, attempts, runs, {
-        now: this.dependencies.now?.() ?? new Date().toISOString(),
-      }),
+      text: detail
+        ? formatOperatorNotificationsMessage(notifications, attempts, runs, { now })
+        : formatOperatorNotificationsSummaryMessage(
+            notifications,
+            attempts,
+            runs,
+            normalizeTelegramLocale(this.dependencies.locale),
+            { now },
+          ),
     };
   }
 

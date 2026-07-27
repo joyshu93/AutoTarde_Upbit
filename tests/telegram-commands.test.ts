@@ -4,7 +4,10 @@ import type {
   BalanceSnapshotRecord,
   ExecutionStateRecord,
   FillRecord,
+  OperatorNotificationDeliveryAttemptRecord,
+  OperatorNotificationDeliveryRunRecord,
   OperatorNotificationRecord,
+  OperatorNotificationType,
   OrderEventRecord,
   OrderRecord,
   PositionSnapshotRecord,
@@ -21,6 +24,8 @@ import { TelegramCommandRouter } from "../src/modules/telegram/commands.js";
 import { listTelegramCommandContracts } from "../src/modules/telegram/contracts.js";
 import {
   formatBalanceMessage,
+  formatOperatorNotificationsMessage,
+  formatOperatorNotificationsSummaryMessage,
   formatOrderDetailMessage,
   formatOrderDetailSummaryMessage,
   formatOrdersMessage,
@@ -3549,7 +3554,7 @@ test("telegram router exposes durable operator alerts inspection", async () => {
     }),
   });
 
-  const alerts = await router.route("/alerts");
+  const alerts = await router.route("/alerts detail");
 
   assert.match(alerts.text, /Operator Alerts/);
   assert.match(alerts.text, /count: 1/);
@@ -3654,7 +3659,7 @@ test("telegram router exposes delivery worker queue metrics in /alerts", async (
     now: () => "2026-04-20T00:05:00.000Z",
   });
 
-  const alerts = await router.route("/alerts");
+  const alerts = await router.route("/alerts detail");
 
   assert.match(alerts.text, /pending_total_count: 4/);
   assert.match(alerts.text, /pending_due_count: 2/);
@@ -3670,6 +3675,325 @@ test("telegram router exposes delivery worker queue metrics in /alerts", async (
   assert.match(alerts.text, /next_scheduled_attempt_at: 2026-04-20T00:11:00.000Z/);
   assert.match(alerts.text, /oldest_active_lease_expires_at: 2026-04-20T00:10:00.000Z/);
   assert.match(alerts.text, /latest_delivery_attempt_at: 2026-04-20T00:04:50.000Z/);
+});
+
+test("telegram alerts summary leads with Korean delivery health and sorts persisted alerts by instant", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveOperatorNotification(createNotification({
+    id: "operator-notification-invalid",
+    notificationType: "SYNC_FAILED",
+    severity: "ERROR",
+    title: "Sync evidence",
+    message: "Persisted invalid timestamp evidence.",
+    deliveryStatus: "FAILED",
+    attemptCount: 2,
+    lastAttemptAt: "2026-04-20T00:04:00.000Z",
+    failureClass: "PERMANENT",
+    lastError: "sync_failed",
+    createdAt: "invalid-time",
+  }));
+  await repository.saveOperatorNotification(createNotification({
+    id: "operator-notification-offset-newest",
+    notificationType: "SCHEDULER_ORDER_SUBMITTED",
+    severity: "INFO",
+    title: "Scheduled order submitted",
+    message: "Persisted submission evidence.",
+    deliveryStatus: "SENT",
+    attemptCount: 1,
+    deliveredAt: "2026-04-20T00:31:01.000Z",
+    createdAt: "2026-04-20T09:31:00+09:00",
+  }));
+  await repository.saveOperatorNotification(createNotification({
+    id: "operator-notification-pending",
+    notificationType: "ORDER_REJECTED",
+    severity: "WARN",
+    title: "Order rejected before submission",
+    message: "Persisted rejection evidence.",
+    deliveryStatus: "PENDING",
+    nextAttemptAt: "2026-04-20T00:35:00.000Z",
+    createdAt: "2026-04-20T00:30:00.000Z",
+  }));
+  await repository.saveOperatorNotificationDeliveryAttempt({
+    id: "attempt-retry",
+    notificationId: "operator-notification-pending",
+    exchangeAccountId: "primary",
+    attemptCount: 1,
+    leaseToken: "lease-retry",
+    outcome: "RETRY_SCHEDULED",
+    failureClass: "RETRYABLE",
+    attemptedAt: "2026-04-20T00:32:00.000Z",
+    nextAttemptAt: "2026-04-20T00:35:00.000Z",
+    deliveredAt: null,
+    errorMessage: "telegram_http_500",
+    createdAt: "2026-04-20T00:32:00.000Z",
+  });
+  await repository.saveOperatorNotificationDeliveryRun({
+    id: "delivery-run-failed",
+    exchangeAccountId: "primary",
+    workerName: "telegram_delivery_inline_worker",
+    status: "FAILED",
+    startedAt: "2026-04-20T00:32:00.000Z",
+    completedAt: "2026-04-20T00:32:01.000Z",
+    attemptedCount: 1,
+    sentCount: 0,
+    retryScheduledCount: 1,
+    failedCount: 0,
+    staleLeaseCount: 0,
+    pendingTotalCount: 1,
+    pendingDueCount: 0,
+    pendingScheduledCount: 1,
+    activeLeaseCount: 0,
+    expiredLeaseCount: 0,
+    abandonedLeaseCandidateCount: 0,
+    skippedReason: null,
+    errorMessage: "worker_failed",
+    summaryJson: "{}",
+  });
+
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    now: () => "2026-04-20T00:33:00.000Z",
+  });
+
+  const alerts = await router.route("/alerts");
+
+  assert.match(alerts.text, /알림 전송 상태/);
+  assert.match(alerts.text, /최근 조회 표본: 알림 최대 10건.*전송 시도 최대 5건/);
+  assert.match(alerts.text, /표본 내 대기 1.*즉시 전송 0.*재시도 예정 1.*실패 알림 1/);
+  assert.match(alerts.text, /표본 내 임대: 활성 0.*만료 0/);
+  assert.match(alerts.text, /표본 내 최근 전송 시도: 전송 0.*재시도 예약 1.*실패 0.*만료 임대 0/);
+  assert.ok(
+    alerts.text.indexOf("2026-04-20 09:31:00 KST") <
+      alerts.text.indexOf("2026-04-20 09:30:00 KST"),
+  );
+  assert.ok(alerts.text.indexOf("2026-04-20 09:30:00 KST") < alerts.text.indexOf("데이터 오류"));
+  assert.match(alerts.text, /정보.*스케줄 주문 제출.*전송 완료/);
+  assert.match(alerts.text, /주의.*주문 거부.*전송 대기/);
+  assert.match(alerts.text, /오류.*동기화 실패.*전송 실패/);
+  assert.match(alerts.text, /제목: Scheduled order submitted/);
+  assert.match(alerts.text, /내용: Persisted submission evidence\./);
+  assert.match(alerts.text, /시도 횟수: 2/);
+  assert.match(alerts.text, /마지막 시도: 2026-04-20 09:04:00 KST/);
+  assert.match(alerts.text, /다음 재시도: 2026-04-20 09:35:00 KST/);
+  assert.match(alerts.text, /전송 완료: 2026-04-20 09:31:01 KST/);
+  assert.match(alerts.text, /오류: sync_failed/);
+  assert.match(alerts.text, /최근 전송 실행: 실패/);
+  assert.match(alerts.text, /최근 시도 결과: 재시도 예약/);
+  assert.match(alerts.text, /전체 기술 정보: \/alerts detail/);
+});
+
+test("telegram alerts summary maps every notification and delivery enum in English", () => {
+  const notificationTypes: readonly OperatorNotificationType[] = [
+    "ORDER_REJECTED",
+    "ORDER_SUBMISSION_FAILED",
+    "RECONCILIATION_DRIFT_DETECTED",
+    "SCHEDULER_STARTUP_BLOCKED",
+    "SCHEDULER_ORDER_REJECTED",
+    "SCHEDULER_ORDER_SUBMITTED",
+    "SCHEDULER_RUN_FAILED",
+    "SCHEDULER_RUN_SKIPPED",
+    "SYNC_FAILED",
+  ];
+  const severities = ["INFO", "WARN", "ERROR"] as const;
+  const deliveryStatuses = ["PENDING", "SENT", "FAILED"] as const;
+  for (const [index, notificationType] of notificationTypes.entries()) {
+    const message = formatOperatorNotificationsSummaryMessage(
+      [createNotification({
+      id: `notification-${index}`,
+      notificationType,
+      severity: severities[index % severities.length]!,
+      deliveryStatus: deliveryStatuses[index % deliveryStatuses.length]!,
+      title: `Original title ${notificationType}`,
+      message: `Original message ${notificationType}`,
+      createdAt: `2026-04-20T00:${String(index).padStart(2, "0")}:00.000Z`,
+      })],
+      [],
+      [],
+      "en-US",
+      { now: "2026-04-20T00:10:00.000Z" },
+    );
+    assert.match(message, new RegExp(escapeRegExp([
+      "Order rejected",
+      "Order submission failed",
+      "Reconciliation drift detected",
+      "Scheduler startup blocked",
+      "Scheduled order rejected",
+      "Scheduled order submitted",
+      "Scheduled run failed",
+      "Scheduled run skipped",
+      "Sync failed",
+    ][index]!)));
+    assert.match(message, new RegExp(escapeRegExp(["Info", "Warning", "Error"][index % 3]!)));
+    assert.match(message, new RegExp(escapeRegExp(["Pending", "Sent", "Failed"][index % 3]!)));
+    assert.match(message, new RegExp(escapeRegExp(`Original title ${notificationType}`)));
+    assert.match(message, new RegExp(escapeRegExp(`Original message ${notificationType}`)));
+  }
+
+  for (const [index, outcome] of ([
+    "SENT",
+    "RETRY_SCHEDULED",
+    "FAILED",
+    "STALE_LEASE",
+  ] as const).entries()) {
+    const message = formatOperatorNotificationsSummaryMessage(
+      [],
+      [createDeliveryAttempt(outcome, index)],
+      [],
+      "en-US",
+    );
+    assert.match(message, new RegExp(escapeRegExp([
+      "Sent",
+      "Retry scheduled",
+      "Failed",
+      "Stale lease",
+    ][index]!)));
+  }
+
+  for (const [index, status] of (["COMPLETED", "SKIPPED", "FAILED"] as const).entries()) {
+    const message = formatOperatorNotificationsSummaryMessage(
+      [],
+      [],
+      [createDeliveryRun(status, index)],
+      "en-US",
+    );
+    assert.match(message, new RegExp(escapeRegExp(["Completed", "Skipped", "Failed"][index]!)));
+  }
+});
+
+test("telegram alerts summary bounds displayed histories and reports omitted sample records", () => {
+  const notifications = Array.from({ length: 5 }, (_, index) =>
+    createNotification({
+      id: `notification-${index}`,
+      title: `Original title ${index}`,
+      message: `Original message ${index}`,
+      createdAt: `2026-04-20T00:0${index}:00.000Z`,
+    }),
+  );
+  const attempts = Array.from({ length: 3 }, (_, index) => createDeliveryAttempt("SENT", index));
+  const runs = Array.from({ length: 3 }, (_, index) => createDeliveryRun("COMPLETED", index));
+
+  const korean = formatOperatorNotificationsSummaryMessage(
+    notifications,
+    attempts,
+    runs,
+    "ko-KR",
+  );
+  const english = formatOperatorNotificationsSummaryMessage(
+    notifications,
+    attempts,
+    runs,
+    "en-US",
+  );
+
+  for (const message of [korean, english]) {
+    assert.match(message, /Original title 4/);
+    assert.match(message, /Original message 4/);
+    assert.match(message, /Original title 3/);
+    assert.match(message, /Original message 3/);
+    assert.match(message, /Original title 2/);
+    assert.match(message, /Original message 2/);
+    assert.doesNotMatch(message, /Original title 1/);
+    assert.doesNotMatch(message, /Original message 1/);
+    assert.doesNotMatch(message, /Original title 0/);
+    assert.doesNotMatch(message, /Original message 0/);
+    assert.equal((message.match(/Recent delivery run:|최근 전송 실행:/g) ?? []).length, 1);
+    assert.equal((message.match(/Recent attempt outcome:|최근 시도 결과:/g) ?? []).length, 1);
+    assert.match(message, /\/alerts detail/);
+  }
+
+  assert.match(korean, /최근 알림 2건 생략/);
+  assert.match(korean, /전송 실행 2건 생략/);
+  assert.match(korean, /전송 시도 2건 생략/);
+  assert.match(english, /2 recent alert\(s\) omitted/);
+  assert.match(english, /2 delivery run\(s\) omitted/);
+  assert.match(english, /2 delivery attempt\(s\) omitted/);
+  assert.match(english, /Recent sample: up to 10 alerts and up to 5 delivery attempts/);
+  assert.match(english, /In-sample pending/);
+});
+
+test("telegram alerts detail preserves canonical output and performs each bounded read once", async () => {
+  const notifications = [
+    createNotification({
+      id: "notification-detail",
+      createdAt: "2026-04-20T00:00:00.000Z",
+    }),
+  ];
+  const attempts = [createDeliveryAttempt("SENT", 0)];
+  const runs = [createDeliveryRun("COMPLETED", 0)];
+  const reads: string[] = [];
+  const repository = new InMemoryExecutionRepository();
+  repository.listOperatorNotifications = async (exchangeAccountId, limit) => {
+    reads.push(`notifications:${exchangeAccountId}:${limit}`);
+    return notifications;
+  };
+  repository.listOperatorNotificationDeliveryAttempts = async (exchangeAccountId, limit) => {
+    reads.push(`attempts:${exchangeAccountId}:${limit}`);
+    return attempts;
+  };
+  repository.listOperatorNotificationDeliveryRuns = async (exchangeAccountId, limit) => {
+    reads.push(`runs:${exchangeAccountId}:${limit}`);
+    return runs;
+  };
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-1",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    now: () => "2026-04-20T00:10:00.000Z",
+  });
+
+  const response = await router.route("/alerts DETAIL");
+
+  assert.equal(
+    response.text,
+    formatOperatorNotificationsMessage(notifications, attempts, runs, {
+      now: "2026-04-20T00:10:00.000Z",
+    }),
+  );
+  assert.deepEqual(reads, [
+    "notifications:primary:10",
+    "attempts:primary:5",
+    "runs:primary:5",
+  ]);
+  assert.equal(
+    (await router.route("/alerts now")).text,
+    "Usage: /alerts [detail]\nShow a concise persisted alert and delivery-health summary or the canonical technical list.",
+  );
+});
+
+test("telegram alerts summary keeps delivery health in Korean and English empty states", () => {
+  const korean = formatOperatorNotificationsSummaryMessage([], [], [], "ko-KR", {
+    now: "2026-04-20T00:10:00.000Z",
+  });
+  const english = formatOperatorNotificationsSummaryMessage([], [], [], "en-US", {
+    now: "2026-04-20T00:10:00.000Z",
+  });
+
+  assert.match(korean, /알림 전송 상태/);
+  assert.match(korean, /저장된 최근 운영 알림이 없습니다/);
+  assert.match(english, /Alert delivery health/);
+  assert.match(english, /No recent persisted operator alerts/);
 });
 
 test("telegram router presents persisted risk history in Korean without claiming current blockers", async () => {
@@ -4064,11 +4388,59 @@ function createNotification(
     failureClass: null,
     leaseToken: null,
     leaseExpiresAt: null,
+    deliveredAt: null,
+    lastError: null,
     ...rest,
     id,
     createdAt,
-    deliveredAt: null,
-    lastError: null,
+  };
+}
+
+function createDeliveryAttempt(
+  outcome: OperatorNotificationDeliveryAttemptRecord["outcome"],
+  index: number,
+): OperatorNotificationDeliveryAttemptRecord {
+  return {
+    id: `attempt-${outcome}`,
+    notificationId: `notification-${index}`,
+    exchangeAccountId: "primary",
+    attemptCount: index + 1,
+    leaseToken: `lease-${index}`,
+    outcome,
+    failureClass: outcome === "RETRY_SCHEDULED" ? "RETRYABLE" : null,
+    attemptedAt: `2026-04-20T00:0${index}:30.000Z`,
+    nextAttemptAt: outcome === "RETRY_SCHEDULED" ? "2026-04-20T00:09:00.000Z" : null,
+    deliveredAt: outcome === "SENT" ? "2026-04-20T00:00:30.000Z" : null,
+    errorMessage: outcome === "FAILED" ? "telegram_http_403" : null,
+    createdAt: `2026-04-20T00:0${index}:30.000Z`,
+  };
+}
+
+function createDeliveryRun(
+  status: OperatorNotificationDeliveryRunRecord["status"],
+  index: number,
+): OperatorNotificationDeliveryRunRecord {
+  return {
+    id: `delivery-run-${status}`,
+    exchangeAccountId: "primary",
+    workerName: "telegram_delivery_inline_worker",
+    status,
+    startedAt: `2026-04-20T00:0${index}:00.000Z`,
+    completedAt: `2026-04-20T00:0${index}:01.000Z`,
+    attemptedCount: 1,
+    sentCount: status === "COMPLETED" ? 1 : 0,
+    retryScheduledCount: 0,
+    failedCount: status === "FAILED" ? 1 : 0,
+    staleLeaseCount: 0,
+    pendingTotalCount: 0,
+    pendingDueCount: 0,
+    pendingScheduledCount: 0,
+    activeLeaseCount: 0,
+    expiredLeaseCount: 0,
+    abandonedLeaseCandidateCount: 0,
+    skippedReason: status === "SKIPPED" ? "delivery_not_configured" : null,
+    errorMessage: status === "FAILED" ? "delivery_worker_failed" : null,
+    summaryJson: "{}",
   };
 }
 

@@ -58,9 +58,9 @@ const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
   {
     command: "/alerts",
     category: "inspection",
-    usage: "/alerts",
-    summary: "Show recent persisted operator_notifications, delivery attempts, retry schedule, and Telegram delivery states.",
-    argumentPolicy: "none",
+    usage: "/alerts [detail]",
+    summary: "Show a concise persisted alert and delivery-health summary or the canonical technical list.",
+    argumentPolicy: "optional_detail",
   },
   {
     command: "/risks",
