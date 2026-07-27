@@ -136,6 +136,27 @@ test("balance and position commands accept only optional detail arguments", () =
   );
 });
 
+test("orders command accepts only an optional detail argument", () => {
+  const ordersDetail = parseTelegramCommand("/orders DETAIL");
+  const ordersExtra = parseTelegramCommand("/orders detail now");
+  const ordersSummary = parseTelegramCommand("/orders summary");
+
+  assert.ok(ordersDetail);
+  assert.ok(ordersExtra);
+  assert.ok(ordersSummary);
+  assert.equal(validateTelegramCommand(ordersDetail), null);
+  assert.equal(validateTelegramCommand(ordersExtra), buildUsageMessage("/orders"));
+  assert.equal(validateTelegramCommand(ordersSummary), buildUsageMessage("/orders"));
+
+  const contract = listTelegramCommandContracts()
+    .find((candidate) => candidate.command === "/orders");
+  assert.equal(contract?.usage, "/orders [detail]");
+  assert.equal(
+    contract?.summary,
+    "Show a concise recent-order summary or the canonical stored order list.",
+  );
+});
+
 test("manual input commands are rejected by the operator contract", () => {
   const message = buildUnsupportedCommandMessage("/setposition BTC 0.25 95000000");
 

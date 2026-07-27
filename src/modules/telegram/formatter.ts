@@ -43,6 +43,7 @@ import {
   formatBalancePresentation,
   formatPositionPresentation,
 } from "./presentation/portfolio.js";
+import { formatOrdersPresentation } from "./presentation/orders.js";
 import {
   describeLiveOrderBlockers,
   formatStatusPresentation,
@@ -474,6 +475,13 @@ export function formatOrdersMessage(orders: OrderRecord[], options?: { limit?: n
       ? [`note: Showing the most recent ${visibleOrders.length} order(s). Use /order <id|identifier> for details.`]
       : []),
   ].join("\n");
+}
+
+export function formatOrdersSummaryMessage(
+  orders: readonly OrderRecord[],
+  locale: TelegramLocale = DEFAULT_TELEGRAM_LOCALE,
+): string {
+  return formatOrdersPresentation(orders, locale);
 }
 
 export function formatOrderDetailMessage(

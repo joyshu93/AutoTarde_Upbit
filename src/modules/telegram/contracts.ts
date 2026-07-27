@@ -86,9 +86,9 @@ const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
   {
     command: "/orders",
     category: "inspection",
-    usage: "/orders",
-    summary: "Show stored order lifecycle records.",
-    argumentPolicy: "none",
+    usage: "/orders [detail]",
+    summary: "Show a concise recent-order summary or the canonical stored order list.",
+    argumentPolicy: "optional_detail",
   },
   {
     command: "/order",

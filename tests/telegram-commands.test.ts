@@ -17,6 +17,8 @@ import { TelegramCommandRouter } from "../src/modules/telegram/commands.js";
 import { listTelegramCommandContracts } from "../src/modules/telegram/contracts.js";
 import {
   formatBalanceMessage,
+  formatOrdersMessage,
+  formatOrdersSummaryMessage,
   formatPositionMessage,
   formatReadinessMessage,
   formatStatusMessage,
@@ -1695,12 +1697,39 @@ test("telegram router reports missing order detail without reading events or fil
   assert.equal(fillLookupCount, 0);
 });
 
-test("telegram router bounds /orders output for delivery-safe summaries", async () => {
+test("telegram router renders a concise Korean orders summary with lifecycle counts and recent-order hints", async () => {
   const repository = new InMemoryExecutionRepository();
-  for (let index = 0; index < 25; index += 1) {
+  let listOrdersCallCount = 0;
+  const listOrders = repository.listOrders.bind(repository);
+  repository.listOrders = async (exchangeAccountId) => {
+    listOrdersCallCount += 1;
+    return listOrders(exchangeAccountId);
+  };
+  const statuses: OrderRecord["status"][] = [
+    "INTENT_CREATED",
+    "RISK_REJECTED",
+    "PERSISTED",
+    "SUBMITTING",
+    "OPEN",
+    "PARTIALLY_FILLED",
+    "FILLED",
+    "CANCEL_REQUESTED",
+    "CANCELED",
+    "REJECTED",
+    "FAILED",
+    "RECONCILIATION_REQUIRED",
+  ];
+  for (const [index, status] of statuses.entries()) {
     await repository.saveOrder(createOrder({
       id: `order-summary-${index}`,
       identifier: `order-summary-identifier-${index}`,
+      status,
+      executionMode: index % 2 === 0 ? "LIVE" : "DRY_RUN",
+      origin: index % 3 === 0 ? "RECOVERY" : index % 3 === 1 ? "OPERATOR" : "STRATEGY",
+      side: index % 2 === 0 ? "bid" : "ask",
+      ordType: index % 2 === 0 ? "price" : "market",
+      price: index % 2 === 0 ? String(500_000 + index) : null,
+      volume: index % 2 === 0 ? null : `0.0000000${index}`,
       updatedAt: `2026-04-20T00:${String(index).padStart(2, "0")}:00.000Z`,
     }));
   }
@@ -1722,13 +1751,318 @@ test("telegram router bounds /orders output for delivery-safe summaries", async 
 
   const response = await router.route("/orders");
 
-  assert.match(response.text, /Orders/);
-  assert.match(response.text, /count: 25/);
+  assert.match(response.text, /최근 주문/);
+  assert.match(response.text, /전체: 12건/);
+  assert.match(response.text, /진행\/확인 필요: 7건/);
+  assert.match(response.text, /체결 완료: 1건/);
+  assert.match(response.text, /취소: 1건/);
+  assert.match(response.text, /거부\/실패: 3건/);
+  assert.match(response.text, /2026-04-20 09:11:00 KST/);
+  assert.match(response.text, /KRW-BTC · 매도 · 확인 필요 · DRY_RUN · 전략/);
+  assert.match(response.text, /수량: 0\.00000001 BTC/);
+  assert.match(response.text, /확인: \/order order-summary-11/);
+  assert.match(response.text, /KRW-BTC · 매수 · 실패 · LIVE · 운영자/);
+  assert.match(response.text, /주문금액: 500,010원/);
+  assert.match(response.text, /로컬 저장/);
+  assert.match(response.text, /전송 중/);
+  assert.match(response.text, /미체결/);
+  assert.match(response.text, /부분 체결/);
+  assert.match(response.text, /체결 완료/);
+  assert.match(response.text, /취소 요청/);
+  assert.match(response.text, /취소 완료/);
+  assert.match(response.text, /거래소 거부/);
+  assert.match(response.text, /2건은 생략되었습니다\./);
+  assert.match(response.text, /전체 기술 목록: \/orders detail/);
+  assert.doesNotMatch(response.text, /order-summary-1(?:\D|$)/);
+  assert.doesNotMatch(response.text, /displayed_count:/);
+  assert.equal(listOrdersCallCount, 1);
+
+  const earlyRepository = new InMemoryExecutionRepository();
+  await earlyRepository.saveOrder(createOrder({
+    id: "order-summary-intent",
+    status: "INTENT_CREATED",
+  }));
+  await earlyRepository.saveOrder(createOrder({
+    id: "order-summary-risk",
+    status: "RISK_REJECTED",
+    updatedAt: "2026-04-20T00:01:00.000Z",
+  }));
+  const earlyRouter = new TelegramCommandRouter({
+    repositories: earlyRepository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-orders-early",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+  });
+  const earlyResponse = await earlyRouter.route("/orders");
+  assert.match(earlyResponse.text, /주문 의도 생성/);
+  assert.match(earlyResponse.text, /리스크 거부/);
+});
+
+test("telegram router renders equivalent English order labels and explicit terminal states", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const statuses: OrderRecord["status"][] = [
+    "INTENT_CREATED",
+    "RISK_REJECTED",
+    "PERSISTED",
+    "SUBMITTING",
+    "OPEN",
+    "PARTIALLY_FILLED",
+    "FILLED",
+    "CANCEL_REQUESTED",
+    "CANCELED",
+    "REJECTED",
+    "FAILED",
+    "RECONCILIATION_REQUIRED",
+  ];
+  for (const [index, status] of statuses.entries()) {
+    await repository.saveOrder(createOrder({
+      id: `order-english-${index}`,
+      identifier: `order-english-identifier-${index}`,
+      status,
+      side: index % 2 === 0 ? "bid" : "ask",
+      origin: "STRATEGY",
+      executionMode: "LIVE",
+      updatedAt: `2026-04-20T00:${String(index).padStart(2, "0")}:00.000Z`,
+    }));
+  }
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-orders-english",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    locale: "en-US",
+  });
+
+  const response = await router.route("/orders");
+
+  assert.match(response.text, /Recent orders/);
+  assert.match(response.text, /Total: 12/);
+  assert.match(response.text, /Active\/recovery required: 7/);
+  assert.match(response.text, /Filled: 1/);
+  assert.match(response.text, /Canceled: 1/);
+  assert.match(response.text, /Rejected\/failed: 3/);
+  assert.match(response.text, /2026-04-20 09:11:00 KST/);
+  assert.match(response.text, /KRW-BTC · Sell · Reconciliation required · LIVE · Strategy/);
+  assert.match(response.text, /· Failed ·/);
+  assert.match(response.text, /Persisted/);
+  assert.match(response.text, /Submitting/);
+  assert.match(response.text, /Open/);
+  assert.match(response.text, /Partially filled/);
+  assert.match(response.text, /Filled/);
+  assert.match(response.text, /Cancel requested/);
+  assert.match(response.text, /Canceled/);
+  assert.match(response.text, /Rejected/);
+  assert.match(response.text, /2 order\(s\) omitted\./);
+  assert.match(response.text, /Full technical list: \/orders detail/);
+
+  const earlyRepository = new InMemoryExecutionRepository();
+  await earlyRepository.saveOrder(createOrder({
+    id: "order-english-intent",
+    status: "INTENT_CREATED",
+  }));
+  await earlyRepository.saveOrder(createOrder({
+    id: "order-english-risk",
+    status: "RISK_REJECTED",
+    updatedAt: "2026-04-20T00:01:00.000Z",
+  }));
+  const earlyRouter = new TelegramCommandRouter({
+    repositories: earlyRepository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-orders-english-early",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    locale: "en-US",
+  });
+  const earlyResponse = await earlyRouter.route("/orders");
+  assert.match(earlyResponse.text, /Intent created/);
+  assert.match(earlyResponse.text, /Risk rejected/);
+});
+
+test("telegram order summary preserves Upbit price and volume semantics for every supported order shape", () => {
+  const cases: Array<{
+    name: string;
+    order: OrderRecord;
+    expected: RegExp[];
+    forbidden: RegExp[];
+  }> = [
+    {
+      name: "limit bid",
+      order: createOrder({
+        id: "order-limit-bid",
+        side: "bid",
+        ordType: "limit",
+        price: "119000000",
+        volume: "0.0001",
+      }),
+      expected: [/주문 단가: 119,000,000원/, /수량: 0\.0001 BTC/],
+      forbidden: [/주문금액:/],
+    },
+    {
+      name: "limit ask",
+      order: createOrder({
+        id: "order-limit-ask",
+        side: "ask",
+        ordType: "limit",
+        price: "120000000",
+        volume: "0.0002",
+      }),
+      expected: [/주문 단가: 120,000,000원/, /수량: 0\.0002 BTC/],
+      forbidden: [/주문금액:/],
+    },
+    {
+      name: "best bid",
+      order: createOrder({
+        id: "order-best-bid",
+        side: "bid",
+        ordType: "best",
+        price: "7000",
+        volume: null,
+        timeInForce: "ioc",
+      }),
+      expected: [/주문금액: 7,000원/],
+      forbidden: [/주문 단가:/, /수량:/],
+    },
+    {
+      name: "best ask",
+      order: createOrder({
+        id: "order-best-ask",
+        side: "ask",
+        ordType: "best",
+        price: null,
+        volume: "0.0003",
+        timeInForce: "fok",
+      }),
+      expected: [/수량: 0\.0003 BTC/],
+      forbidden: [/주문금액:/, /주문 단가:/],
+    },
+    {
+      name: "market ask",
+      order: createOrder({
+        id: "order-market-ask",
+        side: "ask",
+        ordType: "market",
+        price: null,
+        volume: "0.0004",
+      }),
+      expected: [/수량: 0\.0004 BTC/],
+      forbidden: [/주문금액:/, /주문 단가:/],
+    },
+    {
+      name: "price bid",
+      order: createOrder({
+        id: "order-price-bid",
+        side: "bid",
+        ordType: "price",
+        price: "8000",
+        volume: null,
+      }),
+      expected: [/주문금액: 8,000원/],
+      forbidden: [/주문 단가:/, /수량:/],
+    },
+  ];
+
+  for (const orderCase of cases) {
+    const message = formatOrdersSummaryMessage([orderCase.order], "ko-KR");
+    for (const expected of orderCase.expected) {
+      assert.match(message, expected, orderCase.name);
+    }
+    for (const forbidden of orderCase.forbidden) {
+      assert.doesNotMatch(message, forbidden, orderCase.name);
+    }
+  }
+});
+
+test("telegram /orders detail preserves the canonical technical list exactly", async () => {
+  const repository = new InMemoryExecutionRepository();
+  for (let index = 0; index < 25; index += 1) {
+    await repository.saveOrder(createOrder({
+      id: `order-detail-${index}`,
+      identifier: `order-detail-identifier-${index}`,
+      updatedAt: `2026-04-20T00:${String(index).padStart(2, "0")}:00.000Z`,
+    }));
+  }
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-orders-detail",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+  });
+  const orders = await repository.listOrders("primary");
+
+  const response = await router.route("/orders DETAIL");
+
+  assert.equal(response.text, formatOrdersMessage(orders, { limit: 20 }));
   assert.match(response.text, /displayed_count: 20/);
   assert.match(response.text, /omitted_count: 5/);
-  assert.match(response.text, /order-summary-identifier-24/);
-  assert.doesNotMatch(response.text, /order-summary-identifier-0/);
-  assert.match(response.text, /Use \/order <id\|identifier> for details\./);
+  assert.match(response.text, /order-detail-identifier-24/);
+  assert.doesNotMatch(response.text, /order-detail-identifier-0/);
+});
+
+test("telegram /orders summary explicitly reports an empty persisted order list", async () => {
+  const router = createRouter();
+  const englishRouter = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-orders-empty-english",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    locale: "en-US",
+  });
+
+  const response = await router.route("/orders");
+  const englishResponse = await englishRouter.route("/orders");
+
+  assert.match(response.text, /최근 주문/);
+  assert.match(response.text, /전체: 0건/);
+  assert.match(response.text, /저장된 주문이 없습니다\./);
+  assert.match(response.text, /전체 기술 목록: \/orders detail/);
+  assert.match(englishResponse.text, /Recent orders/);
+  assert.match(englishResponse.text, /Total: 0/);
+  assert.match(englishResponse.text, /No stored orders\./);
+  assert.match(englishResponse.text, /Full technical list: \/orders detail/);
 });
 
 test("telegram router renders a concise Korean execution status by default", async () => {

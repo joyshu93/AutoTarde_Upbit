@@ -167,6 +167,8 @@ It provides:
 - scheduler-triggered failures, overlapping-run skips, and scheduler-triggered order submission/rejection outcomes are persisted as operator notifications so automatic operation does not fail silently
 - Windows Task Scheduler helpers register manual-only launch wrappers around ignored local startup scripts; they never store secrets in task definitions or add startup/logon triggers
 - `/order <order-id|identifier>` for one persisted order plus order-event and fill detail without exchange mutation
+- locale-aware `/orders` summary for recent persisted lifecycle state and status counts, with exact `/order <id>` inspection hints
+- `/orders detail` for the canonical bounded technical order list; both forms use the same single read-only order query
 - `/scheduler` for current in-memory scheduler status plus fuller read-only persisted `strategy_scheduler_runs` history without triggering scheduler execution
 - `/inbound` for read-only runtime inbound polling status and persisted `telegram_inbound_offsets` inspection
 - future reconciliation inspection as a read-only operator view
@@ -186,6 +188,7 @@ It provides:
 `/help` is intentionally contract-derived and locale-aware. Presentation defaults to `ko-KR`, supports only `ko-KR` and `en-US`, and does not read repositories, poll Telegram, inspect exchange state, start sync, start strategy runs, start scheduler ticks, mutate orders, or enable live order transmission.
 `/status` is a locale-aware, inspection-only operator summary. `/status detail` preserves the canonical technical output and uses the same bounded repository reads; neither form calls Upbit, triggers reconciliation or strategy execution, starts scheduler work, mutates orders, or enables live order transmission.
 `/balances` and `/positions` are locale-aware, inspection-only summaries of the latest persisted exchange snapshots. Their `detail` forms preserve the canonical technical output. These commands do not call Upbit, trigger sync, infer holdings from Telegram, or accept manual cash or position input.
+`/orders` is a locale-aware, inspection-only summary of recent persisted order lifecycle records. `/orders detail` preserves the canonical technical list. Neither form submits, cancels, retries, reconciles, or otherwise mutates an order.
 `/config` is intentionally non-secret and runtime-derived; it renders configured/not-configured booleans for secrets, exposes ignored deprecated environment variable names when present, and never prints raw credentials, tokens, or chat identifiers.
 `/readiness` is an inspection-only, locale-aware summary with human-readable PASS/WARN/BLOCK guidance. `/readiness detail` preserves the canonical technical checks and safety boundaries. Both forms read the same bounded local state and runtime status, including active/non-terminal order count, recent risk `BLOCK` count, and pending operator notification count, but do not poll Telegram, call Upbit, start sync, run strategies, tick schedulers, mutate offsets, deliver notifications, or mutate orders.
 
