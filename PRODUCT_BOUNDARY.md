@@ -62,7 +62,7 @@ Telegram may expose:
 - `/orders`
 - `/order <order-id|identifier> [detail]`
 - `/scheduler [detail]`
-- `/inbound`
+- `/inbound [detail]`
 - `/pause`
 - `/resume`
 - `/killswitch`
@@ -84,7 +84,7 @@ Telegram `/order <reference>` may present a locale-aware lifecycle summary with 
 Telegram `/risks` may present a locale-aware summary of recent persisted risk-event history, including severity counts, explanations, original messages, and linked order or strategy-decision references. `/risks detail` preserves the canonical technical list. Historical rows are not proof of a currently active risk block, and both forms must use the same bounded local read without evaluating risk, clearing or creating events, calling Upbit, mutating orders, or changing execution state.
 Telegram `/alerts` may present a locale-aware summary of the bounded recent operator-notification and delivery sample, with repository-read limits stated explicitly and only the newest three notifications, one delivery run, and one delivery attempt displayed. `/alerts detail` preserves the canonical technical notification, delivery-run, delivery-attempt, retry, and queue output. Both forms must use the same three bounded local reads and must not claim, send, retry, finalize, or mutate notifications, poll Telegram, call Upbit, run sync or strategy, mutate orders, or change execution state.
 Telegram `/scheduler` may present a locale-aware summary that explicitly separates current in-memory scheduler state from the bounded latest-20 persisted scheduler-run sample and displays only its newest three rows. `/scheduler detail` preserves the canonical runtime, startup-preflight, per-market, and persisted-run fields. Both forms must use the same single bounded history read and one runtime-status snapshot and must not start or stop timers, trigger scheduler ticks, run strategy or sync, call Upbit, create or mutate orders, change execution state, or alter scheduler-run records.
-`/inbound` may inspect runtime inbound polling status and persisted offset progress, but it must not poll Telegram or route commands by itself.
+Telegram `/inbound` may present a locale-aware summary that explicitly separates the current in-memory polling state from persisted `telegram_inbound_offsets` progress and compares their next offsets when both are available. `/inbound detail` preserves the canonical technical runtime and persisted-offset fields. Both forms must use at most one runtime-status snapshot and one offset-record read, and must not poll Telegram, route commands, mutate offset state, call Upbit, run sync or strategy, mutate orders, or change execution state.
 `npm run smoke:telegram:inbound` may perform one bounded Telegram `getUpdates` poll for operator validation, but it forcibly uses `DRY_RUN`, disables live-send and scheduler paths, and never starts the long-running polling loop.
 `npm run smoke:dryrun:readiness` may inspect local DRY_RUN runtime configuration and persisted readiness evidence before the local runtime starts, but it must not run `/sync`, run strategies, poll Telegram, start the scheduler, call Upbit, deliver notifications, or transmit orders.
 `npm run smoke:dryrun:sync` may perform one exchange-backed DRY_RUN `/sync` rehearsal with Upbit read credentials and local persistence, but it must disable live-send, Telegram delivery/inbound polling, scheduler startup, strategy runs, and order transmission.

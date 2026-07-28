@@ -107,9 +107,9 @@ const TELEGRAM_COMMAND_CONTRACTS: readonly TelegramCommandContract[] = [
   {
     command: "/inbound",
     category: "inspection",
-    usage: "/inbound",
-    summary: "Show Telegram inbound polling status and persisted update offset.",
-    argumentPolicy: "none",
+    usage: "/inbound [detail]",
+    summary: "Show a concise Telegram inbound summary or the canonical technical polling and offset detail.",
+    argumentPolicy: "optional_detail",
   },
   {
     command: "/pause",

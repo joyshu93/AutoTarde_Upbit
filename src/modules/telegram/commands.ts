@@ -35,6 +35,7 @@ import {
   formatStatusSummaryMessage,
   formatSyncMessage,
   formatTelegramInboundMessage,
+  formatTelegramInboundSummaryMessage,
 } from "./formatter.js";
 import type {
   ParsedTelegramCommand,
@@ -136,7 +137,10 @@ export class TelegramCommandRouter {
           parsed.args[0]?.toLowerCase() === "detail",
         );
       case "/inbound":
-        return this.buildInboundResponse(exchangeAccountId);
+        return this.buildInboundResponse(
+          exchangeAccountId,
+          parsed.args[0]?.toLowerCase() === "detail",
+        );
       case "/pause":
         return this.applyControlCommand(
           parsed.command,
@@ -494,7 +498,11 @@ export class TelegramCommandRouter {
     };
   }
 
-  private async buildInboundResponse(exchangeAccountId: string): Promise<TelegramResponse> {
+  private async buildInboundResponse(
+    exchangeAccountId: string,
+    detail: boolean,
+  ): Promise<TelegramResponse> {
+    const status = this.dependencies.telegramInboundStatus?.() ?? null;
     const offset = this.dependencies.telegramInboundOffsetStore && this.dependencies.telegramInboundBotTokenRef
       ? await this.dependencies.telegramInboundOffsetStore.getTelegramInboundOffset({
           exchangeAccountId,
@@ -504,7 +512,13 @@ export class TelegramCommandRouter {
       : null;
 
     return {
-      text: formatTelegramInboundMessage(this.dependencies.telegramInboundStatus?.() ?? null, offset),
+      text: detail
+        ? formatTelegramInboundMessage(status, offset)
+        : formatTelegramInboundSummaryMessage(
+            status,
+            offset,
+            normalizeTelegramLocale(this.dependencies.locale),
+          ),
     };
   }
 

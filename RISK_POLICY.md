@@ -110,7 +110,7 @@ The operator surface should expose:
 - `/orders`
 - `/order <order-id|identifier>`
 - `/scheduler`
-- `/inbound`
+- `/inbound [detail]`
 - `/pause`
 - `/resume`
 - `/killswitch`
@@ -127,7 +127,7 @@ When a `LIVE` scheduler is enabled, `/readiness` must warn if the latest persist
 Reconciliation recovery progress such as recovered historical exchange orders and fill backfills may be reported as `WARN`; unresolved portfolio drift, missing order references, lookup failures, deferred lookups, or recovery-required orders remain `BLOCK`.
 Inbound polling must stay disabled by default, must reject non-operator chat IDs before routing commands, and may persist only Telegram update-offset progress as transport state.
 Inbound polling may split long command replies into multiple Telegram messages to satisfy transport limits; such splitting is not execution state and must not change command semantics.
-`/inbound` is inspection-only and must not call Telegram polling, trigger command routing, or mutate offset state.
+`/inbound` and `/inbound detail` are inspection-only. The default summary may compare one in-memory status snapshot with one persisted offset record, while detail preserves canonical technical fields. Neither form may call Telegram polling, start or stop the polling worker, trigger command routing, mutate offset state, call Upbit, run sync or strategy, mutate orders, or change execution state.
 The Telegram inbound smoke command must force `DRY_RUN`, force `ENABLE_LIVE_ORDERS=false`, disable scheduler starts, and execute only one bounded poll.
 The dry-run readiness smoke command must force `DRY_RUN`, force `ENABLE_LIVE_ORDERS=false`, disable scheduler starts, read only local persisted readiness evidence, and never run `/sync`, run strategy, poll Telegram, call Upbit, deliver notifications, or transmit orders.
 The dry-run sync smoke command must force `DRY_RUN`, force `ENABLE_LIVE_ORDERS=false`, disable Telegram delivery and inbound polling, disable scheduler starts, require Upbit read credentials, and run only exchange-backed `/sync` plus read-only inspection commands. It may persist balance snapshots, position snapshots, reconciliation runs, risk evidence from drift detection, and recovery records, but it must not run strategy or transmit orders.

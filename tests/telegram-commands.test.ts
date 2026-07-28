@@ -38,7 +38,9 @@ import {
   formatStatusMessage,
   formatStrategySchedulerRunsMessage,
   formatStrategySchedulerRunsSummaryMessage,
+  formatTelegramInboundMessage,
 } from "../src/modules/telegram/formatter.js";
+import type { TelegramInboundPollingStatus } from "../src/modules/telegram/inbound.js";
 import { test } from "./harness.js";
 
 function createRouter(): TelegramCommandRouter {
@@ -3394,9 +3396,184 @@ function createSchedulerExecutionState(): ExecutionStateRecord {
   };
 }
 
-test("telegram router exposes dedicated telegram inbound inspection", async () => {
-  const offsetStore = new InMemoryTelegramInboundOffsetStore();
-  await offsetStore.saveTelegramInboundOffset({
+function createInboundStatus(
+  overrides: Partial<TelegramInboundPollingStatus> = {},
+): TelegramInboundPollingStatus {
+  return {
+    enabled: true,
+    configured: true,
+    running: true,
+    nextOffset: 42,
+    pollIntervalMs: 2_000,
+    longPollTimeoutSeconds: 25,
+    limit: 10,
+    lastPollAt: "2026-04-20T00:12:00.000Z",
+    lastUpdateId: 41,
+    offsetLoaded: true,
+    offsetStorage: "DURABLE",
+    processedCount: 3,
+    ignoredCount: 1,
+    failedCount: 0,
+    lastError: null,
+    ...overrides,
+  };
+}
+
+test("telegram /inbound returns a Korean healthy summary with synchronized persisted progress", async () => {
+  let runtimeReads = 0;
+  let offsetReads = 0;
+  const router = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: createRouterState(),
+    telegramInboundBotTokenRef: "sha256:bot-a",
+    telegramInboundStatus: () => {
+      runtimeReads += 1;
+      return createInboundStatus();
+    },
+    telegramInboundOffsetStore: {
+      async getTelegramInboundOffset(input) {
+        offsetReads += 1;
+        assert.deepEqual(input, {
+          exchangeAccountId: "primary",
+          updateSource: "GET_UPDATES",
+          botTokenRef: "sha256:bot-a",
+        });
+        return {
+          id: "telegram-inbound-offset-1",
+          exchangeAccountId: "primary",
+          updateSource: "GET_UPDATES",
+          botTokenRef: "sha256:bot-a",
+          nextOffset: 42,
+          lastUpdateId: 41,
+          updatedAt: "2026-04-20T00:11:00.000Z",
+        };
+      },
+      async saveTelegramInboundOffset() {
+        throw new Error("/inbound must not mutate persisted offset state");
+      },
+    },
+  });
+
+  const inbound = await router.route("/inbound");
+
+  assert.match(inbound.text, /^텔레그램 명령 수신$/m);
+  assert.match(inbound.text, /현재 메모리 폴링 상태:/);
+  assert.match(inbound.text, /상태: 실행 중/);
+  assert.match(inbound.text, /다음 조치: 없음/);
+  assert.match(inbound.text, /활성화 예 \| 설정 완료 예 \| 실행 중 예/);
+  assert.match(inbound.text, /오프셋 저장: 영구 저장/);
+  assert.match(inbound.text, /런타임 오프셋 로드: 예/);
+  assert.match(inbound.text, /다음 오프셋 42 \| 최근 업데이트 ID 41/);
+  assert.match(inbound.text, /폴링 간격 2초 \| 롱폴링 제한 25초 \| 배치 한도 10건/);
+  assert.match(inbound.text, /최근 폴링 2026-04-20 09:12:00 KST/);
+  assert.match(inbound.text, /처리 3건 \| 무시 1건 \| 실패 0건/);
+  assert.match(inbound.text, /저장된 telegram_inbound_offsets 진행:/);
+  assert.match(inbound.text, /저장 레코드: 있음/);
+  assert.match(inbound.text, /다음 오프셋 42 \| 최근 업데이트 ID 41/);
+  assert.match(inbound.text, /저장 갱신 2026-04-20 09:11:00 KST/);
+  assert.match(inbound.text, /런타임과 저장 오프셋 비교: 동기화됨/);
+  assert.match(inbound.text, /전체 기술 정보: \/inbound detail/);
+  assert.doesNotMatch(inbound.text, /sha256:bot-a|botTokenRef|bot_token_ref/);
+  assert.equal(runtimeReads, 1);
+  assert.equal(offsetReads, 1);
+});
+
+test("telegram /inbound renders every runtime state and absent persisted progress", async () => {
+  const cases: Array<{
+    status: TelegramInboundPollingStatus | null;
+    expectedState: RegExp;
+    expectedAction: RegExp;
+  }> = [
+    {
+      status: null,
+      expectedState: /상태: 확인 불가/,
+      expectedAction: /다음 조치: 런타임 상태 연결 확인/,
+    },
+    {
+      status: createInboundStatus({ enabled: false, configured: false, running: false }),
+      expectedState: /상태: 비활성/,
+      expectedAction: /다음 조치: 필요 시 인바운드 폴링 활성화/,
+    },
+    {
+      status: createInboundStatus({ configured: false, running: false }),
+      expectedState: /상태: 활성화됐지만 설정 미완료/,
+      expectedAction: /다음 조치: 봇 토큰과 운영자 채팅 ID 설정/,
+    },
+    {
+      status: createInboundStatus({ running: false }),
+      expectedState: /상태: 설정됐지만 실행 중이 아님/,
+      expectedAction: /다음 조치: 인바운드 폴링 시작 상태 확인/,
+    },
+    {
+      status: createInboundStatus(),
+      expectedState: /상태: 실행 중/,
+      expectedAction: /다음 조치: 없음/,
+    },
+  ];
+
+  for (const entry of cases) {
+    const router = new TelegramCommandRouter({
+      repositories: new InMemoryExecutionRepository(),
+      operatorState: createRouterState(),
+      telegramInboundBotTokenRef: "sha256:bot-a",
+      telegramInboundStatus: () => entry.status,
+      telegramInboundOffsetStore: {
+        async getTelegramInboundOffset() {
+          return null;
+        },
+        async saveTelegramInboundOffset() {
+          throw new Error("/inbound must not mutate persisted offset state");
+        },
+      },
+    });
+
+    const response = await router.route("/inbound");
+    assert.match(response.text, entry.expectedState);
+    assert.match(response.text, entry.expectedAction);
+    assert.match(response.text, /저장 레코드: 없음/);
+    assert.match(response.text, /런타임과 저장 오프셋 비교: 확인 불가/);
+  }
+});
+
+test("telegram /inbound exposes failures and distinguishes different offsets", async () => {
+  const exactError = "telegram_http_502: upstream gateway timeout";
+  const router = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: createRouterState(),
+    telegramInboundBotTokenRef: "sha256:bot-a",
+    telegramInboundStatus: () => createInboundStatus({
+      failedCount: 2,
+      lastError: exactError,
+    }),
+    telegramInboundOffsetStore: {
+      async getTelegramInboundOffset() {
+        return {
+          id: "telegram-inbound-offset-1",
+          exchangeAccountId: "primary",
+          updateSource: "GET_UPDATES",
+          botTokenRef: "sha256:bot-a",
+          nextOffset: 40,
+          lastUpdateId: 39,
+          updatedAt: "2026-04-20T00:11:00.000Z",
+        };
+      },
+      async saveTelegramInboundOffset() {
+        throw new Error("/inbound must not mutate persisted offset state");
+      },
+    },
+  });
+
+  const response = await router.route("/inbound");
+
+  assert.match(response.text, /다음 조치: 최근 폴링 오류 확인/);
+  assert.match(response.text, /처리 3건 \| 무시 1건 \| 실패 2건/);
+  assert.match(response.text, new RegExp(`최근 오류: ${exactError}`));
+  assert.match(response.text, /런타임과 저장 오프셋 비교: 다름/);
+});
+
+test("telegram /inbound supports en-US and preserves exact canonical detail", async () => {
+  const status = createInboundStatus();
+  const offset = {
     id: "telegram-inbound-offset-1",
     exchangeAccountId: "primary",
     updateSource: "GET_UPDATES",
@@ -3404,58 +3581,47 @@ test("telegram router exposes dedicated telegram inbound inspection", async () =
     nextOffset: 42,
     lastUpdateId: 41,
     updatedAt: "2026-04-20T00:11:00.000Z",
-  });
+  } as const;
+  let runtimeReads = 0;
+  let offsetReads = 0;
   const router = new TelegramCommandRouter({
     repositories: new InMemoryExecutionRepository(),
-    operatorState: new InMemoryOperatorStateStore({
-      id: "state-1",
-      exchangeAccountId: "primary",
-      executionMode: "DRY_RUN",
-      liveExecutionGate: "DISABLED",
-      systemStatus: "RUNNING",
-      killSwitchActive: false,
-      pauseReason: null,
-      degradedReason: null,
-      degradedAt: null,
-      updatedAt: "2026-04-20T00:00:00.000Z",
-    }),
-    telegramInboundOffsetStore: offsetStore,
+    operatorState: createRouterState(),
+    locale: "en-US",
     telegramInboundBotTokenRef: "sha256:bot-a",
-    telegramInboundStatus: () => ({
-      enabled: true,
-      configured: true,
-      running: true,
-      nextOffset: 42,
-      pollIntervalMs: 2_000,
-      longPollTimeoutSeconds: 25,
-      limit: 10,
-      lastPollAt: "2026-04-20T00:12:00.000Z",
-      lastUpdateId: 41,
-      offsetLoaded: true,
-      offsetStorage: "DURABLE",
-      processedCount: 3,
-      ignoredCount: 1,
-      failedCount: 0,
-      lastError: null,
-    }),
+    telegramInboundStatus: () => {
+      runtimeReads += 1;
+      return status;
+    },
+    telegramInboundOffsetStore: {
+      async getTelegramInboundOffset() {
+        offsetReads += 1;
+        return offset;
+      },
+      async saveTelegramInboundOffset() {
+        throw new Error("/inbound must not mutate persisted offset state");
+      },
+    },
   });
 
-  const inbound = await router.route("/inbound");
+  const summary = await router.route("/inbound");
+  assert.match(summary.text, /^Telegram command inbound$/m);
+  assert.match(summary.text, /Current in-memory polling state:/);
+  assert.match(summary.text, /State: running/);
+  assert.match(summary.text, /Next action: none/);
+  assert.match(summary.text, /Offset storage: durable/);
+  assert.match(summary.text, /Runtime and persisted offset comparison: synchronized/);
+  assert.match(summary.text, /Full technical details: \/inbound detail/);
 
-  assert.match(inbound.text, /Telegram Inbound/);
-  assert.match(inbound.text, /state_source: runtime polling status \+ persisted telegram_inbound_offsets/);
-  assert.match(inbound.text, /enabled: true/);
-  assert.match(inbound.text, /configured: true/);
-  assert.match(inbound.text, /running: true/);
-  assert.match(inbound.text, /offset_storage: DURABLE/);
-  assert.match(inbound.text, /runtime_next_offset: 42/);
-  assert.match(inbound.text, /processed_count: 3/);
-  assert.match(inbound.text, /ignored_count: 1/);
-  assert.match(inbound.text, /persisted_offset_available: true/);
-  assert.match(inbound.text, /persisted_bot_token_ref: sha256:bot-a/);
-  assert.match(inbound.text, /persisted_next_offset: 42/);
-  assert.match(inbound.text, /persisted_last_update_id: 41/);
-  assert.match(inbound.text, /operator_boundary: Telegram does not accept manual cash or position input\./);
+  const detail = await router.route("/inbound DETAIL");
+  assert.equal(detail.text, formatTelegramInboundMessage(status, offset));
+  assert.match(detail.text, /persisted_bot_token_ref: sha256:bot-a/);
+  assert.equal(runtimeReads, 2);
+  assert.equal(offsetReads, 2);
+  assert.equal(
+    (await router.route("/inbound now")).text,
+    "Usage: /inbound [detail]\nShow a concise Telegram inbound summary or the canonical technical polling and offset detail.",
+  );
 });
 
 test("telegram router includes recent reconciliation summary in /status when available", async () => {

@@ -101,7 +101,11 @@ test("parseTelegramCommand normalizes bot mentions and preserves arguments", () 
   assert.equal(schedulerParsed.contract.usage, "/scheduler [detail]");
   assert.ok(inboundParsed);
   assert.equal(inboundParsed.command, "/inbound");
-  assert.equal(inboundParsed.contract.summary, "Show Telegram inbound polling status and persisted update offset.");
+  assert.equal(
+    inboundParsed.contract.summary,
+    "Show a concise Telegram inbound summary or the canonical technical polling and offset detail.",
+  );
+  assert.equal(inboundParsed.contract.usage, "/inbound [detail]");
   assert.ok(orderParsed);
   assert.equal(orderParsed.command, "/order");
   assert.deepEqual(orderParsed.args, ["order-1"]);
@@ -229,6 +233,7 @@ test("no-argument commands return usage guidance when extra arguments are suppli
   const risksParsed = parseTelegramCommand("/risks now");
   const schedulerDetailParsed = parseTelegramCommand("/scheduler DETAIL");
   const schedulerParsed = parseTelegramCommand("/scheduler now");
+  const inboundDetailParsed = parseTelegramCommand("/inbound DETAIL");
   const inboundParsed = parseTelegramCommand("/inbound now");
   const missingOrderParsed = parseTelegramCommand("/order");
   const extraOrderParsed = parseTelegramCommand("/order order-1 now");
@@ -319,6 +324,8 @@ test("no-argument commands return usage guidance when extra arguments are suppli
     validateTelegramCommand(schedulerParsed),
     buildUsageMessage("/scheduler"),
   );
+  assert.ok(inboundDetailParsed);
+  assert.equal(validateTelegramCommand(inboundDetailParsed), null);
   assert.ok(inboundParsed);
   assert.equal(
     validateTelegramCommand(inboundParsed),
@@ -1019,9 +1026,10 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   assert.match(schedulerResponse.text, /state_source: runtime scheduler status \+ persisted strategy_scheduler_runs/);
   assert.match(schedulerResponse.text, /runtime_status_source: unavailable/);
   assert.match(schedulerResponse.text, /\| KRW-BTC \| COMPLETED \| trigger=SCHEDULER/);
-  assert.match(inboundResponse.text, /Telegram Inbound/);
-  assert.match(inboundResponse.text, /enabled: true/);
-  assert.match(inboundResponse.text, /persisted_next_offset: 88/);
+  assert.match(inboundResponse.text, /텔레그램 명령 수신/);
+  assert.match(inboundResponse.text, /활성화 예 \| 설정 완료 예 \| 실행 중 아니요/);
+  assert.match(inboundResponse.text, /다음 오프셋 88 \| 최근 업데이트 ID 87/);
+  assert.match(inboundResponse.text, /런타임과 저장 오프셋 비교: 동기화됨/);
   assert.deepEqual(historyRequests, [3, 10]);
   assert.deepEqual(alertRequests, [10, 500, 5000]);
   assert.deepEqual(reconciliationRequests, [1, 10, 1]);
@@ -1067,7 +1075,7 @@ test("router applies control commands, blocks invalid arguments, and advertises 
   const invalidInboundResponse = await router.route("/inbound now");
   assert.equal(
     invalidInboundResponse.text,
-    "Usage: /inbound\nShow Telegram inbound polling status and persisted update offset.",
+    "Usage: /inbound [detail]\nShow a concise Telegram inbound summary or the canonical technical polling and offset detail.",
   );
   assert.deepEqual(stateTransitions, ["pause:maintenance window"]);
 

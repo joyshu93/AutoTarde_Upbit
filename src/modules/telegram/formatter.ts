@@ -51,6 +51,7 @@ import {
 import { formatOrdersPresentation } from "./presentation/orders.js";
 import { formatOrderDetailPresentation } from "./presentation/order-detail.js";
 import { formatRiskEventsPresentation } from "./presentation/risks.js";
+import { formatTelegramInboundPresentation } from "./presentation/inbound.js";
 import {
   describeLiveOrderBlockers,
   formatStatusPresentation,
@@ -1146,6 +1147,14 @@ export function formatTelegramInboundMessage(
     `persisted_updated_at: ${offset?.updatedAt ?? "none"}`,
     `operator_boundary: ${MANUAL_INPUT_NOTE}`,
   ].join("\n");
+}
+
+export function formatTelegramInboundSummaryMessage(
+  status: TelegramInboundPollingStatus | null,
+  offset: TelegramInboundOffsetRecord | null,
+  locale: TelegramLocale = DEFAULT_TELEGRAM_LOCALE,
+): string {
+  return formatTelegramInboundPresentation(status, offset, locale);
 }
 
 function formatStrategySchedulerStatusLines(status: StrategySchedulerStatus | null): string[] {
