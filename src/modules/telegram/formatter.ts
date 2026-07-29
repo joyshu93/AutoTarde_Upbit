@@ -58,6 +58,7 @@ import {
   type LiveSendPath,
 } from "./presentation/status.js";
 import { formatControlPresentation } from "./presentation/control.js";
+import { formatSyncPresentation } from "./presentation/sync.js";
 
 const MANUAL_INPUT_NOTE = "Telegram does not accept manual cash or position input.";
 
@@ -993,14 +994,11 @@ export function formatControlCommandMessage(
   );
 }
 
-export function formatSyncMessage(result: TelegramSyncResult): string {
-  return [
-    "Reconciliation Sync",
-    `status: ${result.status}`,
-    `requested_at: ${result.requestedAt}`,
-    `detail: ${result.detail}`,
-    `operator_boundary: ${MANUAL_INPUT_NOTE}`,
-  ].join("\n");
+export function formatSyncMessage(
+  result: TelegramSyncResult,
+  locale: TelegramLocale = DEFAULT_TELEGRAM_LOCALE,
+): string {
+  return formatSyncPresentation(result, locale);
 }
 
 export function formatStrategyRunMessage(result: TelegramStrategyRunResult): string {

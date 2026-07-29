@@ -42,7 +42,7 @@ const COMMAND_EXPECTATIONS = [
   },
   {
     command: "/sync",
-    requiredPatterns: [/Reconciliation Sync/u, /status: COMPLETED/u, /reconciliation_source=OPERATOR_SYNC/u],
+    requiredPatterns: [/동기화 요청 완료/u, /status: COMPLETED/u, /reconciliation_source=OPERATOR_SYNC/u],
   },
   {
     command: "/balances",

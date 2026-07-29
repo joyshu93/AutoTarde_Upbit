@@ -28,6 +28,7 @@ import {
   formatRuntimeConfigMessage,
   formatStrategySchedulerRunsMessage,
   formatStrategyPreviewMessage,
+  formatSyncMessage,
   formatTelegramInboundMessage,
 } from "../src/modules/telegram/formatter.js";
 import type { TelegramSyncResult } from "../src/modules/telegram/interfaces.js";
@@ -1114,6 +1115,129 @@ test("router surfaces a wired sync controller when available", async () => {
   assert.deepEqual(syncRequests, ["primary:/sync"]);
   assert.match(response.text, /status: COMPLETED/);
   assert.match(response.text, /detail: Reconciliation run completed for the primary account\./);
+});
+
+test("formatSyncMessage presents every sync status in Korean with canonical evidence", () => {
+  const cases = [
+    {
+      status: "COMPLETED",
+      readableStatus: "동기화 요청 완료",
+      explanation: "동기화 요청이 완료되었습니다.",
+      nextAction: "/readiness",
+    },
+    {
+      status: "ALREADY_RUNNING",
+      readableStatus: "동기화 진행 중",
+      explanation: "이미 동기화 요청이 진행 중입니다.",
+      nextAction: "/synchistory",
+    },
+    {
+      status: "NOT_CONNECTED",
+      readableStatus: "동기화 기능 연결 안 됨",
+      explanation: "이 프로세스에 동기화 기능이 연결되지 않았습니다.",
+      nextAction: "/config",
+    },
+    {
+      status: "FAILED",
+      readableStatus: "동기화 실패",
+      explanation: "동기화 요청을 완료하지 못했습니다.",
+      nextAction: "/alerts",
+    },
+  ] as const;
+
+  for (const entry of cases) {
+    const message = formatSyncMessage({
+      status: entry.status,
+      requestedAt: "2026-07-16T00:30:45.000Z",
+      detail: "drift & <gap> \"확인\" '필요'",
+    }, "ko-KR");
+
+    assert.match(message, new RegExp(`^${entry.readableStatus}`, "u"));
+    assert.match(message, new RegExp(entry.explanation, "u"));
+    assert.match(message, new RegExp(entry.nextAction.replace("/", "\\/"), "u"));
+    assert.match(message, /요청 시각: 2026-07-16 09:30:45 KST/u);
+    assert.match(message, new RegExp(`status: ${entry.status}`, "u"));
+    assert.match(message, /requested_at: 2026-07-16T00:30:45\.000Z/u);
+    assert.ok(message.includes("detail: drift & <gap> \"확인\" '필요'"));
+    assert.match(message, /Telegram은 수동 현금 또는 포지션 입력을 받지 않습니다\./u);
+  }
+});
+
+test("formatSyncMessage supports equivalent English presentation", () => {
+  const message = formatSyncMessage({
+    status: "COMPLETED",
+    requestedAt: "2026-07-16T00:30:45.000Z",
+    detail: "Request completed; reconciliation detail may still report drift.",
+  }, "en-US");
+
+  assert.match(message, /^Sync request completed/u);
+  assert.match(message, /The sync request completed\./u);
+  assert.match(message, /Next action: Inspect \/readiness/u);
+  assert.match(message, /Requested at: 2026-07-16 09:30:45 KST/u);
+  assert.match(message, /status: COMPLETED/u);
+  assert.match(message, /requested_at: 2026-07-16T00:30:45\.000Z/u);
+  assert.match(message, /detail: Request completed; reconciliation detail may still report drift\./u);
+  assert.match(message, /Telegram does not accept manual cash or position input\./u);
+});
+
+test("formatSyncMessage retains an invalid raw timestamp while using localized none", () => {
+  const korean = formatSyncMessage({
+    status: "FAILED",
+    requestedAt: "not-an-iso-time",
+    detail: "invalid timestamp fixture",
+  }, "ko-KR");
+  const english = formatSyncMessage({
+    status: "FAILED",
+    requestedAt: "not-an-iso-time",
+    detail: "invalid timestamp fixture",
+  }, "en-US");
+
+  assert.match(korean, /요청 시각: 없음/u);
+  assert.match(korean, /requested_at: not-an-iso-time/u);
+  assert.match(english, /Requested at: none/u);
+  assert.match(english, /requested_at: not-an-iso-time/u);
+});
+
+test("router localizes sync, invokes a configured controller once, and rejects arguments without invocation", async () => {
+  const syncRequests: string[] = [];
+  const router = new TelegramCommandRouter({
+    operatorState: createOperatorStateStub(),
+    repositories: createRepositoryStub(),
+    locale: "en-US",
+    syncController: {
+      async requestSync(request): Promise<TelegramSyncResult> {
+        syncRequests.push(`${request.exchangeAccountId}:${request.requestedCommand}`);
+        return {
+          status: "COMPLETED",
+          requestedAt: "2026-07-16T00:30:45.000Z",
+          detail: "sync detail",
+        };
+      },
+    },
+  });
+
+  const response = await router.route("/sync");
+  const invalidResponse = await router.route("/sync detail");
+
+  assert.deepEqual(syncRequests, ["primary:/sync"]);
+  assert.match(response.text, /^Sync request completed/u);
+  assert.equal(invalidResponse.text, buildUsageMessage("/sync"));
+});
+
+test("router presents a missing sync controller as localized NOT_CONNECTED", async () => {
+  const router = new TelegramCommandRouter({
+    operatorState: createOperatorStateStub(),
+    repositories: createRepositoryStub(),
+    locale: "ko-KR",
+    now: () => "invalid-now",
+  });
+
+  const response = await router.route("/sync");
+
+  assert.match(response.text, /^동기화 기능 연결 안 됨/u);
+  assert.match(response.text, /요청 시각: 없음/u);
+  assert.match(response.text, /status: NOT_CONNECTED/u);
+  assert.match(response.text, /requested_at: invalid-now/u);
 });
 
 function createExecutionState(

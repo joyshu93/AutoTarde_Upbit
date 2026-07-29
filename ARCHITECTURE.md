@@ -157,6 +157,7 @@ It provides:
 - locale-aware `/balances` and `/positions` summaries over the latest persisted exchange snapshots
 - `/balances detail` and `/positions detail` for the canonical technical snapshot output; all four forms use the same bounded local reads and never accept manual portfolio input
 - `/sync` for reconciliation-triggered snapshot and reconciliation record persistence with read-only public ticker valuation
+- locale-aware `/sync` result presentation over the single existing reconciliation-controller result, retaining canonical status, raw request timestamp, and exact detail without performing another sync or any additional exchange, repository, strategy, scheduler, order, or notification action
 - `/preview BTC|ETH` for one non-mutating PositionGuard decision and order-intent preview
 - `/run BTC|ETH` for one deterministic PositionGuard strategy runner cycle through the configured safe execution path
 - `/status` concise strategy-scheduler state and per-market next-run timestamps

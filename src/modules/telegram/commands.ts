@@ -161,7 +161,10 @@ export class TelegramCommandRouter {
         );
       case "/sync":
         return {
-          text: formatSyncMessage(await this.requestSync(exchangeAccountId)),
+          text: formatSyncMessage(
+            await this.requestSync(exchangeAccountId),
+            normalizeTelegramLocale(this.dependencies.locale),
+          ),
         };
       case "/preview":
         return {

@@ -164,7 +164,7 @@ function createRouteResponse(command: string, readinessStatus: "PASS" | "WARN" |
       ].join("\n");
     case "/sync":
       return [
-        "Reconciliation Sync",
+        "동기화 요청 완료",
         "status: COMPLETED",
         "detail: Stored balance snapshot (3 balances). reconciliation_source=OPERATOR_SYNC. Reconciliation status=SUCCESS.",
       ].join("\n");
