@@ -31,7 +31,10 @@ import {
   formatSyncMessage,
   formatTelegramInboundMessage,
 } from "../src/modules/telegram/formatter.js";
-import type { TelegramSyncResult } from "../src/modules/telegram/interfaces.js";
+import type {
+  TelegramStrategyPreviewResult,
+  TelegramSyncResult,
+} from "../src/modules/telegram/interfaces.js";
 import { test } from "./harness.js";
 
 test("parseTelegramCommand normalizes bot mentions and preserves arguments", () => {
@@ -689,6 +692,282 @@ test("formatters expose stored snapshots, risk events, and keep Telegram manual 
   assert.match(strategyPreviewMessage, /order_side: bid/);
   assert.match(strategyPreviewMessage, /no_mutation_boundary: \/preview never persists strategy decisions, creates orders, sends orders, or triggers reconciliation\./);
 });
+
+test("strategy preview presentation localizes every status without changing canonical evidence", () => {
+  const cases: ReadonlyArray<{
+    status: TelegramStrategyPreviewResult["status"];
+    koreanLabel: string;
+    nextAction: RegExp;
+  }> = [
+    { status: "COMPLETED", koreanLabel: "미리보기 완료", nextAction: /\/readiness.*\/run BTC\|ETH/ },
+    { status: "ALREADY_RUNNING", koreanLabel: "전략 확인 진행 중", nextAction: /기다린 뒤.*다시 시도/ },
+    { status: "NOT_CONNECTED", koreanLabel: "미리보기 기능 연결 안 됨", nextAction: /\/config.*프로세스/ },
+    { status: "FAILED", koreanLabel: "미리보기 실패", nextAction: /detail.*\/alerts/ },
+  ];
+
+  for (const testCase of cases) {
+    const message = formatStrategyPreviewMessage(
+      createStrategyPreviewResult({ status: testCase.status }),
+      "ko-KR",
+    );
+
+    assert.match(message, /전략 미리보기 \(Strategy Preview\)/);
+    assert.match(message, new RegExp(`상태: ${testCase.koreanLabel}`));
+    assert.match(message, testCase.nextAction);
+    assert.match(message, new RegExp(`status: ${testCase.status}`));
+    assert.match(message, /전략 판단을 저장하지 않았습니다/);
+    assert.match(message, /주문을 전송하지 않았습니다/);
+  }
+});
+
+test("strategy preview presentation covers actions and execution dispositions including unknown values", () => {
+  const actionCases: ReadonlyArray<[TelegramStrategyPreviewResult["action"], string]> = [
+    ["ENTER", "신규 매수 판단"],
+    ["ADD", "추가 매수 판단"],
+    ["HOLD", "관망 판단"],
+    ["REDUCE", "일부 매도 판단"],
+    ["EXIT", "매도 종료 판단"],
+    [null, "판단 없음"],
+  ];
+  const dispositionCases: ReadonlyArray<[string | null, string]> = [
+    ["IMMEDIATE", "즉시 처리"],
+    ["DEFERRED_CONFIRMATION", "추가 확인 대기"],
+    ["EXECUTED_AFTER_CONFIRMATION", "확인 후 처리"],
+    ["SKIPPED", "처리 생략"],
+    ["FUTURE_DISPOSITION", "알 수 없는 처리 상태 (FUTURE_DISPOSITION)"],
+    [null, "처리 상태 없음"],
+  ];
+
+  for (const [action, expected] of actionCases) {
+    const message = formatStrategyPreviewMessage(
+      createStrategyPreviewResult({ action }),
+      "ko-KR",
+    );
+    assert.match(message, new RegExp(`판단: ${expected}`));
+    assert.match(message, new RegExp(`action: ${action ?? "none"}`));
+  }
+
+  for (const [executionDisposition, expected] of dispositionCases) {
+    const message = formatStrategyPreviewMessage(
+      createStrategyPreviewResult({ executionDisposition }),
+      "ko-KR",
+    );
+    assert.ok(message.includes(`실행 처리: ${expected}`));
+    assert.match(
+      message,
+      new RegExp(`execution_disposition: ${executionDisposition ?? "none"}`),
+    );
+  }
+});
+
+test("strategy preview presentation explains HOLD and Upbit order intent semantics", () => {
+  const hold = formatStrategyPreviewMessage(
+    createStrategyPreviewResult({
+      action: "HOLD",
+      executionDisposition: "SKIPPED",
+      requestedNotionalKrw: null,
+      orderSide: null,
+      orderType: null,
+      orderPrice: null,
+    }),
+    "ko-KR",
+  );
+  const marketBuy = formatStrategyPreviewMessage(
+    createStrategyPreviewResult({
+      orderSide: "bid",
+      orderType: "price",
+      orderPrice: "150000",
+      orderVolume: null,
+    }),
+    "ko-KR",
+  );
+  const marketSell = formatStrategyPreviewMessage(
+    createStrategyPreviewResult({
+      market: "KRW-ETH",
+      action: "EXIT",
+      orderSide: "ask",
+      orderType: "market",
+      orderPrice: null,
+      orderVolume: "0.25",
+      requestedQuantity: 0.25,
+    }),
+    "ko-KR",
+  );
+  const limit = formatStrategyPreviewMessage(
+    createStrategyPreviewResult({
+      market: "KRW-ETH",
+      action: "ADD",
+      orderSide: "bid",
+      orderType: "limit",
+      orderPrice: "5000000",
+      orderVolume: "0.125",
+      requestedQuantity: 0.125,
+    }),
+    "ko-KR",
+  );
+
+  assert.match(hold, /주문 의도: 없음 \(미리보기 결과에 주문 의도가 없습니다\.\)/);
+  assert.match(marketBuy, /시장가 매수 의도.*KRW 지출 금액 150,000원/);
+  assert.match(marketSell, /시장가 매도 의도.*매도 수량 0\.25 ETH/);
+  assert.match(limit, /지정가 매수 의도.*주문 단가 5,000,000원.*주문 수량 0\.125 ETH/);
+  assert.doesNotMatch(marketBuy, /주문 (실행|제출|접수|저장)/);
+});
+
+test("strategy preview presentation rejects non-decimal, non-finite, and unsafe order prices without changing canonical values", () => {
+  const invalidOrderPrices = [
+    "0x10",
+    "1e3",
+    "Infinity",
+    "-Infinity",
+    "NaN",
+    "9007199254740993",
+  ];
+
+  for (const orderPrice of invalidOrderPrices) {
+    const korean = formatStrategyPreviewMessage(
+      createStrategyPreviewResult({ orderPrice }),
+      "ko-KR",
+    );
+    const english = formatStrategyPreviewMessage(
+      createStrategyPreviewResult({ orderPrice }),
+      "en-US",
+    );
+
+    assert.match(korean, /시장가 매수 의도 - KRW 지출 금액 없음/);
+    assert.match(english, /Market buy intent - KRW spend amount none/);
+    assert.ok(korean.includes(`order_price: ${orderPrice}`));
+    assert.ok(english.includes(`order_price: ${orderPrice}`));
+  }
+
+  const invalidLimit = formatStrategyPreviewMessage(
+    createStrategyPreviewResult({
+      orderType: "limit",
+      orderPrice: "0x10",
+      orderVolume: "0.0015",
+    }),
+    "ko-KR",
+  );
+  assert.match(invalidLimit, /지정가 매수 의도 - 주문 단가 없음, 주문 수량 0\.0015 BTC/);
+  assert.match(invalidLimit, /order_price: 0x10/);
+});
+
+test("strategy preview presentation formats valid plain-decimal order prices without precision loss", () => {
+  const exactSafeInteger = formatStrategyPreviewMessage(
+    createStrategyPreviewResult({ orderPrice: "9007199254740991" }),
+    "ko-KR",
+  );
+  const roundedDecimal = formatStrategyPreviewMessage(
+    createStrategyPreviewResult({ orderPrice: "00150000.50" }),
+    "en-US",
+  );
+
+  assert.match(exactSafeInteger, /KRW 지출 금액 9,007,199,254,740,991원/);
+  assert.match(exactSafeInteger, /order_price: 9007199254740991/);
+  assert.match(roundedDecimal, /KRW spend amount KRW 150,001/);
+  assert.match(roundedDecimal, /order_price: 00150000\.50/);
+});
+
+test("strategy preview presentation formats BTC and ETH values while retaining raw invalid evidence and exact detail", () => {
+  const detail = `원문 & <tag> > "quoted" 'single' 한국어`;
+  const valid = formatStrategyPreviewMessage(
+    createStrategyPreviewResult({ detail }),
+    "ko-KR",
+  );
+  const invalid = formatStrategyPreviewMessage(
+    createStrategyPreviewResult({
+      requestedAt: "not-a-timestamp",
+      market: "KRW-ETH",
+      referencePrice: Number.NaN,
+      requestedNotionalKrw: Number.POSITIVE_INFINITY,
+      requestedQuantity: Number.NaN,
+      detail,
+    }),
+    "ko-KR",
+  );
+
+  assert.match(valid, /시장\/자산: KRW-BTC \/ BTC/);
+  assert.match(valid, /기준 가격: 100,000,000원/);
+  assert.match(valid, /요청 금액: 150,000원/);
+  assert.match(valid, /요청 수량: 0\.0015 BTC/);
+  assert.match(valid, /요청 시각: 2026-04-20 09:11:00 KST/);
+  assert.match(invalid, /시장\/자산: KRW-ETH \/ ETH/);
+  assert.match(invalid, /기준 가격: 없음/);
+  assert.match(invalid, /요청 금액: 없음/);
+  assert.match(invalid, /요청 수량: 없음/);
+  assert.match(invalid, /요청 시각: 없음/);
+  assert.match(invalid, /requested_at: not-a-timestamp/);
+  assert.ok(valid.includes(`detail: ${detail}`));
+  assert.ok(invalid.includes(`detail: ${detail}`));
+});
+
+test("strategy preview presentation provides equivalent English output and retains every canonical field", () => {
+  const result = createStrategyPreviewResult({
+    status: "COMPLETED",
+    market: "KRW-ETH",
+    action: "REDUCE",
+    executionDisposition: "DEFERRED_CONFIRMATION",
+    referencePrice: 5_000_000,
+    requestedNotionalKrw: 625_000,
+    requestedQuantity: 0.125,
+    orderSide: "ask",
+    orderType: "limit",
+    orderPrice: "5000000",
+    orderVolume: "0.125",
+    detail: "Intent only; state can change.",
+  });
+  const message = formatStrategyPreviewMessage(result, "en-US");
+
+  assert.match(message, /Strategy Preview/);
+  assert.match(message, /State: Preview completed/);
+  assert.match(message, /Market\/asset: KRW-ETH \/ ETH/);
+  assert.match(message, /Action: Partial sell decision/);
+  assert.match(message, /Execution disposition: Deferred for confirmation/);
+  assert.match(message, /Order intent: Limit sell intent.*unit price KRW 5,000,000.*quantity 0\.125 ETH/);
+  assert.match(message, /No strategy decision was persisted/);
+  assert.match(message, /No order was sent/);
+
+  const canonicalLines = [
+    "status: COMPLETED",
+    "requested_at: 2026-04-20T00:11:00.000Z",
+    "market: KRW-ETH",
+    "action: REDUCE",
+    "execution_disposition: DEFERRED_CONFIRMATION",
+    "reference_price: 5000000",
+    "requested_notional_krw: 625000",
+    "requested_quantity: 0.125",
+    "order_side: ask",
+    "order_type: limit",
+    "order_price: 5000000",
+    "order_volume: 0.125",
+    "detail: Intent only; state can change.",
+    "no_mutation_boundary: /preview never persists strategy decisions, creates orders, sends orders, or triggers reconciliation.",
+    "operator_boundary: Telegram does not accept manual cash or position input.",
+  ];
+  for (const line of canonicalLines) {
+    assert.ok(message.includes(line), `missing canonical line: ${line}`);
+  }
+});
+
+function createStrategyPreviewResult(
+  overrides: Partial<TelegramStrategyPreviewResult> = {},
+): TelegramStrategyPreviewResult {
+  return {
+    status: "COMPLETED",
+    requestedAt: "2026-04-20T00:11:00.000Z",
+    market: "KRW-BTC",
+    action: "ENTER",
+    executionDisposition: "IMMEDIATE",
+    referencePrice: 100_000_000,
+    requestedNotionalKrw: 150_000,
+    requestedQuantity: 0.0015,
+    orderSide: "bid",
+    orderType: "price",
+    orderPrice: "150000",
+    orderVolume: null,
+    detail: "Preview computed without persistence or order submission.",
+    ...overrides,
+  };
+}
 
 test("router applies control commands, blocks invalid arguments, and advertises sync wiring state", async () => {
   const stateTransitions: string[] = [];

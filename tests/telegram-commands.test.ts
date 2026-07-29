@@ -5248,6 +5248,113 @@ test("telegram router calls a wired strategy run controller for supported assets
   assert.match(response.text, /submission_accepted: none/);
 });
 
+test("router localizes preview, invokes its controller once, and performs no extra state reads", async () => {
+  const baseRepositories = new InMemoryExecutionRepository();
+  const baseOperatorState = new InMemoryOperatorStateStore({
+    id: "preview-state",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  });
+  let repositoryReads = 0;
+  let operatorStateReads = 0;
+  let previewCalls = 0;
+  const repositories = new Proxy(baseRepositories, {
+    get(target, property, receiver) {
+      repositoryReads += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const operatorState = new Proxy(baseOperatorState, {
+    get(target, property, receiver) {
+      operatorStateReads += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const router = new TelegramCommandRouter({
+    repositories,
+    operatorState,
+    locale: "ko-KR",
+    strategyRunController: {
+      async requestPreview(request) {
+        previewCalls += 1;
+        return {
+          status: "COMPLETED",
+          requestedAt: "2026-04-20T00:11:00.000Z",
+          market: request.market,
+          action: "HOLD",
+          executionDisposition: "SKIPPED",
+          referencePrice: 5_000_000,
+          requestedNotionalKrw: null,
+          requestedQuantity: null,
+          orderSide: null,
+          orderType: null,
+          orderPrice: null,
+          orderVolume: null,
+          detail: "No order intent.",
+        };
+      },
+      async requestRun() {
+        throw new Error("requestRun must not be called by /preview");
+      },
+    },
+  });
+
+  const response = await router.route("/preview ETH");
+
+  assert.equal(previewCalls, 1);
+  assert.equal(repositoryReads, 0);
+  assert.equal(operatorStateReads, 0);
+  assert.match(response.text, /전략 미리보기 \(Strategy Preview\)/);
+  assert.match(response.text, /시장\/자산: KRW-ETH \/ ETH/);
+  assert.match(response.text, /주문 의도: 없음/);
+});
+
+test("router keeps invalid preview requests usage-only and localizes missing controller state", async () => {
+  let previewCalls = 0;
+  const routerWithController = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: new InMemoryOperatorStateStore({
+      id: "invalid-preview-state",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    strategyRunController: {
+      async requestPreview() {
+        previewCalls += 1;
+        throw new Error("invalid preview requests must not reach the controller");
+      },
+      async requestRun() {
+        throw new Error("requestRun must not be called");
+      },
+    },
+  });
+  const routerWithoutController = createRouter();
+
+  const invalidAsset = await routerWithController.route("/preview DOGE");
+  const extraArgs = await routerWithController.route("/preview BTC now");
+  const missingController = await routerWithoutController.route("/preview BTC");
+
+  assert.equal(previewCalls, 0);
+  assert.equal(invalidAsset.text, "Usage: /preview BTC|ETH\nPreview one deterministic PositionGuard strategy decision and order intent without persistence or order submission.");
+  assert.equal(extraArgs.text, "Usage: /preview BTC|ETH\nPreview one deterministic PositionGuard strategy decision and order intent without persistence or order submission.");
+  assert.match(missingController.text, /상태: 미리보기 기능 연결 안 됨/);
+  assert.match(missingController.text, /status: NOT_CONNECTED/);
+});
+
 function createNotification(
   overrides: Partial<OperatorNotificationRecord> & Pick<OperatorNotificationRecord, "id" | "createdAt">,
 ): OperatorNotificationRecord {

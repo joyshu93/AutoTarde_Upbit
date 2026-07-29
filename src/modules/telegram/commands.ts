@@ -168,7 +168,10 @@ export class TelegramCommandRouter {
         };
       case "/preview":
         return {
-          text: formatStrategyPreviewMessage(await this.requestStrategyPreview(parsed.args, exchangeAccountId)),
+          text: formatStrategyPreviewMessage(
+            await this.requestStrategyPreview(parsed.args, exchangeAccountId),
+            normalizeTelegramLocale(this.dependencies.locale),
+          ),
         };
       case "/run":
         return {

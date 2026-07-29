@@ -59,6 +59,7 @@ import {
 } from "./presentation/status.js";
 import { formatControlPresentation } from "./presentation/control.js";
 import { formatSyncPresentation } from "./presentation/sync.js";
+import { formatStrategyPreviewPresentation } from "./presentation/preview.js";
 
 const MANUAL_INPUT_NOTE = "Telegram does not accept manual cash or position input.";
 
@@ -1017,25 +1018,11 @@ export function formatStrategyRunMessage(result: TelegramStrategyRunResult): str
   ].join("\n");
 }
 
-export function formatStrategyPreviewMessage(result: TelegramStrategyPreviewResult): string {
-  return [
-    "Strategy Preview",
-    `status: ${result.status}`,
-    `requested_at: ${result.requestedAt}`,
-    `market: ${result.market ?? "none"}`,
-    `action: ${result.action ?? "none"}`,
-    `execution_disposition: ${result.executionDisposition ?? "none"}`,
-    `reference_price: ${result.referencePrice ?? "none"}`,
-    `requested_notional_krw: ${result.requestedNotionalKrw ?? "none"}`,
-    `requested_quantity: ${result.requestedQuantity ?? "none"}`,
-    `order_side: ${result.orderSide ?? "none"}`,
-    `order_type: ${result.orderType ?? "none"}`,
-    `order_price: ${result.orderPrice ?? "none"}`,
-    `order_volume: ${result.orderVolume ?? "none"}`,
-    `detail: ${result.detail}`,
-    "no_mutation_boundary: /preview never persists strategy decisions, creates orders, sends orders, or triggers reconciliation.",
-    `operator_boundary: ${MANUAL_INPUT_NOTE}`,
-  ].join("\n");
+export function formatStrategyPreviewMessage(
+  result: TelegramStrategyPreviewResult,
+  locale: TelegramLocale = DEFAULT_TELEGRAM_LOCALE,
+): string {
+  return formatStrategyPreviewPresentation(result, locale);
 }
 
 export function formatStrategySchedulerRunsMessage(
