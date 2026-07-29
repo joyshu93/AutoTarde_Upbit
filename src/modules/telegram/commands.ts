@@ -85,7 +85,10 @@ export class TelegramCommandRouter {
         };
       case "/config":
         return {
-          text: formatRuntimeConfigMessage(this.dependencies.runtimeConfig ?? null),
+          text: formatRuntimeConfigMessage(
+            this.dependencies.runtimeConfig ?? null,
+            normalizeTelegramLocale(this.dependencies.locale),
+          ),
         };
       case "/readiness":
         return this.buildReadinessResponse(
@@ -175,7 +178,10 @@ export class TelegramCommandRouter {
         };
       case "/run":
         return {
-          text: formatStrategyRunMessage(await this.requestStrategyRun(parsed.args, exchangeAccountId)),
+          text: formatStrategyRunMessage(
+            await this.requestStrategyRun(parsed.args, exchangeAccountId),
+            normalizeTelegramLocale(this.dependencies.locale),
+          ),
         };
       default:
         return {
@@ -428,7 +434,10 @@ export class TelegramCommandRouter {
     const transitions = await this.dependencies.operatorState.listTransitions(10);
 
     return {
-      text: formatStateHistoryMessage(transitions),
+      text: formatStateHistoryMessage(
+        transitions,
+        normalizeTelegramLocale(this.dependencies.locale),
+      ),
     };
   }
 
@@ -559,7 +568,11 @@ export class TelegramCommandRouter {
     ]);
 
     return {
-      text: formatRecoveryProgressMessage(runs[0] ?? null, checkpoints),
+      text: formatRecoveryProgressMessage(
+        runs[0] ?? null,
+        checkpoints,
+        normalizeTelegramLocale(this.dependencies.locale),
+      ),
     };
   }
 
@@ -567,7 +580,10 @@ export class TelegramCommandRouter {
     const runs = await this.dependencies.repositories.listReconciliationRuns(exchangeAccountId, 10);
 
     return {
-      text: formatReconciliationRunsMessage(runs),
+      text: formatReconciliationRunsMessage(
+        runs,
+        normalizeTelegramLocale(this.dependencies.locale),
+      ),
     };
   }
 

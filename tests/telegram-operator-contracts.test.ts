@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import type {
   BalanceSnapshotRecord,
@@ -24,18 +26,75 @@ import {
   formatPositionMessage,
   formatReadinessMessage,
   formatReconciliationRunsMessage,
+  formatRecoveryProgressMessage,
   formatRiskEventsMessage,
   formatRuntimeConfigMessage,
+  formatStateHistoryMessage,
   formatStrategySchedulerRunsMessage,
   formatStrategyPreviewMessage,
+  formatStrategyRunMessage,
   formatSyncMessage,
   formatTelegramInboundMessage,
 } from "../src/modules/telegram/formatter.js";
 import type {
   TelegramStrategyPreviewResult,
+  TelegramStrategyRunResult,
   TelegramSyncResult,
 } from "../src/modules/telegram/interfaces.js";
 import { test } from "./harness.js";
+
+test("formatter remains a re-export-only compatibility facade", () => {
+  const formatterSource = readFileSync(
+    join(process.cwd(), "src", "modules", "telegram", "formatter.ts"),
+    "utf8",
+  ).trim();
+
+  assert.equal(
+    formatterSource,
+    'export * from "./presentation/technical.js";',
+  );
+});
+
+function createInspectionRuntimeConfig() {
+  return {
+    serviceName: "AutoTrade_Upbit",
+    executionMode: "DRY_RUN" as const,
+    liveExecutionGate: "DISABLED" as const,
+    liveSendPath: "DRY_RUN_ADAPTER" as const,
+    upbitBaseUrl: "https://api.upbit.com",
+    databasePath: "./var/operator.sqlite",
+    telegramLocale: "ko-KR" as const,
+    exchangeBackedReadEnabled: false,
+    telegramDeliveryEnabled: true,
+    telegramBotTokenConfigured: false,
+    telegramOperatorChatIdConfigured: false,
+    telegramDeliveryMaxAttempts: 5,
+    telegramDeliveryBaseBackoffMs: 15_000,
+    telegramDeliveryMaxBackoffMs: 300_000,
+    telegramDeliveryLeaseMs: 30_000,
+    telegramInboundPollingEnabled: true,
+    telegramInboundPollIntervalMs: 2_000,
+    telegramInboundPollTimeoutSeconds: 25,
+    telegramInboundPollLimit: 10,
+    deprecatedIgnoredEnvVars: ["MAX_LIVE_ORDER_VALUE_KRW"],
+    strategySchedulerEnabled: false,
+    strategySchedulerRunOnStart: false,
+    strategySchedulerBtcIntervalMs: 3_600_000,
+    strategySchedulerEthIntervalMs: 3_600_000,
+    reconciliationMaxOrderLookupsPerRun: 10,
+    reconciliationHistoryMaxPagesPerMarket: 3,
+    reconciliationClosedOrderLookbackDays: 7,
+    reconciliationHistoryStopBeforeDays: 365,
+    reconciliationHistoryRetentionAssumptionDays: 365,
+    stalePriceThresholdMs: 30_000,
+    minimumOrderValueKrw: 5_000,
+    maxAllocationByAsset: {
+      BTC: 0.6,
+      ETH: 0.6,
+    },
+    totalExposureCap: 0.75,
+  };
+}
 
 test("parseTelegramCommand normalizes bot mentions and preserves arguments", () => {
   const helpParsed = parseTelegramCommand("/HELP@autotrade_upbit_bot");
@@ -969,6 +1028,206 @@ function createStrategyPreviewResult(
   };
 }
 
+test("strategy run presentation localizes every status without changing canonical evidence", () => {
+  const cases: ReadonlyArray<{
+    status: TelegramStrategyRunResult["status"];
+    koreanLabel: string;
+    nextAction: RegExp;
+  }> = [
+    { status: "COMPLETED", koreanLabel: "실행 요청 처리 완료", nextAction: /\/preview.*다음 주기/ },
+    { status: "ALREADY_RUNNING", koreanLabel: "전략 실행 진행 중", nextAction: /기다린 뒤.*다시 시도/ },
+    { status: "SKIPPED", koreanLabel: "전략 실행 생략", nextAction: /detail.*\/readiness/ },
+    { status: "NOT_CONNECTED", koreanLabel: "전략 실행 기능 연결 안 됨", nextAction: /\/config.*프로세스/ },
+    { status: "FAILED", koreanLabel: "전략 실행 실패", nextAction: /detail.*\/alerts/ },
+  ];
+
+  for (const testCase of cases) {
+    const message = formatStrategyRunMessage(
+      createStrategyRunResult({ status: testCase.status }),
+      "ko-KR",
+    );
+
+    assert.match(message, /전략 실행 결과 \(Strategy Run\)/);
+    assert.match(message, new RegExp(`상태: ${testCase.koreanLabel}`));
+    assert.match(message, testCase.nextAction);
+    assert.match(message, new RegExp(`status: ${testCase.status}`));
+    assert.match(message, /LIVE 모드.*실주문/);
+  }
+});
+
+test("strategy run presentation covers actions and submission outcomes without calling acceptance a fill", () => {
+  const actionCases: ReadonlyArray<[TelegramStrategyRunResult["action"], string]> = [
+    ["ENTER", "신규 매수"],
+    ["ADD", "추가 매수"],
+    ["HOLD", "관망"],
+    ["REDUCE", "일부 매도"],
+    ["EXIT", "매도 종료"],
+    [null, "판단 없음"],
+  ];
+
+  for (const [action, expected] of actionCases) {
+    const message = formatStrategyRunMessage(
+      createStrategyRunResult({ action }),
+      "ko-KR",
+    );
+    assert.match(message, new RegExp(`판단: ${expected}`));
+    assert.match(message, new RegExp(`action: ${action ?? "none"}`));
+  }
+
+  const noRequest = formatStrategyRunMessage(
+    createStrategyRunResult({
+      action: "HOLD",
+      submissionAccepted: null,
+      orderId: null,
+      orderStatus: null,
+    }),
+    "ko-KR",
+  );
+  const accepted = formatStrategyRunMessage(
+    createStrategyRunResult({
+      action: "ENTER",
+      submissionAccepted: true,
+      orderId: "order-accepted-1",
+      orderStatus: "OPEN",
+    }),
+    "ko-KR",
+  );
+  const rejected = formatStrategyRunMessage(
+    createStrategyRunResult({
+      action: "ENTER",
+      submissionAccepted: false,
+      orderId: null,
+      orderStatus: null,
+      detail: "위험 정책에서 거부됨 & exact <detail>",
+    }),
+    "ko-KR",
+  );
+
+  assert.match(noRequest, /주문 결과: 주문 요청 없음/);
+  assert.match(noRequest, /주문을 요청하지 않았습니다/);
+  assert.match(accepted, /주문 결과: 주문 접수됨/);
+  assert.match(accepted, /체결을 의미하지 않습니다/);
+  assert.match(accepted, /\/order order-accepted-1/);
+  assert.doesNotMatch(accepted, /주문 (체결됨|체결 완료)/);
+  assert.match(rejected, /주문 결과: 주문 거부됨/);
+  assert.match(rejected, /\/risks.*\/alerts/);
+  assert.ok(rejected.includes("detail: 위험 정책에서 거부됨 & exact <detail>"));
+});
+
+test("strategy run presentation labels lifecycle states while retaining raw values", () => {
+  const lifecycleCases: ReadonlyArray<[
+    NonNullable<TelegramStrategyRunResult["orderStatus"]>,
+    string,
+  ]> = [
+    ["OPEN", "주문 열림"],
+    ["PARTIALLY_FILLED", "부분 체결"],
+    ["FILLED", "체결 완료"],
+    ["CANCELED", "주문 취소"],
+    ["FAILED", "주문 실패"],
+    ["RECONCILIATION_REQUIRED", "동기화 확인 필요"],
+  ];
+
+  for (const [orderStatus, readable] of lifecycleCases) {
+    const message = formatStrategyRunMessage(
+      createStrategyRunResult({
+        submissionAccepted: true,
+        orderId: `order-${orderStatus}`,
+        orderStatus,
+      }),
+      "ko-KR",
+    );
+    assert.match(message, new RegExp(`주문 상태: ${readable}`));
+    assert.match(message, new RegExp(`order_status: ${orderStatus}`));
+    assert.match(message, /주문 접수는 체결 증명이 아닙니다/);
+  }
+});
+
+test("strategy run presentation formats KST, preserves invalid raw time and exact detail", () => {
+  const detail = `원문 & <tag> > "quoted" 'single' 한국어`;
+  const valid = formatStrategyRunMessage(
+    createStrategyRunResult({ detail }),
+    "ko-KR",
+  );
+  const invalid = formatStrategyRunMessage(
+    createStrategyRunResult({
+      requestedAt: "not-a-timestamp",
+      market: null,
+      strategyDecisionId: null,
+      action: null,
+      orderId: null,
+      orderStatus: null,
+      submissionAccepted: null,
+      detail,
+    }),
+    "ko-KR",
+  );
+
+  assert.match(valid, /요청 시각: 2026-04-20 09:15:00 KST/);
+  assert.match(invalid, /요청 시각: 없음/);
+  assert.match(invalid, /requested_at: not-a-timestamp/);
+  assert.match(invalid, /시장\/자산: 없음/);
+  assert.match(invalid, /전략 판단 ID: 없음/);
+  assert.ok(valid.includes(`detail: ${detail}`));
+  assert.ok(invalid.includes(`detail: ${detail}`));
+});
+
+test("strategy run presentation provides equivalent English output and retains every canonical field", () => {
+  const result = createStrategyRunResult({
+    status: "COMPLETED",
+    market: "KRW-ETH",
+    strategyDecisionId: "decision-en-1",
+    action: "REDUCE",
+    submissionAccepted: true,
+    orderId: "order-en-1",
+    orderStatus: "PARTIALLY_FILLED",
+    detail: "Order accepted; inspect lifecycle.",
+  });
+  const message = formatStrategyRunMessage(result, "en-US");
+
+  assert.match(message, /Strategy Run Result/);
+  assert.match(message, /State: Run request processed/);
+  assert.match(message, /Market\/asset: KRW-ETH \/ ETH/);
+  assert.match(message, /Action: Partial sell/);
+  assert.match(message, /Submission: Order accepted/);
+  assert.match(message, /Acceptance is not proof of a fill/);
+  assert.match(message, /Order state: Partially filled/);
+  assert.match(message, /In LIVE mode, \/run can send a real order/);
+  assert.match(message, /\/order order-en-1/);
+
+  const canonicalLines = [
+    "status: COMPLETED",
+    "requested_at: 2026-04-20T00:15:00.000Z",
+    "market: KRW-ETH",
+    "strategy_decision_id: decision-en-1",
+    "action: REDUCE",
+    "submission_accepted: true",
+    "order_id: order-en-1",
+    "order_status: PARTIALLY_FILLED",
+    "detail: Order accepted; inspect lifecycle.",
+    "operator_boundary: Telegram does not accept manual cash or position input.",
+  ];
+  for (const line of canonicalLines) {
+    assert.ok(message.includes(line), `missing canonical line: ${line}`);
+  }
+});
+
+function createStrategyRunResult(
+  overrides: Partial<TelegramStrategyRunResult> = {},
+): TelegramStrategyRunResult {
+  return {
+    status: "COMPLETED",
+    requestedAt: "2026-04-20T00:15:00.000Z",
+    market: "KRW-BTC",
+    strategyDecisionId: "strategy-decision-1",
+    action: "HOLD",
+    orderId: null,
+    orderStatus: null,
+    submissionAccepted: null,
+    detail: "Decision HOLD persisted; no order submission was requested.",
+    ...overrides,
+  };
+}
+
 test("router applies control commands, blocks invalid arguments, and advertises sync wiring state", async () => {
   const stateTransitions: string[] = [];
   const historyRequests: number[] = [];
@@ -1457,6 +1716,244 @@ test("formatSyncMessage supports equivalent English presentation", () => {
   assert.match(message, /requested_at: 2026-07-16T00:30:45\.000Z/u);
   assert.match(message, /detail: Request completed; reconciliation detail may still report drift\./u);
   assert.match(message, /Telegram does not accept manual cash or position input\./u);
+});
+
+test("configuration presentation is Korean-first, supports English, and never renders secret values", () => {
+  const config = createInspectionRuntimeConfig();
+  const korean = formatRuntimeConfigMessage(config, "ko-KR");
+  const english = formatRuntimeConfigMessage(config, "en-US");
+  const missingKorean = formatRuntimeConfigMessage(null, "ko-KR");
+  const missingEnglish = formatRuntimeConfigMessage(null, "en-US");
+
+  assert.match(korean, /^실행 설정 \(Runtime Config\)/u);
+  assert.match(korean, /실행 모드: 모의 실행 \(DRY_RUN\)/u);
+  assert.match(korean, /실주문: 차단됨/u);
+  assert.match(korean, /필수 설정 누락: Telegram 봇 토큰, Telegram 운영자 채팅 ID/u);
+  assert.doesNotMatch(korean, /필수 설정 누락:.*Upbit 조회 자격 증명/u);
+  assert.match(korean, /무시되는 이전 환경 변수: MAX_LIVE_ORDER_VALUE_KRW/u);
+  assert.match(english, /^Runtime configuration \(Runtime Config\)/u);
+  assert.match(english, /Execution mode: dry run \(DRY_RUN\)/u);
+  assert.match(english, /Missing required configuration: Telegram bot token, Telegram operator chat ID/u);
+  assert.doesNotMatch(english, /Missing required configuration:.*Upbit read credentials/u);
+  assert.match(missingKorean, /실행 설정을 확인할 수 없습니다/u);
+  assert.match(missingEnglish, /Runtime configuration is unavailable/u);
+
+  for (const message of [korean, english]) {
+    assert.match(message, /state_source: runtime app configuration/u);
+    assert.match(message, /execution_mode: DRY_RUN/u);
+    assert.match(message, /live_gate: DISABLED/u);
+    assert.match(message, /live_send_path: DRY_RUN_ADAPTER/u);
+    assert.match(message, /telegram_bot_token_configured: false/u);
+    assert.match(message, /telegram_operator_chat_id_configured: false/u);
+    assert.match(message, /deprecated_ignored_env_vars: MAX_LIVE_ORDER_VALUE_KRW/u);
+    assert.doesNotMatch(message, /123456:secret-token|upbit-secret-value|operator-chat-secret/u);
+  }
+});
+
+test("configuration presentation requires credentials only for enabled LIVE and Telegram capabilities", () => {
+  const offlineDryRun = {
+    ...createInspectionRuntimeConfig(),
+    telegramDeliveryEnabled: false,
+    telegramInboundPollingEnabled: false,
+  };
+  const liveWithoutUpbitReads = {
+    ...offlineDryRun,
+    executionMode: "LIVE" as const,
+    liveExecutionGate: "ENABLED" as const,
+    liveSendPath: "LIVE_ADAPTER" as const,
+  };
+  const telegramEnabled = {
+    ...offlineDryRun,
+    telegramDeliveryEnabled: true,
+  };
+
+  const offlineKorean = formatRuntimeConfigMessage(offlineDryRun, "ko-KR");
+  const offlineEnglish = formatRuntimeConfigMessage(offlineDryRun, "en-US");
+  const liveKorean = formatRuntimeConfigMessage(liveWithoutUpbitReads, "ko-KR");
+  const liveEnglish = formatRuntimeConfigMessage(liveWithoutUpbitReads, "en-US");
+  const telegramKorean = formatRuntimeConfigMessage(telegramEnabled, "ko-KR");
+  const telegramEnglish = formatRuntimeConfigMessage(telegramEnabled, "en-US");
+
+  assert.match(offlineKorean, /필수 설정 누락: 없음/u);
+  assert.match(offlineEnglish, /Missing required configuration: none/u);
+  assert.match(liveKorean, /필수 설정 누락: Upbit 조회 자격 증명/u);
+  assert.match(liveEnglish, /Missing required configuration: Upbit read credentials/u);
+  assert.match(telegramKorean, /필수 설정 누락: Telegram 봇 토큰, Telegram 운영자 채팅 ID/u);
+  assert.match(telegramEnglish, /Missing required configuration: Telegram bot token, Telegram operator chat ID/u);
+
+  for (const message of [
+    offlineKorean,
+    offlineEnglish,
+    liveKorean,
+    liveEnglish,
+    telegramKorean,
+    telegramEnglish,
+  ]) {
+    assert.match(message, /exchange_backed_read_enabled: false/u);
+    assert.match(message, /telegram_bot_token_configured: false/u);
+    assert.match(message, /telegram_operator_chat_id_configured: false/u);
+    assert.match(message, /secret_boundary: secret values are never rendered/u);
+  }
+});
+
+test("execution-state history presentation handles empty and populated evidence with KST and exact canonical rows", () => {
+  const transition = {
+    id: "transition-localized-1",
+    exchangeAccountId: "primary",
+    command: "/pause" as const,
+    fromExecutionMode: "LIVE" as const,
+    toExecutionMode: "LIVE" as const,
+    fromLiveExecutionGate: "ENABLED" as const,
+    toLiveExecutionGate: "ENABLED" as const,
+    fromSystemStatus: "RUNNING" as const,
+    toSystemStatus: "PAUSED" as const,
+    fromKillSwitchActive: false,
+    toKillSwitchActive: false,
+    reason: `정기 점검 & exact <reason>`,
+    createdAt: "2026-07-29T00:30:45.000Z",
+  };
+  const canonical = "- 2026-07-29T00:30:45.000Z | /pause | RUNNING -> PAUSED | mode LIVE -> LIVE | gate ENABLED -> ENABLED | reason=정기 점검 & exact <reason>";
+  const korean = formatStateHistoryMessage([transition], "ko-KR");
+  const english = formatStateHistoryMessage([transition], "en-US");
+  const empty = formatStateHistoryMessage([], "ko-KR");
+  const emptyEnglish = formatStateHistoryMessage([], "en-US");
+
+  assert.match(korean, /^실행 상태 변경 이력 \(Execution State History\)/u);
+  assert.match(korean, /저장된 과거 기록이며 현재 실행 상태를 증명하지 않습니다/u);
+  assert.match(korean, /2026-07-29 09:30:45 KST/u);
+  assert.match(korean, /운영자 일시정지/u);
+  assert.match(english, /^Execution-state history \(Execution State History\)/u);
+  assert.match(english, /persisted history and does not prove the current execution state/u);
+  assert.match(empty, /저장된 실행 상태 변경 기록이 없습니다/u);
+  assert.match(emptyEnglish, /No execution-state transitions are stored/u);
+  for (const message of [korean, english]) {
+    assert.ok(message.includes(canonical));
+    assert.match(message, /state_source: persisted execution_state_transitions/u);
+  }
+});
+
+test("reconciliation history presentation explains latest persisted evidence without changing canonical rows", () => {
+  const detail = `stored error & exact <message>`;
+  const run = {
+    id: "recon-localized-1",
+    exchangeAccountId: "primary",
+    status: "DRIFT_DETECTED" as const,
+    startedAt: "2026-07-29T00:40:00.000Z",
+    completedAt: "2026-07-29T00:40:05.000Z",
+    summaryJson: JSON.stringify({
+      source: "SCHEDULER_PREFLIGHT",
+      issues: [
+        { code: "EXCHANGE_ORDER_RECOVERED" },
+        { code: "ORDER_FILLS_BACKFILLED" },
+      ],
+      processedCount: 2,
+      deferredCount: 0,
+      historyRecovery: {
+        coverageStatus: "IN_PROGRESS",
+        confidenceLevel: "PARTIAL",
+        confidenceReason: "ARCHIVE_IN_PROGRESS",
+      },
+    }),
+    errorMessage: detail,
+  };
+  const korean = formatReconciliationRunsMessage([run], "ko-KR");
+  const english = formatReconciliationRunsMessage([run], "en-US");
+  const empty = formatReconciliationRunsMessage([], "ko-KR");
+  const emptyEnglish = formatReconciliationRunsMessage([], "en-US");
+
+  assert.match(korean, /^동기화 이력 \(Reconciliation History\)/u);
+  assert.match(korean, /최근 결과: 차이 감지 \(DRIFT_DETECTED\)/u);
+  assert.match(korean, /감지 항목: 2건/u);
+  assert.match(korean, /이력 범위: 진행 중 \(IN_PROGRESS\)/u);
+  assert.match(korean, /신뢰도: 부분 확인 \(PARTIAL\).*ARCHIVE_IN_PROGRESS/u);
+  assert.match(korean, /2026-07-29 09:40:00 KST/u);
+  assert.match(english, /^Reconciliation history \(Reconciliation History\)/u);
+  assert.match(english, /Latest outcome: drift detected \(DRIFT_DETECTED\)/u);
+  assert.match(empty, /저장된 동기화 실행 기록이 없습니다/u);
+  assert.match(emptyEnglish, /No reconciliation runs are stored/u);
+  for (const message of [korean, english]) {
+    assert.match(message, /state_source: persisted reconciliation_runs/u);
+    assert.match(message, /codes=EXCHANGE_ORDER_RECOVERED,ORDER_FILLS_BACKFILLED/u);
+    assert.ok(message.includes(`error=${detail}`));
+  }
+});
+
+test("recovery presentation explains persisted coverage, retention, progress, and checkpoints without overstating completion", () => {
+  const storedFailure = `archive delayed & exact <failure>`;
+  const latestRun = {
+    id: "recovery-localized-1",
+    exchangeAccountId: "primary",
+    status: "DRIFT_DETECTED" as const,
+    startedAt: "2026-07-29T00:50:00.000Z",
+    completedAt: "2026-07-29T00:50:05.000Z",
+    summaryJson: JSON.stringify({
+      source: "STARTUP_RECOVERY",
+      issues: [{ code: "EXCHANGE_ORDER_RECOVERED" }],
+      historyRecovery: {
+        closedOrderLookbackDays: 7,
+        stopBeforeDays: 365,
+        stopBeforeAt: "2025-07-29T00:50:00.000Z",
+        retentionAssumptionDays: 365,
+        retentionBoundaryAt: "2025-07-29T00:50:00.000Z",
+        retentionStatus: "WITHIN_ASSUMED_RETENTION",
+        coverageStatus: "IN_PROGRESS",
+        confidenceLevel: "PARTIAL",
+        confidenceReason: "ARCHIVE_IN_PROGRESS",
+        failureMessage: storedFailure,
+        scannedSnapshotCount: 5,
+        recoveredOrderCount: 2,
+        markets: [{
+          market: "KRW-BTC",
+          archivalWindowStartAt: "2026-07-15T00:50:00.000Z",
+          archivalWindowEndAt: "2026-07-22T00:50:00.000Z",
+          nextWindowEndAt: "2026-07-15T00:50:00.000Z",
+          archiveComplete: false,
+          retentionStatus: "WITHIN_ASSUMED_RETENTION",
+          confidenceLevel: "PARTIAL",
+          confidenceReason: "ARCHIVE_IN_PROGRESS",
+          openHistoryTruncated: false,
+          recentClosedHistoryTruncated: false,
+          archivalClosedHistoryTruncated: false,
+          openPagesScanned: 1,
+          recentClosedPagesScanned: 1,
+          archivalClosedPagesScanned: 1,
+          snapshotCount: 5,
+        }],
+      },
+    }),
+    errorMessage: null,
+  };
+  const checkpoints = [{
+    id: "checkpoint-localized-1",
+    exchangeAccountId: "primary",
+    market: "KRW-BTC" as const,
+    checkpointType: "CLOSED_ORDER_ARCHIVE" as const,
+    nextWindowEndAt: "2026-07-15T00:50:00.000Z",
+    updatedAt: "2026-07-29T00:50:05.000Z",
+  }];
+  const korean = formatRecoveryProgressMessage(latestRun, checkpoints, "ko-KR");
+  const english = formatRecoveryProgressMessage(latestRun, checkpoints, "en-US");
+  const missing = formatRecoveryProgressMessage(null, [], "ko-KR");
+  const missingEnglish = formatRecoveryProgressMessage(null, [], "en-US");
+
+  assert.match(korean, /^거래소 이력 복구 \(Exchange History Recovery\)/u);
+  assert.match(korean, /복구 범위: 진행 중 \(IN_PROGRESS\)/u);
+  assert.match(korean, /신뢰도: 부분 확인 \(PARTIAL\).*ARCHIVE_IN_PROGRESS/u);
+  assert.match(korean, /보존 범위 판단: 가정된 보존 기간 안쪽 \(WITHIN_ASSUMED_RETENTION\)/u);
+  assert.match(korean, /시장 진행: KRW-BTC.*완료 아님/u);
+  assert.match(korean, /저장 체크포인트: 1개/u);
+  assert.match(korean, /2026-07-29 09:50:00 KST/u);
+  assert.doesNotMatch(korean, /거래소 전체 이력 복구 완료/u);
+  assert.match(english, /^Exchange-history recovery \(Exchange History Recovery\)/u);
+  assert.match(english, /Coverage: in progress \(IN_PROGRESS\)/u);
+  assert.match(missing, /저장된 복구 실행 근거가 없습니다/u);
+  assert.match(missingEnglish, /No persisted recovery-run evidence is available/u);
+  for (const message of [korean, english]) {
+    assert.match(message, /state_source: persisted reconciliation_runs \+ history_recovery_checkpoints/u);
+    assert.ok(message.includes(`failure_message: ${storedFailure}`));
+    assert.match(message, /persisted_checkpoints: 1/u);
+    assert.match(message, /archive_complete=false/u);
+  }
 });
 
 test("formatSyncMessage retains an invalid raw timestamp while using localized none", () => {

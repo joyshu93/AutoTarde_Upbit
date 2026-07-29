@@ -409,6 +409,74 @@ test("telegram router exposes non-secret runtime config inspection", async () =>
   assert.doesNotMatch(response.text, /123456:real-bot-token|real-upbit-secret|UPBIT_SECRET_KEY=/);
 });
 
+test("localized configuration and history inspection preserve bounded reads and invoke no mutation controller", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "inspection-state-1",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-07-29T00:00:00.000Z",
+  });
+  const transitionLimits: number[] = [];
+  const reconciliationLimits: number[] = [];
+  const checkpointAccounts: string[] = [];
+  const originalListTransitions = operatorState.listTransitions.bind(operatorState);
+  const originalListReconciliationRuns = repository.listReconciliationRuns.bind(repository);
+  const originalListCheckpoints = repository.listHistoryRecoveryCheckpoints.bind(repository);
+
+  operatorState.listTransitions = async (limit) => {
+    transitionLimits.push(limit ?? -1);
+    return originalListTransitions(limit);
+  };
+  repository.listReconciliationRuns = async (exchangeAccountId, limit) => {
+    reconciliationLimits.push(limit ?? -1);
+    return originalListReconciliationRuns(exchangeAccountId, limit);
+  };
+  repository.listHistoryRecoveryCheckpoints = async (exchangeAccountId) => {
+    checkpointAccounts.push(exchangeAccountId);
+    return originalListCheckpoints(exchangeAccountId);
+  };
+
+  const failMutation = async () => {
+    throw new Error("inspection localization must not invoke mutation controllers");
+  };
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState,
+    runtimeConfig: {
+      ...createRuntimeConfig(),
+      telegramLocale: "ko-KR",
+    },
+    locale: "en-US",
+    syncController: {
+      requestSync: failMutation,
+    },
+    strategyRunController: {
+      requestRun: failMutation,
+      requestPreview: failMutation,
+    },
+  });
+
+  const config = await router.route("/config");
+  const stateHistory = await router.route("/statehistory");
+  const syncHistory = await router.route("/synchistory");
+  const recovery = await router.route("/recovery");
+
+  assert.match(config.text, /^Runtime configuration \(Runtime Config\)/u);
+  assert.match(stateHistory.text, /^Execution-state history \(Execution State History\)/u);
+  assert.match(syncHistory.text, /^Reconciliation history \(Reconciliation History\)/u);
+  assert.match(recovery.text, /^Exchange-history recovery \(Exchange History Recovery\)/u);
+  assert.deepEqual(transitionLimits, [10]);
+  assert.deepEqual(reconciliationLimits, [10, 1]);
+  assert.deepEqual(checkpointAccounts, ["primary"]);
+});
+
 test("telegram router exposes read-only operator readiness", async () => {
   const repository = new InMemoryExecutionRepository();
   await repository.saveBalanceSnapshot({
@@ -5246,6 +5314,84 @@ test("telegram router calls a wired strategy run controller for supported assets
   assert.match(response.text, /strategy_decision_id: strategy-decision-1/);
   assert.match(response.text, /action: HOLD/);
   assert.match(response.text, /submission_accepted: none/);
+});
+
+test("router localizes run, calls BTC and ETH exactly once, rejects invalid requests, and performs no extra reads", async () => {
+  const baseRepositories = new InMemoryExecutionRepository();
+  const baseOperatorState = new InMemoryOperatorStateStore({
+    id: "run-state",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  });
+  let repositoryReads = 0;
+  let operatorStateReads = 0;
+  let runCalls = 0;
+  const markets: string[] = [];
+  const repositories = new Proxy(baseRepositories, {
+    get(target, property, receiver) {
+      repositoryReads += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const operatorState = new Proxy(baseOperatorState, {
+    get(target, property, receiver) {
+      operatorStateReads += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const router = new TelegramCommandRouter({
+    repositories,
+    operatorState,
+    locale: "ko-KR",
+    strategyRunController: {
+      async requestRun(request) {
+        runCalls += 1;
+        markets.push(request.market);
+        return {
+          status: "COMPLETED",
+          requestedAt: "2026-04-20T00:15:00.000Z",
+          market: request.market,
+          strategyDecisionId: `decision-${request.market}`,
+          action: "HOLD",
+          orderId: null,
+          orderStatus: null,
+          submissionAccepted: null,
+          detail: "Decision HOLD persisted; no order submission was requested.",
+        };
+      },
+      async requestPreview() {
+        throw new Error("requestPreview must not be called by /run");
+      },
+    },
+  });
+
+  const btc = await router.route("/run BTC");
+  const eth = await router.route("/run ETH");
+  const invalidAsset = await router.route("/run DOGE");
+  const extraArgs = await router.route("/run BTC now");
+
+  assert.equal(runCalls, 2);
+  assert.deepEqual(markets, ["KRW-BTC", "KRW-ETH"]);
+  assert.equal(repositoryReads, 0);
+  assert.equal(operatorStateReads, 0);
+  assert.match(btc.text, /전략 실행 결과 \(Strategy Run\)/);
+  assert.match(btc.text, /시장\/자산: KRW-BTC \/ BTC/);
+  assert.match(eth.text, /시장\/자산: KRW-ETH \/ ETH/);
+  assert.equal(
+    invalidAsset.text,
+    "Usage: /run BTC|ETH\nRun one deterministic PositionGuard strategy cycle for a supported asset through the safe execution path.",
+  );
+  assert.equal(
+    extraArgs.text,
+    "Usage: /run BTC|ETH\nRun one deterministic PositionGuard strategy cycle for a supported asset through the safe execution path.",
+  );
 });
 
 test("router localizes preview, invokes its controller once, and performs no extra state reads", async () => {

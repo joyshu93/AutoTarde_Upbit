@@ -138,18 +138,19 @@ Telegram is an operator surface only.
 It provides:
 - `/help` for static command-contract inspection and operator safety boundaries
 - `/start` as a transport-friendly alias to `/help`
-- `/config` for non-secret runtime configuration, ignored deprecated environment variables, live blockers, and explicit risk-limit inspection
+- locale-aware `/config` for non-secret runtime configuration, ignored deprecated environment variables, enabled-feature credential requirements, live blockers, and explicit risk-limit inspection
 - locale-aware `/readiness` operator summary over runtime config, execution state, worker status, latest persisted health records, and bounded local persistence health
 - `/readiness detail` for the canonical technical check list; both forms classify reconciliation recovery progress as warnings while keeping portfolio drift and unresolved order recovery as blockers
 - inspection commands
 - pause/resume/killswitch controls
 - reporting-friendly formatters
+- a stable `telegram/formatter.ts` compatibility facade that re-exports the implementation from `telegram/presentation/technical.ts`, allowing focused presentation modules without changing existing imports
 - persisted-status inspection that can summarize recent operator-state transitions
 - locale-aware `/status` operator summary for execution mode, live-order availability and blockers, kill-switch and degraded state, scheduler timing, and latest persisted reconciliation health
 - `/status detail` for the canonical technical execution view, including checkpointed exchange-history recovery progress, retention-assumption status, coverage status, confidence classification, scheduler counters, and recent state transitions
-- `/statehistory` for read-only execution_state transition history
-- `/synchistory` for read-only persisted reconciliation_runs inspection
-- `/recovery` for read-only checkpointed exchange-history recovery progress inspection
+- locale-aware `/statehistory` for read-only execution_state transition history with KST guidance and unchanged canonical transition evidence
+- locale-aware `/synchistory` for read-only persisted reconciliation_runs inspection with coverage/confidence guidance and unchanged canonical run evidence
+- locale-aware `/recovery` for read-only checkpointed exchange-history recovery progress inspection without overstating archive completeness
 - locale-aware `/alerts` summary for the bounded recent notification and delivery sample, including pending, due, scheduled retry, failed, lease, and recent attempt counts with the sample limits stated explicitly
 - `/alerts detail` for the canonical technical notification, delivery-run, delivery-attempt, retry, and queue-metric output
 - locale-aware `/risks` summary for recent persisted `risk_events`, including severity counts, rule explanations, original messages, and linked order or strategy-decision references
@@ -159,7 +160,7 @@ It provides:
 - `/sync` for reconciliation-triggered snapshot and reconciliation record persistence with read-only public ticker valuation
 - locale-aware `/sync` result presentation over the single existing reconciliation-controller result, retaining canonical status, raw request timestamp, and exact detail without performing another sync or any additional exchange, repository, strategy, scheduler, order, or notification action
 - locale-aware `/preview BTC|ETH` for one non-mutating PositionGuard decision and order-intent preview, retaining canonical fields and Upbit order-shape semantics while adding no calculation, persistence, exchange read, reconciliation, or order transmission
-- `/run BTC|ETH` for one deterministic PositionGuard strategy runner cycle through the configured safe execution path
+- locale-aware `/run BTC|ETH` for one deterministic PositionGuard strategy runner cycle through the configured safe execution path; the presentation preserves canonical output, warns about LIVE transmission capability, and never equates submission acceptance with a fill
 - `/status` concise strategy-scheduler state and per-market next-run timestamps
 - `/status detail` strategy-scheduler lines for configured intervals, recent in-memory outcomes, persisted recent scheduler run history, startup preflight scope, detail, and check results
 - `/readiness` warns when a `LIVE` scheduler is running while the latest persisted balance snapshot, position snapshot, or reconciliation run is older than the shortest configured scheduler interval
