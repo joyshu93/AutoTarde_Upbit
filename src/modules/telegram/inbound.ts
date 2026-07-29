@@ -1,5 +1,9 @@
 import type { TelegramCommandRouter } from "./commands.js";
-import type { TelegramCallbackClient, TelegramMessageClient } from "./delivery.js";
+import type {
+  TelegramCallbackClient,
+  TelegramMessageClient,
+  TelegramMessageEditClient,
+} from "./delivery.js";
 import type { TelegramInboundOffsetStore } from "../db/interfaces.js";
 import { createId } from "../../shared/ids.js";
 import {
@@ -25,6 +29,9 @@ const DEFAULT_TELEGRAM_INBOUND_LONG_POLL_TIMEOUT_SECONDS = 25;
 const DEFAULT_TELEGRAM_INBOUND_LIMIT = 20;
 const MAX_INBOUND_REPLY_TEXT_LENGTH = 3_500;
 const MAX_INBOUND_ERROR_LENGTH = 240;
+const CALLBACK_ACK_CLIENT_UNAVAILABLE = "telegram_callback_ack_client_unavailable";
+const CALLBACK_ROUTER_UNAVAILABLE = "telegram_callback_router_unavailable";
+const CALLBACK_EDIT_CLIENT_UNAVAILABLE = "telegram_callback_edit_client_unavailable";
 
 export interface TelegramUpdateClient {
   getUpdates(input: {
@@ -131,7 +138,7 @@ export class TelegramInboundPollingService {
       updateClient: TelegramUpdateClient | null;
       messageClient: TelegramMessageClient | null;
       callbackClient?: TelegramCallbackClient | null;
-      router: Pick<TelegramCommandRouter, "route">;
+      router: Pick<TelegramCommandRouter, "route"> & Partial<Pick<TelegramCommandRouter, "routeReadOnlyCallback">>;
       operatorChatId: string | null;
       exchangeAccountId?: string;
       initialOffset?: number | null;
@@ -256,10 +263,16 @@ export class TelegramInboundPollingService {
             text,
             this.dependencies.exchangeAccountId ?? "primary",
           );
-          for (const replyText of splitTelegramReplyText(response.text)) {
+          for (const [index, replyText] of splitTelegramReplyText(response.text).entries()) {
             await this.dependencies.messageClient?.sendMessage({
               chatId: this.dependencies.operatorChatId ?? "",
               text: replyText,
+              ...(index === 0 && response.parseMode !== undefined
+                ? { parseMode: response.parseMode }
+                : {}),
+              ...(index === 0 && response.replyMarkup !== undefined
+                ? { replyMarkup: response.replyMarkup }
+                : {}),
             });
           }
           processed += 1;
@@ -327,15 +340,46 @@ export class TelegramInboundPollingService {
         : null;
     const acknowledgementText = action === null ? "요청을 처리할 수 없습니다." : undefined;
 
-    const callbackClient = this.callbackClient();
-    if (callbackClient) {
-      await callbackClient.answerCallbackQuery({
-        callbackQueryId: callbackQuery.callbackId,
-        ...(acknowledgementText === undefined ? {} : { text: acknowledgementText }),
-      });
+    if (action === null) {
+      const callbackClient = this.callbackClient();
+      if (callbackClient) {
+        await callbackClient.answerCallbackQuery({
+          callbackQueryId: callbackQuery.callbackId,
+          ...(acknowledgementText === undefined ? {} : { text: acknowledgementText }),
+        });
+      }
+      return false;
     }
 
-    return action !== null;
+    const callbackClient = this.callbackClient();
+    if (!callbackClient) {
+      throw new Error(CALLBACK_ACK_CLIENT_UNAVAILABLE);
+    }
+    await callbackClient.answerCallbackQuery({ callbackQueryId: callbackQuery.callbackId });
+
+    const routeReadOnlyCallback = this.dependencies.router.routeReadOnlyCallback;
+    if (!routeReadOnlyCallback) {
+      throw new Error(CALLBACK_ROUTER_UNAVAILABLE);
+    }
+
+    const editClient = this.messageEditClient();
+    if (!editClient) {
+      throw new Error(CALLBACK_EDIT_CLIENT_UNAVAILABLE);
+    }
+
+    const response = await routeReadOnlyCallback(
+      action,
+      this.dependencies.exchangeAccountId ?? "primary",
+    );
+    await editClient.editMessageText({
+      chatId: callbackQuery.chatId,
+      messageId: callbackQuery.messageId,
+      text: response.text,
+      ...(response.parseMode === undefined ? {} : { parseMode: response.parseMode }),
+      ...(response.replyMarkup === undefined ? {} : { replyMarkup: response.replyMarkup }),
+    });
+
+    return true;
   }
 
   private callbackClient(): TelegramCallbackClient | null {
@@ -350,6 +394,19 @@ export class TelegramInboundPollingService {
       typeof messageClient.answerCallbackQuery === "function"
     ) {
       return messageClient as TelegramCallbackClient;
+    }
+
+    return null;
+  }
+
+  private messageEditClient(): TelegramMessageEditClient | null {
+    const messageClient = this.dependencies.messageClient;
+    if (
+      messageClient &&
+      "editMessageText" in messageClient &&
+      typeof messageClient.editMessageText === "function"
+    ) {
+      return messageClient as TelegramMessageEditClient;
     }
 
     return null;

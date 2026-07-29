@@ -147,6 +147,44 @@ test("telegram inbound polling splits long routed replies before sending", async
   assert.match(sent[1] ?? "", /tail/);
 });
 
+test("telegram inbound preserves the dashboard HTML and inline keyboard on /start", async () => {
+  const sent: Array<{
+    chatId: string;
+    text: string;
+    parseMode?: string;
+    replyMarkup?: { inlineKeyboard: readonly (readonly { callbackData: string }[])[] };
+  }> = [];
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: createUpdateClient([], [[createUpdate(15, "123", "/start")]]),
+    messageClient: {
+      async sendMessage(input) {
+        sent.push(input);
+      },
+    },
+    router: {
+      async route() {
+        return {
+          text: "<b>dashboard</b>",
+          parseMode: "HTML" as const,
+          replyMarkup: { inlineKeyboard: [[{ text: "Status", callbackData: "status" }]] },
+        };
+      },
+    },
+    operatorChatId: "123",
+  });
+
+  const summary = await service.pollOnce();
+
+  assert.equal(summary.status, "COMPLETED");
+  assert.deepEqual(sent, [{
+    chatId: "123",
+    text: "<b>dashboard</b>",
+    parseMode: "HTML",
+    replyMarkup: { inlineKeyboard: [[{ text: "Status", callbackData: "status" }]] },
+  }]);
+});
+
 test("splitTelegramReplyText prefers newline boundaries and hard-splits long lines", () => {
   assert.deepEqual(splitTelegramReplyText("short", 10), ["short"]);
   assert.deepEqual(splitTelegramReplyText("aaa\nbbb\nccc", 7), ["aaa\nbbb", "ccc"]);
@@ -370,6 +408,7 @@ test("telegram inbound uses a callback acknowledgement capability exposed by its
   const acknowledgements: Array<{ callbackQueryId: string; text?: string }> = [];
   const messageClient = {
     async sendMessage() {},
+    async editMessageText() {},
     async answerCallbackQuery(input: { callbackQueryId: string; text?: string }) {
       acknowledgements.push(input);
     },
@@ -392,6 +431,13 @@ test("telegram inbound uses a callback acknowledgement capability exposed by its
       async route() {
         throw new Error("callbacks_must_not_route");
       },
+      async routeReadOnlyCallback() {
+        return {
+          text: "<pre>status</pre>",
+          parseMode: "HTML" as const,
+          replyMarkup: { inlineKeyboard: [] },
+        };
+      },
     },
     operatorChatId: "123",
   });
@@ -405,6 +451,253 @@ test("telegram inbound uses a callback acknowledgement capability exposed by its
       callbackQueryId: "callback-message-client",
     },
   ]);
+});
+
+test("telegram inbound acknowledges a valid callback before lookup and edits only its originating message", async () => {
+  const timeline: string[] = [];
+  const savedOffsets: TelegramInboundOffsetRecord[] = [];
+  const edited: Array<{ chatId: string; messageId: number; text: string; parseMode?: string }> = [];
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: createUpdateClient([], [
+      [
+        createCallbackUpdate(76, {
+          callbackId: "callback-status",
+          senderId: "123",
+          chatId: "123",
+          messageId: 44,
+          data: "status:refresh",
+        }),
+      ],
+    ]),
+    messageClient: {
+      async sendMessage() {
+        throw new Error("callback_navigation_must_not_send_message");
+      },
+      async editMessageText(input: { chatId: string; messageId: number; text: string; parseMode?: string }) {
+        timeline.push("edit");
+        edited.push(input);
+      },
+    },
+    callbackClient: {
+      async answerCallbackQuery() {
+        timeline.push("ack");
+      },
+    },
+    router: {
+      async route() {
+        throw new Error("callbacks_must_not_use_generic_route");
+      },
+      async routeReadOnlyCallback(action: { type: string }) {
+        timeline.push(`lookup:${action.type}`);
+        return {
+          text: "<b>status</b>",
+          parseMode: "HTML" as const,
+          replyMarkup: { inlineKeyboard: [[{ text: "Home", callbackData: "home" }]] },
+        };
+      },
+    },
+    operatorChatId: "123",
+    offsetStore: {
+      ...createOffsetStore({ savedOffsets }),
+      async saveTelegramInboundOffset(record: TelegramInboundOffsetRecord) {
+        timeline.push("offset");
+        savedOffsets.push(record);
+      },
+    },
+    botTokenRef: "sha256:bot-a",
+  } as unknown as ConstructorParameters<typeof TelegramInboundPollingService>[0]);
+
+  const summary = await service.pollOnce();
+
+  assert.equal(summary.status, "COMPLETED");
+  assert.equal(summary.processedCount, 1);
+  assert.deepEqual(timeline, ["offset", "ack", "lookup:STATUS_REFRESH", "edit"]);
+  assert.deepEqual(edited, [{
+    chatId: "123",
+    messageId: 44,
+    text: "<b>status</b>",
+    parseMode: "HTML",
+    replyMarkup: { inlineKeyboard: [[{ text: "Home", callbackData: "home" }]] },
+  }]);
+});
+
+test("telegram inbound records edit failures after the acknowledgement without retrying its persisted callback", async () => {
+  const savedOffsets: TelegramInboundOffsetRecord[] = [];
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: createUpdateClient([], [
+      [
+        createCallbackUpdate(77, {
+          callbackId: "callback-edit-failure",
+          senderId: "123",
+          chatId: "123",
+          messageId: 45,
+          data: "home",
+        }),
+      ],
+    ]),
+    messageClient: {
+      async sendMessage() {},
+      async editMessageText() {
+        throw new Error("telegram_callback_edit_failed");
+      },
+    },
+    callbackClient: {
+      async answerCallbackQuery() {},
+    },
+    router: {
+      async route() {
+        throw new Error("callbacks_must_not_use_generic_route");
+      },
+      async routeReadOnlyCallback() {
+        return {
+          text: "<b>home</b>",
+          parseMode: "HTML" as const,
+          replyMarkup: { inlineKeyboard: [[{ text: "Home", callbackData: "home" }]] },
+        };
+      },
+    },
+    operatorChatId: "123",
+    offsetStore: createOffsetStore({ savedOffsets }),
+    botTokenRef: "sha256:bot-a",
+  } as unknown as ConstructorParameters<typeof TelegramInboundPollingService>[0]);
+
+  const summary = await service.pollOnce();
+
+  assert.equal(summary.status, "FAILED");
+  assert.equal(summary.errorMessage, "telegram_callback_edit_failed");
+  assert.equal(savedOffsets[0]?.nextOffset, 78);
+});
+
+test("telegram inbound fails a valid callback without an acknowledgement client before lookup or edit", async () => {
+  const savedOffsets: TelegramInboundOffsetRecord[] = [];
+  let lookups = 0;
+  let edits = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: createUpdateClient([], [[createCallbackUpdate(78, {
+      callbackId: "callback-no-ack",
+      senderId: "123",
+      chatId: "123",
+      messageId: 46,
+      data: "home",
+    })]]),
+    messageClient: {
+      async sendMessage() {},
+      async editMessageText() {
+        edits += 1;
+      },
+    },
+    router: {
+      async route() {
+        throw new Error("callbacks_must_not_use_generic_route");
+      },
+      async routeReadOnlyCallback() {
+        lookups += 1;
+        return { text: "<pre>home</pre>", parseMode: "HTML" as const, replyMarkup: { inlineKeyboard: [] } };
+      },
+    },
+    operatorChatId: "123",
+    offsetStore: createOffsetStore({ savedOffsets }),
+    botTokenRef: "sha256:bot-a",
+  } as unknown as ConstructorParameters<typeof TelegramInboundPollingService>[0]);
+
+  const summary = await service.pollOnce();
+
+  assert.equal(summary.status, "FAILED");
+  assert.equal(summary.errorMessage, "telegram_callback_ack_client_unavailable");
+  assert.equal(summary.processedCount, 0);
+  assert.equal(lookups, 0);
+  assert.equal(edits, 0);
+  assert.equal(savedOffsets[0]?.nextOffset, 79);
+});
+
+test("telegram inbound fails a valid callback after ACK when the read-only router is unavailable", async () => {
+  const savedOffsets: TelegramInboundOffsetRecord[] = [];
+  let acknowledgements = 0;
+  let edits = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: createUpdateClient([], [[createCallbackUpdate(79, {
+      callbackId: "callback-no-router",
+      senderId: "123",
+      chatId: "123",
+      messageId: 47,
+      data: "home",
+    })]]),
+    messageClient: {
+      async sendMessage() {},
+      async editMessageText() {
+        edits += 1;
+      },
+    },
+    callbackClient: {
+      async answerCallbackQuery() {
+        acknowledgements += 1;
+      },
+    },
+    router: {
+      async route() {
+        throw new Error("callbacks_must_not_use_generic_route");
+      },
+    },
+    operatorChatId: "123",
+    offsetStore: createOffsetStore({ savedOffsets }),
+    botTokenRef: "sha256:bot-a",
+  } as unknown as ConstructorParameters<typeof TelegramInboundPollingService>[0]);
+
+  const summary = await service.pollOnce();
+
+  assert.equal(summary.status, "FAILED");
+  assert.equal(summary.errorMessage, "telegram_callback_router_unavailable");
+  assert.equal(acknowledgements, 1);
+  assert.equal(edits, 0);
+  assert.equal(savedOffsets[0]?.nextOffset, 80);
+});
+
+test("telegram inbound fails a valid callback after ACK when message editing is unavailable", async () => {
+  const savedOffsets: TelegramInboundOffsetRecord[] = [];
+  let acknowledgements = 0;
+  let lookups = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: createUpdateClient([], [[createCallbackUpdate(80, {
+      callbackId: "callback-no-edit",
+      senderId: "123",
+      chatId: "123",
+      messageId: 48,
+      data: "home",
+    })]]),
+    messageClient: {
+      async sendMessage() {},
+    },
+    callbackClient: {
+      async answerCallbackQuery() {
+        acknowledgements += 1;
+      },
+    },
+    router: {
+      async route() {
+        throw new Error("callbacks_must_not_use_generic_route");
+      },
+      async routeReadOnlyCallback() {
+        lookups += 1;
+        return { text: "<pre>home</pre>", parseMode: "HTML" as const, replyMarkup: { inlineKeyboard: [] } };
+      },
+    },
+    operatorChatId: "123",
+    offsetStore: createOffsetStore({ savedOffsets }),
+    botTokenRef: "sha256:bot-a",
+  } as unknown as ConstructorParameters<typeof TelegramInboundPollingService>[0]);
+
+  const summary = await service.pollOnce();
+
+  assert.equal(summary.status, "FAILED");
+  assert.equal(summary.errorMessage, "telegram_callback_edit_client_unavailable");
+  assert.equal(acknowledgements, 1);
+  assert.equal(lookups, 0);
+  assert.equal(savedOffsets[0]?.nextOffset, 81);
 });
 
 test("telegram inbound records callback acknowledgement failures after persisting the update offset", async () => {

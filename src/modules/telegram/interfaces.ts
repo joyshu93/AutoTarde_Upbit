@@ -17,7 +17,9 @@ import type { TelegramInboundPollingStatus } from "./inbound.js";
 import type { TelegramLocale } from "./presentation/locale.js";
 
 export interface TelegramResponse {
-  text: string;
+  readonly text: string;
+  readonly parseMode?: TelegramParseMode;
+  readonly replyMarkup?: TelegramInlineKeyboardMarkup;
 }
 
 export type TelegramParseMode = "HTML";

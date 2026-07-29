@@ -46,10 +46,30 @@ import type {
   TelegramStrategyRunResult,
   TelegramSyncResult,
 } from "./interfaces.js";
+import type { TelegramReadOnlyCallbackAction } from "./callbacks.js";
 import { getMarketForAsset } from "../../domain/types.js";
 import type { ReconciliationRunRecord, StrategySchedulerRunRecord } from "../../domain/types.js";
 import type { OperatorStateStore } from "../db/interfaces.js";
 import { normalizeTelegramLocale } from "./presentation/locale.js";
+import {
+  backHomeKeyboard,
+  buildTelegramDashboardResponse,
+  buildTelegramReadOnlyResponse,
+  detailKeyboard,
+  expiredCallbackResponse,
+  homeKeyboard,
+} from "./presentation/dashboard.js";
+import {
+  formatOrdersPagePresentation,
+  sortTelegramOrdersNewestFirst,
+  TELEGRAM_ORDER_PAGE_SIZE,
+} from "./presentation/orders.js";
+import {
+  formatAlertDetailPresentation,
+  formatAlertsPagePresentation,
+  sortTelegramAlertsNewestFirst,
+  TELEGRAM_ALERT_PAGE_SIZE,
+} from "./presentation/alerts.js";
 
 export class TelegramCommandRouter {
   constructor(private readonly dependencies: TelegramRouterDependencies) {}
@@ -73,6 +93,10 @@ export class TelegramCommandRouter {
     const validationMessage = validateTelegramCommand(parsed);
     if (validationMessage) {
       return { text: validationMessage };
+    }
+
+    if (isTelegramStartCommand(input)) {
+      return buildTelegramDashboardResponse(normalizeTelegramLocale(this.dependencies.locale));
     }
 
     switch (parsed.command) {
@@ -203,6 +227,165 @@ export class TelegramCommandRouter {
             normalizeTelegramLocale(this.dependencies.locale),
           ),
     };
+  }
+
+  async routeReadOnlyCallback(
+    action: TelegramReadOnlyCallbackAction,
+    exchangeAccountId = "primary",
+  ): Promise<TelegramResponse> {
+    const locale = normalizeTelegramLocale(this.dependencies.locale);
+    switch (action.type) {
+      case "HOME":
+        return buildTelegramDashboardResponse(locale);
+      case "STATUS":
+      case "STATUS_REFRESH":
+        return this.buildCallbackResponse(
+          (await this.buildStatusResponse(exchangeAccountId, false)).text,
+          detailKeyboard(locale, "status:detail", "status:refresh"),
+          locale,
+        );
+      case "STATUS_DETAIL":
+        return this.buildCallbackResponse(
+          (await this.buildStatusResponse(exchangeAccountId, true)).text,
+          backHomeKeyboard(locale, "status"),
+          locale,
+        );
+      case "READINESS":
+      case "READINESS_REFRESH":
+        return this.buildCallbackResponse(
+          (await this.buildReadinessResponse(exchangeAccountId, false)).text,
+          detailKeyboard(locale, "readiness:detail", "readiness:refresh"),
+          locale,
+        );
+      case "READINESS_DETAIL":
+        return this.buildCallbackResponse(
+          (await this.buildReadinessResponse(exchangeAccountId, true)).text,
+          backHomeKeyboard(locale, "readiness"),
+          locale,
+        );
+      case "BALANCES":
+        return this.buildCallbackResponse(
+          (await this.buildBalanceResponse(exchangeAccountId, false)).text,
+          homeKeyboard(locale),
+          locale,
+        );
+      case "POSITIONS":
+        return this.buildCallbackResponse(
+          (await this.buildPositionResponse(exchangeAccountId, false)).text,
+          homeKeyboard(locale),
+          locale,
+        );
+      case "ORDERS_PAGE":
+        return this.buildOrdersCallbackPage(action.page, exchangeAccountId, locale);
+      case "ORDERS_DETAIL":
+        return this.buildOrderCallbackDetail(action.orderId, exchangeAccountId, locale);
+      case "ALERTS_PAGE":
+        return this.buildAlertsCallbackPage(action.page, exchangeAccountId, locale);
+      case "ALERTS_DETAIL":
+        return this.buildAlertCallbackDetail(action.alertId, exchangeAccountId, locale);
+      case "RISKS":
+        return this.buildCallbackResponse(
+          (await this.buildRiskEventsResponse(exchangeAccountId, false)).text,
+          homeKeyboard(locale),
+          locale,
+        );
+      case "SCHEDULER":
+        return this.buildCallbackResponse(
+          (await this.buildSchedulerResponse(exchangeAccountId, false)).text,
+          homeKeyboard(locale),
+          locale,
+        );
+    }
+  }
+
+  private buildCallbackResponse(
+    text: string,
+    replyMarkup: import("./interfaces.js").TelegramInlineKeyboardMarkup,
+    locale: ReturnType<typeof normalizeTelegramLocale>,
+  ): TelegramResponse {
+    return buildTelegramReadOnlyResponse(text, replyMarkup, locale);
+  }
+
+  private async buildOrdersCallbackPage(
+    page: number,
+    exchangeAccountId: string,
+    locale: ReturnType<typeof normalizeTelegramLocale>,
+  ): Promise<TelegramResponse> {
+    const orders = sortTelegramOrdersNewestFirst(
+      await this.dependencies.repositories.listOrders(exchangeAccountId),
+    );
+    const firstIndex = page * TELEGRAM_ORDER_PAGE_SIZE;
+    if (firstIndex >= orders.length && !(page === 0 && orders.length === 0)) {
+      return expiredCallbackResponse(locale);
+    }
+
+    const visibleCount = Math.min(TELEGRAM_ORDER_PAGE_SIZE, orders.length - firstIndex);
+    return this.buildCallbackResponse(
+      formatOrdersPagePresentation(orders, page, locale),
+      buildPagedKeyboard(locale, "orders", page, firstIndex, visibleCount, orders.length),
+      locale,
+    );
+  }
+
+  private async buildOrderCallbackDetail(
+    orderId: number,
+    exchangeAccountId: string,
+    locale: ReturnType<typeof normalizeTelegramLocale>,
+  ): Promise<TelegramResponse> {
+    const orders = sortTelegramOrdersNewestFirst(
+      await this.dependencies.repositories.listOrders(exchangeAccountId),
+    );
+    const order = orders[orderId];
+    if (!order) {
+      return expiredCallbackResponse(locale);
+    }
+
+    return this.buildCallbackResponse(
+      (await this.buildOrderDetailResponse(exchangeAccountId, order.id, true)).text,
+      backHomeKeyboard(locale, `orders:page:${Math.floor(orderId / TELEGRAM_ORDER_PAGE_SIZE)}`),
+      locale,
+    );
+  }
+
+  private async buildAlertsCallbackPage(
+    page: number,
+    exchangeAccountId: string,
+    locale: ReturnType<typeof normalizeTelegramLocale>,
+  ): Promise<TelegramResponse> {
+    const alerts = sortTelegramAlertsNewestFirst(
+      await this.dependencies.repositories.listOperatorNotifications(exchangeAccountId, 10),
+    );
+    const firstIndex = page * TELEGRAM_ALERT_PAGE_SIZE;
+    if (firstIndex >= alerts.length && !(page === 0 && alerts.length === 0)) {
+      return expiredCallbackResponse(locale);
+    }
+
+    const visibleCount = Math.min(TELEGRAM_ALERT_PAGE_SIZE, alerts.length - firstIndex);
+    return this.buildCallbackResponse(
+      formatAlertsPagePresentation(alerts, page, locale),
+      buildPagedKeyboard(locale, "alerts", page, firstIndex, visibleCount, alerts.length),
+      locale,
+    );
+  }
+
+  private async buildAlertCallbackDetail(
+    alertId: number,
+    exchangeAccountId: string,
+    locale: ReturnType<typeof normalizeTelegramLocale>,
+  ): Promise<TelegramResponse> {
+    const alerts = sortTelegramAlertsNewestFirst(
+      await this.dependencies.repositories.listOperatorNotifications(exchangeAccountId, 10),
+    );
+    const alert = alerts[alertId];
+    if (!alert) {
+      return expiredCallbackResponse(locale);
+    }
+
+    return this.buildCallbackResponse(
+      formatAlertDetailPresentation(alert, locale),
+      backHomeKeyboard(locale, `alerts:page:${Math.floor(alertId / TELEGRAM_ALERT_PAGE_SIZE)}`),
+      locale,
+    );
   }
 
   private async buildPositionResponse(
@@ -606,6 +789,36 @@ export class TelegramCommandRouter {
       ),
     };
   }
+}
+
+function buildPagedKeyboard(
+  locale: import("./presentation/locale.js").TelegramLocale,
+  resource: "orders" | "alerts",
+  page: number,
+  firstIndex: number,
+  visibleCount: number,
+  totalCount: number,
+): import("./interfaces.js").TelegramInlineKeyboardMarkup {
+  const detailRows = Array.from({ length: visibleCount }, (_, index) => [{
+    text: locale === "ko-KR" ? `상세 ${firstIndex + index + 1}` : `Detail ${firstIndex + index + 1}`,
+    callbackData: `${resource}:detail:${firstIndex + index}`,
+  }]);
+  const navigation = [
+    ...(page > 0
+      ? [{ text: locale === "ko-KR" ? "이전" : "Previous", callbackData: `${resource}:page:${page - 1}` }]
+      : []),
+    ...((firstIndex + visibleCount) < totalCount
+      ? [{ text: locale === "ko-KR" ? "다음" : "Next", callbackData: `${resource}:page:${page + 1}` }]
+      : []),
+    { text: locale === "ko-KR" ? "홈" : "Home", callbackData: "home" },
+  ];
+
+  return { inlineKeyboard: [...detailRows, navigation] };
+}
+
+function isTelegramStartCommand(input: string): boolean {
+  const [rawCommand = "", ...args] = input.trim().split(/\s+/u);
+  return args.length === 0 && rawCommand.toLowerCase().split("@", 1)[0] === "/start";
 }
 
 function buildStatusFormatOptions(

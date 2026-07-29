@@ -41,6 +41,7 @@ import {
   formatStrategySchedulerRunsSummaryMessage,
   formatTelegramInboundMessage,
 } from "../src/modules/telegram/formatter.js";
+import { buildTelegramReadOnlyResponse } from "../src/modules/telegram/presentation/dashboard.js";
 import type { TelegramInboundPollingStatus } from "../src/modules/telegram/inbound.js";
 import { test } from "./harness.js";
 
@@ -256,12 +257,21 @@ test("telegram router parses supported operator commands only", () => {
   assert.equal(router.parse("status"), null);
 });
 
-test("telegram help defaults to Korean and preserves every command usage", async () => {
+test("telegram help remains complete while /start returns the Korean dashboard", async () => {
   const router = createRouter();
   const response = await router.route("/help");
   const startResponse = await router.route("/start");
 
-  assert.equal(startResponse.text, response.text);
+  const dashboard = startResponse as typeof startResponse & {
+    parseMode?: string;
+    replyMarkup?: { inlineKeyboard: readonly (readonly { callbackData: string }[])[] };
+  };
+  assert.equal(dashboard.parseMode, "HTML");
+  assert.match(dashboard.text, /AutoTrade Upbit/);
+  assert.deepEqual(
+    dashboard.replyMarkup?.inlineKeyboard.flat().map((button) => button.callbackData),
+    ["status", "readiness", "balances", "positions", "orders:page:0", "alerts:page:0", "risks", "scheduler"],
+  );
   assert.match(response.text, /AutoTrade Upbit 도움말/);
   assert.match(response.text, /조회 명령/);
   assert.match(response.text, /운영 명령/);
@@ -272,7 +282,7 @@ test("telegram help defaults to Korean and preserves every command usage", async
   }
 });
 
-test("telegram help supports English and start is an exact help alias", async () => {
+test("telegram help supports English while /start keeps the dashboard controls read-only", async () => {
   const router = new TelegramCommandRouter({
     repositories: new InMemoryExecutionRepository(),
     operatorState: new InMemoryOperatorStateStore({
@@ -293,7 +303,22 @@ test("telegram help supports English and start is an exact help alias", async ()
   const helpResponse = await router.route("/help");
   const startResponse = await router.route("/start");
 
-  assert.equal(startResponse.text, helpResponse.text);
+  const dashboard = startResponse as typeof startResponse & {
+    parseMode?: string;
+    replyMarkup?: { inlineKeyboard: readonly (readonly { callbackData: string }[])[] };
+  };
+  assert.equal(dashboard.parseMode, "HTML");
+  assert.match(dashboard.text, /AutoTrade Upbit/);
+  assert.ok(
+    dashboard.replyMarkup?.inlineKeyboard.flat().every((button) => ![
+      "run",
+      "preview",
+      "sync",
+      "pause",
+      "resume",
+      "killswitch",
+    ].includes(button.callbackData)),
+  );
   assert.match(helpResponse.text, /AutoTrade Upbit Help/);
   assert.match(helpResponse.text, /Inspection commands/);
   assert.match(helpResponse.text, /Operator controls/);
@@ -302,6 +327,76 @@ test("telegram help supports English and start is an exact help alias", async ()
   for (const contract of listTelegramCommandContracts()) {
     assert.match(helpResponse.text, new RegExp(escapeRegExp(contract.usage)));
   }
+});
+
+test("telegram start accepts a bot mention but rejects arguments without rendering a dashboard", async () => {
+  const router = createRouter();
+
+  const mentionedStart = await router.route("/start@AutoTradeBot");
+  const invalidStart = await router.route("/start unexpected");
+
+  assert.equal(mentionedStart.parseMode, "HTML");
+  assert.ok(mentionedStart.replyMarkup);
+  assert.equal(
+    invalidStart.text,
+    "Usage: /help\nShow supported Telegram operator commands and safety boundaries.",
+  );
+  assert.equal(invalidStart.parseMode, undefined);
+  assert.equal(invalidStart.replyMarkup, undefined);
+});
+
+test("read-only callback HTML responses truncate long dynamic status readiness order and alert content", () => {
+  const buildResponse = buildTelegramReadOnlyResponse as unknown as (
+    text: string,
+    replyMarkup: { inlineKeyboard: readonly (readonly { text: string; callbackData: string }[])[] },
+    locale: "ko-KR" | "en-US",
+  ) => { text: string };
+  const keyboard = { inlineKeyboard: [[{ text: "Home", callbackData: "home" }]] };
+  const dynamicSources = {
+    status: `degraded_reason: ${"<status&>".repeat(1_000)}`,
+    readiness: `risk_message: ${"<readiness&>".repeat(1_000)}`,
+    order: `failure_message: ${"<order&>".repeat(1_000)}`,
+    alert: `message: ${"<alert&>".repeat(1_000)}`,
+  };
+
+  for (const [name, source] of Object.entries(dynamicSources)) {
+    const response = buildResponse(source, keyboard, "en-US");
+    const escapedBody = response.text.slice("<pre>".length, -"</pre>".length);
+    assert.ok(response.text.length <= 3_500, name);
+    assert.ok(response.text.length <= 4_096, name);
+    assert.ok(response.text.startsWith("<pre>") && response.text.endsWith("</pre>"), name);
+    assert.ok(!escapedBody.includes("<") && !escapedBody.includes(">"), name);
+    assert.match(response.text, /truncated/i, name);
+  }
+
+  const korean = buildResponse("<긴 내용&>".repeat(1_000), keyboard, "ko-KR");
+  assert.ok(korean.text.length <= 3_500);
+  assert.match(korean.text, /생략/u);
+});
+
+test("English callback routes retain the English truncation notice", async () => {
+  const router = new TelegramCommandRouter({
+    repositories: new InMemoryExecutionRepository(),
+    operatorState: new InMemoryOperatorStateStore({
+      id: "english-callback-truncation",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "DEGRADED",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: "<long-status&>".repeat(1_000),
+      degradedAt: "2026-04-20T00:00:00.000Z",
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+    locale: "en-US",
+  });
+
+  const response = await router.routeReadOnlyCallback({ type: "STATUS_DETAIL" });
+
+  assert.ok(response.text.length <= 3_500);
+  assert.match(response.text, /Content truncated for Telegram\./);
+  assert.doesNotMatch(response.text, /생략/u);
 });
 
 test("telegram help dependency locale wins over a differing runtime config locale", async () => {
@@ -5460,6 +5555,183 @@ test("router localizes preview, invokes its controller once, and performs no ext
   assert.match(response.text, /전략 미리보기 \(Strategy Preview\)/);
   assert.match(response.text, /시장\/자산: KRW-ETH \/ ETH/);
   assert.match(response.text, /주문 의도: 없음/);
+});
+
+test("telegram read-only callbacks return typed HTML views for every approved action", async () => {
+  const repository = new InMemoryExecutionRepository();
+  for (let index = 0; index < 6; index += 1) {
+    await repository.saveOrder(createOrder({
+      id: `callback-order-${index}`,
+      updatedAt: `2026-04-20T00:0${index}:00.000Z`,
+    }));
+  }
+  for (let index = 0; index < 4; index += 1) {
+    await repository.saveOperatorNotification(createNotification({
+      id: `callback-alert-${index}`,
+      title: `alert <${index}>`,
+      message: `message & ${index}`,
+      createdAt: `2026-04-20T00:0${index}:30.000Z`,
+    }));
+  }
+
+  const mutationCalls: string[] = [];
+  const operatorState = new Proxy(new InMemoryOperatorStateStore({
+    id: "callback-state",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  }), {
+    get(target, property, receiver) {
+      if (
+        typeof property === "string" &&
+        [
+          "pause",
+          "resume",
+          "activateKillSwitch",
+          "setExecutionMode",
+          "setLiveExecutionGate",
+          "markDegraded",
+          "clearDegraded",
+        ].includes(property)
+      ) {
+        return () => {
+          mutationCalls.push(property);
+          throw new Error(`callback_must_not_mutate_operator_state:${property}`);
+        };
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState,
+    syncController: {
+      async requestSync() {
+        throw new Error("callbacks_must_not_sync");
+      },
+    },
+    strategyRunController: {
+      async requestRun() {
+        throw new Error("callbacks_must_not_run");
+      },
+      async requestPreview() {
+        throw new Error("callbacks_must_not_preview");
+      },
+    },
+  });
+  const callbackRouter = router as unknown as {
+    routeReadOnlyCallback(action: unknown, exchangeAccountId?: string): Promise<{
+      text: string;
+      parseMode: "HTML";
+      replyMarkup: { inlineKeyboard: readonly (readonly { callbackData: string }[])[] };
+    }>;
+  };
+  const actions = [
+    { type: "HOME" },
+    { type: "STATUS" },
+    { type: "STATUS_DETAIL" },
+    { type: "STATUS_REFRESH" },
+    { type: "READINESS" },
+    { type: "READINESS_DETAIL" },
+    { type: "READINESS_REFRESH" },
+    { type: "BALANCES" },
+    { type: "POSITIONS" },
+    { type: "ORDERS_PAGE", page: 0 },
+    { type: "ORDERS_DETAIL", orderId: 0 },
+    { type: "ALERTS_PAGE", page: 0 },
+    { type: "ALERTS_DETAIL", alertId: 0 },
+    { type: "RISKS" },
+    { type: "SCHEDULER" },
+  ];
+
+  for (const action of actions) {
+    const response = await callbackRouter.routeReadOnlyCallback(action);
+    assert.equal(response.parseMode, "HTML", action.type);
+    assert.ok(response.replyMarkup.inlineKeyboard.length > 0, action.type);
+  }
+  assert.deepEqual(mutationCalls, []);
+});
+
+test("telegram read-only callback pages are bounded, escaped, and expire without detail reads", async () => {
+  const repository = new InMemoryExecutionRepository();
+  for (let index = 0; index < 6; index += 1) {
+    await repository.saveOrder(createOrder({
+      id: `page-order-${index}`,
+      updatedAt: `2026-04-20T00:0${index}:00.000Z`,
+    }));
+  }
+  for (let index = 0; index < 4; index += 1) {
+    await repository.saveOperatorNotification(createNotification({
+      id: `page-alert-${index}`,
+      title: `alert <${index}>`,
+      message: `message & ${index}`,
+      createdAt: `2026-04-20T00:0${index}:30.000Z`,
+    }));
+  }
+  let eventReads = 0;
+  let fillReads = 0;
+  repository.listOrderEvents = async () => {
+    eventReads += 1;
+    return [];
+  };
+  repository.listFills = async () => {
+    fillReads += 1;
+    return [];
+  };
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "page-state",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    }),
+  });
+  const callbackRouter = router as unknown as {
+    routeReadOnlyCallback(action: unknown, exchangeAccountId?: string): Promise<{
+      text: string;
+      replyMarkup: { inlineKeyboard: readonly (readonly { callbackData: string }[])[] };
+    }>;
+  };
+
+  const firstOrders = await callbackRouter.routeReadOnlyCallback({ type: "ORDERS_PAGE", page: 0 });
+  const secondOrders = await callbackRouter.routeReadOnlyCallback({ type: "ORDERS_PAGE", page: 1 });
+  const firstAlerts = await callbackRouter.routeReadOnlyCallback({ type: "ALERTS_PAGE", page: 0 });
+  const secondAlerts = await callbackRouter.routeReadOnlyCallback({ type: "ALERTS_PAGE", page: 1 });
+  const expiredOrder = await callbackRouter.routeReadOnlyCallback({ type: "ORDERS_DETAIL", orderId: 99 });
+  const expiredAlertsPage = await callbackRouter.routeReadOnlyCallback({ type: "ALERTS_PAGE", page: 2 });
+  const expiredAlert = await callbackRouter.routeReadOnlyCallback({ type: "ALERTS_DETAIL", alertId: 4 });
+  const alertDetail = await callbackRouter.routeReadOnlyCallback({ type: "ALERTS_DETAIL", alertId: 0 });
+
+  assert.match(firstOrders.text, /page-order-5/);
+  assert.doesNotMatch(firstOrders.text, /page-order-0/);
+  const secondOrderButtons = secondOrders.replyMarkup.inlineKeyboard.flat().map((button) => button.callbackData);
+  assert.ok(secondOrderButtons.includes("orders:page:0"));
+  assert.ok(secondOrderButtons.includes("home"));
+  assert.ok(!secondOrderButtons.includes("orders:page:2"));
+  assert.match(firstAlerts.text, /alert &lt;3&gt;/);
+  const secondAlertButtons = secondAlerts.replyMarkup.inlineKeyboard.flat().map((button) => button.callbackData);
+  assert.ok(secondAlertButtons.includes("alerts:page:0"));
+  assert.ok(secondAlertButtons.includes("home"));
+  assert.ok(!secondAlertButtons.includes("alerts:page:2"));
+  assert.match(alertDetail.text, /message &amp; 3/);
+  assert.match(expiredOrder.text, /expired|not found|만료|찾을 수 없/u);
+  assert.match(expiredAlertsPage.text, /expired|not found|만료|찾을 수 없/u);
+  assert.match(expiredAlert.text, /expired|not found|만료|찾을 수 없/u);
+  assert.equal(eventReads, 0);
+  assert.equal(fillReads, 0);
 });
 
 test("router keeps invalid preview requests usage-only and localizes missing controller state", async () => {

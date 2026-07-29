@@ -85,7 +85,7 @@ Current remaining gaps:
 - `/readiness` treats exchange-history recovery progress as a warning instead of blocking when no portfolio drift or unresolved order recovery remains
 - Telegram `/start` is handled as a `/help` alias
 - Telegram `/help` and `/start` use `TELEGRAM_LOCALE`; the explicit default is `ko-KR`, and `en-US` is the only alternative.
-- Telegram transport now has typed HTML, inline-keyboard, message-edit, and callback-acknowledgement primitives. Callback polling authenticates both source chat and sender, persists the update offset before handling, and accepts only a closed read-only navigation vocabulary; dashboard lookup routing is intentionally deferred to the next implementation stage.
+- Telegram `/start` now renders a Korean-first read-only dashboard with inline navigation for status, readiness, balances, positions, orders, alerts, risks, and scheduler evidence. Callback polling authenticates both source chat and sender, persists the update offset before handling, acknowledges before lookup, and edits only the originating bot message.
 - Telegram `/sync` presents the existing reconciliation request result in the configured locale while retaining canonical status, raw request time, and exact detail. Its formatter does not run another sync or infer that a completed request was drift-free.
 - scheduler startup now records an automatic `strategySchedulerStartupPreflight`; in `LIVE` mode it blocks scheduler timers unless live gate, live adapter wiring, execution state, fresh exchange-backed snapshots, fresh reconciliation health, and active-order state are safe
 - live scheduler startup blocks now persist an operator notification before startup can close local persistence
@@ -245,7 +245,7 @@ Telegram inbound polling stays disabled unless all three conditions are true:
 
 Inbound polling is separate from `ENABLE_TELEGRAM_DELIVERY`: delivery controls outbound queued notifications, while inbound polling controls operator command receiving.
 Inbound polling persists update offsets before routing each update to avoid replaying the same operator command indefinitely after process restart. Reply or route failures are explicit in the polling status; they do not mutate execution, reconciliation, order, balance, or position truth.
-Callback updates follow the same offset-first replay boundary. A callback is authorized only when both its private source chat and sender match the configured operator, and only typed read-only navigation actions are accepted. Unknown, malformed, oversized, or mutation-shaped callbacks are acknowledged without reaching the text command router; callback-driven dashboard reads and edited-message navigation are not wired yet.
+Callback updates follow the same offset-first replay boundary. A callback is authorized only when both its private source chat and sender match the configured operator, and only typed read-only navigation actions are accepted. Unknown, malformed, oversized, or mutation-shaped callbacks are acknowledged without reaching the text command router. Valid callbacks use a dedicated read-only route, then edit the originating message with a final 3,500-character cap. Order pages contain five rows and alert pages contain three; missing capabilities and edit failures remain explicit polling failures without replaying the persisted update.
 
 For a bounded real-bot smoke test, use:
 

@@ -133,6 +133,44 @@ export function formatOperatorNotificationsPresentation(
   ].join("\n");
 }
 
+export const TELEGRAM_ALERT_PAGE_SIZE = 3;
+
+export function sortTelegramAlertsNewestFirst(
+  notifications: readonly OperatorNotificationRecord[],
+): OperatorNotificationRecord[] {
+  return sortByInstant(notifications, (record) => record.createdAt);
+}
+
+export function formatAlertsPagePresentation(
+  sortedNotifications: readonly OperatorNotificationRecord[],
+  page: number,
+  locale: TelegramLocale,
+): string {
+  const visibleNotifications = sortedNotifications.slice(
+    page * TELEGRAM_ALERT_PAGE_SIZE,
+    (page + 1) * TELEGRAM_ALERT_PAGE_SIZE,
+  );
+  return [
+    locale === "ko-KR" ? "운영 알림" : "Operator alerts",
+    `${locale === "ko-KR" ? "페이지" : "Page"}: ${page + 1}`,
+    `${locale === "ko-KR" ? "전체" : "Total"}: ${sortedNotifications.length}`,
+    ...(visibleNotifications.length === 0
+      ? [locale === "ko-KR" ? "저장된 알림이 없습니다." : "No stored alerts."]
+      : visibleNotifications.flatMap((notification) => formatNotification(notification, locale))),
+  ].join("\n");
+}
+
+export function formatAlertDetailPresentation(
+  notification: OperatorNotificationRecord,
+  locale: TelegramLocale,
+): string {
+  return [
+    locale === "ko-KR" ? "알림 상세" : "Alert detail",
+    `id: ${notification.id}`,
+    ...formatNotification(notification, locale),
+  ].join("\n");
+}
+
 function formatNotification(
   notification: OperatorNotificationRecord,
   locale: TelegramLocale,

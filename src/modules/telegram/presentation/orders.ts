@@ -13,6 +13,7 @@ import {
 import type { TelegramLocale } from "./locale.js";
 
 const SUMMARY_LIMIT = 10;
+export const TELEGRAM_ORDER_PAGE_SIZE = 5;
 
 const ACTIVE_OR_RECOVERY_STATUSES = new Set<OrderLifecycleStatus>([
   "INTENT_CREATED",
@@ -68,6 +69,31 @@ export function formatOrdersPresentation(
       : ["최근 10건:", ...visibleOrders.flatMap((order) => buildOrderLines(order, locale))]),
     ...(omittedCount > 0 ? [`${omittedCount}건은 생략되었습니다.`] : []),
     "전체 기술 목록: /orders detail",
+  ].join("\n");
+}
+
+export function sortTelegramOrdersNewestFirst(orders: readonly OrderRecord[]): OrderRecord[] {
+  return [...orders].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+export function formatOrdersPagePresentation(
+  sortedOrders: readonly OrderRecord[],
+  page: number,
+  locale: TelegramLocale,
+): string {
+  const visibleOrders = sortedOrders.slice(
+    page * TELEGRAM_ORDER_PAGE_SIZE,
+    (page + 1) * TELEGRAM_ORDER_PAGE_SIZE,
+  );
+  const heading = locale === "ko-KR" ? "주문 목록" : "Orders";
+  const pageLabel = locale === "ko-KR" ? "페이지" : "Page";
+  const empty = locale === "ko-KR" ? "저장된 주문이 없습니다." : "No stored orders.";
+
+  return [
+    heading,
+    `${pageLabel}: ${page + 1}`,
+    `${locale === "ko-KR" ? "전체" : "Total"}: ${sortedOrders.length}`,
+    ...(visibleOrders.length === 0 ? [empty] : visibleOrders.flatMap((order) => buildOrderLines(order, locale))),
   ].join("\n");
 }
 

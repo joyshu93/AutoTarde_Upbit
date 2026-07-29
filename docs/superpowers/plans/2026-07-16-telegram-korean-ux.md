@@ -97,12 +97,12 @@
 
 **Produces:** `/start` dashboard, status/readiness refresh, order and alert pagination, and detail navigation using edited messages.
 
-- [ ] Write failing tests for dashboard buttons and each approved callback action.
-- [ ] Write failing tests proving callbacks cannot call operator-state mutations, sync, preview, or run controllers.
-- [ ] Run focused tests and verify expected failures.
-- [ ] Implement a read-only callback route that reuses repository-backed inspection builders and bounded page sizes.
-- [ ] Edit the originating bot message after callback acknowledgement instead of sending chat-cluttering navigation messages.
-- [ ] Run focused and full tests.
+- [x] Write failing tests for dashboard buttons and each approved callback action.
+- [x] Write failing tests proving callbacks cannot call operator-state mutations, sync, preview, or run controllers.
+- [x] Run focused tests and verify expected failures.
+- [x] Implement a read-only callback route that reuses repository-backed inspection builders and bounded page sizes.
+- [x] Edit the originating bot message after callback acknowledgement instead of sending chat-cluttering navigation messages.
+- [x] Run focused and full tests.
 
 ### Task 5: Localized Telegram Command Menu And Integration Documentation
 
