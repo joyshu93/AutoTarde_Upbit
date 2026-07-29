@@ -57,6 +57,7 @@ import {
   formatStatusPresentation,
   type LiveSendPath,
 } from "./presentation/status.js";
+import { formatControlPresentation } from "./presentation/control.js";
 
 const MANUAL_INPUT_NOTE = "Telegram does not accept manual cash or position input.";
 
@@ -974,24 +975,22 @@ export function formatControlCommandMessage(
   nextState: ExecutionStateRecord,
   options?: {
     liveSendPath?: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
+    locale?: TelegramLocale;
   },
 ): string {
-  const blockers = describeLiveOrderBlockers(nextState, options?.liveSendPath ?? "DRY_RUN_ADAPTER");
+  if (command !== "/pause" && command !== "/resume" && command !== "/killswitch") {
+    throw new Error(`Unsupported control command: ${command}`);
+  }
 
-  return [
-    "Execution Control",
-    `command: ${command}`,
-    `result: accepted`,
-    `transition: ${previousState.systemStatus} -> ${nextState.systemStatus}`,
-    `mode_transition: ${previousState.executionMode} -> ${nextState.executionMode}`,
-    `live_gate_transition: ${previousState.liveExecutionGate} -> ${nextState.liveExecutionGate}`,
-    `system_status: ${nextState.systemStatus}`,
-    `kill_switch: ${nextState.killSwitchActive ? "on" : "off"}`,
-    `pause_reason: ${nextState.pauseReason ?? "none"}`,
-    `live_orders_allowed: ${blockers.length === 0 ? "true" : "false"}`,
-    `blocked_by: ${blockers.length === 0 ? "none" : blockers.join(",")}`,
-    `updated_at: ${nextState.updatedAt}`,
-  ].join("\n");
+  return formatControlPresentation(
+    {
+      command,
+      previousState,
+      nextState,
+      liveSendPath: options?.liveSendPath ?? "DRY_RUN_ADAPTER",
+    },
+    options?.locale ?? DEFAULT_TELEGRAM_LOCALE,
+  );
 }
 
 export function formatSyncMessage(result: TelegramSyncResult): string {

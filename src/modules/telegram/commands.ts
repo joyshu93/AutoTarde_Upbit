@@ -577,9 +577,10 @@ export class TelegramCommandRouter {
         command,
         previousState,
         nextState,
-        this.dependencies.liveSendPath
-          ? { liveSendPath: this.dependencies.liveSendPath }
-          : undefined,
+        {
+          liveSendPath: this.dependencies.liveSendPath ?? "DRY_RUN_ADAPTER",
+          locale: normalizeTelegramLocale(this.dependencies.locale),
+        },
       ),
     };
   }

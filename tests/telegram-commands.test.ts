@@ -21,6 +21,7 @@ import {
   InMemoryOperatorStateStore,
   InMemoryTelegramInboundOffsetStore,
 } from "../src/modules/db/repositories/in-memory-repositories.js";
+import type { OperatorStateStore } from "../src/modules/db/interfaces.js";
 import { TelegramCommandRouter } from "../src/modules/telegram/commands.js";
 import { listTelegramCommandContracts } from "../src/modules/telegram/contracts.js";
 import {
@@ -59,6 +60,100 @@ function createRouter(): TelegramCommandRouter {
       updatedAt: "2026-04-20T00:00:00.000Z",
     }),
   });
+}
+
+function createControlState(
+  overrides: Partial<ExecutionStateRecord>,
+): ExecutionStateRecord {
+  return {
+    id: "control-state",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-04-20T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function createControlRouterFixture(
+  initialState: ExecutionStateRecord,
+  transitions: {
+    pause?: ExecutionStateRecord;
+    resume?: ExecutionStateRecord;
+    activateKillSwitch?: ExecutionStateRecord;
+  },
+  options?: {
+    locale?: "ko-KR" | "en-US";
+    liveSendPath?: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
+  },
+): {
+  router: TelegramCommandRouter;
+  calls: {
+    getState: number;
+    pause: number;
+    resume: number;
+    activateKillSwitch: number;
+  };
+} {
+  let currentState = initialState;
+  const calls = {
+    getState: 0,
+    pause: 0,
+    resume: 0,
+    activateKillSwitch: 0,
+  };
+  const operatorState: OperatorStateStore = {
+    async getState() {
+      calls.getState += 1;
+      return currentState;
+    },
+    async listTransitions() {
+      return [];
+    },
+    async pause() {
+      calls.pause += 1;
+      currentState = transitions.pause ?? currentState;
+      return currentState;
+    },
+    async resume() {
+      calls.resume += 1;
+      currentState = transitions.resume ?? currentState;
+      return currentState;
+    },
+    async activateKillSwitch() {
+      calls.activateKillSwitch += 1;
+      currentState = transitions.activateKillSwitch ?? currentState;
+      return currentState;
+    },
+    async setExecutionMode() {
+      throw new Error("control presentation test must not change execution mode");
+    },
+    async setLiveExecutionGate() {
+      throw new Error("control presentation test must not change the live gate");
+    },
+    async markDegraded() {
+      throw new Error("control presentation test must not mark state degraded");
+    },
+    async clearDegraded() {
+      throw new Error("control presentation test must not clear degraded state");
+    },
+  };
+  const dependencies = {
+    repositories: new InMemoryExecutionRepository(),
+    operatorState,
+    ...(options?.locale ? { locale: options.locale } : {}),
+    ...(options?.liveSendPath ? { liveSendPath: options.liveSendPath } : {}),
+  };
+
+  return {
+    router: new TelegramCommandRouter(dependencies),
+    calls,
+  };
 }
 
 function createRuntimeConfig() {
@@ -4687,6 +4782,370 @@ test("telegram router activates kill switch", async () => {
   const response = await router.route("/killswitch operator_stop");
   assert.match(response.text, /system_status: KILL_SWITCHED/);
   assert.match(response.text, /kill_switch: on/);
+});
+
+test("telegram control result renders Korean pause guidance, canonical evidence, and KST time", async () => {
+  const previous = createControlState({
+    systemStatus: "RUNNING",
+    updatedAt: "2026-04-20T00:00:00.000Z",
+  });
+  const next = createControlState({
+    systemStatus: "PAUSED",
+    pauseReason: "정기 점검",
+    updatedAt: "2026-04-20T01:02:03.000Z",
+  });
+  const fixture = createControlRouterFixture(previous, {
+    pause: next,
+  });
+
+  const response = await fixture.router.route("/pause 정기 점검");
+
+  assert.match(response.text, /실행 제어 결과/);
+  assert.match(response.text, /command: \/pause/);
+  assert.match(response.text, /result: accepted/);
+  assert.match(response.text, /신규 실행이 일시정지되었습니다/);
+  assert.match(response.text, /\/status/);
+  assert.match(response.text, /준비된 경우에만 \/resume/);
+  assert.match(response.text, /transition: RUNNING -> PAUSED/);
+  assert.match(response.text, /execution_mode: DRY_RUN/);
+  assert.match(response.text, /live_gate: DISABLED/);
+  assert.match(response.text, /live_orders_allowed: false/);
+  assert.match(response.text, /blocked_by: DRY_RUN,LIVE_GATE_DISABLED,PAUSED,DRY_RUN_ADAPTER/);
+  assert.match(response.text, /kill_switch: off/);
+  assert.match(response.text, /reason: 정기 점검/);
+  assert.match(response.text, /2026-04-20 10:02:03 KST/);
+  assert.deepEqual(fixture.calls, {
+    getState: 1,
+    pause: 1,
+    resume: 0,
+    activateKillSwitch: 0,
+  });
+});
+
+test("telegram control result warns when Korean resume restores real-order-capable operation", async () => {
+  const previous = createControlState({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "PAUSED",
+    pauseReason: "operator_check",
+  });
+  const next = createControlState({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "RUNNING",
+    updatedAt: "2026-04-20T02:00:00.000Z",
+  });
+  const fixture = createControlRouterFixture(previous, {
+    resume: next,
+  }, {
+    liveSendPath: "LIVE_ADAPTER",
+  });
+
+  const response = await fixture.router.route("/resume");
+
+  assert.match(response.text, /실주문 가능 상태로 다시 진입할 수 있습니다/);
+  assert.match(response.text, /\/readiness/);
+  assert.match(response.text, /transition: PAUSED -> RUNNING/);
+  assert.match(response.text, /execution_mode: LIVE/);
+  assert.match(response.text, /live_gate: ENABLED/);
+  assert.match(response.text, /live_orders_allowed: true/);
+  assert.match(response.text, /blocked_by: none/);
+  assert.doesNotMatch(response.text, /실행은 계속 차단되어 있습니다/);
+  assert.deepEqual(fixture.calls, {
+    getState: 1,
+    pause: 0,
+    resume: 1,
+    activateKillSwitch: 0,
+  });
+});
+
+test("telegram control result explains Korean resume blockers with canonical codes", async () => {
+  const previous = createControlState({
+    systemStatus: "PAUSED",
+    pauseReason: "operator_check",
+  });
+  const next = createControlState({
+    systemStatus: "RUNNING",
+    updatedAt: "2026-04-20T03:00:00.000Z",
+  });
+  const fixture = createControlRouterFixture(previous, {
+    resume: next,
+  });
+
+  const response = await fixture.router.route("/resume");
+
+  assert.match(response.text, /실행은 계속 차단되어 있습니다/);
+  assert.match(response.text, /DRY_RUN,LIVE_GATE_DISABLED,DRY_RUN_ADAPTER/);
+  assert.match(response.text, /blocked_by: DRY_RUN,LIVE_GATE_DISABLED,DRY_RUN_ADAPTER/);
+  assert.doesNotMatch(response.text, /실주문 가능 상태로 다시 진입할 수 있습니다/);
+});
+
+test("telegram control result never claims resume cleared an active kill switch", async () => {
+  const previous = createControlState({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "KILL_SWITCHED",
+    killSwitchActive: true,
+    pauseReason: "emergency_stop",
+  });
+  const next = createControlState({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "KILL_SWITCHED",
+    killSwitchActive: true,
+    pauseReason: null,
+    updatedAt: "2026-04-20T04:00:00.000Z",
+  });
+  const fixture = createControlRouterFixture(previous, {
+    resume: next,
+  }, {
+    liveSendPath: "LIVE_ADAPTER",
+  });
+
+  const response = await fixture.router.route("/resume");
+
+  assert.match(response.text, /킬 스위치는 계속 활성 상태입니다/);
+  assert.match(response.text, /\/resume 명령은 킬 스위치를 해제하지 않습니다/);
+  assert.match(response.text, /transition: KILL_SWITCHED -> KILL_SWITCHED/);
+  assert.match(response.text, /blocked_by: KILL_SWITCHED/);
+  assert.match(response.text, /kill_switch: on/);
+  assert.match(response.text, /pause_reason: none/);
+  assert.match(response.text, /previous_kill_switch_reason: emergency_stop/);
+  assert.doesNotMatch(response.text, /pause_reason: emergency_stop/);
+  assert.doesNotMatch(response.text, /운영이 재개되었습니다/);
+});
+
+test("telegram control result preserves metacharacters in the exact plain-text reason", async () => {
+  const reason = 'ops <halt> & "review"';
+  const fixture = createControlRouterFixture(
+    createControlState({
+      systemStatus: "RUNNING",
+    }),
+    {
+      pause: createControlState({
+        systemStatus: "PAUSED",
+        pauseReason: reason,
+        updatedAt: "2026-04-20T04:30:00.000Z",
+      }),
+    },
+  );
+
+  const response = await fixture.router.route(`/pause ${reason}`);
+
+  assert.match(response.text, /pause_reason: ops <halt> & "review"/);
+  assert.doesNotMatch(response.text, /&lt;|&amp;|&quot;/);
+});
+
+test("telegram pause during an active kill switch stays truthful in Korean and never recommends resume", async () => {
+  const previous = createControlState({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "KILL_SWITCHED",
+    killSwitchActive: true,
+    pauseReason: "emergency_stop",
+  });
+  const next = createControlState({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "KILL_SWITCHED",
+    killSwitchActive: true,
+    pauseReason: "secondary_pause",
+    updatedAt: "2026-04-20T04:40:00.000Z",
+  });
+  const fixture = createControlRouterFixture(previous, {
+    pause: next,
+  }, {
+    liveSendPath: "LIVE_ADAPTER",
+  });
+
+  const response = await fixture.router.route("/pause secondary_pause");
+
+  assert.match(response.text, /킬 스위치 활성 상태가 유지되며 실행은 계속 차단됩니다/);
+  assert.match(response.text, /\/pause 명령은 킬 스위치 상태를 변경하지 않습니다/);
+  assert.match(response.text, /transition: KILL_SWITCHED -> KILL_SWITCHED/);
+  assert.match(response.text, /pause_reason: secondary_pause/);
+  assert.doesNotMatch(response.text, /일시정지 상태가 유지됩니다/);
+  assert.doesNotMatch(response.text, /\/resume/);
+});
+
+test("telegram pause during an active kill switch has equivalent truthful English output", async () => {
+  const previous = createControlState({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "KILL_SWITCHED",
+    killSwitchActive: true,
+    pauseReason: "emergency_stop",
+  });
+  const next = createControlState({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "KILL_SWITCHED",
+    killSwitchActive: true,
+    pauseReason: "secondary_pause",
+  });
+  const fixture = createControlRouterFixture(previous, {
+    pause: next,
+  }, {
+    locale: "en-US",
+    liveSendPath: "LIVE_ADAPTER",
+  });
+
+  const response = await fixture.router.route("/pause secondary_pause");
+
+  assert.match(response.text, /The kill switch remains active and execution remains blocked/);
+  assert.match(response.text, /\/pause does not change the kill-switch state/);
+  assert.doesNotMatch(response.text, /The system remains paused/);
+  assert.doesNotMatch(response.text, /\/resume/);
+});
+
+test("telegram repeated resume describes RUNNING to RUNNING truthfully in Korean", async () => {
+  const running = createControlState({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "RUNNING",
+  });
+  const fixture = createControlRouterFixture(running, {
+    resume: createControlState({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      systemStatus: "RUNNING",
+      updatedAt: "2026-04-20T04:50:00.000Z",
+    }),
+  }, {
+    liveSendPath: "LIVE_ADAPTER",
+  });
+
+  const response = await fixture.router.route("/resume");
+
+  assert.match(response.text, /이미 실행 중이며 RUNNING 상태가 유지됩니다/);
+  assert.match(response.text, /\/readiness/);
+  assert.match(response.text, /transition: RUNNING -> RUNNING/);
+  assert.doesNotMatch(response.text, /일시정지가 해제되었습니다/);
+});
+
+test("telegram repeated resume has equivalent truthful English output", async () => {
+  const running = createControlState({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "RUNNING",
+  });
+  const fixture = createControlRouterFixture(running, {
+    resume: createControlState({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      systemStatus: "RUNNING",
+    }),
+  }, {
+    locale: "en-US",
+    liveSendPath: "LIVE_ADAPTER",
+  });
+
+  const response = await fixture.router.route("/resume");
+
+  assert.match(response.text, /The system was already running and remains RUNNING/);
+  assert.match(response.text, /\/readiness/);
+  assert.doesNotMatch(response.text, /The pause was released/);
+});
+
+test("telegram control results describe kill switch and repeated transitions truthfully", async () => {
+  const paused = createControlState({
+    systemStatus: "PAUSED",
+    pauseReason: "existing_pause",
+  });
+  const repeatedPause = createControlRouterFixture(paused, {
+    pause: createControlState({
+      systemStatus: "PAUSED",
+      pauseReason: "existing_pause",
+      updatedAt: "2026-04-20T05:00:00.000Z",
+    }),
+  });
+  const pauseResponse = await repeatedPause.router.route("/pause existing_pause");
+  assert.match(pauseResponse.text, /일시정지 상태가 유지됩니다/);
+  assert.doesNotMatch(pauseResponse.text, /일시정지 상태로 전환되었습니다/);
+
+  const killed = createControlState({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "KILL_SWITCHED",
+    killSwitchActive: true,
+    pauseReason: "emergency_stop",
+  });
+  const repeatedKill = createControlRouterFixture(killed, {
+    activateKillSwitch: createControlState({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      systemStatus: "KILL_SWITCHED",
+      killSwitchActive: true,
+      pauseReason: "emergency_stop",
+      updatedAt: "2026-04-20T06:00:00.000Z",
+    }),
+  }, {
+    liveSendPath: "LIVE_ADAPTER",
+  });
+  const killResponse = await repeatedKill.router.route("/killswitch emergency_stop");
+  assert.match(killResponse.text, /글로벌 킬 스위치는 활성 상태이며 실행은 계속 차단됩니다/);
+  assert.match(killResponse.text, /킬 스위치 활성 상태가 유지됩니다/);
+  assert.doesNotMatch(killResponse.text, /\/resume.*해제/);
+  assert.deepEqual(repeatedKill.calls, {
+    getState: 1,
+    pause: 0,
+    resume: 0,
+    activateKillSwitch: 1,
+  });
+});
+
+test("telegram control result renders equivalent English information", async () => {
+  const previous = createControlState({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "RUNNING",
+  });
+  const next = createControlState({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "KILL_SWITCHED",
+    killSwitchActive: true,
+    pauseReason: "operator_stop",
+    updatedAt: "2026-04-20T07:08:09.000Z",
+  });
+  const fixture = createControlRouterFixture(previous, {
+    activateKillSwitch: next,
+  }, {
+    locale: "en-US",
+    liveSendPath: "LIVE_ADAPTER",
+  });
+
+  const response = await fixture.router.route("/killswitch operator_stop");
+
+  assert.match(response.text, /Execution control result/);
+  assert.match(response.text, /command: \/killswitch/);
+  assert.match(response.text, /result: accepted/);
+  assert.match(response.text, /global kill switch is active and execution remains blocked/i);
+  assert.match(response.text, /Review \/status/);
+  assert.match(response.text, /transition: RUNNING -> KILL_SWITCHED/);
+  assert.match(response.text, /execution_mode: LIVE/);
+  assert.match(response.text, /live_gate: ENABLED/);
+  assert.match(response.text, /live_orders_allowed: false/);
+  assert.match(response.text, /blocked_by: KILL_SWITCHED/);
+  assert.match(response.text, /kill_switch: on/);
+  assert.match(response.text, /reason: operator_stop/);
+  assert.match(response.text, /2026-04-20 16:08:09 KST/);
+});
+
+test("invalid control arguments preserve usage responses without state reads or transitions", async () => {
+  const state = createControlState({});
+  const fixture = createControlRouterFixture(state, {});
+
+  assert.equal(
+    (await fixture.router.route("/resume now")).text,
+    "Usage: /resume\nResume execution when the kill switch is clear.",
+  );
+  assert.deepEqual(fixture.calls, {
+    getState: 0,
+    pause: 0,
+    resume: 0,
+    activateKillSwitch: 0,
+  });
 });
 
 test("telegram router exposes strategy run trigger without manual portfolio input", async () => {
