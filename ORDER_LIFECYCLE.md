@@ -180,6 +180,7 @@ Scheduler runtime status and scheduler run history are likewise operational audi
 Scheduler startup, scheduled account refresh, and per-run preflight state is also operational control state, not order lifecycle truth. It may block timers or scheduled ticks because health evidence is missing or stale, be shown in `/status` or `/readiness`, and persist scheduler operator notifications, but it must not create, cancel, retry, or reconcile an order by itself.
 Manual live `/run` preflight state is likewise operational control state, not order lifecycle truth; if it blocks, no strategy decision or order lifecycle record is created.
 Inbound Telegram update offsets are durable transport progress state, not order lifecycle truth.
+Typed Telegram callback acknowledgements and future read-only message edits are transport and presentation behavior only. They must not create an order intent or lifecycle transition, and the callback parser cannot represent execution or operator-state mutation commands.
 The `/inbound` command may inspect that transport progress, but it must not become an order-lifecycle transition.
 The `smoke:telegram:inbound` script may route at most one fetched operator update through the command router, but it remains transport validation and must not become an order-lifecycle transition by itself.
 The `smoke:dryrun:readiness` script reads local runtime configuration and persisted readiness evidence only; it must not run `/sync`, run strategies, start background workers, deliver notifications, call Upbit, or create order-lifecycle records.

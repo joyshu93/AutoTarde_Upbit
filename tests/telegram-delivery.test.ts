@@ -5,11 +5,12 @@ import { InMemoryExecutionRepository } from "../src/modules/db/repositories/in-m
 import {
   OperatorNotificationDeliveryService,
   TelegramBotApiClient,
+  type TelegramMessageEditClient,
 } from "../src/modules/telegram/delivery.js";
 import { DurableTelegramReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
 
-test("telegram bot api client posts sendMessage payloads", async () => {
+test("telegram bot api client sends typed HTML messages and returns Telegram message ids", async () => {
   const requests: Array<{
     input: RequestInfo | URL;
     init: RequestInit | undefined;
@@ -27,9 +28,31 @@ test("telegram bot api client posts sendMessage payloads", async () => {
     },
   });
 
-  await client.sendMessage({
+  const typedClient = client as unknown as {
+    sendMessage(input: {
+      chatId: string;
+      text: string;
+      parseMode?: "HTML";
+      replyMarkup?: {
+        inlineKeyboard: readonly (readonly {
+          text: string;
+          callbackData: string;
+        }[])[];
+      };
+    }): Promise<{ messageId: number }>;
+  };
+  const result = await typedClient.sendMessage({
     chatId: "chat-1",
-    text: "hello operator",
+    text: "<b>hello operator</b>",
+    parseMode: "HTML",
+    replyMarkup: {
+      inlineKeyboard: [[
+        {
+          text: "Status",
+          callbackData: "status",
+        },
+      ]],
+    },
   });
 
   assert.equal(requests.length, 1);
@@ -37,8 +60,197 @@ test("telegram bot api client posts sendMessage payloads", async () => {
   assert.equal(requests[0]?.init?.method, "POST");
   const body = JSON.parse(String(requests[0]?.init?.body ?? "{}")) as Record<string, unknown>;
   assert.equal(body.chat_id, "chat-1");
-  assert.equal(body.text, "hello operator");
+  assert.equal(body.text, "<b>hello operator</b>");
+  assert.equal(body.parse_mode, "HTML");
+  assert.deepEqual(body.reply_markup, {
+    inline_keyboard: [[
+      {
+        text: "Status",
+        callback_data: "status",
+      },
+    ]],
+  });
+  assert.deepEqual(result, { messageId: 1 });
 });
+
+test("telegram bot api client edits messages with typed markup and disabled previews", async () => {
+  const requests: Array<{
+    input: RequestInfo | URL;
+    init: RequestInit | undefined;
+  }> = [];
+  const client = new TelegramBotApiClient({
+    botToken: "token-1",
+    fetchImpl: async (input, init) => {
+      requests.push({ input, init });
+      return new Response(JSON.stringify({ ok: true, result: true }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+        },
+      });
+    },
+  });
+
+  const editClient: TelegramMessageEditClient = client;
+  await editClient.editMessageText({
+    chatId: "chat-1",
+    messageId: 42,
+    text: "<b>Status</b>",
+    parseMode: "HTML",
+    replyMarkup: {
+      inlineKeyboard: [[
+        {
+          text: "Refresh",
+          callbackData: "status:refresh",
+        },
+      ]],
+    },
+  });
+
+  assert.equal(String(requests[0]?.input), "https://api.telegram.org/bottoken-1/editMessageText");
+  const body = JSON.parse(String(requests[0]?.init?.body ?? "{}")) as Record<string, unknown>;
+  assert.deepEqual(body, {
+    chat_id: "chat-1",
+    message_id: 42,
+    text: "<b>Status</b>",
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [[
+        {
+          text: "Refresh",
+          callback_data: "status:refresh",
+        },
+      ]],
+    },
+    disable_web_page_preview: true,
+  });
+});
+
+test("telegram bot api client acknowledges callbacks without navigation side effects", async () => {
+  const requests: Array<{
+    input: RequestInfo | URL;
+    init: RequestInit | undefined;
+  }> = [];
+  const client = new TelegramBotApiClient({
+    botToken: "token-1",
+    fetchImpl: async (input, init) => {
+      requests.push({ input, init });
+      return new Response(JSON.stringify({ ok: true, result: true }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+        },
+      });
+    },
+  });
+
+  const typedClient = client as unknown as {
+    answerCallbackQuery(input: {
+      callbackQueryId: string;
+      text?: string;
+    }): Promise<void>;
+  };
+  await typedClient.answerCallbackQuery({
+    callbackQueryId: "callback-1",
+    text: "요청을 처리할 수 없습니다.",
+  });
+
+  assert.equal(String(requests[0]?.input), "https://api.telegram.org/bottoken-1/answerCallbackQuery");
+  const body = JSON.parse(String(requests[0]?.init?.body ?? "{}")) as Record<string, unknown>;
+  assert.deepEqual(body, {
+    callback_query_id: "callback-1",
+    text: "요청을 처리할 수 없습니다.",
+  });
+});
+
+test("telegram bot api client rejects non-OK and preserves HTTP 200 Telegram rejection metadata", async () => {
+  const nonOkClient = new TelegramBotApiClient({
+    botToken: "token-1",
+    fetchImpl: async () =>
+      new Response(JSON.stringify({ ok: false, description: "Bad Request: invalid message" }), {
+        status: 400,
+        headers: {
+          "content-type": "application/json",
+        },
+      }),
+  }) as unknown as {
+    editMessageText(input: {
+      chatId: string;
+      messageId: number;
+      text: string;
+    }): Promise<void>;
+  };
+  const rejectedClient = new TelegramBotApiClient({
+    botToken: "token-1",
+    fetchImpl: async () =>
+      new Response(JSON.stringify({
+        ok: false,
+        description: "Too Many Requests: retry later",
+        parameters: {
+          retry_after: 3,
+        },
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+        },
+      }),
+  }) as unknown as {
+    answerCallbackQuery(input: {
+      callbackQueryId: string;
+    }): Promise<void>;
+  };
+
+  await assert.rejects(
+    nonOkClient.editMessageText({
+      chatId: "chat-1",
+      messageId: 1,
+      text: "status",
+    }),
+    /Bad Request: invalid message/,
+  );
+  await assert.rejects(
+    rejectedClient.answerCallbackQuery({
+      callbackQueryId: "callback-1",
+    }),
+    isRetryableTelegramApiError,
+  );
+});
+
+test("telegram bot api client rejects malformed JSON success responses across all transport methods", async () => {
+  const client = createTelegramClientWithResponse("not-json");
+
+  await assertTelegramMethodsRejectInvalidSuccessEnvelope(client);
+});
+
+test("telegram bot api client rejects success responses missing ok across all transport methods", async () => {
+  const client = createTelegramClientWithResponse(JSON.stringify({
+    result: {
+      message_id: 1,
+    },
+  }));
+
+  await assertTelegramMethodsRejectInvalidSuccessEnvelope(client);
+});
+
+for (const invalidMessageId of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+  test(`telegram bot api client rejects invalid sendMessage message_id ${invalidMessageId}`, async () => {
+    const client = createTelegramClientWithResponse(JSON.stringify({
+      ok: true,
+      result: {
+        message_id: invalidMessageId,
+      },
+    }));
+
+    await assert.rejects(
+      client.sendMessage({
+        chatId: "chat-1",
+        text: "status",
+      }),
+      /telegram_send_message_invalid_response/,
+    );
+  });
+}
 
 test("delivery service marks pending notifications as sent after successful Telegram delivery in oldest-first order", async () => {
   const repositories = new InMemoryExecutionRepository();
@@ -578,6 +790,59 @@ test("durable reporter queues notifications and kicks the delivery service witho
   assert.equal(notifications[0]?.failureClass, null);
   assert.equal(notifications[0]?.deliveredAt, null);
 });
+
+function createTelegramClientWithResponse(rawBody: string): TelegramBotApiClient {
+  return new TelegramBotApiClient({
+    botToken: "token-1",
+    fetchImpl: async () => new Response(rawBody, {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+      },
+    }),
+  });
+}
+
+async function assertTelegramMethodsRejectInvalidSuccessEnvelope(
+  client: TelegramBotApiClient,
+): Promise<void> {
+  for (const request of [
+    () => client.sendMessage({
+      chatId: "chat-1",
+      text: "status",
+    }),
+    () => client.editMessageText({
+      chatId: "chat-1",
+      messageId: 1,
+      text: "status",
+    }),
+    () => client.answerCallbackQuery({
+      callbackQueryId: "callback-1",
+    }),
+  ]) {
+    await assert.rejects(request(), isPermanentEnvelopeError);
+  }
+}
+
+function isPermanentEnvelopeError(error: unknown): boolean {
+  return Boolean(
+    error instanceof Error &&
+      error.message === "telegram_api_invalid_success_envelope" &&
+      "failureClass" in error &&
+      error.failureClass === "PERMANENT",
+  );
+}
+
+function isRetryableTelegramApiError(error: unknown): boolean {
+  return Boolean(
+    error instanceof Error &&
+      error.message === "Too Many Requests: retry later" &&
+      "failureClass" in error &&
+      error.failureClass === "RETRYABLE" &&
+      "retryAfterMs" in error &&
+      error.retryAfterMs === 3_000,
+  );
+}
 
 function createNotification(
   overrides: Partial<OperatorNotificationRecord> & Pick<OperatorNotificationRecord, "id" | "createdAt">,

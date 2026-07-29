@@ -1,7 +1,22 @@
 import type { TelegramCommandRouter } from "./commands.js";
-import type { TelegramMessageClient } from "./delivery.js";
+import type { TelegramCallbackClient, TelegramMessageClient } from "./delivery.js";
 import type { TelegramInboundOffsetStore } from "../db/interfaces.js";
 import { createId } from "../../shared/ids.js";
+import {
+  isAuthorizedTelegramCallbackQuery,
+  parseTelegramReadOnlyCallbackAction,
+} from "./callbacks.js";
+import type {
+  TelegramCallbackQueryInput,
+  TelegramInboundMessage,
+  TelegramInboundUpdate,
+} from "./interfaces.js";
+
+export type {
+  TelegramCallbackQueryInput,
+  TelegramInboundMessage,
+  TelegramInboundUpdate,
+} from "./interfaces.js";
 
 const DEFAULT_TELEGRAM_API_BASE_URL = "https://api.telegram.org";
 const DEFAULT_TELEGRAM_INBOUND_TIMEOUT_MS = 30_000;
@@ -10,17 +25,6 @@ const DEFAULT_TELEGRAM_INBOUND_LONG_POLL_TIMEOUT_SECONDS = 25;
 const DEFAULT_TELEGRAM_INBOUND_LIMIT = 20;
 const MAX_INBOUND_REPLY_TEXT_LENGTH = 3_500;
 const MAX_INBOUND_ERROR_LENGTH = 240;
-
-export interface TelegramInboundUpdate {
-  readonly updateId: number;
-  readonly message: TelegramInboundMessage | null;
-}
-
-export interface TelegramInboundMessage {
-  readonly messageId: number;
-  readonly chatId: string;
-  readonly text: string | null;
-}
 
 export interface TelegramUpdateClient {
   getUpdates(input: {
@@ -88,7 +92,7 @@ export class TelegramBotUpdateClient implements TelegramUpdateClient {
         ...(input.offset === null ? {} : { offset: input.offset }),
         timeout: input.timeoutSeconds,
         limit: input.limit,
-        allowed_updates: ["message"],
+        allowed_updates: ["message", "callback_query"],
       }),
       signal: AbortSignal.timeout(this.dependencies.timeoutMs ?? DEFAULT_TELEGRAM_INBOUND_TIMEOUT_MS),
     });
@@ -126,6 +130,7 @@ export class TelegramInboundPollingService {
       enabled: boolean;
       updateClient: TelegramUpdateClient | null;
       messageClient: TelegramMessageClient | null;
+      callbackClient?: TelegramCallbackClient | null;
       router: Pick<TelegramCommandRouter, "route">;
       operatorChatId: string | null;
       exchangeAccountId?: string;
@@ -220,6 +225,21 @@ export class TelegramInboundPollingService {
       for (const update of updates) {
         await this.advanceOffset(update.updateId);
 
+        if (update.callbackQuery) {
+          try {
+            const accepted = await this.handleCallbackQuery(update.callbackQuery);
+            if (accepted) {
+              processed += 1;
+            } else {
+              ignored += 1;
+            }
+          } catch (error) {
+            failed += 1;
+            this.lastError = sanitizeTelegramInboundError(error);
+          }
+          continue;
+        }
+
         if (!this.isOperatorMessage(update)) {
           ignored += 1;
           continue;
@@ -294,6 +314,45 @@ export class TelegramInboundPollingService {
 
   private isOperatorMessage(update: TelegramInboundUpdate): boolean {
     return update.message?.chatId === this.dependencies.operatorChatId;
+  }
+
+  private async handleCallbackQuery(callbackQuery: TelegramCallbackQueryInput): Promise<boolean> {
+    const authorized = isAuthorizedTelegramCallbackQuery(
+      callbackQuery,
+      this.dependencies.operatorChatId,
+    );
+    const action =
+      authorized && callbackQuery.data !== null
+        ? parseTelegramReadOnlyCallbackAction(callbackQuery.data)
+        : null;
+    const acknowledgementText = action === null ? "요청을 처리할 수 없습니다." : undefined;
+
+    const callbackClient = this.callbackClient();
+    if (callbackClient) {
+      await callbackClient.answerCallbackQuery({
+        callbackQueryId: callbackQuery.callbackId,
+        ...(acknowledgementText === undefined ? {} : { text: acknowledgementText }),
+      });
+    }
+
+    return action !== null;
+  }
+
+  private callbackClient(): TelegramCallbackClient | null {
+    if (this.dependencies.callbackClient) {
+      return this.dependencies.callbackClient;
+    }
+
+    const messageClient = this.dependencies.messageClient;
+    if (
+      messageClient &&
+      "answerCallbackQuery" in messageClient &&
+      typeof messageClient.answerCallbackQuery === "function"
+    ) {
+      return messageClient as TelegramCallbackClient;
+    }
+
+    return null;
   }
 
   private async loadDurableOffsetIfNeeded(): Promise<void> {
@@ -408,9 +467,13 @@ function normalizeTelegramUpdate(raw: unknown): TelegramInboundUpdate | null {
   }
 
   const message = "message" in raw ? normalizeTelegramMessage(raw.message) : null;
+  const callbackQuery = "callback_query" in raw
+    ? normalizeTelegramCallbackQuery(raw.callback_query)
+    : null;
   return {
     updateId: raw.update_id,
     message,
+    callbackQuery,
   };
 }
 
@@ -434,6 +497,32 @@ function normalizeTelegramMessage(raw: unknown): TelegramInboundMessage | null {
     messageId,
     chatId,
     text: "text" in raw && typeof raw.text === "string" ? raw.text : null,
+  };
+}
+
+function normalizeTelegramCallbackQuery(raw: unknown): TelegramCallbackQueryInput | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+
+  const callbackId = "id" in raw && typeof raw.id === "string" ? raw.id : null;
+  const senderRaw = "from" in raw && raw.from && typeof raw.from === "object" ? raw.from : null;
+  const senderId =
+    senderRaw && "id" in senderRaw && (typeof senderRaw.id === "number" || typeof senderRaw.id === "string")
+      ? String(senderRaw.id)
+      : null;
+  const message = "message" in raw ? normalizeTelegramMessage(raw.message) : null;
+
+  if (!callbackId || !senderId || !message) {
+    return null;
+  }
+
+  return {
+    callbackId,
+    senderId,
+    chatId: message.chatId,
+    messageId: message.messageId,
+    data: "data" in raw && typeof raw.data === "string" ? raw.data : null,
   };
 }
 

@@ -6,6 +6,12 @@ import type {
 } from "../../domain/types.js";
 import { createId } from "../../shared/ids.js";
 import type { ExecutionRepository } from "../db/interfaces.js";
+import type {
+  TelegramEditMessageTextInput,
+  TelegramInlineKeyboardMarkup,
+  TelegramMessageSendResult,
+  TelegramSendMessageInput,
+} from "./interfaces.js";
 
 const DEFAULT_TELEGRAM_API_BASE_URL = "https://api.telegram.org";
 const DEFAULT_TELEGRAM_DELIVERY_TIMEOUT_MS = 5_000;
@@ -18,9 +24,17 @@ const MAX_DELIVERY_TEXT_LENGTH = 3_500;
 const MAX_DELIVERY_ERROR_LENGTH = 240;
 
 export interface TelegramMessageClient {
-  sendMessage(input: {
-    chatId: string;
-    text: string;
+  sendMessage(input: TelegramSendMessageInput): Promise<TelegramMessageSendResult | void>;
+}
+
+export interface TelegramMessageEditClient {
+  editMessageText(input: TelegramEditMessageTextInput): Promise<void>;
+}
+
+export interface TelegramCallbackClient {
+  answerCallbackQuery(input: {
+    callbackQueryId: string;
+    text?: string;
   }): Promise<void>;
 }
 
@@ -50,7 +64,7 @@ class TelegramDeliveryError extends Error {
   }
 }
 
-export class TelegramBotApiClient implements TelegramMessageClient {
+export class TelegramBotApiClient implements TelegramMessageClient, TelegramMessageEditClient, TelegramCallbackClient {
   constructor(
     private readonly dependencies: {
       botToken: string;
@@ -60,10 +74,50 @@ export class TelegramBotApiClient implements TelegramMessageClient {
     },
   ) {}
 
-  async sendMessage(input: {
-    chatId: string;
-    text: string;
+  async sendMessage(input: TelegramSendMessageInput): Promise<TelegramMessageSendResult> {
+    const parsed = await this.postTelegramApi(
+      "sendMessage",
+      buildTelegramMessagePayload(input),
+    );
+    const result = parsed?.result;
+    if (
+      !result ||
+      typeof result !== "object" ||
+      !("message_id" in result) ||
+      typeof result.message_id !== "number" ||
+      !Number.isSafeInteger(result.message_id) ||
+      result.message_id <= 0
+    ) {
+      throw new TelegramDeliveryError("telegram_send_message_invalid_response", "PERMANENT");
+    }
+
+    return {
+      messageId: result.message_id,
+    };
+  }
+
+  async editMessageText(input: TelegramEditMessageTextInput): Promise<void> {
+    await this.postTelegramApi("editMessageText", {
+      chat_id: input.chatId,
+      message_id: input.messageId,
+      ...buildTelegramMessagePayload(input),
+    });
+  }
+
+  async answerCallbackQuery(input: {
+    callbackQueryId: string;
+    text?: string;
   }): Promise<void> {
+    await this.postTelegramApi("answerCallbackQuery", {
+      callback_query_id: input.callbackQueryId,
+      ...(input.text === undefined ? {} : { text: input.text }),
+    });
+  }
+
+  private async postTelegramApi(
+    method: "sendMessage" | "editMessageText" | "answerCallbackQuery",
+    body: Record<string, unknown>,
+  ): Promise<{ ok: true; result?: unknown }> {
     const fetchImpl = this.dependencies.fetchImpl ?? globalThis.fetch;
     if (!fetchImpl) {
       throw new TelegramDeliveryError("telegram_fetch_unavailable", "RETRYABLE");
@@ -71,16 +125,12 @@ export class TelegramBotApiClient implements TelegramMessageClient {
 
     let response: Response;
     try {
-      response = await fetchImpl(buildTelegramSendMessageUrl(this.dependencies), {
+      response = await fetchImpl(buildTelegramMethodUrl(this.dependencies, method), {
         method: "POST",
         headers: {
           "content-type": "application/json",
         },
-        body: JSON.stringify({
-          chat_id: input.chatId,
-          text: input.text,
-          disable_web_page_preview: true,
-        }),
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(
           this.dependencies.timeoutMs ?? DEFAULT_TELEGRAM_DELIVERY_TIMEOUT_MS,
         ),
@@ -95,9 +145,18 @@ export class TelegramBotApiClient implements TelegramMessageClient {
       throw buildTelegramHttpError(response.status, parsed);
     }
 
-    if (parsed && parsed.ok === false) {
+    if (parsed?.ok === false) {
       throw buildTelegramApiRejectionError(parsed);
     }
+
+    if (!parsed || parsed.ok !== true) {
+      throw buildTelegramInvalidSuccessEnvelopeError();
+    }
+
+    return {
+      ok: true,
+      ...(parsed.result === undefined ? {} : { result: parsed.result }),
+    };
   }
 }
 
@@ -654,22 +713,55 @@ export function formatOperatorNotificationDeliveryText(
   );
 }
 
-function buildTelegramSendMessageUrl(dependencies: {
+function buildTelegramMethodUrl(dependencies: {
   botToken: string;
   apiBaseUrl?: string;
-}): string {
+}, method: "sendMessage" | "editMessageText" | "answerCallbackQuery"): string {
   const apiBaseUrl = dependencies.apiBaseUrl?.trim() || DEFAULT_TELEGRAM_API_BASE_URL;
-  return `${apiBaseUrl}/bot${dependencies.botToken}/sendMessage`;
+  return `${apiBaseUrl}/bot${dependencies.botToken}/${method}`;
+}
+
+function buildTelegramMessagePayload(
+  input: TelegramSendMessageInput,
+): Record<string, unknown> {
+  return {
+    chat_id: input.chatId,
+    text: input.text,
+    ...(input.parseMode === undefined ? {} : { parse_mode: input.parseMode }),
+    ...(input.replyMarkup === undefined
+      ? {}
+      : { reply_markup: serializeTelegramInlineKeyboardMarkup(input.replyMarkup) }),
+    disable_web_page_preview: true,
+  };
+}
+
+function serializeTelegramInlineKeyboardMarkup(
+  replyMarkup: TelegramInlineKeyboardMarkup,
+): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } {
+  return {
+    inline_keyboard: replyMarkup.inlineKeyboard.map((row) =>
+      row.map((button) => ({
+        text: button.text,
+        callback_data: button.callbackData,
+      })),
+    ),
+  };
 }
 
 function tryParseTelegramApiResponse(
   rawBody: string,
-): { ok?: boolean; description?: string; parameters?: { retry_after?: number } } | null {
+): {
+  ok?: boolean;
+  description?: string;
+  parameters?: { retry_after?: number };
+  result?: unknown;
+} | null {
   try {
     return JSON.parse(rawBody) as {
       ok?: boolean;
       description?: string;
       parameters?: { retry_after?: number };
+      result?: unknown;
     };
   } catch {
     return null;
@@ -692,6 +784,10 @@ function buildTelegramHttpError(
   }
 
   return new TelegramDeliveryError(description, "PERMANENT");
+}
+
+function buildTelegramInvalidSuccessEnvelopeError(): TelegramDeliveryError {
+  return new TelegramDeliveryError("telegram_api_invalid_success_envelope", "PERMANENT");
 }
 
 function buildTelegramApiRejectionError(

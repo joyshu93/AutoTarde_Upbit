@@ -20,6 +20,52 @@ export interface TelegramResponse {
   text: string;
 }
 
+export type TelegramParseMode = "HTML";
+
+export interface TelegramInlineKeyboardButton {
+  readonly text: string;
+  readonly callbackData: string;
+}
+
+export interface TelegramInlineKeyboardMarkup {
+  readonly inlineKeyboard: readonly (readonly TelegramInlineKeyboardButton[])[];
+}
+
+export interface TelegramSendMessageInput {
+  readonly chatId: string;
+  readonly text: string;
+  readonly parseMode?: TelegramParseMode;
+  readonly replyMarkup?: TelegramInlineKeyboardMarkup;
+}
+
+export interface TelegramEditMessageTextInput extends TelegramSendMessageInput {
+  readonly messageId: number;
+}
+
+export interface TelegramMessageSendResult {
+  readonly messageId: number;
+}
+
+export interface TelegramCallbackQueryInput {
+  readonly callbackId: string;
+  readonly senderId: string;
+  readonly chatId: string;
+  readonly messageId: number;
+  readonly data: string | null;
+}
+
+export interface TelegramInboundMessage {
+  readonly messageId: number;
+  readonly chatId: string;
+  readonly text: string | null;
+}
+
+export interface TelegramInboundUpdate {
+  readonly updateId: number;
+  readonly message: TelegramInboundMessage | null;
+  readonly callbackQuery: TelegramCallbackQueryInput | null;
+}
+
 export type SupportedTelegramCommand = OperatorCommand["command"];
 export type TelegramCommandCategory = "inspection" | "control";
 export type TelegramCommandArgumentPolicy =

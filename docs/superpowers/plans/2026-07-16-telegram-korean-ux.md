@@ -77,12 +77,12 @@
 
 **Produces:** typed inline keyboards, `editMessageText`, `answerCallbackQuery`, callback update normalization, and a closed read-only callback action parser.
 
-- [ ] Write failing transport tests for `parse_mode`, `reply_markup`, returned `message_id`, `editMessageText`, and `answerCallbackQuery`.
-- [ ] Write failing inbound tests for `allowed_updates=[message,callback_query]`, callback normalization, private operator authorization, malformed callback acknowledgement, and message editing.
-- [ ] Run the focused tests and verify expected failures.
-- [ ] Implement typed transport primitives and callback polling without changing notification retry semantics.
-- [ ] Implement callback-data parsing that cannot represent mutation commands.
-- [ ] Run focused and full tests.
+- [x] Write failing transport tests for `parse_mode`, `reply_markup`, returned `message_id`, `editMessageText`, and `answerCallbackQuery`.
+- [x] Write failing inbound tests for `allowed_updates=[message,callback_query]`, callback normalization, private operator authorization, malformed callback acknowledgement, and message editing.
+- [x] Run the focused tests and verify expected failures.
+- [x] Implement typed transport primitives and callback polling without changing notification retry semantics.
+- [x] Implement callback-data parsing that cannot represent mutation commands.
+- [x] Run focused and full tests.
 
 ### Task 4: Read-Only Dashboard, Refresh, And Pagination
 
@@ -136,4 +136,3 @@
 - [ ] Confirm `DRY_RUN` defaults and live-order gates are unchanged.
 - [ ] Run `npm.cmd run check` fresh and record the result.
 - [ ] Run `git diff --check` and record the result.
-
