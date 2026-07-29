@@ -38,6 +38,22 @@ export interface TelegramCallbackClient {
   }): Promise<void>;
 }
 
+export interface TelegramSetMyCommandsInput {
+  readonly commands: readonly {
+    readonly command: string;
+    readonly description: string;
+  }[];
+  readonly scope: {
+    readonly type: "chat";
+    readonly chatId: string;
+  };
+  readonly languageCode?: "en";
+}
+
+export interface TelegramCommandMenuClient {
+  setMyCommands(input: TelegramSetMyCommandsInput): Promise<void>;
+}
+
 export interface OperatorNotificationDeliverySummary {
   attempted: number;
   sent: number;
@@ -64,7 +80,7 @@ class TelegramDeliveryError extends Error {
   }
 }
 
-export class TelegramBotApiClient implements TelegramMessageClient, TelegramMessageEditClient, TelegramCallbackClient {
+export class TelegramBotApiClient implements TelegramMessageClient, TelegramMessageEditClient, TelegramCallbackClient, TelegramCommandMenuClient {
   constructor(
     private readonly dependencies: {
       botToken: string;
@@ -114,8 +130,22 @@ export class TelegramBotApiClient implements TelegramMessageClient, TelegramMess
     });
   }
 
+  async setMyCommands(input: TelegramSetMyCommandsInput): Promise<void> {
+    await this.postTelegramApi("setMyCommands", {
+      commands: input.commands.map((command) => ({
+        command: command.command,
+        description: command.description,
+      })),
+      scope: {
+        type: input.scope.type,
+        chat_id: input.scope.chatId,
+      },
+      ...(input.languageCode === undefined ? {} : { language_code: input.languageCode }),
+    });
+  }
+
   private async postTelegramApi(
-    method: "sendMessage" | "editMessageText" | "answerCallbackQuery",
+    method: "sendMessage" | "editMessageText" | "answerCallbackQuery" | "setMyCommands",
     body: Record<string, unknown>,
   ): Promise<{ ok: true; result?: unknown }> {
     const fetchImpl = this.dependencies.fetchImpl ?? globalThis.fetch;
@@ -716,7 +746,7 @@ export function formatOperatorNotificationDeliveryText(
 function buildTelegramMethodUrl(dependencies: {
   botToken: string;
   apiBaseUrl?: string;
-}, method: "sendMessage" | "editMessageText" | "answerCallbackQuery"): string {
+}, method: "sendMessage" | "editMessageText" | "answerCallbackQuery" | "setMyCommands"): string {
   const apiBaseUrl = dependencies.apiBaseUrl?.trim() || DEFAULT_TELEGRAM_API_BASE_URL;
   return `${apiBaseUrl}/bot${dependencies.botToken}/${method}`;
 }

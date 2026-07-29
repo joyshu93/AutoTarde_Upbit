@@ -120,11 +120,11 @@
 
 **Produces:** idempotent Korean/English `setMyCommands` registration and documented operator UX boundaries.
 
-- [ ] Write failing tests for Korean default command descriptions, English language-specific descriptions, setup failure isolation, and secret-free status reporting.
-- [ ] Run focused tests and verify expected failures.
-- [ ] Implement non-trading Telegram interface setup that never blocks runtime trading safety startup when Telegram rejects profile configuration.
-- [ ] Update docs with `TELEGRAM_LOCALE`, summary/detail usage, dashboard buttons, callback authorization, and unchanged mutation-command safety boundaries.
-- [ ] Run `npm.cmd run check` and inspect `git diff --check`.
+- [x] Write failing tests for Korean default command descriptions, English language-specific descriptions, setup failure isolation, and secret-free status reporting.
+- [x] Run focused tests and verify expected failures.
+- [x] Implement non-trading Telegram interface setup that never blocks runtime trading safety startup when Telegram rejects profile configuration.
+- [x] Update docs with `TELEGRAM_LOCALE`, summary/detail usage, dashboard buttons, callback authorization, and unchanged mutation-command safety boundaries.
+- [x] Run `npm.cmd run check` and inspect `git diff --check`.
 
 ### Task 6: Final Safety Review
 

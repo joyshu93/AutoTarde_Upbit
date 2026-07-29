@@ -7,6 +7,7 @@ import {
   TelegramBotApiClient,
   type TelegramMessageEditClient,
 } from "../src/modules/telegram/delivery.js";
+import { TelegramCommandMenuSetupService } from "../src/modules/telegram/setup.js";
 import { DurableTelegramReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
 
@@ -161,6 +162,143 @@ test("telegram bot api client acknowledges callbacks without navigation side eff
     callback_query_id: "callback-1",
     text: "요청을 처리할 수 없습니다.",
   });
+});
+
+test("telegram command-menu setup registers Korean fallback and English operator-chat menus", async () => {
+  const requests: Array<{ input: RequestInfo | URL; init: RequestInit | undefined }> = [];
+  const setupService = new TelegramCommandMenuSetupService({
+    client: new TelegramBotApiClient({
+      botToken: "token-1",
+      fetchImpl: async (input, init) => {
+        requests.push({ input, init });
+        return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
+      },
+    }),
+    operatorChatId: "operator-chat-1",
+  });
+
+  const result = await setupService.setup();
+
+  assert.deepEqual(result, {
+    configured: true,
+    attempted: true,
+    status: "COMPLETED",
+    failureCode: null,
+    korean: "COMPLETED",
+    english: "COMPLETED",
+  });
+  assert.equal(requests.length, 2);
+  assert.equal(String(requests[0]?.input), "https://api.telegram.org/bottoken-1/setMyCommands");
+  assert.equal(requests[0]?.init?.method, "POST");
+  assert.deepEqual(JSON.parse(String(requests[0]?.init?.body)), {
+    commands: expectedKoreanCommandMenu(),
+    scope: { type: "chat", chat_id: "operator-chat-1" },
+  });
+  assert.deepEqual(JSON.parse(String(requests[1]?.init?.body)), {
+    commands: expectedEnglishCommandMenu(),
+    scope: { type: "chat", chat_id: "operator-chat-1" },
+    language_code: "en",
+  });
+});
+
+test("telegram command-menu setup repeats the same replacement requests without other side effects", async () => {
+  const requests: Array<Record<string, unknown>> = [];
+  const setupService = new TelegramCommandMenuSetupService({
+    client: {
+      async setMyCommands(input) {
+        requests.push(JSON.parse(JSON.stringify(input)) as Record<string, unknown>);
+      },
+    },
+    operatorChatId: "operator-chat-1",
+  });
+
+  const first = await setupService.setup();
+  const second = await setupService.setup();
+
+  assert.deepEqual(first, second);
+  assert.equal(requests.length, 4);
+  assert.deepEqual(requests[0], requests[2]);
+  assert.deepEqual(requests[1], requests[3]);
+});
+
+test("telegram command-menu setup skips without configuration and never calls the transport", async () => {
+  let calls = 0;
+  const setupService = new TelegramCommandMenuSetupService({
+    client: {
+      async setMyCommands() {
+        calls += 1;
+      },
+    },
+    operatorChatId: null,
+  });
+
+  const result = await setupService.setup();
+
+  assert.deepEqual(result, {
+    configured: false,
+    attempted: false,
+    status: "SKIPPED",
+    failureCode: "telegram_command_menu_not_configured",
+    korean: "NOT_ATTEMPTED",
+    english: "NOT_ATTEMPTED",
+  });
+  assert.equal(calls, 0);
+});
+
+test("telegram command-menu setup captures first and second registration failures without leaking secrets", async () => {
+  const token = "token-that-must-not-leak";
+  const tokenBearingUrl = `https://api.telegram.org/bot${token}/setMyCommands`;
+  const firstFailure = new TelegramCommandMenuSetupService({
+    client: new TelegramBotApiClient({
+      botToken: token,
+      fetchImpl: async () => {
+        throw new Error(`transport secret ${token}`);
+      },
+    }),
+    operatorChatId: "operator-chat-1",
+  });
+  let secondRequest = 0;
+  const secondFailure = new TelegramCommandMenuSetupService({
+    client: new TelegramBotApiClient({
+      botToken: token,
+      fetchImpl: async () => {
+        secondRequest += 1;
+        return new Response(
+          secondRequest === 1
+            ? JSON.stringify({ ok: true, result: true })
+            : "malformed-response",
+          { status: 200 },
+        );
+      },
+    }),
+    operatorChatId: "operator-chat-1",
+  });
+
+  const firstResult = await firstFailure.setup();
+  const secondResult = await secondFailure.setup();
+
+  assert.deepEqual(firstResult, {
+    configured: true,
+    attempted: true,
+    status: "FAILED",
+    failureCode: "telegram_command_menu_korean_failed",
+    korean: "FAILED",
+    english: "NOT_ATTEMPTED",
+  });
+  assert.deepEqual(secondResult, {
+    configured: true,
+    attempted: true,
+    status: "FAILED",
+    failureCode: "telegram_command_menu_english_failed",
+    korean: "COMPLETED",
+    english: "FAILED",
+  });
+  for (const result of [firstResult, secondResult]) {
+    const serialized = JSON.stringify(result);
+    assert.equal(serialized.includes(token), false);
+    assert.equal(serialized.includes(tokenBearingUrl), false);
+    assert.equal(serialized.includes("transport secret"), false);
+  }
 });
 
 test("telegram bot api client rejects non-OK and preserves HTTP 200 Telegram rejection metadata", async () => {
@@ -842,6 +980,58 @@ function isRetryableTelegramApiError(error: unknown): boolean {
       "retryAfterMs" in error &&
       error.retryAfterMs === 3_000,
   );
+}
+
+function expectedKoreanCommandMenu(): Array<{ command: string; description: string }> {
+  return [
+    { command: "help", description: "지원 명령과 안전 경계를 확인합니다" },
+    { command: "config", description: "실행 설정과 안전 게이트를 확인합니다" },
+    { command: "readiness", description: "운영 준비 상태를 확인합니다" },
+    { command: "status", description: "실행 상태를 확인합니다" },
+    { command: "statehistory", description: "실행 상태 변경 이력을 확인합니다" },
+    { command: "synchistory", description: "동기화 이력을 확인합니다" },
+    { command: "recovery", description: "주문 이력 복구 진행 상황을 확인합니다" },
+    { command: "alerts", description: "운영 알림과 전송 상태를 확인합니다" },
+    { command: "risks", description: "위험 이벤트 이력을 확인합니다" },
+    { command: "balances", description: "저장된 거래소 잔고를 확인합니다" },
+    { command: "positions", description: "저장된 BTC/ETH 보유 현황을 확인합니다" },
+    { command: "orders", description: "저장된 주문 목록을 확인합니다" },
+    { command: "order", description: "주문 상태와 체결을 확인합니다" },
+    { command: "scheduler", description: "자동 실행 상태와 이력을 확인합니다" },
+    { command: "inbound", description: "텔레그램 명령 수신 상태를 확인합니다" },
+    { command: "pause", description: "자동 실행과 주문 실행을 일시 중지합니다" },
+    { command: "resume", description: "킬 스위치가 해제되면 실행을 재개합니다" },
+    { command: "killswitch", description: "전역 킬 스위치를 켜고 실행을 중단합니다" },
+    { command: "sync", description: "거래소 상태와 로컬 기록 동기화를 요청합니다" },
+    { command: "preview", description: "주문 없이 BTC/ETH 전략 판단을 미리 확인합니다" },
+    { command: "run", description: "안전 실행 경로로 BTC/ETH 전략을 한 번 실행합니다" },
+  ];
+}
+
+function expectedEnglishCommandMenu(): Array<{ command: string; description: string }> {
+  return [
+    { command: "help", description: "Show supported commands and safety boundaries." },
+    { command: "config", description: "Show runtime configuration and safety gates." },
+    { command: "readiness", description: "Show operator readiness." },
+    { command: "status", description: "Show execution status." },
+    { command: "statehistory", description: "Show execution state history." },
+    { command: "synchistory", description: "Show reconciliation history." },
+    { command: "recovery", description: "Show order-history recovery progress." },
+    { command: "alerts", description: "Show operator alerts and delivery health." },
+    { command: "risks", description: "Show risk event history." },
+    { command: "balances", description: "Show stored exchange balances." },
+    { command: "positions", description: "Show stored BTC and ETH positions." },
+    { command: "orders", description: "Show stored orders." },
+    { command: "order", description: "Show an order lifecycle and fills." },
+    { command: "scheduler", description: "Show automatic-run status and history." },
+    { command: "inbound", description: "Show Telegram command intake status." },
+    { command: "pause", description: "Pause automated execution and orders." },
+    { command: "resume", description: "Resume execution when kill switch is clear." },
+    { command: "killswitch", description: "Activate the global kill switch." },
+    { command: "sync", description: "Request exchange and local-state reconciliation." },
+    { command: "preview", description: "Preview a BTC or ETH strategy decision." },
+    { command: "run", description: "Run one BTC or ETH strategy cycle safely." },
+  ];
 }
 
 function createNotification(

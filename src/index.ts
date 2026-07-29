@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url";
+
 import { createApp } from "./app/create-app.js";
 import {
   hasBackgroundRuntime,
@@ -7,6 +9,40 @@ import {
 import { buildStrategySchedulerStartupPreflight } from "./app/scheduler-preflight.js";
 import { applyStartupRecoveryPolicy, runStartupRecovery } from "./app/startup-recovery.js";
 import { detectExecutionStateSeedMismatches } from "./modules/db/interfaces.js";
+import type { TelegramCommandMenuSetupResult } from "./modules/telegram/setup.js";
+
+export interface TelegramRuntimeStartupResult {
+  readonly strategySchedulerStatus: { readonly started: boolean };
+  readonly strategySchedulerStartupBlockNotified: boolean;
+  readonly telegramInboundPollingStatus: { readonly running: boolean };
+  readonly telegramCommandMenuSetup: TelegramCommandMenuSetupResult;
+}
+
+export async function startTelegramRuntime(input: {
+  strategyScheduler: {
+    start(): { readonly started: boolean };
+    reportStartupBlockIfNeeded(): Promise<boolean>;
+  };
+  telegramInboundPolling: {
+    start(): { readonly running: boolean };
+  };
+  telegramCommandMenuSetup: {
+    setup(): Promise<TelegramCommandMenuSetupResult>;
+  };
+}): Promise<TelegramRuntimeStartupResult> {
+  const strategySchedulerStatus = input.strategyScheduler.start();
+  const strategySchedulerStartupBlockNotified =
+    await input.strategyScheduler.reportStartupBlockIfNeeded();
+  const telegramInboundPollingStatus = input.telegramInboundPolling.start();
+  const telegramCommandMenuSetup = await input.telegramCommandMenuSetup.setup();
+
+  return {
+    strategySchedulerStatus,
+    strategySchedulerStartupBlockNotified,
+    telegramInboundPollingStatus,
+    telegramCommandMenuSetup,
+  };
+}
 
 async function main(): Promise<void> {
   const app = createApp();
@@ -69,9 +105,13 @@ async function main(): Promise<void> {
     liveSendPath: app.liveSendPath,
   });
   app.strategyScheduler.setStartupPreflight(strategySchedulerStartupPreflight);
-  const strategySchedulerStatus = app.strategyScheduler.start();
-  const strategySchedulerStartupBlockNotified = await app.strategyScheduler.reportStartupBlockIfNeeded();
-  const telegramInboundPollingStatus = app.telegramInboundPolling.start();
+  const telegramRuntime = await startTelegramRuntime(app);
+  const {
+    strategySchedulerStatus,
+    strategySchedulerStartupBlockNotified,
+    telegramInboundPollingStatus,
+    telegramCommandMenuSetup,
+  } = telegramRuntime;
   const runtimeHasBackgroundWork = hasBackgroundRuntime({
     strategyScheduler: strategySchedulerStatus,
     telegramInboundPolling: telegramInboundPollingStatus,
@@ -120,6 +160,7 @@ async function main(): Promise<void> {
     telegramInboundPollingEnabled: app.config.telegramInboundPollingEnabled,
     telegramInboundPollingConfigured: app.telegramInboundPolling.isConfigured(),
     telegramInboundPolling: telegramInboundPollingStatus,
+    telegramCommandMenuSetup,
     strategySchedulerStartupPreflight,
     strategySchedulerStartupBlockNotified,
     strategyScheduler: strategySchedulerStatus,
@@ -133,7 +174,9 @@ async function main(): Promise<void> {
   }
 }
 
-void main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  void main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

@@ -27,6 +27,7 @@ import {
   OperatorNotificationDeliveryService,
   TelegramBotApiClient,
 } from "../modules/telegram/delivery.js";
+import { TelegramCommandMenuSetupService } from "../modules/telegram/setup.js";
 import {
   TelegramBotUpdateClient,
   TelegramInboundPollingService,
@@ -48,6 +49,7 @@ export interface AppServices {
   exchangeBackedReadEnabled: boolean;
   liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
   notificationDelivery: OperatorNotificationDeliveryService;
+  telegramCommandMenuSetup: TelegramCommandMenuSetupService;
   telegramInboundPolling: TelegramInboundPollingService;
   persistence: SqlitePersistenceBundle;
 }
@@ -109,6 +111,10 @@ export function createApp(
     baseBackoffMs: config.telegramDeliveryBaseBackoffMs,
     maxBackoffMs: config.telegramDeliveryMaxBackoffMs,
     leaseDurationMs: config.telegramDeliveryLeaseMs,
+  });
+  const telegramCommandMenuSetup = new TelegramCommandMenuSetupService({
+    client: telegramMessageClient,
+    operatorChatId: config.telegramOperatorChatId,
   });
   const reporter = new DurableTelegramReporter({
     repositories,
@@ -300,6 +306,7 @@ export function createApp(
     exchangeBackedReadEnabled,
     liveSendPath,
     notificationDelivery,
+    telegramCommandMenuSetup,
     telegramInboundPolling,
     persistence,
   };

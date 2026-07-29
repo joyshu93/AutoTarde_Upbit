@@ -86,6 +86,7 @@ Current remaining gaps:
 - Telegram `/start` is handled as a `/help` alias
 - Telegram `/help` and `/start` use `TELEGRAM_LOCALE`; the explicit default is `ko-KR`, and `en-US` is the only alternative.
 - Telegram `/start` now renders a Korean-first read-only dashboard with inline navigation for status, readiness, balances, positions, orders, alerts, risks, and scheduler evidence. Callback polling authenticates both source chat and sender, persists the update offset before handling, acknowledges before lookup, and edits only the originating bot message.
+- Telegram startup can register a deterministic Korean fallback command menu plus an English `language_code=en` menu for the configured operator chat. This profile setup is idempotent, non-trading, secret-free in status output, and isolated from scheduler or inbound startup if Telegram rejects it.
 - Telegram `/sync` presents the existing reconciliation request result in the configured locale while retaining canonical status, raw request time, and exact detail. Its formatter does not run another sync or infer that a completed request was drift-free.
 - scheduler startup now records an automatic `strategySchedulerStartupPreflight`; in `LIVE` mode it blocks scheduler timers unless live gate, live adapter wiring, execution state, fresh exchange-backed snapshots, fresh reconciliation health, and active-order state are safe
 - live scheduler startup blocks now persist an operator notification before startup can close local persistence
@@ -246,6 +247,8 @@ Telegram inbound polling stays disabled unless all three conditions are true:
 Inbound polling is separate from `ENABLE_TELEGRAM_DELIVERY`: delivery controls outbound queued notifications, while inbound polling controls operator command receiving.
 Inbound polling persists update offsets before routing each update to avoid replaying the same operator command indefinitely after process restart. Reply or route failures are explicit in the polling status; they do not mutate execution, reconciliation, order, balance, or position truth.
 Callback updates follow the same offset-first replay boundary. A callback is authorized only when both its private source chat and sender match the configured operator, and only typed read-only navigation actions are accepted. Unknown, malformed, oversized, or mutation-shaped callbacks are acknowledged without reaching the text command router. Valid callbacks use a dedicated read-only route, then edit the originating message with a final 3,500-character cap. Order pages contain five rows and alert pages contain three; missing capabilities and edit failures remain explicit polling failures without replaying the persisted update.
+
+When `TELEGRAM_BOT_TOKEN` and `TELEGRAM_OPERATOR_CHAT_ID` are configured, runtime startup also calls Telegram `setMyCommands` for that private operator chat. The no-language fallback list uses Korean descriptions and the `en` list uses English descriptions. Repeating startup replaces those lists with the same deterministic values. This changes only Telegram menu metadata; it does not execute a command or alter any trading record. Setup status is included in the startup banner without token, token-bearing URL, or arbitrary transport error text, and a setup failure does not prevent scheduler or inbound polling startup.
 
 For a bounded real-bot smoke test, use:
 

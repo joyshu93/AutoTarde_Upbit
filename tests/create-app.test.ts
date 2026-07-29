@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { createApp } from "../src/app/create-app.js";
 import type { AppConfig } from "../src/app/env.js";
+import { startTelegramRuntime } from "../src/index.js";
 import { DryRunExchangeAdapter } from "../src/modules/exchange/interfaces.js";
 import { createDryRunOperatorMarketDataReader } from "../src/smoke/dryrun-operator.js";
 import { test } from "./harness.js";
@@ -14,9 +15,84 @@ test("createApp keeps dry-run adapter as the default live send path", async () =
 
   assert.equal(app.liveSendPath, "DRY_RUN_ADAPTER");
   assert.equal(app.strategyScheduler.getStatus().liveSendPath, "DRY_RUN_ADAPTER");
+  assert.equal(app.telegramCommandMenuSetup.isConfigured(), false);
 
   app.persistence.close();
   await cleanupTempDatabase(databasePath);
+});
+
+test("createApp wires command-menu setup without changing live-send selection", async () => {
+  const databasePath = await createTempDatabasePath("command-menu");
+  const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
+  const previousSecretKey = process.env.UPBIT_SECRET_KEY;
+  process.env.UPBIT_ACCESS_KEY = "test-access-key";
+  process.env.UPBIT_SECRET_KEY = "test-secret-key";
+
+  try {
+    const app = createApp(createConfig({
+      databasePath,
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      telegramBotToken: "test-telegram-token",
+      telegramOperatorChatId: "operator-chat-1",
+    }));
+
+    assert.equal(app.liveSendPath, "LIVE_ADAPTER");
+    assert.equal(app.strategyScheduler.getStatus().liveSendPath, "LIVE_ADAPTER");
+    assert.equal(app.telegramCommandMenuSetup.isConfigured(), true);
+    app.persistence.close();
+  } finally {
+    restoreOptionalEnv("UPBIT_ACCESS_KEY", previousAccessKey);
+    restoreOptionalEnv("UPBIT_SECRET_KEY", previousSecretKey);
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("runtime starts scheduler and inbound decisions before isolated command-menu setup reporting", async () => {
+  const events: string[] = [];
+  const commandMenuResult = {
+    configured: true,
+    attempted: true,
+    status: "FAILED" as const,
+    failureCode: "telegram_command_menu_english_failed",
+    korean: "COMPLETED" as const,
+    english: "FAILED" as const,
+  };
+
+  const result = await startTelegramRuntime({
+    strategyScheduler: {
+      start() {
+        events.push("scheduler:start");
+        return { started: true };
+      },
+      async reportStartupBlockIfNeeded() {
+        events.push("scheduler:report");
+        return false;
+      },
+    },
+    telegramInboundPolling: {
+      start() {
+        events.push("inbound:start");
+        return { running: true };
+      },
+    },
+    telegramCommandMenuSetup: {
+      async setup() {
+        events.push("menu:setup");
+        return commandMenuResult;
+      },
+    },
+  });
+
+  assert.deepEqual(events, [
+    "scheduler:start",
+    "scheduler:report",
+    "inbound:start",
+    "menu:setup",
+  ]);
+  assert.equal(result.telegramCommandMenuSetup.status, "FAILED");
+  assert.equal(result.strategySchedulerStatus.started, true);
+  assert.equal(result.telegramInboundPollingStatus.running, true);
 });
 
 test("createApp wires the live adapter only when live mode, live gate, and Upbit credentials are configured", async () => {
