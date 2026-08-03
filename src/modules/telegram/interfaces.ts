@@ -59,6 +59,8 @@ export interface TelegramCallbackQueryInput {
 export interface TelegramInboundMessage {
   readonly messageId: number;
   readonly chatId: string;
+  readonly senderId: string | null;
+  readonly chatType: "private" | "group" | "supergroup" | "channel" | null;
   readonly text: string | null;
 }
 

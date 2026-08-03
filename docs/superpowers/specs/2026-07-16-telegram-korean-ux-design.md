@@ -1,5 +1,4 @@
 # Telegram Korean-First Operator UX Design
-
 ## Goal
 
 Make the Telegram operator interface Korean-first and easier to operate without changing the exchange-backed truth model, persisted audit records, strategy decisions, risk policy, or live-order safety gates.
@@ -88,4 +87,3 @@ Unknown, expired, or malformed callbacks return a localized non-mutating acknowl
 - Transport tests cover markup, message editing, command registration, and callback acknowledgement.
 - Inbound tests cover callback normalization, authorization, read-only routing, pagination, and malformed callbacks.
 - Regression tests prove text mutation commands continue to use the existing command router and callback actions cannot invoke them.
-

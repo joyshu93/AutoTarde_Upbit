@@ -326,7 +326,11 @@ export class TelegramInboundPollingService {
   }
 
   private isOperatorMessage(update: TelegramInboundUpdate): boolean {
-    return update.message?.chatId === this.dependencies.operatorChatId;
+    return Boolean(
+      update.message?.chatType === "private" &&
+      update.message.chatId === this.dependencies.operatorChatId &&
+      update.message.senderId === this.dependencies.operatorChatId,
+    );
   }
 
   private async handleCallbackQuery(callbackQuery: TelegramCallbackQueryInput): Promise<boolean> {
@@ -545,6 +549,16 @@ function normalizeTelegramMessage(raw: unknown): TelegramInboundMessage | null {
     chatRaw && "id" in chatRaw && (typeof chatRaw.id === "number" || typeof chatRaw.id === "string")
       ? String(chatRaw.id)
       : null;
+  const chatType =
+    chatRaw && "type" in chatRaw && isTelegramChatType(chatRaw.type)
+      ? chatRaw.type
+      : null;
+  const senderRaw = "from" in raw && raw.from && typeof raw.from === "object" ? raw.from : null;
+  const senderId =
+    senderRaw && "id" in senderRaw &&
+      (typeof senderRaw.id === "number" || typeof senderRaw.id === "string")
+      ? String(senderRaw.id)
+      : null;
 
   if (!chatId) {
     return null;
@@ -553,8 +567,16 @@ function normalizeTelegramMessage(raw: unknown): TelegramInboundMessage | null {
   return {
     messageId,
     chatId,
+    senderId,
+    chatType,
     text: "text" in raw && typeof raw.text === "string" ? raw.text : null,
   };
+}
+
+function isTelegramChatType(
+  value: unknown,
+): value is "private" | "group" | "supergroup" | "channel" {
+  return value === "private" || value === "group" || value === "supergroup" || value === "channel";
 }
 
 function normalizeTelegramCallbackQuery(raw: unknown): TelegramCallbackQueryInput | null {
@@ -599,10 +621,55 @@ function tryParseTelegramApiResponse(
 
 function sanitizeTelegramInboundError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  const normalized = message.replace(/\s+/gu, " ").trim();
+  const normalized = redactSensitiveQueryValues(message)
+    .replace(/\/bot[^/?#\s]+/giu, "/bot[REDACTED]")
+    .replace(/\b\d{5,}:[A-Za-z0-9_-]{10,}\b/gu, "[REDACTED]")
+    .replace(/\bBearer\s+[^\s,;]+/giu, "Bearer [REDACTED]")
+    .replace(/\s+/gu, " ")
+    .trim();
   if (normalized.length <= MAX_INBOUND_ERROR_LENGTH) {
     return normalized;
   }
 
   return `${normalized.slice(0, MAX_INBOUND_ERROR_LENGTH - 3)}...`;
+}
+
+function redactSensitiveQueryValues(message: string): string {
+  return message.replace(
+    /([?&])([^=&#\s]+)=([^&#\s]*)/gu,
+    (match, delimiter: string, rawKey: string) =>
+      isSensitiveQueryKey(rawKey) ? `${delimiter}${rawKey}=[REDACTED]` : match,
+  );
+}
+
+function isSensitiveQueryKey(rawKey: string): boolean {
+  let decodedKey = rawKey.replace(/\+/gu, " ");
+  try {
+    decodedKey = decodeURIComponent(decodedKey);
+  } catch {
+    // Malformed percent encoding still receives conservative raw-key inspection.
+  }
+
+  const normalizedKey = decodedKey
+    .replace(/([a-z0-9])([A-Z])/gu, "$1_$2")
+    .toLowerCase();
+  const parts = normalizedKey.split(/[^a-z0-9]+/gu).filter(Boolean);
+  const compactKey = parts.join("");
+
+  if (parts.some((part) =>
+    part === "secret" ||
+    part === "token" ||
+    part === "key" ||
+    part === "credential" ||
+    part === "password" ||
+    part === "authorization"
+  )) {
+    return true;
+  }
+
+  if (compactKey.endsWith("secret") || compactKey.endsWith("token") || compactKey.endsWith("credential")) {
+    return true;
+  }
+
+  return /^(?:api|auth|client|private|public|service|signing|encryption)key$/u.test(compactKey);
 }

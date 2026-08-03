@@ -109,6 +109,109 @@ test("telegram inbound polling filters unauthorized chats and advances offset", 
   assert.equal(service.getStatus().offsetStorage, "DURABLE");
 });
 
+test("telegram inbound ignores group commands and persists their durable offset", async () => {
+  const routed: string[] = [];
+  const savedOffsets: TelegramInboundOffsetRecord[] = [];
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: createUpdateClient([], [[
+      createUpdate(14, "123", "/killswitch", {
+        senderId: "123",
+        chatType: "group",
+      }),
+    ]]),
+    messageClient: {
+      async sendMessage() {
+        throw new Error("unauthorized_group_must_not_receive_reply");
+      },
+    },
+    router: {
+      async route(input) {
+        routed.push(input);
+        return { text: "must_not_route" };
+      },
+    },
+    operatorChatId: "123",
+    offsetStore: createOffsetStore({ savedOffsets }),
+    botTokenRef: "sha256:bot-a",
+  });
+
+  const summary = await service.pollOnce();
+
+  assert.equal(summary.status, "COMPLETED");
+  assert.equal(summary.processedCount, 0);
+  assert.equal(summary.ignoredCount, 1);
+  assert.equal(summary.nextOffset, 15);
+  assert.equal(savedOffsets[0]?.nextOffset, 15);
+  assert.deepEqual(routed, []);
+});
+
+test("telegram inbound ignores private commands from a mismatched sender", async () => {
+  const routed: string[] = [];
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: createUpdateClient([], [[
+      createUpdate(15, "123", "/pause", {
+        senderId: "999",
+        chatType: "private",
+      }),
+    ]]),
+    messageClient: {
+      async sendMessage() {
+        throw new Error("unauthorized_sender_must_not_receive_reply");
+      },
+    },
+    router: {
+      async route(input) {
+        routed.push(input);
+        return { text: "must_not_route" };
+      },
+    },
+    operatorChatId: "123",
+  });
+
+  const summary = await service.pollOnce();
+
+  assert.equal(summary.status, "COMPLETED");
+  assert.equal(summary.processedCount, 0);
+  assert.equal(summary.ignoredCount, 1);
+  assert.deepEqual(routed, []);
+});
+
+test("telegram inbound accepts private commands from the configured operator sender", async () => {
+  const routed: string[] = [];
+  const sent: string[] = [];
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: createUpdateClient([], [[
+      createUpdate(16, "123", "/status", {
+        senderId: "123",
+        chatType: "private",
+      }),
+    ]]),
+    messageClient: {
+      async sendMessage(input) {
+        sent.push(`${input.chatId}:${input.text}`);
+      },
+    },
+    router: {
+      async route(input) {
+        routed.push(input);
+        return { text: "authorized" };
+      },
+    },
+    operatorChatId: "123",
+  });
+
+  const summary = await service.pollOnce();
+
+  assert.equal(summary.status, "COMPLETED");
+  assert.equal(summary.processedCount, 1);
+  assert.equal(summary.ignoredCount, 0);
+  assert.deepEqual(routed, ["/status"]);
+  assert.deepEqual(sent, ["123:authorized"]);
+});
+
 test("telegram inbound polling splits long routed replies before sending", async () => {
   const sent: string[] = [];
   const service = new TelegramInboundPollingService({
@@ -227,6 +330,80 @@ test("telegram inbound polling records route or reply failures without retrying 
   assert.equal(savedOffsets[0]?.lastUpdateId, 20);
   assert.equal(service.getStatus().failedCount, 1);
   assert.equal(service.getStatus().lastError, "telegram_http_500");
+});
+
+test("telegram inbound redacts bot-token URLs and secret-like values from lastError", async () => {
+  const secretError = [
+    "proxy failed https://api.telegram.org/bot123456:ABC-Secret/getUpdates",
+    "?access_token=query-secret&foo=visible",
+    "Authorization: Bearer bearer-secret",
+  ].join("");
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: createUpdateClient([], [[createUpdate(21, "123", "/status")]]),
+    messageClient: {
+      async sendMessage() {
+        throw new Error(secretError);
+      },
+    },
+    router: {
+      async route() {
+        return { text: "status" };
+      },
+    },
+    operatorChatId: "123",
+  });
+
+  const summary = await service.pollOnce();
+  const lastError = service.getStatus().lastError ?? "";
+
+  assert.equal(summary.status, "FAILED");
+  assert.equal(summary.errorMessage, lastError);
+  assert.doesNotMatch(lastError, /123456:ABC-Secret/u);
+  assert.doesNotMatch(lastError, /query-secret/u);
+  assert.doesNotMatch(lastError, /bearer-secret/u);
+  assert.match(lastError, /\[REDACTED\]/u);
+});
+
+test("telegram inbound redacts compound secret-bearing query keys without hiding harmless evidence", async () => {
+  const secretError = [
+    "proxy https://x.test/?client_secret=s1&private_key=s2&credential=s3",
+    "&client_token=s4&auth_token=s5&refreshToken=s6",
+    "&signingCredential=s7&service-key=s8&foo=visible",
+  ].join("");
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: createUpdateClient([], [[createUpdate(22, "123", "/inbound")]]),
+    messageClient: {
+      async sendMessage() {
+        throw new Error(secretError);
+      },
+    },
+    router: {
+      async route() {
+        return { text: "inbound" };
+      },
+    },
+    operatorChatId: "123",
+  });
+
+  const summary = await service.pollOnce();
+  const lastError = service.getStatus().lastError ?? "";
+
+  assert.equal(summary.status, "FAILED");
+  assert.equal(summary.errorMessage, lastError);
+  for (const secret of ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"]) {
+    assert.doesNotMatch(lastError, new RegExp(`=${secret}(?:&|$)`, "u"));
+  }
+  assert.match(lastError, /client_secret=\[REDACTED\]/u);
+  assert.match(lastError, /private_key=\[REDACTED\]/u);
+  assert.match(lastError, /credential=\[REDACTED\]/u);
+  assert.match(lastError, /client_token=\[REDACTED\]/u);
+  assert.match(lastError, /auth_token=\[REDACTED\]/u);
+  assert.match(lastError, /refreshToken=\[REDACTED\]/u);
+  assert.match(lastError, /signingCredential=\[REDACTED\]/u);
+  assert.match(lastError, /service-key=\[REDACTED\]/u);
+  assert.match(lastError, /foo=visible/u);
 });
 
 test("telegram inbound polling normalizes callback updates and requests both supported update types", async () => {
@@ -846,8 +1023,12 @@ test("telegram bot update client posts getUpdates payload and normalizes message
             update_id: 30,
             message: {
               message_id: 7,
+              from: {
+                id: 123,
+              },
               chat: {
                 id: 123,
+                type: "private",
               },
               text: "/status",
             },
@@ -884,6 +1065,8 @@ test("telegram bot update client posts getUpdates payload and normalizes message
       message: {
         messageId: 7,
         chatId: "123",
+        senderId: "123",
+        chatType: "private",
         text: "/status",
       },
       callbackQuery: null,
@@ -900,12 +1083,18 @@ function createUpdate(
   updateId: number,
   chatId: string,
   text: string | null,
+  options: {
+    senderId?: string;
+    chatType?: "private" | "group" | "supergroup" | "channel";
+  } = {},
 ): TelegramInboundUpdate {
   return {
     updateId,
     message: {
       messageId: updateId * 10,
       chatId,
+      senderId: options.senderId ?? chatId,
+      chatType: options.chatType ?? "private",
       text,
     },
     callbackQuery: null,

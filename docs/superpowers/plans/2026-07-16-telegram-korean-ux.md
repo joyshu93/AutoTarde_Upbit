@@ -34,10 +34,10 @@
 
 **Produces:** `TelegramLocale`, `normalizeTelegramLocale`, `formatTelegramTimestamp`, `formatTelegramKrw`, `formatTelegramQuantity`, and `escapeTelegramHtml`.
 
-- [ ] Write tests asserting the missing env defaults to `ko-KR`, `en-US` is accepted, unsupported values fall back to `ko-KR`, UTC timestamps render in `Asia/Seoul`, KRW is grouped, quantities avoid floating noise, and HTML metacharacters are escaped.
-- [ ] Run `npm.cmd test` and verify the new tests fail because locale and presentation primitives do not exist.
-- [ ] Implement the minimal typed locale/config and common formatting functions and pass locale into `TelegramRuntimeConfigSnapshot` and `TelegramRouterDependencies`.
-- [ ] Run `npm.cmd test` and verify the suite passes.
+- [x] Write tests asserting the missing env defaults to `ko-KR`, `en-US` is accepted, unsupported values fall back to `ko-KR`, UTC timestamps render in `Asia/Seoul`, KRW is grouped, quantities avoid floating noise, and HTML metacharacters are escaped.
+- [x] Run `npm.cmd test` and verify the new tests fail because locale and presentation primitives do not exist.
+- [x] Implement the minimal typed locale/config and common formatting functions and pass locale into `TelegramRuntimeConfigSnapshot` and `TelegramRouterDependencies`.
+- [x] Run `npm.cmd test` and verify the suite passes.
 
 ### Task 2: Localized Summary And Detail Formatters
 
@@ -58,12 +58,12 @@
 **Consumes:** Task 1 locale and common formatting functions.
 **Produces:** Korean-first summaries, English summaries, stable technical detail formatters, and `detail` argument handling.
 
-- [ ] Write failing tests for Korean `/help`, `/status`, `/readiness`, `/balances`, `/positions`, `/orders`, `/order`, `/alerts`, `/risks`, `/scheduler`, control results, sync, preview, and run results.
-- [ ] Write failing tests proving `/status detail`, `/readiness detail`, `/alerts detail`, and `/orders detail` retain canonical technical fields and identifiers.
-- [ ] Run the focused Telegram tests and verify failures are caused by missing localized presentation behavior.
-- [ ] Move the exhaustive implementation to `presentation/technical.ts`, retain compatibility exports, and implement focused localized summary modules.
-- [ ] Extend command argument contracts only for the approved `detail` forms and keep mutation command validation unchanged.
-- [ ] Run the focused Telegram tests and the full suite.
+- [x] Write failing tests for Korean `/help`, `/status`, `/readiness`, `/balances`, `/positions`, `/orders`, `/order`, `/alerts`, `/risks`, `/scheduler`, control results, sync, preview, and run results.
+- [x] Write failing tests proving `/status detail`, `/readiness detail`, `/alerts detail`, and `/orders detail` retain canonical technical fields and identifiers.
+- [x] Run the focused Telegram tests and verify failures are caused by missing localized presentation behavior.
+- [x] Move the exhaustive implementation to `presentation/technical.ts`, retain compatibility exports, and implement focused localized summary modules.
+- [x] Extend command argument contracts only for the approved `detail` forms and keep mutation command validation unchanged.
+- [x] Run the focused Telegram tests and the full suite.
 
 ### Task 3: Typed Telegram Buttons, Editing, And Callback Input
 
@@ -131,8 +131,8 @@
 **Files:**
 - Review all changed files.
 
-- [ ] Confirm no callback action can reach execution, sync, pause, resume, or kill-switch mutation dependencies.
-- [ ] Confirm persisted order, fill, balance, position, risk, reconciliation, and notification schemas are unchanged.
-- [ ] Confirm `DRY_RUN` defaults and live-order gates are unchanged.
-- [ ] Run `npm.cmd run check` fresh and record the result.
-- [ ] Run `git diff --check` and record the result.
+- [x] Confirm no callback action can reach execution, sync, pause, resume, or kill-switch mutation dependencies.
+- [x] Confirm persisted order, fill, balance, position, risk, reconciliation, and notification schemas are unchanged.
+- [x] Confirm `DRY_RUN` defaults and live-order gates are unchanged.
+- [x] Run `npm.cmd run check` fresh and record the result.
+- [x] Run `git diff --check` and record the result.

@@ -76,6 +76,9 @@ test("runtime starts scheduler and inbound decisions before isolated command-men
         return { running: true };
       },
     },
+    installRuntimeSignalHandlers() {
+      events.push("signals:install");
+    },
     telegramCommandMenuSetup: {
       async setup() {
         events.push("menu:setup");
@@ -88,6 +91,7 @@ test("runtime starts scheduler and inbound decisions before isolated command-men
     "scheduler:start",
     "scheduler:report",
     "inbound:start",
+    "signals:install",
     "menu:setup",
   ]);
   assert.equal(result.telegramCommandMenuSetup.status, "FAILED");

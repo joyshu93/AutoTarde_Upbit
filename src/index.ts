@@ -26,6 +26,7 @@ export async function startTelegramRuntime(input: {
   telegramInboundPolling: {
     start(): { readonly running: boolean };
   };
+  installRuntimeSignalHandlers(): void;
   telegramCommandMenuSetup: {
     setup(): Promise<TelegramCommandMenuSetupResult>;
   };
@@ -34,6 +35,12 @@ export async function startTelegramRuntime(input: {
   const strategySchedulerStartupBlockNotified =
     await input.strategyScheduler.reportStartupBlockIfNeeded();
   const telegramInboundPollingStatus = input.telegramInboundPolling.start();
+  if (hasBackgroundRuntime({
+    strategyScheduler: strategySchedulerStatus,
+    telegramInboundPolling: telegramInboundPollingStatus,
+  })) {
+    input.installRuntimeSignalHandlers();
+  }
   const telegramCommandMenuSetup = await input.telegramCommandMenuSetup.setup();
 
   return {
@@ -105,7 +112,12 @@ async function main(): Promise<void> {
     liveSendPath: app.liveSendPath,
   });
   app.strategyScheduler.setStartupPreflight(strategySchedulerStartupPreflight);
-  const telegramRuntime = await startTelegramRuntime(app);
+  const telegramRuntime = await startTelegramRuntime({
+    strategyScheduler: app.strategyScheduler,
+    telegramInboundPolling: app.telegramInboundPolling,
+    installRuntimeSignalHandlers: () => installRuntimeSignalHandlers({ app }),
+    telegramCommandMenuSetup: app.telegramCommandMenuSetup,
+  });
   const {
     strategySchedulerStatus,
     strategySchedulerStartupBlockNotified,
@@ -119,9 +131,6 @@ async function main(): Promise<void> {
   const runtimeShutdown = runtimeHasBackgroundWork
     ? "SIGNAL_HANDLERS_INSTALLED"
     : "NO_BACKGROUND_RUNTIME";
-  if (runtimeHasBackgroundWork) {
-    installRuntimeSignalHandlers({ app });
-  }
   const seedMismatches = detectExecutionStateSeedMismatches(state, {
     executionMode: app.config.executionMode,
     liveExecutionGate: app.config.liveExecutionGate,
