@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, readdir, rm } from "node:fs/promises";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 
 import type {
@@ -64,6 +65,10 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
     assert.ok(migrationRows.some((row) => row.filename === "0012_add_telegram_inbound_offsets.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0014_extend_scheduler_operator_notification_types.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0015_add_scheduler_startup_blocked_notification_type.sql"));
+    assert.ok(migrationRows.some((row) => row.filename === "0016_add_pending_confirmation_strategy_decision_status.sql"));
+
+    const foreignKeyViolations = handle.db.prepare("PRAGMA foreign_key_check").all();
+    assert.deepEqual(foreignKeyViolations, []);
 
     for (const tableName of [
       "users",
@@ -557,6 +562,57 @@ test("createSqlitePersistence bootstraps operator state and round-trips app-faci
   }
 });
 
+test("migration 0016 preserves existing strategy decision references", async () => {
+  const databasePath = await createTempDatabasePath("migration-0016-existing-references");
+  await createPre0016Database(databasePath, false);
+  const handle = openSqliteDatabase(databasePath);
+
+  try {
+    const decision = handle.db.prepare("SELECT status FROM strategy_decisions WHERE id = ?")
+      .get("legacy-decision") as { status: string } | undefined;
+    const order = handle.db.prepare("SELECT strategy_decision_id FROM orders WHERE id = ?")
+      .get("legacy-order") as { strategy_decision_id: string | null } | undefined;
+    const risk = handle.db.prepare("SELECT strategy_decision_id FROM risk_events WHERE id = ?")
+      .get("legacy-risk") as { strategy_decision_id: string | null } | undefined;
+    const violations = handle.db.prepare("PRAGMA foreign_key_check").all();
+
+    assert.equal(decision?.status, "READY");
+    assert.equal(order?.strategy_decision_id, "legacy-decision");
+    assert.equal(risk?.strategy_decision_id, "legacy-decision");
+    assert.deepEqual(violations, []);
+  } finally {
+    handle.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("migration 0016 rolls back its table rebuild when legacy data copy fails", async () => {
+  const databasePath = await createTempDatabasePath("migration-0016-rollback");
+  await createPre0016Database(databasePath, true);
+
+  assert.throws(
+    () => openSqliteDatabase(databasePath),
+    /reference_price|no such column/i,
+  );
+
+  const inspection = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const tableRows = inspection.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name IN ('strategy_decisions', 'strategy_decisions_new')
+      ORDER BY name ASC
+    `).all() as Array<{ name: string }>;
+    const migration = inspection.prepare("SELECT filename FROM _schema_migrations WHERE filename = ?")
+      .get("0016_add_pending_confirmation_strategy_decision_status.sql");
+
+    assert.deepEqual(tableRows.map((row) => row.name), ["strategy_decisions"]);
+    assert.equal(migration, undefined);
+  } finally {
+    inspection.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
 test("sqlite repository round-trips durable telegram inbound offsets by bot token ref", async () => {
   const databasePath = await createTempDatabasePath("telegram-inbound-offset");
   const bundle = createSqlitePersistence({
@@ -673,6 +729,41 @@ test("sqlite repository returns the latest strategy decision for a market and st
 
     assert.deepEqual(latestAny, otherStrategy);
     assert.deepEqual(latestPositionGuard, newer);
+  } finally {
+    bundle.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("sqlite repository round-trips pending-confirmation strategy decisions after migrations", async () => {
+  const databasePath = await createTempDatabasePath("pending-confirmation-decision");
+  const bundle = createSqlitePersistence({
+    databasePath,
+    exchangeAccountId: "primary",
+    userId: "operator",
+    userTelegramId: "telegram-user",
+    userDisplayName: "Operator",
+    accessKeyRef: "ENV:UPBIT_ACCESS_KEY",
+    secretKeyRef: "ENV:UPBIT_SECRET_KEY",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    killSwitchActive: false,
+  });
+
+  try {
+    const decision = createStrategyDecisionRecord({
+      id: "decision-pending-confirmation",
+      status: "PENDING_CONFIRMATION",
+    });
+
+    await bundle.repositories.saveStrategyDecision(decision);
+
+    const stored = await bundle.repositories.getLatestStrategyDecision(
+      "primary",
+      "KRW-BTC",
+      "position_guard.paper_core.v1",
+    );
+    assert.deepEqual(stored, decision);
   } finally {
     bundle.close();
     await cleanupTempDatabase(databasePath);
@@ -897,6 +988,103 @@ async function createTempDatabasePath(label: string): Promise<string> {
 
 async function cleanupTempDatabase(databasePath: string): Promise<void> {
   await rm(databasePath, { force: true });
+}
+
+async function createPre0016Database(
+  databasePath: string,
+  omitReferencePriceColumn: boolean,
+): Promise<void> {
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE _schema_migrations (
+        filename TEXT PRIMARY KEY,
+        applied_at TEXT NOT NULL
+      );
+      CREATE TABLE users (
+        id TEXT PRIMARY KEY
+      );
+      CREATE TABLE exchange_accounts (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+      CREATE TABLE strategy_decisions (
+        id TEXT PRIMARY KEY,
+        exchange_account_id TEXT NOT NULL,
+        strategy_key TEXT NOT NULL,
+        market TEXT NOT NULL CHECK (market IN ('KRW-BTC', 'KRW-ETH')),
+        action TEXT NOT NULL CHECK (action IN ('ENTER', 'ADD', 'REDUCE', 'EXIT', 'HOLD')),
+        status TEXT NOT NULL CHECK (status IN ('READY', 'BLOCKED_BY_RISK', 'NO_ACTION', 'DATA_STALE')),
+        decision_basis_json TEXT NOT NULL,
+        intended_notional_krw TEXT,
+        intended_quantity TEXT,
+        ${omitReferencePriceColumn ? "" : "reference_price TEXT,"}
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE
+      );
+      CREATE TABLE orders (
+        id TEXT PRIMARY KEY,
+        strategy_decision_id TEXT,
+        exchange_account_id TEXT NOT NULL,
+        FOREIGN KEY (strategy_decision_id) REFERENCES strategy_decisions(id) ON DELETE SET NULL,
+        FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE
+      );
+      CREATE TABLE risk_events (
+        id TEXT PRIMARY KEY,
+        exchange_account_id TEXT NOT NULL,
+        strategy_decision_id TEXT,
+        order_id TEXT,
+        FOREIGN KEY (exchange_account_id) REFERENCES exchange_accounts(id) ON DELETE CASCADE,
+        FOREIGN KEY (strategy_decision_id) REFERENCES strategy_decisions(id) ON DELETE SET NULL,
+        FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE SET NULL
+      );
+      INSERT INTO users (id) VALUES ('legacy-user');
+      INSERT INTO exchange_accounts (id, user_id) VALUES ('primary', 'legacy-user');
+      INSERT INTO strategy_decisions (
+        id,
+        exchange_account_id,
+        strategy_key,
+        market,
+        action,
+        status,
+        decision_basis_json,
+        intended_notional_krw,
+        intended_quantity,
+        ${omitReferencePriceColumn ? "" : "reference_price,"}
+        created_at
+      ) VALUES (
+        'legacy-decision',
+        'primary',
+        'position_guard.paper_core.v1',
+        'KRW-BTC',
+        'ENTER',
+        'READY',
+        '{}',
+        '100000',
+        NULL,
+        ${omitReferencePriceColumn ? "" : "'110000000',"}
+        '2026-04-20T00:00:00.000Z'
+      );
+      INSERT INTO orders (id, strategy_decision_id, exchange_account_id)
+        VALUES ('legacy-order', 'legacy-decision', 'primary');
+      INSERT INTO risk_events (id, exchange_account_id, strategy_decision_id, order_id)
+        VALUES ('legacy-risk', 'primary', 'legacy-decision', 'legacy-order');
+    `);
+
+    const migrationNames = (await readdir(path.resolve(process.cwd(), "migrations")))
+      .filter((filename) => filename.endsWith(".sql"))
+      .filter((filename) => filename !== "0016_add_pending_confirmation_strategy_decision_status.sql");
+    const insertMigration = db.prepare(
+      "INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)",
+    );
+    for (const filename of migrationNames) {
+      insertMigration.run(filename, "2026-04-20T00:00:00.000Z");
+    }
+  } finally {
+    db.close();
+  }
 }
 
 function createNotification(

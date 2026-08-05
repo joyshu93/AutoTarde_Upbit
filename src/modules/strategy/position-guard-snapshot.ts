@@ -38,24 +38,31 @@ export async function fetchPositionGuardMarketSnapshot(
   reader: PositionGuardPublicMarketDataReader,
   input: FetchPositionGuardMarketSnapshotInput,
 ): Promise<PositionGuardMarketSnapshot> {
+  const candleTo = input.to === undefined
+    ? getCompletedCandleBoundaries(input.fetchedAt)
+    : {
+        "1h": input.to,
+        "4h": input.to,
+        "1d": input.to,
+      };
   const [tickers, oneHourCandles, fourHourCandles, oneDayCandles] = await Promise.all([
     reader.getTickers([input.market]),
     reader.getMinuteCandles({
       market: input.market,
       unit: 60,
       count: input.candleCount,
-      ...(input.to === undefined ? {} : { to: input.to }),
+      to: candleTo["1h"],
     }),
     reader.getMinuteCandles({
       market: input.market,
       unit: 240,
       count: input.candleCount,
-      ...(input.to === undefined ? {} : { to: input.to }),
+      to: candleTo["4h"],
     }),
     reader.getDayCandles({
       market: input.market,
       count: input.candleCount,
-      ...(input.to === undefined ? {} : { to: input.to }),
+      to: candleTo["1d"],
     }),
   ]);
   const ticker = tickers.find((candidate) => candidate.market === input.market);
@@ -71,6 +78,25 @@ export async function fetchPositionGuardMarketSnapshot(
     fourHourCandles,
     oneDayCandles,
   });
+}
+
+function getCompletedCandleBoundaries(
+  fetchedAt: string,
+): Record<SupportedStrategyTimeframe, string> {
+  const fetchedAtMs = Date.parse(fetchedAt);
+  if (Number.isNaN(fetchedAtMs)) {
+    throw new Error(`Invalid PositionGuard snapshot time: ${fetchedAt}`);
+  }
+
+  return {
+    "1h": toBoundaryIso(fetchedAtMs, timeframeDurationMs("1h")),
+    "4h": toBoundaryIso(fetchedAtMs, timeframeDurationMs("4h")),
+    "1d": toBoundaryIso(fetchedAtMs, timeframeDurationMs("1d")),
+  };
+}
+
+function toBoundaryIso(timestampMs: number, durationMs: number): string {
+  return new Date(Math.floor(timestampMs / durationMs) * durationMs).toISOString();
 }
 
 export function buildPositionGuardMarketSnapshot(

@@ -13,7 +13,12 @@ export type LiveExecutionGate = "DISABLED" | "ENABLED";
 export type SystemStatus = "BOOTING" | "RUNNING" | "PAUSED" | "KILL_SWITCHED" | "DEGRADED";
 
 export type StrategyDecisionAction = "ENTER" | "ADD" | "REDUCE" | "EXIT" | "HOLD";
-export type StrategyDecisionStatus = "READY" | "BLOCKED_BY_RISK" | "NO_ACTION" | "DATA_STALE";
+export type StrategyDecisionStatus =
+  | "READY"
+  | "PENDING_CONFIRMATION"
+  | "BLOCKED_BY_RISK"
+  | "NO_ACTION"
+  | "DATA_STALE";
 
 export type OrderSide = "bid" | "ask";
 export type OrderType = "limit" | "price" | "market" | "best";

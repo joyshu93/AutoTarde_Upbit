@@ -41,6 +41,7 @@ function createExecutionService(overrides?: {
     exchangeAdapter: overrides?.exchangeAdapter ?? new DryRunExchangeAdapter(),
     repositories,
     operatorState,
+    now: () => "2026-04-20T00:00:20.000Z",
     ...(overrides?.validationAdapter ? { validationAdapter: overrides.validationAdapter } : {}),
     ...(overrides?.reporter ? { reporter: overrides.reporter } : {}),
   };
@@ -71,6 +72,7 @@ test("execution service persists a dry-run order and blocks duplicate idempotent
   const input = {
     exchangeAccountId: "primary",
     strategyDecisionId: "decision-1",
+    referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
     decision: {
       strategyKey: "deterministic.stub.v1",
       market: "KRW-BTC" as const,
@@ -126,6 +128,7 @@ test("execution service settles dry-run price bids with a synthetic fill derived
   const result = await service.submitOrderFromDecision({
     exchangeAccountId: "primary",
     strategyDecisionId: "decision-price-bid",
+    referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
     decision: {
       strategyKey: "deterministic.stub.v1",
       market: "KRW-BTC",
@@ -203,6 +206,7 @@ test("execution service applies minimum order value to market asks using referen
   const result = await service.submitOrderFromDecision({
     exchangeAccountId: "primary",
     strategyDecisionId: "decision-small-ask",
+    referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
     decision: {
       strategyKey: "deterministic.stub.v1",
       market: "KRW-BTC",
@@ -228,6 +232,64 @@ test("execution service applies minimum order value to market asks using referen
   assert.equal(orders.length, 0);
   assert.equal(riskEvents.length, 1);
   assert.equal(riskEvents[0]?.ruleCode, "MINIMUM_ORDER_VALUE_GUARD");
+});
+
+test("execution service rejects a stale strategy reference price while accepting a fresh one", async () => {
+  const { service, repositories } = createExecutionService();
+  await repositories.saveBalanceSnapshot({
+    id: "balance-price-freshness",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:00:10.000Z",
+    source: "EXCHANGE_POLL",
+    totalKrwValue: "10000000",
+    balancesJson: "[]",
+  });
+  await repositories.savePositionSnapshot({
+    id: "position-price-freshness",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:00:10.000Z",
+    source: "EXCHANGE_POLL",
+    positionsJson: "[]",
+  });
+
+  const staleInput = {
+    exchangeAccountId: "primary",
+    strategyDecisionId: "decision-stale-reference-price",
+    referencePriceCapturedAt: "2026-04-19T23:59:00.000Z",
+    decision: {
+      strategyKey: "deterministic.stub.v1",
+      market: "KRW-BTC" as const,
+      action: "ENTER" as const,
+      reasonCodes: ["STALE_REFERENCE_PRICE"],
+      referencePrice: 100_000_000,
+      requestedNotionalKrw: 100_000,
+      requestedQuantity: 0.001,
+      metadata: {},
+    },
+    side: "bid" as const,
+    ordType: "limit" as const,
+    price: "100000000",
+    volume: "0.001",
+  };
+  const freshInput = {
+    ...staleInput,
+    strategyDecisionId: "decision-fresh-reference-price",
+    referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
+  };
+
+  const staleResult = await service.submitOrderFromDecision(staleInput);
+  const freshResult = await service.submitOrderFromDecision(freshInput);
+  const orders = await repositories.listOrders("primary");
+  const riskEvents = await repositories.listRiskEvents("primary");
+
+  assert.equal(staleResult.accepted, false);
+  assert.equal(staleResult.order, null);
+  assert.equal(freshResult.accepted, true);
+  assert.equal(orders.length, 1);
+  assert.equal(orders[0]?.strategyDecisionId, "decision-fresh-reference-price");
+  assert.equal(riskEvents.length, 1);
+  assert.equal(riskEvents[0]?.strategyDecisionId, "decision-stale-reference-price");
+  assert.equal(riskEvents[0]?.ruleCode, "STALE_PRICE_GUARD");
 });
 
 test("execution service blocks new orders when startup recovery has left the system DEGRADED", async () => {
@@ -257,6 +319,7 @@ test("execution service blocks new orders when startup recovery has left the sys
   const result = await service.submitOrderFromDecision({
     exchangeAccountId: "primary",
     strategyDecisionId: "decision-degraded",
+    referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
     decision: {
       strategyKey: "deterministic.stub.v1",
       market: "KRW-BTC",
@@ -351,6 +414,7 @@ test("execution service blocks order persistence when order chance rejects the r
   const result = await service.submitOrderFromDecision({
     exchangeAccountId: "primary",
     strategyDecisionId: "decision-unsupported-type",
+    referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
     decision: {
       strategyKey: "deterministic.stub.v1",
       market: "KRW-BTC",
@@ -460,6 +524,7 @@ test("execution service queues an operator notification when an order is rejecte
     repositories,
     operatorState,
     reporter,
+    now: () => "2026-04-20T00:00:20.000Z",
   });
 
   await repositories.saveBalanceSnapshot({
@@ -481,6 +546,7 @@ test("execution service queues an operator notification when an order is rejecte
   await service.submitOrderFromDecision({
     exchangeAccountId: "primary",
     strategyDecisionId: "decision-notification-1",
+    referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
     decision: {
       strategyKey: "deterministic.stub.v1",
       market: "KRW-BTC",
@@ -576,6 +642,7 @@ test("execution service blocks order persistence when exchange order test report
   const result = await service.submitOrderFromDecision({
     exchangeAccountId: "primary",
     strategyDecisionId: "decision-market-offline",
+    referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
     decision: {
       strategyKey: "deterministic.stub.v1",
       market: "KRW-ETH",
@@ -675,6 +742,7 @@ test("execution service blocks price orders below the exchange min total before 
   const result = await service.submitOrderFromDecision({
     exchangeAccountId: "primary",
     strategyDecisionId: "decision-min-total",
+    referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
     decision: {
       strategyKey: "deterministic.stub.v1",
       market: "KRW-BTC",
@@ -731,6 +799,7 @@ test("execution service records order mode from persisted operator state", async
     exchangeAdapter: new DryRunExchangeAdapter(),
     repositories,
     operatorState,
+    now: () => "2026-04-20T00:00:20.000Z",
   });
 
   await repositories.saveBalanceSnapshot({
@@ -752,6 +821,7 @@ test("execution service records order mode from persisted operator state", async
   const result = await service.submitOrderFromDecision({
     exchangeAccountId: "primary",
     strategyDecisionId: "decision-2",
+    referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
     decision: {
       strategyKey: "deterministic.stub.v1",
       market: "KRW-ETH",

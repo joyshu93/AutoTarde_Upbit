@@ -64,7 +64,7 @@ export interface SqliteStrategyDecisionRow {
   strategy_key: string;
   market: "KRW-BTC" | "KRW-ETH";
   action: "ENTER" | "ADD" | "REDUCE" | "EXIT" | "HOLD";
-  status: "READY" | "BLOCKED_BY_RISK" | "NO_ACTION" | "DATA_STALE";
+  status: "READY" | "PENDING_CONFIRMATION" | "BLOCKED_BY_RISK" | "NO_ACTION" | "DATA_STALE";
   decision_basis_json: string;
   intended_notional_krw: string | null;
   intended_quantity: string | null;

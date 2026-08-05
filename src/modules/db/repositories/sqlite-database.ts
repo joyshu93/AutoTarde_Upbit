@@ -13,12 +13,35 @@ export function openSqliteDatabase(databasePath: string): SqliteDatabaseHandle {
   }
 
   const db = new DatabaseSync(databasePath);
-  db.exec("PRAGMA foreign_keys = ON;");
-  db.exec("PRAGMA journal_mode = WAL;");
-  db.exec("PRAGMA busy_timeout = 5000;");
+  try {
+    db.exec("PRAGMA foreign_keys = ON;");
+    db.exec("PRAGMA journal_mode = WAL;");
+    db.exec("PRAGMA busy_timeout = 5000;");
 
-  ensureMigrationTable(db);
-  applyMigrations(db, resolve(process.cwd(), "migrations"));
+    ensureMigrationTable(db);
+    applyMigrations(db, resolve(process.cwd(), "migrations"));
+  } catch (error) {
+    const cleanupErrors: unknown[] = [];
+    try {
+      if (db.isTransaction) {
+        db.exec("ROLLBACK;");
+      }
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError);
+    }
+    try {
+      db.close();
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError);
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupErrors],
+        `SQLite initialization failed and cleanup also failed: ${formatError(error)}`,
+      );
+    }
+    throw error;
+  }
 
   return {
     db,
@@ -26,6 +49,10 @@ export function openSqliteDatabase(databasePath: string): SqliteDatabaseHandle {
       db.close();
     },
   };
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function ensureMigrationTable(db: DatabaseSync): void {

@@ -57,6 +57,91 @@ test("position guard runner persists a strategy decision without submitting when
   assert.equal(createOrderCallCount, 0);
 });
 
+test("position guard runner persists deferred confirmation without submitting an order", async () => {
+  let createOrderCallCount = 0;
+  const repositories = new InMemoryExecutionRepository();
+  const executionService = createExecutionService(repositories, {
+    async createOrder(request) {
+      createOrderCallCount += 1;
+      return new DryRunExchangeAdapter().createOrder(request);
+    },
+  });
+  await seedEmptyPortfolio(repositories);
+
+  const runner = new PositionGuardStrategyRunner({
+    repositories,
+    executionService,
+    marketDataReader: createFlatMarketReader(),
+    config: createDefaultPositionGuardRunnerConfig("primary"),
+  });
+  const generatedAt = "2026-04-20T01:05:00.000Z";
+  const decision = createBullishDecisionBundle("DEFERRED_CONFIRMATION", generatedAt);
+  Object.defineProperty(runner, "buildDecision", {
+    value: async () => decision,
+  });
+
+  const result = await runner.runOnce({
+    market: "KRW-BTC",
+    generatedAt,
+  });
+  const persistedDecision = await repositories.getLatestStrategyDecision(
+    "primary",
+    "KRW-BTC",
+    result.strategyDecision.strategyKey,
+  );
+  const orders = await repositories.listOrders("primary");
+
+  assert.equal(result.strategyDecision.action, "ENTER");
+  assert.equal(result.engineDecision.executionDisposition, "DEFERRED_CONFIRMATION");
+  assert.equal(result.strategyDecision.metadata.executionDisposition, "DEFERRED_CONFIRMATION");
+  assert.equal(result.strategyDecisionRecord.status, "PENDING_CONFIRMATION");
+  assert.equal(persistedDecision?.id, result.strategyDecisionRecord.id);
+  assert.equal(result.submission, null);
+  assert.equal(orders.length, 0);
+  assert.equal(createOrderCallCount, 0);
+});
+
+test("position guard runner keeps confirmed decisions order-capable", async () => {
+  let createOrderCallCount = 0;
+  const repositories = new InMemoryExecutionRepository();
+  const executionService = createExecutionService(repositories, {
+    async createOrder(request) {
+      createOrderCallCount += 1;
+      return new DryRunExchangeAdapter().createOrder(request);
+    },
+  });
+  await seedEmptyPortfolio(repositories);
+
+  const runner = new PositionGuardStrategyRunner({
+    repositories,
+    executionService,
+    marketDataReader: createFlatMarketReader(),
+    config: createDefaultPositionGuardRunnerConfig("primary"),
+  });
+  const generatedAt = "2026-04-20T01:05:00.000Z";
+  const decision = createBullishDecisionBundle("EXECUTED_AFTER_CONFIRMATION", generatedAt);
+  Object.defineProperty(runner, "buildDecision", {
+    value: async () => decision,
+  });
+
+  const result = await runner.runOnce({
+    market: "KRW-BTC",
+    generatedAt,
+  });
+  const persistedDecision = await repositories.getLatestStrategyDecision(
+    "primary",
+    "KRW-BTC",
+    result.strategyDecision.strategyKey,
+  );
+  const orders = await repositories.listOrders("primary");
+
+  assert.equal(result.engineDecision.executionDisposition, "EXECUTED_AFTER_CONFIRMATION");
+  assert.equal(persistedDecision?.id, result.strategyDecisionRecord.id);
+  assert.equal(result.submission?.accepted, true);
+  assert.equal(orders.length, 1);
+  assert.equal(createOrderCallCount, 1);
+});
+
 test("position guard preview computes a decision without persisting or submitting", async () => {
   let createOrderCallCount = 0;
   const repositories = new InMemoryExecutionRepository();
@@ -102,7 +187,9 @@ test("position guard runner maps buy and sell decisions to Upbit spot order requ
     referencePrice: 100_000_000,
     requestedNotionalKrw: 150_000,
     requestedQuantity: null,
-    metadata: {},
+    metadata: {
+      executionDisposition: "EXECUTED_AFTER_CONFIRMATION",
+    },
   };
   const exitDecision: StrategyDecision = {
     strategyKey: "position_guard.paper_core.v1",
@@ -118,17 +205,20 @@ test("position guard runner maps buy and sell decisions to Upbit spot order requ
   const buyInput = toOrderSubmissionInput({
     exchangeAccountId: "primary",
     strategyDecisionId: "decision-buy",
+    referencePriceCapturedAt: "2026-04-20T01:05:00.000Z",
     decision: enterDecision,
   });
   const sellInput = toOrderSubmissionInput({
     exchangeAccountId: "primary",
     strategyDecisionId: "decision-sell",
+    referencePriceCapturedAt: "2026-04-20T01:05:00.000Z",
     decision: exitDecision,
   });
 
   assert.deepEqual(buyInput, {
     exchangeAccountId: "primary",
     strategyDecisionId: "decision-buy",
+    referencePriceCapturedAt: "2026-04-20T01:05:00.000Z",
     decision: enterDecision,
     side: "bid",
     ordType: "price",
@@ -138,6 +228,7 @@ test("position guard runner maps buy and sell decisions to Upbit spot order requ
   assert.deepEqual(sellInput, {
     exchangeAccountId: "primary",
     strategyDecisionId: "decision-sell",
+    referencePriceCapturedAt: "2026-04-20T01:05:00.000Z",
     decision: exitDecision,
     side: "ask",
     ordType: "market",
@@ -296,7 +387,123 @@ function createExecutionService(
     validationAdapter: exchangeAdapter,
     repositories,
     operatorState: new InMemoryOperatorStateStore(createExecutionState()),
+    now: () => "2026-04-20T01:05:10.000Z",
   });
+}
+
+function createBullishDecisionBundle(
+  executionDisposition: "DEFERRED_CONFIRMATION" | "EXECUTED_AFTER_CONFIRMATION",
+  generatedAt: string,
+): {
+  strategyDecision: StrategyDecision;
+  engineDecision: PositionGuardEngineDecision;
+  context: PositionGuardStrategyContext;
+  referencePriceCapturedAt: string;
+} {
+  const engineDecision: PositionGuardEngineDecision = {
+    action: "ENTER",
+    summary: "Borderline entry signal.",
+    reasons: ["Confirmation is required."],
+    targetNotionalKrw: 100_000,
+    targetQuantityFraction: null,
+    referencePrice: 100_000_000,
+    executionDisposition,
+    signalQuality: {
+      score: 6,
+      bucket: "BORDERLINE",
+      confirmationRequired: true,
+      confirmationSatisfied: executionDisposition === "EXECUTED_AFTER_CONFIRMATION",
+      reentryPenaltyApplied: false,
+    },
+    exposureGuardrails: {
+      perAssetMaxAllocation: 0.45,
+      totalPortfolioMaxExposure: 0.75,
+      remainingAssetCapacity: 450_000,
+      remainingPortfolioCapacity: 750_000,
+    },
+    diagnostics: {
+      regime: "RECLAIM_ATTEMPT",
+      riskLevel: "LOW",
+      invalidationState: "CLEAR",
+      invalidationLevel: 95_000_000,
+      entryPath: "RECLAIM",
+      trendAlignmentScore: 3,
+      recoveryQualityScore: 3,
+      breakdownPressureScore: 0,
+      weakeningStage: "NONE",
+      upperRangeChase: false,
+      pullbackZone: false,
+      reclaimStructure: true,
+      breakoutHoldStructure: false,
+    },
+  };
+  const strategyDecision: StrategyDecision = {
+    strategyKey: "position_guard.paper_core.v1",
+    market: "KRW-BTC",
+    action: "ENTER",
+    reasonCodes: ["enter", executionDisposition.toLowerCase()],
+    referencePrice: engineDecision.referencePrice,
+    requestedNotionalKrw: engineDecision.targetNotionalKrw,
+    requestedQuantity: null,
+    metadata: {
+      executionDisposition,
+      confirmationRequired: true,
+      confirmationSatisfied: executionDisposition === "EXECUTED_AFTER_CONFIRMATION",
+    },
+  };
+  const context: PositionGuardStrategyContext = {
+    asset: "BTC",
+    market: "KRW-BTC",
+    generatedAt,
+    availableKrw: 1_000_000,
+    positionQuantity: 0,
+    averageEntryPrice: 0,
+    portfolio: {
+      totalEquityKrw: 1_000_000,
+      assetMarketValueKrw: 0,
+      totalExposureKrw: 0,
+    },
+    latestDecision: null,
+    recentExit: {
+      createdAt: null,
+      hoursSinceExit: null,
+      realizedPnl: null,
+    },
+    settings: createDefaultPositionGuardRunnerConfig("primary").settings,
+    analysis: {
+      regime: "RECLAIM_ATTEMPT",
+      riskLevel: "LOW",
+      invalidationState: "CLEAR",
+      invalidationLevel: 95_000_000,
+      pullbackZone: false,
+      reclaimStructure: true,
+      breakoutHoldStructure: false,
+      upperRangeChase: false,
+      currentPrice: 100_000_000,
+      entryPath: "RECLAIM",
+      trendAlignmentScore: 3,
+      recoveryQualityScore: 3,
+      breakdownPressureScore: 0,
+      weakeningStage: "NONE",
+      breakdown1d: false,
+      breakdown4h: false,
+      failedReclaim: false,
+      bearishMomentumExpansion: false,
+      volumeRecovery: false,
+      macdImproving: false,
+      rsiRecovery: false,
+      atrShock: false,
+      averageEntryPrice: 0,
+      pnlPct: 0,
+    },
+  };
+
+  return {
+    strategyDecision,
+    engineDecision,
+    context,
+    referencePriceCapturedAt: generatedAt,
+  };
 }
 
 function createExecutionState(): ExecutionStateRecord {

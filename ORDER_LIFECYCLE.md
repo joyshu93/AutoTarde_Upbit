@@ -6,6 +6,10 @@ Define one explicit lifecycle that works for both `DRY_RUN` and future `LIVE` ex
 
 The system must never treat “strategy said buy” as equivalent to “order exists.” Orders need explicit lifecycle records.
 
+A `DEFERRED_CONFIRMATION` strategy decision is persisted as `PENDING_CONFIRMATION` but does not create an order intent or `orders` row. A later matching `EXECUTED_AFTER_CONFIRMATION` decision must pass the full lifecycle independently.
+
+Before an eligible strategy decision enters this lifecycle, stale-price age is measured from the exchange ticker timestamp used as its reference price to the local submission time. The explicit stale threshold applies to the absolute timestamp difference so materially future-dated exchange evidence is blocked without introducing a hidden clock-skew allowance.
+
 ## Canonical States
 
 - `INTENT_CREATED`

@@ -86,8 +86,8 @@ export interface PositionGuardPublicBacktestRunResult {
 }
 
 const DEFAULT_PAGE_SIZE = 200;
-const DEFAULT_PAGE_LIMIT = 10;
-const DEFAULT_WARMUP_DAYS = 45;
+const DEFAULT_PAGE_LIMIT = 100;
+const DEFAULT_WARMUP_DAYS = 220;
 const TIMEFRAME_ORDER: SupportedStrategyTimeframe[] = ["1h", "4h", "1d"];
 const NON_MUTATION_BOUNDARY: PositionGuardPublicBacktestNonMutationBoundary = {
   database: false,
@@ -232,6 +232,9 @@ async function fetchTimeframeCandles(input: {
 }): Promise<StrategyMarketCandle[]> {
   const candlesByOpenTime = new Map<string, StrategyMarketCandle>();
   let to = new Date(input.endMs).toISOString();
+  let reachedHistoryStart = false;
+  let sourceExhausted = false;
+  let pagesFetched = 0;
 
   for (let page = 0; page < input.pageLimit; page += 1) {
     const rawCandles = await fetchRawCandlePage(input.reader, {
@@ -240,7 +243,9 @@ async function fetchTimeframeCandles(input: {
       count: input.pageSize,
       to,
     });
+    pagesFetched += 1;
     if (rawCandles.length === 0) {
+      sourceExhausted = true;
       break;
     }
 
@@ -258,14 +263,28 @@ async function fetchTimeframeCandles(input: {
     }
     const oldestCloseMs = toUtcMs(oldest.closeTime, `${input.timeframe} oldest closeTime`);
     if (oldestCloseMs <= input.historyStartMs) {
+      reachedHistoryStart = true;
+      break;
+    }
+
+    if (rawCandles.length < input.pageSize) {
+      sourceExhausted = true;
       break;
     }
 
     const nextTo = oldest.openTime;
     if (nextTo === to) {
-      break;
+      throw new Error(
+        `PositionGuard backtest ${input.timeframe} candle pagination made no progress before historyStartAt ${input.historyStartAt}.`,
+      );
     }
     to = nextTo;
+  }
+
+  if (!reachedHistoryStart && !sourceExhausted && pagesFetched >= input.pageLimit) {
+    throw new Error(
+      `PositionGuard backtest ${input.timeframe} candle coverage did not reach historyStartAt ${input.historyStartAt} before pageLimit=${input.pageLimit}.`,
+    );
   }
 
   return [...candlesByOpenTime.values()].sort(

@@ -28,9 +28,9 @@ export type PositionGuardBacktestAnalysisFrame = PositionGuardBacktestFrame & {
 };
 
 const DEFAULT_MINIMUM_COMPLETED_CANDLES: Record<SupportedStrategyTimeframe, number> = {
-  "1h": 24,
-  "4h": 24,
-  "1d": 30,
+  "1h": 200,
+  "4h": 200,
+  "1d": 200,
 };
 
 export function buildPositionGuardBacktestFrames(

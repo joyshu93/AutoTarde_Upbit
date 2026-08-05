@@ -91,6 +91,7 @@ export class PositionGuardStrategyRunner {
       exchangeAccountId: this.dependencies.config.exchangeAccountId,
       strategyDecisionId: strategyDecisionRecord.id,
       decision: decision.strategyDecision,
+      referencePriceCapturedAt: decision.referencePriceCapturedAt,
     });
     const submission = orderInput === null
       ? null
@@ -111,6 +112,7 @@ export class PositionGuardStrategyRunner {
       exchangeAccountId: this.dependencies.config.exchangeAccountId,
       strategyDecisionId: "preview",
       decision: decision.strategyDecision,
+      referencePriceCapturedAt: decision.referencePriceCapturedAt,
     });
 
     return {
@@ -123,6 +125,7 @@ export class PositionGuardStrategyRunner {
     strategyDecision: StrategyDecision;
     engineDecision: PositionGuardEngineDecision;
     context: PositionGuardStrategyContext;
+    referencePriceCapturedAt: string;
   }> {
     const marketSnapshot = await fetchPositionGuardMarketSnapshot(this.dependencies.marketDataReader, {
       market: input.market,
@@ -140,11 +143,13 @@ export class PositionGuardStrategyRunner {
     });
     const engineDecision = decidePositionGuardCore(context);
     const strategyDecision = toStrategyDecision(context, engineDecision);
+    const referencePriceCapturedAt = resolveReferencePriceCapturedAt(marketSnapshot);
 
     return {
       strategyDecision,
       engineDecision,
       context,
+      referencePriceCapturedAt,
     };
   }
 }
@@ -162,7 +167,11 @@ export function createStrategyDecisionRecord(input: {
     strategyKey: input.strategyDecision.strategyKey,
     market: input.strategyDecision.market,
     action: input.strategyDecision.action,
-    status: input.strategyDecision.action === "HOLD" ? "NO_ACTION" : "READY",
+    status: input.engineDecision.executionDisposition === "DEFERRED_CONFIRMATION"
+      ? "PENDING_CONFIRMATION"
+      : input.strategyDecision.action === "HOLD"
+        ? "NO_ACTION"
+        : "READY",
     decisionBasisJson: JSON.stringify({
       strategyDecision: input.strategyDecision,
       engineDecision: input.engineDecision,
@@ -195,7 +204,12 @@ export function toOrderSubmissionInput(input: {
   exchangeAccountId: string;
   strategyDecisionId: string;
   decision: StrategyDecision;
+  referencePriceCapturedAt: string;
 }): SubmitOrderFromDecisionInput | null {
+  if (input.decision.metadata.executionDisposition === "DEFERRED_CONFIRMATION") {
+    return null;
+  }
+
   switch (input.decision.action) {
     case "ENTER":
     case "ADD": {
@@ -206,6 +220,7 @@ export function toOrderSubmissionInput(input: {
       return {
         exchangeAccountId: input.exchangeAccountId,
         strategyDecisionId: input.strategyDecisionId,
+        referencePriceCapturedAt: input.referencePriceCapturedAt,
         decision: input.decision,
         side: "bid",
         ordType: "price",
@@ -222,6 +237,7 @@ export function toOrderSubmissionInput(input: {
       return {
         exchangeAccountId: input.exchangeAccountId,
         strategyDecisionId: input.strategyDecisionId,
+        referencePriceCapturedAt: input.referencePriceCapturedAt,
         decision: input.decision,
         side: "ask",
         ordType: "market",
@@ -246,6 +262,26 @@ export function createDefaultPositionGuardRunnerConfig(
 
 function formatDecimal(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(12).replace(/0+$/u, "").replace(/\.$/u, "");
+}
+
+function resolveReferencePriceCapturedAt(
+  snapshot: Awaited<ReturnType<typeof fetchPositionGuardMarketSnapshot>>,
+): string {
+  if (
+    typeof snapshot.ticker.exchangeTimestampMs === "number"
+    && Number.isFinite(snapshot.ticker.exchangeTimestampMs)
+  ) {
+    return new Date(snapshot.ticker.exchangeTimestampMs).toISOString();
+  }
+
+  if (snapshot.ticker.tradeTimeUtc) {
+    const timestampMs = Date.parse(snapshot.ticker.tradeTimeUtc);
+    if (!Number.isNaN(timestampMs)) {
+      return new Date(timestampMs).toISOString();
+    }
+  }
+
+  throw new Error(`No valid exchange reference-price timestamp is available for ${snapshot.market}.`);
 }
 
 function toOrderPreview(input: SubmitOrderFromDecisionInput): PositionGuardOrderPreview {

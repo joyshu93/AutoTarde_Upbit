@@ -39,15 +39,18 @@ Current strategy direction:
 - the first pure `PositionGuard_PaperTrade` core port exists in `position-guard-core`
 - the first pure `PositionGuard_PaperTrade` market-structure analyzer port exists in `market-structure`
 - `position-guard-snapshot` now normalizes Upbit public ticker and 1h/4h/1d candle responses into the analyzer input shape
+- live snapshot reads use exclusive timeframe-aligned boundaries, retaining 200 completed 1h/4h/1d candles for EMA200 without including the active candle
 - `position-guard-context` now assembles persisted balances, positions, latest compatible strategy decisions, and recent filled sell context into the core decision input shape
 - `position-guard-runner` now performs one explicit market cycle: public snapshot read, structure analysis, persisted context assembly, core decision, durable strategy-decision persistence, and optional `DRY_RUN` execution submission
 - `position-guard-runner` also supports a non-mutating preview path that computes the same decision and order intent without persisting strategy decisions or submitting orders
 - the port preserves invalidation-first exits, no-chase entries, staged entry/add sizing, soft reduce logic, and borderline hourly confirmation semantics
+- borderline `DEFERRED_CONFIRMATION` decisions are persisted as `PENDING_CONFIRMATION` without an order; only a later matching `EXECUTED_AFTER_CONFIRMATION` decision is order-capable, and offline replay follows the same rule
 - flat portfolios treat bearish exit evidence as risk avoidance and return `HOLD` without a sell quantity, so the strategy does not emit no-position exit orders
 - REDUCE decisions avoid double-counting derived `riskLevel` summaries and require independent weakening evidence when the structure stage is still `NONE`, so borderline bearish momentum alone remains a HOLD
 - PositionGuard now applies a profit-protective staged defensive exposure policy for open positions in weak downtrend, breakdown-risk, and profitable range-deterioration states, suppressing below-minimum reduce intents while preserving immediate invalidation exits
 - `position-guard-backtest` provides a pure offline replay harness for PositionGuard analysis frames, applying fee, slippage, minimum-trade, turnover, drawdown, and regime/action metrics without touching DB, Telegram, exchange adapters, order lifecycle records, or live-send gates
 - `position-guard-backtest-frames` converts completed historical 1h/4h/1d candle arrays into replay frames at 1h decision cutoffs, exposing source candle counts and latest close times so research runs can audit that no future candle data was used
+- replay frames require 200 completed candles in every timeframe by default, and the public runner uses a 220-day warmup plus a 100-page fetch ceiling so EMA200 availability matches the live analyzer contract
 - `position-guard-backtest-report` turns replay results into stable offline summaries with cash/buy-and-hold benchmarks, monthly returns, regime return contribution, skip-reason counts, trade diagnostics, action/regime counts, return, drawdown, turnover, fee, skipped-intent, time-in-market, and source-window warnings without touching DB, Telegram, exchange adapters, order lifecycle records, or live-send gates
 - `position-guard-public-backtest` fetches paginated Upbit public 1h/4h/1d candles sequentially, de-duplicates overlapping pages, builds no-lookahead replay frames, and formats a research report without touching DB, Telegram, private exchange endpoints, order lifecycle records, or live-send gates
 - Telegram `/run BTC|ETH` now exposes a controlled operator trigger for one runner cycle without enabling live order transmission
@@ -69,6 +72,7 @@ Current guard families:
 - paused execution
 - live-mode gate
 - stale price guard
+- stale-price evidence uses the exchange ticker timestamp that supplied the strategy reference price rather than resetting the capture time when submission begins
 - duplicate order guard
 - minimum order value guard
 - per-asset allocation cap

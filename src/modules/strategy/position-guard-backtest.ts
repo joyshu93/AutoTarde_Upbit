@@ -248,6 +248,14 @@ function applyDecision(input: {
   trade: PositionGuardBacktestTrade | null;
   skipReason: PositionGuardBacktestSkipReason | null;
 } {
+  if (input.decision.executionDisposition === "DEFERRED_CONFIRMATION") {
+    return {
+      state: cloneState(input.state),
+      trade: null,
+      skipReason: null,
+    };
+  }
+
   switch (input.decision.action) {
     case "ENTER":
     case "ADD":

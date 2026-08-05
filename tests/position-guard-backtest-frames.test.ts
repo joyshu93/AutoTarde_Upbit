@@ -70,17 +70,47 @@ test("position guard backtest frame builder waits for required completed history
   ]);
 });
 
+test("position guard backtest frame builder defaults to 200 completed candles in every timeframe", () => {
+  const firstEligibleAt = "2026-04-20T00:00:00.000Z";
+  const frames = buildPositionGuardBacktestFrames({
+    asset: "BTC",
+    market: "KRW-BTC",
+    oneHourCandles: createCandleSeries("1h", 201, "2026-04-20T01:00:00.000Z"),
+    fourHourCandles: createCandleSeries("4h", 201, "2026-04-20T04:00:00.000Z"),
+    oneDayCandles: createCandleSeries("1d", 200, firstEligibleAt),
+  });
+
+  assert.equal(frames[0]?.generatedAt, firstEligibleAt);
+  assert.ok(frames.every((frame) => frame.source.candleCounts["1h"] >= 200));
+  assert.ok(frames.every((frame) => frame.source.candleCounts["4h"] >= 200));
+  assert.ok(frames.every((frame) => frame.source.candleCounts["1d"] >= 200));
+});
+
+function createCandleSeries(
+  timeframe: "1h" | "4h" | "1d",
+  count: number,
+  finalCloseTime: string,
+): StrategyMarketCandle[] {
+  const durationMs = getTimeframeDurationMs(timeframe);
+  const finalCloseMs = Date.parse(finalCloseTime);
+
+  return Array.from({ length: count }, (_, index) => {
+    const closeMs = finalCloseMs - (count - index - 1) * durationMs;
+    return createCandle(
+      timeframe,
+      new Date(closeMs - durationMs).toISOString(),
+      100 + index,
+    );
+  });
+}
+
 function createCandle(
   timeframe: "1h" | "4h" | "1d",
   openTime: string,
   closePrice: number,
 ): StrategyMarketCandle {
   const openMs = Date.parse(openTime);
-  const durationMs = timeframe === "1h"
-    ? 60 * 60 * 1000
-    : timeframe === "4h"
-      ? 4 * 60 * 60 * 1000
-      : 24 * 60 * 60 * 1000;
+  const durationMs = getTimeframeDurationMs(timeframe);
 
   return {
     market: "KRW-BTC",
@@ -94,4 +124,12 @@ function createCandle(
     volume: 100,
     quoteVolume: closePrice * 100,
   };
+}
+
+function getTimeframeDurationMs(timeframe: "1h" | "4h" | "1d"): number {
+  return timeframe === "1h"
+    ? 60 * 60 * 1000
+    : timeframe === "4h"
+      ? 4 * 60 * 60 * 1000
+      : 24 * 60 * 60 * 1000;
 }

@@ -4,6 +4,10 @@ import {
   buildPositionGuardMarketSnapshot,
   fetchPositionGuardMarketSnapshot,
 } from "../src/modules/strategy/position-guard-snapshot.js";
+import {
+  analyzePositionGuardMarketStructure,
+  type SupportedStrategyTimeframe,
+} from "../src/modules/strategy/market-structure.js";
 import type {
   UpbitCandleSnapshot,
   UpbitGetDayCandlesRequest,
@@ -82,6 +86,82 @@ test("position guard snapshot fetcher requests ticker plus 1h, 4h, and 1d candle
   assert.equal(snapshot.asset, "ETH");
   assert.equal(snapshot.timeframes["1h"].candles.length, 1);
 });
+
+test("position guard snapshot fetcher provides 200 completed candles per timeframe for EMA200", async () => {
+  const decisionAt = "2026-04-20T05:30:00.000Z";
+  const requestedTo: Partial<Record<SupportedStrategyTimeframe, string>> = {};
+  const reader = {
+    async getTickers(markets: readonly UpbitSpotMarket[]): Promise<readonly UpbitTickerSnapshot[]> {
+      return markets.map((market) => ({
+        market,
+        trade_price: 120_000_000,
+        trade_timestamp: Date.parse(decisionAt),
+      }));
+    },
+    async getMinuteCandles(request: UpbitGetMinuteCandlesRequest): Promise<readonly UpbitCandleSnapshot[]> {
+      const timeframe = request.unit === 60 ? "1h" : "4h";
+      if (request.to !== undefined) requestedTo[timeframe] = request.to;
+      return createCandleWindow({
+        count: request.count,
+        decisionAt,
+        durationMs: request.unit * 60 * 1000,
+        ...(request.to === undefined ? {} : { to: request.to }),
+        unit: request.unit,
+      });
+    },
+    async getDayCandles(request: UpbitGetDayCandlesRequest): Promise<readonly UpbitCandleSnapshot[]> {
+      if (request.to !== undefined) requestedTo["1d"] = request.to;
+      return createCandleWindow({
+        count: request.count,
+        decisionAt,
+        durationMs: 24 * 60 * 60 * 1000,
+        ...(request.to === undefined ? {} : { to: request.to }),
+      });
+    },
+  };
+
+  const snapshot = await fetchPositionGuardMarketSnapshot(reader, {
+    market: "KRW-BTC",
+    fetchedAt: decisionAt,
+    candleCount: 200,
+  });
+  const analysis = analyzePositionGuardMarketStructure(snapshot);
+  const decisionAtMs = Date.parse(decisionAt);
+
+  for (const timeframe of ["1h", "4h", "1d"] as const) {
+    const candles = snapshot.timeframes[timeframe].candles;
+    const completedCandleCount = candles.filter((candle) => Date.parse(candle.closeTime) <= decisionAtMs).length;
+    assert.equal(candles.length, 200, `${timeframe} should retain the requested production candle count`);
+    assert.equal(completedCandleCount, 200, `${timeframe} should contain 200 completed candles`);
+    assert.notEqual(analysis.timeframes[timeframe].indicators.ema200, null, `${timeframe} EMA200 should be computable`);
+  }
+
+  assert.deepEqual(requestedTo, {
+    "1h": "2026-04-20T05:00:00.000Z",
+    "4h": "2026-04-20T04:00:00.000Z",
+    "1d": "2026-04-20T00:00:00.000Z",
+  });
+});
+
+function createCandleWindow(input: {
+  count: number;
+  decisionAt: string;
+  durationMs: number;
+  to?: string;
+  unit?: 60 | 240;
+}): UpbitCandleSnapshot[] {
+  const decisionAtMs = Date.parse(input.decisionAt);
+  const activeCandleOpenMs = Math.floor(decisionAtMs / input.durationMs) * input.durationMs;
+  const endExclusiveMs = input.to === undefined
+    ? activeCandleOpenMs + input.durationMs
+    : Date.parse(input.to);
+
+  return Array.from({ length: input.count }, (_, index) => {
+    const openMs = endExclusiveMs - ((index + 1) * input.durationMs);
+    const utcStart = new Date(openMs).toISOString().replace(".000Z", "");
+    return createUpbitCandle(utcStart, 120_000_000 - index * 10_000, input.unit);
+  });
+}
 
 function createUpbitCandle(
   utcStart: string,

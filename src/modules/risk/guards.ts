@@ -40,8 +40,8 @@ export function evaluateRiskGuards(context: RiskEvaluationContext): RiskEvaluati
     triggeredRules.push(block("STALE_PRICE_GUARD", "No price snapshot is available for risk evaluation."));
   } else {
     const ageMs = Date.parse(context.now) - Date.parse(context.priceSnapshot.capturedAt);
-    if (!Number.isFinite(ageMs) || ageMs > context.policy.stalePriceThresholdMs) {
-      triggeredRules.push(block("STALE_PRICE_GUARD", "Price snapshot is stale."));
+    if (!Number.isFinite(ageMs) || Math.abs(ageMs) > context.policy.stalePriceThresholdMs) {
+      triggeredRules.push(block("STALE_PRICE_GUARD", "Price snapshot is stale or outside the allowed clock skew."));
     }
   }
 

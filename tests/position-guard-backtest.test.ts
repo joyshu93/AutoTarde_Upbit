@@ -94,6 +94,41 @@ test("position guard backtest skips order intents below the execution minimum", 
   assert.equal(result.finalState.quantity, 0);
 });
 
+test("position guard backtest executes only after a deferred entry is confirmed", () => {
+  const analysis: Partial<PositionGuardStructureAnalysis> = {
+    regime: "RECLAIM_ATTEMPT",
+    currentPrice: 100_000,
+    entryPath: "RECLAIM",
+    reclaimStructure: true,
+    trendAlignmentScore: 3,
+    recoveryQualityScore: 3,
+  };
+  const result = runPositionGuardBacktest({
+    asset: "BTC",
+    market: "KRW-BTC",
+    initialCashKrw: 1_000_000,
+    initialQuantity: 0,
+    initialAverageEntryPrice: 0,
+    frames: [
+      createFrame("2026-04-20T01:05:00.000Z", analysis),
+      createFrame("2026-04-20T02:05:00.000Z", analysis),
+    ],
+  });
+
+  assert.equal(result.frames[0]?.decision.action, "ENTER");
+  assert.equal(result.frames[0]?.decision.executionDisposition, "DEFERRED_CONFIRMATION");
+  assert.equal(result.frames[0]?.executed, false);
+  assert.equal(result.frames[0]?.trade, null);
+  assert.equal(result.frames[0]?.skipReason, null);
+  assert.equal(result.frames[1]?.decision.action, "ENTER");
+  assert.equal(result.frames[1]?.decision.executionDisposition, "EXECUTED_AFTER_CONFIRMATION");
+  assert.equal(result.frames[1]?.executed, true);
+  assert.equal(result.frames[1]?.trade?.action, "ENTER");
+  assert.equal(result.metrics.tradeCount, 1);
+  assert.equal(result.metrics.skippedOrderCount, 0);
+  assert.ok(result.finalState.quantity > 0);
+});
+
 function createFrame(
   generatedAt: string,
   analysisOverrides: Partial<PositionGuardStructureAnalysis>,

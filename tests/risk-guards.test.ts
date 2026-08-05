@@ -50,6 +50,41 @@ test("risk guards block stale or missing market references", () => {
   );
 });
 
+test("risk guards block market references materially in the future", () => {
+  const result = evaluateRiskGuards(
+    createRiskContext({
+      priceSnapshot: {
+        market: "KRW-BTC",
+        tradePrice: 100_000_000,
+        capturedAt: "2026-04-20T00:01:20.000Z",
+      },
+      now: "2026-04-20T00:00:20.000Z",
+    }),
+  );
+
+  assert.equal(result.accepted, false);
+  assert.deepEqual(
+    result.triggeredRules.map((rule) => rule.code),
+    ["STALE_PRICE_GUARD"],
+  );
+});
+
+test("risk guards tolerate future clock skew within the explicit stale threshold", () => {
+  const result = evaluateRiskGuards(
+    createRiskContext({
+      priceSnapshot: {
+        market: "KRW-BTC",
+        tradePrice: 100_000_000,
+        capturedAt: "2026-04-20T00:00:30.000Z",
+      },
+      now: "2026-04-20T00:00:20.000Z",
+    }),
+  );
+
+  assert.equal(result.accepted, true);
+  assert.deepEqual(result.triggeredRules, []);
+});
+
 test("risk guards block execution while operator state is DEGRADED", () => {
   const result = evaluateRiskGuards(
     createRiskContext({

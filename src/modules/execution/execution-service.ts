@@ -25,11 +25,12 @@ export class ExecutionService {
       repositories: ExecutionRepository;
       operatorState: OperatorStateStore;
       reporter?: OperatorNotificationReporter;
+      now?: () => string;
     },
   ) {}
 
   async submitOrderFromDecision(input: SubmitOrderFromDecisionInput): Promise<SubmitOrderFromDecisionResult> {
-    const requestedAt = new Date().toISOString();
+    const requestedAt = this.dependencies.now?.() ?? new Date().toISOString();
     const decision = input.decision;
     const market = input.market ?? decision.market;
     const idempotencyKey = buildOrderIdempotencyKey({
@@ -84,7 +85,7 @@ export class ExecutionService {
       priceSnapshot: {
         market,
         tradePrice: decision.referencePrice,
-        capturedAt: requestedAt,
+        capturedAt: input.referencePriceCapturedAt,
       },
       portfolio,
       openOrders,

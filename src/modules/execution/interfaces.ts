@@ -3,6 +3,7 @@ import type { OrderOrigin, OrderRecord, StrategyDecision, SupportedMarket } from
 export interface SubmitOrderFromDecisionInput {
   exchangeAccountId: string;
   strategyDecisionId: string | null;
+  referencePriceCapturedAt: string;
   decision: StrategyDecision;
   side: "bid" | "ask";
   ordType: "limit" | "price" | "market" | "best";
