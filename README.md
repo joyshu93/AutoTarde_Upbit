@@ -286,6 +286,26 @@ If that live scheduler startup preflight blocks timer installation, the runtime 
 Every later `LIVE` scheduled tick first runs an exchange-backed account-health refresh that persists current balance snapshots, position snapshots, and reconciliation evidence with source `SCHEDULER_PREFLIGHT`. The tick then runs the same persisted-health preflight before the strategy runner is invoked. If refresh fails or account-health evidence remains stale or unsafe, the tick is recorded as a failed `strategy_scheduler_runs` row and operator notification, and no strategy decision or order intent is created.
 When either scheduler or Telegram inbound polling is running, use normal process signals such as `Ctrl+C` / `SIGINT` or `SIGTERM` to stop the process. Shutdown is explicit: inbound polling is stopped, scheduler timers are cleared, and SQLite persistence is closed before the process exits.
 
+## Read-Only Performance Report
+
+Generate a deterministic performance report from persisted local fills and position snapshots:
+
+```powershell
+npm run report:performance -- --database ./var/company-live.sqlite --exchange-account primary --mode LIVE --origin STRATEGY
+```
+
+Bound the report to a half-open `[from,to)` period and request stable JSON output when needed:
+
+```powershell
+npm run report:performance -- --database ./var/company-live.sqlite --exchange-account primary --mode LIVE --origin STRATEGY --from 2026-08-01T00:00:00.000Z --to 2026-08-10T00:00:00.000Z --json
+```
+
+All four selection arguments are required: `--database`, `--exchange-account`, `--mode`, and `--origin`. Optional `--from` is inclusive and `--to` is exclusive. With `--from`, opening inventory comes from the latest position snapshot at or before that instant; without it, the latest snapshot before the first selected fill is used. Marks come from the latest snapshot at or before `--to`, or the latest snapshot when `--to` is omitted.
+
+The command opens the existing SQLite file directly with `readOnly: true`. It does not apply migrations, create a database, call Upbit or Telegram, run reconciliation or strategy, start scheduler work, mutate order lifecycle state, or transmit orders. Missing costs, fees, unmatched sells, and unavailable marks remain explicit warnings or `unknown`; they are not silently replaced with zero.
+
+The result is performance attributed to the selected order stream and its reported opening inventory. It is not total account return and does not treat deposits, withdrawals, unrelated order origins, or external balance changes as strategy profit.
+
 ## Local DRY_RUN Script
 
 Before connecting a real Telegram bot or Upbit read credentials, run the fixture-backed offline operator rehearsal:

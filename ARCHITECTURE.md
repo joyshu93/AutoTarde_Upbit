@@ -63,6 +63,16 @@ Current strategy direction:
 - regular scheduler timer ticks are queued across configured markets for the exchange account, so simultaneous BTC/ETH timers do not produce account-lock `ALREADY_RUNNING` skips
 - in `LIVE`, once a scheduled market tick submits an order, remaining market ticks from that same scheduler batch are persisted as `SKIPPED` and deferred to the next interval; scheduler batches use one-second granularity so millisecond-staggered BTC/ETH timers from the same cadence still share the same batch
 
+### `performance`
+
+Calculates and reports persisted order-stream performance without joining the runtime execution graph.
+
+- `performance-calculator` is pure FIFO accounting over normalized fills, opening positions, and mark prices. It separates opening-inventory realized PnL from selected-stream realized PnL and preserves missing fees or costs as unknown values and warnings.
+- `sqlite-performance-reader` is a read-only adapter that constructs calculator input from explicitly selected account, execution mode, order origin, and optional `[from,to)` bounds. It opens an existing database with `DatabaseSync(path, { readOnly: true })` directly and never imports migration or runtime wiring.
+- the opening snapshot is the latest snapshot at or before `from`, or the latest snapshot before the first selected fill when `from` is absent. The mark snapshot is the latest at or before `to`, or the latest available snapshot when `to` is absent.
+- `performance-report` is a thin CLI that validates all arguments, exposes snapshot and fill provenance, and formats stable text or JSON. It does not call Upbit, Telegram, reconciliation, strategy, scheduler, execution, or order mutation paths.
+- the report describes the selected order stream and its opening inventory, not account-wide return. Deposits, withdrawals, unrelated origins, and unexplained balance changes are outside its PnL attribution.
+
 ### `risk`
 
 Applies hard guardrails before an order can proceed.

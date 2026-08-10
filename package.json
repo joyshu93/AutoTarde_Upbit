@@ -21,6 +21,7 @@
     "smoke:live:readiness": "npm run build && node dist/src/smoke/live-readiness.js",
     "smoke:live:scheduler-preflight": "npm run build && node dist/src/smoke/live-scheduler-preflight.js",
     "backtest:positionguard": "npm run build && node dist/src/research/position-guard-public-backtest.js",
+    "report:performance": "npm run build && node dist/src/research/performance-report.js",
     "check": "npm run typecheck && npm run test"
   },
   "devDependencies": {
