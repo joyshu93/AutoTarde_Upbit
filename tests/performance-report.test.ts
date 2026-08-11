@@ -90,6 +90,10 @@ test("performance report timestamps require explicit ISO timezone and normalize 
     () => parsePerformanceReportArgs(requiredArgs("--from", "2026-08-01T00:00:00")),
     /Invalid --from timestamp.*explicit ISO-8601 timezone/,
   );
+  assert.throws(
+    () => parsePerformanceReportArgs(requiredArgs("--from", "2026-08-01T00:00:00.1234567890Z")),
+    /Invalid --from timestamp.*explicit ISO-8601 timezone/,
+  );
 
   const parsed = parsePerformanceReportArgs(
     requiredArgs(
@@ -101,6 +105,17 @@ test("performance report timestamps require explicit ISO timezone and normalize 
   );
   assert.equal(parsed.from, "2026-08-01T00:00:00.000Z");
   assert.equal(parsed.to, "2026-08-02T00:00:00.000Z");
+
+  const precise = parsePerformanceReportArgs(
+    requiredArgs(
+      "--from",
+      "2026-07-06T18:27:39.360311+09:00",
+      "--to",
+      "2026-07-06T18:27:39.360312+09:00",
+    ),
+  );
+  assert.equal(precise.from, "2026-07-06T09:27:39.360311Z");
+  assert.equal(precise.to, "2026-07-06T09:27:39.360312Z");
 
   const databasePath = await createPerformanceFixture("canonical-timezone");
   try {
@@ -119,6 +134,57 @@ test("performance report timestamps require explicit ISO timezone and normalize 
     });
     assert.equal(result.provenance.filters.from, "2026-08-01T00:00:00.000Z");
     assert.equal(result.provenance.filters.to, "2026-08-02T00:00:00.000Z");
+  } finally {
+    await cleanupPerformanceDatabase(databasePath);
+  }
+});
+
+test("SQLite performance reader orders and filters fills within one millisecond", async () => {
+  const databasePath = await createPerformanceFixture("sub-millisecond-fills");
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.prepare("UPDATE fills SET filled_at = ? WHERE id = ?").run(
+      "2026-08-01T12:00:00.000200Z",
+      "fill-in-period",
+    );
+    db.prepare(`
+      INSERT INTO orders (
+        id, strategy_decision_id, exchange_account_id, market, side, origin, execution_mode
+      ) VALUES (?, NULL, ?, ?, ?, ?, ?)
+    `).run("order-z-earlier", "primary", "KRW-BTC", "ask", "STRATEGY", "LIVE");
+    db.prepare(`
+      INSERT INTO fills (
+        id, order_id, market, side, price, volume, fee_currency, fee_amount, filled_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "z-earlier",
+      "order-z-earlier",
+      "KRW-BTC",
+      "ask",
+      "109",
+      "0.1",
+      "KRW",
+      "0.01",
+      "2026-08-01T12:00:00.000100Z",
+    );
+  } finally {
+    db.close();
+  }
+
+  try {
+    const ordered = readPerformanceInput({
+      ...baseFilters(databasePath),
+      from: "2026-08-01T12:00:00.000050Z",
+      to: "2026-08-01T12:00:00.000250Z",
+    });
+    assert.deepEqual(ordered.tradeFills.map((fill) => fill.id), ["z-earlier", "fill-in-period"]);
+
+    const filtered = readPerformanceInput({
+      ...baseFilters(databasePath),
+      from: "2026-08-01T12:00:00.000150Z",
+      to: "2026-08-01T12:00:00.000250Z",
+    });
+    assert.deepEqual(filtered.tradeFills.map((fill) => fill.id), ["fill-in-period"]);
   } finally {
     await cleanupPerformanceDatabase(databasePath);
   }
@@ -145,8 +211,8 @@ test("SQLite performance reader applies persisted filters and [from,to) snapshot
       { market: "KRW-ETH", quantity: 1, averagePriceKrw: 190 },
     ]);
     assert.deepEqual(result.input.markPrices, [
-      { market: "KRW-BTC", priceKrw: 120 },
-      { market: "KRW-ETH", priceKrw: 210 },
+      { market: "KRW-BTC", priceKrw: 105 },
+      { market: "KRW-ETH", priceKrw: 190 },
     ]);
     assert.deepEqual(result.provenance.filters, {
       databasePath,
@@ -166,12 +232,171 @@ test("SQLite performance reader applies persisted filters and [from,to) snapshot
       source: "RECONCILIATION",
     });
     assert.deepEqual(result.provenance.markSnapshot, {
-      id: "position-mark-boundary",
-      capturedAt: "2026-08-02T00:00:00.000Z",
+      id: "position-opening-boundary",
+      capturedAt: "2026-08-01T00:00:00.000Z",
       source: "RECONCILIATION",
     });
+    assert.deepEqual(
+      result.markObservations.map((observation) => ({
+        snapshotId: observation.snapshotId,
+        capturedAt: observation.capturedAt,
+      })),
+      [{
+        snapshotId: "position-opening-boundary",
+        capturedAt: "2026-08-01T00:00:00.000Z",
+      }],
+    );
+    assert.deepEqual(result.markObservations[0]?.prices, {
+      "KRW-BTC": 105,
+      "KRW-ETH": 190,
+    });
+    assert.equal(result.provenance.markObservationCount, 1);
+    assert.equal(result.provenance.firstMarkObservationAt, "2026-08-01T00:00:00.000Z");
+    assert.equal(result.provenance.lastMarkObservationAt, "2026-08-01T00:00:00.000Z");
   } finally {
     await rm(databasePath, { force: true });
+  }
+});
+
+test("SQLite performance reader enriches fills with validated strategy decision evidence", async () => {
+  const databasePath = await createPerformanceFixture("decision-evidence");
+  const db = new DatabaseSync(databasePath);
+  try {
+    insertDecision(db, {
+      id: "decision-exit",
+      accountId: "primary",
+      market: "KRW-BTC",
+      action: "EXIT",
+    });
+    db.prepare("UPDATE orders SET strategy_decision_id = ? WHERE id = ?").run(
+      "decision-exit",
+      "order-in-period",
+    );
+  } finally {
+    db.close();
+  }
+
+  try {
+    const result = readPerformanceInput({
+      ...baseFilters(databasePath),
+      from: "2026-08-01T00:00:00.000Z",
+      to: "2026-08-02T00:00:00.000Z",
+    });
+    assert.deepEqual(result.tradeFills, [{
+      id: "fill-in-period",
+      orderId: "order-in-period",
+      strategyDecisionId: "decision-exit",
+      decisionAction: "EXIT",
+      market: "KRW-BTC",
+      side: "ask",
+      priceKrw: 110,
+      volume: 0.1,
+      feeKrw: 0.01,
+      filledAt: "2026-08-01T12:00:00.000Z",
+    }]);
+  } finally {
+    await cleanupPerformanceDatabase(databasePath);
+  }
+});
+
+test("SQLite performance reader rejects missing and contradictory strategy decision links", async () => {
+  const cases = [
+    {
+      label: "missing-decision",
+      prepare(db: DatabaseSync): void {
+        db.prepare("UPDATE orders SET strategy_decision_id = ? WHERE id = ?").run(
+          "missing-decision",
+          "order-in-period",
+        );
+      },
+      expected: /Order order-in-period references missing strategy decision missing-decision/,
+    },
+    {
+      label: "decision-account",
+      prepare(db: DatabaseSync): void {
+        insertDecision(db, {
+          id: "bad-account",
+          accountId: "secondary",
+          market: "KRW-BTC",
+          action: "EXIT",
+        });
+        db.prepare("UPDATE orders SET strategy_decision_id = ? WHERE id = ?").run(
+          "bad-account",
+          "order-in-period",
+        );
+      },
+      expected: /decision account secondary does not match order account primary/,
+    },
+    {
+      label: "decision-market",
+      prepare(db: DatabaseSync): void {
+        insertDecision(db, {
+          id: "bad-market",
+          accountId: "primary",
+          market: "KRW-ETH",
+          action: "EXIT",
+        });
+        db.prepare("UPDATE orders SET strategy_decision_id = ? WHERE id = ?").run(
+          "bad-market",
+          "order-in-period",
+        );
+      },
+      expected: /decision market KRW-ETH does not match order market KRW-BTC/,
+    },
+    {
+      label: "decision-action",
+      prepare(db: DatabaseSync): void {
+        insertDecision(db, {
+          id: "bad-action",
+          accountId: "primary",
+          market: "KRW-BTC",
+          action: "ENTER",
+        });
+        db.prepare("UPDATE orders SET strategy_decision_id = ? WHERE id = ?").run(
+          "bad-action",
+          "order-in-period",
+        );
+      },
+      expected: /decision action ENTER contradicts ask order side/,
+    },
+    {
+      label: "decision-hold",
+      prepare(db: DatabaseSync): void {
+        insertDecision(db, {
+          id: "bad-hold",
+          accountId: "primary",
+          market: "KRW-BTC",
+          action: "HOLD",
+        });
+        db.prepare("UPDATE orders SET strategy_decision_id = ? WHERE id = ?").run(
+          "bad-hold",
+          "order-in-period",
+        );
+      },
+      expected: /decision action HOLD cannot be linked to a fill/,
+    },
+  ] as const;
+
+  for (const fixture of cases) {
+    const databasePath = await createPerformanceFixture(fixture.label);
+    const db = new DatabaseSync(databasePath);
+    try {
+      fixture.prepare(db);
+    } finally {
+      db.close();
+    }
+    try {
+      assert.throws(
+        () => readPerformanceInput({
+          ...baseFilters(databasePath),
+          from: "2026-08-01T00:00:00.000Z",
+          to: "2026-08-02T00:00:00.000Z",
+        }),
+        fixture.expected,
+      );
+    } finally {
+      await cleanupPerformanceDatabase(databasePath);
+    }
   }
 });
 
@@ -282,6 +507,76 @@ test("SQLite performance reader rejects damaged selected fill and account snapsh
   }
 });
 
+test("SQLite performance reader ignores out-of-period snapshot payload and source corruption", async () => {
+  const databasePath = await createPerformanceFixture("out-of-period-snapshot-payload");
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.prepare(`
+      UPDATE position_snapshots
+      SET source = ?, positions_json = ?
+      WHERE id = ?
+    `).run("", "not-json", "position-latest");
+  } finally {
+    db.close();
+  }
+
+  try {
+    const result = readPerformanceInput({
+      ...baseFilters(databasePath),
+      from: "2026-08-01T00:00:00.000Z",
+      to: "2026-08-02T00:00:00.000Z",
+    });
+    assert.equal(result.provenance.markSnapshot?.id, "position-opening-boundary");
+    assert.deepEqual(result.markObservations.map((item) => item.snapshotId), [
+      "position-opening-boundary",
+    ]);
+  } finally {
+    await cleanupPerformanceDatabase(databasePath);
+  }
+});
+
+test("SQLite performance reader rejects selected snapshot payload and source corruption", async () => {
+  const cases = [
+    {
+      label: "selected-snapshot-source",
+      column: "source",
+      value: "",
+      expected: /Position snapshot position-opening-boundary source must be a non-empty string/,
+    },
+    {
+      label: "selected-snapshot-json",
+      column: "positions_json",
+      value: "not-json",
+      expected: /Position snapshot position-opening-boundary positions_json must be valid JSON/,
+    },
+  ] as const;
+
+  for (const fixture of cases) {
+    const databasePath = await createPerformanceFixture(fixture.label);
+    const db = new DatabaseSync(databasePath);
+    try {
+      db.prepare(`UPDATE position_snapshots SET ${fixture.column} = ? WHERE id = ?`).run(
+        fixture.value,
+        "position-opening-boundary",
+      );
+    } finally {
+      db.close();
+    }
+    try {
+      assert.throws(
+        () => readPerformanceInput({
+          ...baseFilters(databasePath),
+          from: "2026-08-01T00:00:00.000Z",
+          to: "2026-08-02T00:00:00.000Z",
+        }),
+        fixture.expected,
+      );
+    } finally {
+      await cleanupPerformanceDatabase(databasePath);
+    }
+  }
+});
+
 test("SQLite performance reader ignores out-of-period non-timestamp fill corruption", async () => {
   const numericDatabasePath = await createPerformanceFixture("out-of-period-number");
   const numericDb = new DatabaseSync(numericDatabasePath);
@@ -374,8 +669,11 @@ test("SQLite performance reader is compatible with the fully migrated operationa
 
     assert.equal(result.provenance.fillCount, 1);
     assert.equal(result.input.fills[0]?.id, "migrated-fill");
+    assert.equal(result.tradeFills[0]?.orderId, "migrated-order");
+    assert.equal(result.tradeFills[0]?.decisionAction, null);
+    assert.deepEqual(result.markObservations.map((item) => item.snapshotId), ["migrated-opening"]);
     assert.equal(result.provenance.openingSnapshot?.id, "migrated-opening");
-    assert.equal(result.provenance.markSnapshot?.id, "migrated-mark");
+    assert.equal(result.provenance.markSnapshot?.id, "migrated-opening");
   } finally {
     await cleanupPerformanceDatabase(databasePath);
   }
@@ -396,7 +694,7 @@ test("performance report exposes stable provenance and selected-stream disclaime
     assert.match(text, /Performance Report/);
     assert.match(text, /period: \[2026-08-01T00:00:00.000Z, 2026-08-02T00:00:00.000Z\)/);
     assert.match(text, /opening_snapshot: position-opening-boundary @ 2026-08-01T00:00:00.000Z/);
-    assert.match(text, /mark_snapshot: position-mark-boundary @ 2026-08-02T00:00:00.000Z/);
+    assert.match(text, /mark_snapshot: position-opening-boundary @ 2026-08-01T00:00:00.000Z/);
     assert.match(text, /KRW-BTC/);
     assert.match(text, /KRW-ETH/);
     assert.ok(text.indexOf("KRW-BTC") < text.indexOf("KRW-ETH"));
@@ -406,12 +704,48 @@ test("performance report exposes stable provenance and selected-stream disclaime
     );
 
     const parsed = JSON.parse(json) as Record<string, unknown>;
-    assert.deepEqual(Object.keys(parsed), ["provenance", "performance", "disclaimer"]);
+    assert.deepEqual(Object.keys(parsed), [
+      "provenance",
+      "performance",
+      "diagnostics",
+      "recentCompletedEpisodes",
+      "disclaimer",
+    ]);
+    const diagnostics = parsed.diagnostics as {
+      policy: { breakevenToleranceKrw: number };
+      combined: { completedEpisodeCount: number; selectedSliceCount: number };
+      realizedPnlCurve: { equityDefinition: string; observationFrequency: string };
+      markPnlCurve: { observationFrequency: string; sampleCount: number };
+    };
+    assert.equal(diagnostics.policy.breakevenToleranceKrw, 1e-9);
+    assert.equal(diagnostics.combined.completedEpisodeCount, 0);
+    assert.equal(diagnostics.combined.selectedSliceCount, 0);
+    assert.equal(
+      diagnostics.realizedPnlCurve.equityDefinition,
+      "CUMULATIVE_SELECTED_STREAM_REALIZED_PNL_KRW",
+    );
+    assert.equal(diagnostics.realizedPnlCurve.observationFrequency, "SELL_FILL_EPOCH");
+    assert.equal(diagnostics.markPnlCurve.observationFrequency, "PERSISTED_MARK_SNAPSHOT");
+    assert.equal(diagnostics.markPnlCurve.sampleCount, 1);
+    assert.deepEqual(parsed.recentCompletedEpisodes, []);
     assert.equal(
       parsed.disclaimer,
       "This is selected order stream performance; it is not total account return.",
     );
     assert.equal(formatPerformanceReport(report, "json"), json);
+    assert.doesNotMatch(json, /NaN|Infinity/);
+    assert.match(text, /Episode win unit: completed position episodes/);
+    assert.match(text, /FIFO realization slices/);
+    assert.match(text, /gross_realized_pnl_krw:/);
+    assert.match(text, /fee_completeness:/);
+    assert.match(text, /Realized curve: CUMULATIVE_SELECTED_STREAM_REALIZED_PNL_KRW/);
+    assert.match(text, /Snapshot mark curve: SELECTED_STREAM_ATTRIBUTED_PNL_KRW/);
+    assert.match(text, /entry_action_contribution:/);
+    assert.match(text, /exit_action_contribution:/);
+    assert.match(text, /KRW-BTC realized drawdown:/);
+    assert.match(text, /KRW-ETH snapshot mark drawdown:/);
+    assert.match(text, /Recent completed episodes \(most recent, max 10\):/);
+    assert.match(text, /mark_observations: 1/);
 
     const unknownFeesReport = {
       ...report,
@@ -432,6 +766,78 @@ test("performance report exposes stable provenance and selected-stream disclaime
     assert.doesNotMatch(unknownFeesText, /paid_fees_krw: 0(?:\.0+)?\b/);
   } finally {
     await rm(databasePath, { force: true });
+  }
+});
+
+test("performance report text distinguishes persisted marks from usable curve points", async () => {
+  const databasePath = await createPerformanceFixture("mark-coverage-text");
+  try {
+    const report = buildPerformanceReport({
+      ...baseFilters(databasePath),
+      from: "2026-08-01T00:00:00.000Z",
+      to: "2026-08-02T00:00:00.000Z",
+      output: "text",
+    });
+    const partialCurve = {
+      ...report.diagnostics.markPnlCurve,
+      persistedObservationCount: 3,
+      usableObservationCount: 2,
+      sampleCount: 2,
+    };
+    const unusableEthCurve = {
+      ...report.diagnostics.marketMarkPnlCurves["KRW-ETH"],
+      persistedObservationCount: 3,
+      usableObservationCount: 0,
+      sampleCount: 0,
+    };
+    const coverageReport = {
+      ...report,
+      diagnostics: {
+        ...report.diagnostics,
+        markPnlCurve: partialCurve,
+        marketMarkPnlCurves: {
+          ...report.diagnostics.marketMarkPnlCurves,
+          "KRW-ETH": unusableEthCurve,
+        },
+      },
+    };
+
+    const text = formatPerformanceReport(coverageReport, "text");
+
+    assert.match(
+      text,
+      /Snapshot mark curve: .*persisted_observation_count=3; usable_observation_count=2; curve_points=2; coverage=PARTIAL;/,
+    );
+    assert.match(
+      text,
+      /KRW-ETH snapshot mark drawdown: .*persisted_observation_count=3 usable_observation_count=0 curve_points=0 coverage=UNUSABLE/,
+    );
+    assert.match(
+      text,
+      /Usable snapshot mark points require persisted snapshots with complete mark and cost evidence;/,
+    );
+    assert.doesNotMatch(text, /use each persisted snapshot mark/);
+  } finally {
+    await cleanupPerformanceDatabase(databasePath);
+  }
+});
+
+test("building the diagnostics report leaves the migrated SQLite checksum unchanged", async () => {
+  const databasePath = await createMigratedPerformanceFixture("diagnostics-readonly");
+  try {
+    const before = await checksum(databasePath);
+    const report = buildPerformanceReport({
+      ...baseFilters(databasePath),
+      from: "2026-08-01T00:00:00.000Z",
+      to: "2026-08-02T00:00:00.000Z",
+      output: "json",
+    });
+    const output = formatPerformanceReport(report, "json");
+    const after = await checksum(databasePath);
+    assert.equal(after, before);
+    assert.doesNotMatch(output, /NaN|Infinity/);
+  } finally {
+    await cleanupPerformanceDatabase(databasePath);
   }
 });
 
@@ -481,8 +887,15 @@ async function createPerformanceFixture(label: string): Promise<string> {
         source TEXT NOT NULL,
         positions_json TEXT NOT NULL
       );
+      CREATE TABLE strategy_decisions (
+        id TEXT PRIMARY KEY,
+        exchange_account_id TEXT NOT NULL,
+        market TEXT NOT NULL,
+        action TEXT NOT NULL
+      );
       CREATE TABLE orders (
         id TEXT PRIMARY KEY,
+        strategy_decision_id TEXT,
         exchange_account_id TEXT NOT NULL,
         market TEXT NOT NULL,
         side TEXT NOT NULL,
@@ -537,8 +950,9 @@ async function createPerformanceFixture(label: string): Promise<string> {
     );
 
     const insertOrder = db.prepare(`
-      INSERT INTO orders (id, exchange_account_id, market, side, origin, execution_mode)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO orders (
+        id, strategy_decision_id, exchange_account_id, market, side, origin, execution_mode
+      ) VALUES (?, NULL, ?, ?, ?, ?, ?)
     `);
     const insertFill = db.prepare(`
       INSERT INTO fills (
@@ -612,6 +1026,21 @@ async function createPerformanceFixture(label: string): Promise<string> {
     db.close();
   }
   return databasePath;
+}
+
+function insertDecision(
+  db: DatabaseSync,
+  decision: {
+    id: string;
+    accountId: string;
+    market: "KRW-BTC" | "KRW-ETH";
+    action: "ENTER" | "ADD" | "REDUCE" | "EXIT" | "HOLD";
+  },
+): void {
+  db.prepare(`
+    INSERT INTO strategy_decisions (id, exchange_account_id, market, action)
+    VALUES (?, ?, ?, ?)
+  `).run(decision.id, decision.accountId, decision.market, decision.action);
 }
 
 function positionsJson(

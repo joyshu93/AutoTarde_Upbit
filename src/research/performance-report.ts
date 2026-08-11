@@ -8,6 +8,14 @@ import {
   type PerformanceCalculationResult,
 } from "../modules/performance/performance-calculator.js";
 import {
+  diagnosePerformance,
+  type Metric,
+  type PerformanceDiagnosticGroup,
+  type PerformanceDiagnosticsResult,
+} from "../modules/performance/performance-diagnostics.js";
+import type { PositionEpisode } from "../modules/performance/performance-trade-matcher.js";
+import { comparePerformanceTimestamps } from "../modules/performance/performance-timestamp.js";
+import {
   normalizeExplicitIsoTimestamp,
   readPerformanceInput,
   type PerformanceReadFilters,
@@ -23,11 +31,15 @@ export type PerformanceReportOptions = PerformanceReadFilters & {
 export type PerformanceReport = {
   provenance: PerformanceReadProvenance;
   performance: PerformanceCalculationResult;
+  diagnostics: PerformanceDiagnosticsResult;
+  recentCompletedEpisodes: readonly PositionEpisode[];
   disclaimer: "This is selected order stream performance; it is not total account return.";
 };
 
 const DISCLAIMER =
   "This is selected order stream performance; it is not total account return." as const;
+export const PERFORMANCE_BREAKEVEN_TOLERANCE_KRW = 1e-9;
+const RECENT_COMPLETED_EPISODE_LIMIT = 10;
 
 export function parsePerformanceReportArgs(argv: readonly string[]): PerformanceReportOptions {
   const values = new Map<string, string>();
@@ -68,7 +80,7 @@ export function parsePerformanceReportArgs(argv: readonly string[]): Performance
   const origin = parseOrigin(requireArgument(values, "origin"));
   const from = parseOptionalTimestamp(values.get("from"), "from");
   const to = parseOptionalTimestamp(values.get("to"), "to");
-  if (from !== undefined && to !== undefined && Date.parse(from) >= Date.parse(to)) {
+  if (from !== undefined && to !== undefined && comparePerformanceTimestamps(from, to) >= 0) {
     throw new Error("--from must be earlier than --to.");
   }
 
@@ -85,9 +97,22 @@ export function parsePerformanceReportArgs(argv: readonly string[]): Performance
 
 export function buildPerformanceReport(options: PerformanceReportOptions): PerformanceReport {
   const readResult = readPerformanceInput(options);
+  const diagnostics = diagnosePerformance({
+    fills: readResult.tradeFills,
+    ...(readResult.input.openingPositions === undefined
+      ? {}
+      : { openingPositions: readResult.input.openingPositions }),
+    markObservations: readResult.markObservations,
+    policy: { breakevenToleranceKrw: PERFORMANCE_BREAKEVEN_TOLERANCE_KRW },
+  });
   return {
     provenance: readResult.provenance,
     performance: calculatePerformance(readResult.input),
+    diagnostics,
+    recentCompletedEpisodes: diagnostics.matchResult.episodes
+      .filter((episode) => episode.status === "COMPLETED")
+      .sort(compareRecentEpisodes)
+      .slice(0, RECENT_COMPLETED_EPISODE_LIMIT),
     disclaimer: DISCLAIMER,
   };
 }
@@ -96,7 +121,7 @@ export function formatPerformanceReport(
   report: PerformanceReport,
   output: PerformanceReportOutput,
 ): string {
-  if (output === "json") return JSON.stringify(report, null, 2);
+  if (output === "json") return stringifyFiniteJson(report);
 
   const filters = report.provenance.filters;
   const lines = [
@@ -112,6 +137,9 @@ export function formatPerformanceReport(
     `last_fill_at: ${report.provenance.lastFillAt ?? "none"}`,
     `opening_snapshot: ${formatSnapshot(report.provenance.openingSnapshot)}`,
     `mark_snapshot: ${formatSnapshot(report.provenance.markSnapshot)}`,
+    `mark_observations: ${report.provenance.markObservationCount}`,
+    `first_mark_observation_at: ${report.provenance.firstMarkObservationAt ?? "none"}`,
+    `last_mark_observation_at: ${report.provenance.lastMarkObservationAt ?? "none"}`,
     "",
     ...report.performance.markets.flatMap(formatMarket),
     "Totals",
@@ -124,14 +152,131 @@ export function formatPerformanceReport(
     `market_value_krw: ${formatNumber(report.performance.totals.marketValueKrw)}`,
     `gross_unrealized_pnl_krw: ${formatNumber(report.performance.totals.grossUnrealizedPnlKrw)}`,
     "",
+    "Professional Diagnostics",
+    `breakeven_tolerance_krw: ${PERFORMANCE_BREAKEVEN_TOLERANCE_KRW}`,
+    "Episode win unit: completed position episodes (zero inventory to positive and back to zero).",
+    ...formatDiagnosticGroup("Combined", report.diagnostics.combined),
+    ...formatDiagnosticGroup("KRW-BTC", report.diagnostics.markets["KRW-BTC"]),
+    ...formatDiagnosticGroup("KRW-ETH", report.diagnostics.markets["KRW-ETH"]),
+    "Curves And Drawdowns",
+    `Realized curve: ${report.diagnostics.realizedPnlCurve.equityDefinition}; observation_frequency=${report.diagnostics.realizedPnlCurve.observationFrequency}; max_gross_drawdown_krw=${formatMetric(report.diagnostics.realizedPnlCurve.maxGrossDrawdownKrw)}; max_net_drawdown_krw=${formatMetric(report.diagnostics.realizedPnlCurve.maxNetDrawdownKrw)}`,
+    `Snapshot mark curve: ${report.diagnostics.markPnlCurve.equityDefinition}; observation_frequency=${report.diagnostics.markPnlCurve.observationFrequency}; ${formatMarkCoverage(report.diagnostics.markPnlCurve, "; ")}; max_observation_gap_ms=${formatNumber(report.diagnostics.markPnlCurve.maxObservationGapMs)}; max_gross_drawdown_krw=${formatMetric(report.diagnostics.markPnlCurve.maxGrossDrawdownKrw)}; max_net_drawdown_krw=${formatMetric(report.diagnostics.markPnlCurve.maxNetDrawdownKrw)}`,
+    `KRW-BTC realized drawdown: gross=${formatMetric(report.diagnostics.marketRealizedPnlCurves["KRW-BTC"].maxGrossDrawdownKrw)} net=${formatMetric(report.diagnostics.marketRealizedPnlCurves["KRW-BTC"].maxNetDrawdownKrw)}`,
+    `KRW-BTC snapshot mark drawdown: gross=${formatMetric(report.diagnostics.marketMarkPnlCurves["KRW-BTC"].maxGrossDrawdownKrw)} net=${formatMetric(report.diagnostics.marketMarkPnlCurves["KRW-BTC"].maxNetDrawdownKrw)} ${formatMarkCoverage(report.diagnostics.marketMarkPnlCurves["KRW-BTC"], " ")}`,
+    `KRW-ETH realized drawdown: gross=${formatMetric(report.diagnostics.marketRealizedPnlCurves["KRW-ETH"].maxGrossDrawdownKrw)} net=${formatMetric(report.diagnostics.marketRealizedPnlCurves["KRW-ETH"].maxNetDrawdownKrw)}`,
+    `KRW-ETH snapshot mark drawdown: gross=${formatMetric(report.diagnostics.marketMarkPnlCurves["KRW-ETH"].maxGrossDrawdownKrw)} net=${formatMetric(report.diagnostics.marketMarkPnlCurves["KRW-ETH"].maxNetDrawdownKrw)} ${formatMarkCoverage(report.diagnostics.marketMarkPnlCurves["KRW-ETH"], " ")}`,
+    "Realized curve points are cumulative selected-stream PnL at sell-fill instants; drawdown is peak minus cumulative PnL.",
+    "Usable snapshot mark points require persisted snapshots with complete mark and cost evidence; persisted observations may be excluded; no interpolation or future observations are used; drawdown is peak minus attributed PnL.",
+    "",
+    `Recent completed episodes (most recent, max ${RECENT_COMPLETED_EPISODE_LIMIT}):`,
+    ...formatRecentEpisodes(report.recentCompletedEpisodes),
+    "",
     `warnings: ${report.performance.warnings.length}`,
     ...report.performance.warnings.map(
       (warning) => `- ${warning.code} | ${warning.market} | ${warning.message}`,
     ),
+    `diagnostic_warnings: ${report.diagnostics.warnings.length}`,
+    ...report.diagnostics.warnings.map((warning) => `- ${warning}`),
     "",
     `Disclaimer: ${report.disclaimer}`,
   ];
   return lines.join("\n");
+}
+
+function formatMarkCoverage(
+  curve: PerformanceDiagnosticsResult["markPnlCurve"],
+  separator: string,
+): string {
+  const coverage =
+    curve.persistedObservationCount === 0
+      ? "UNAVAILABLE"
+      : curve.usableObservationCount === 0
+        ? "UNUSABLE"
+        : curve.usableObservationCount < curve.persistedObservationCount
+          ? "PARTIAL"
+          : "COMPLETE";
+  return [
+    `persisted_observation_count=${curve.persistedObservationCount}`,
+    `usable_observation_count=${curve.usableObservationCount}`,
+    `curve_points=${curve.sampleCount}`,
+    `coverage=${coverage}`,
+  ].join(separator);
+}
+
+function formatDiagnosticGroup(
+  label: string,
+  group: PerformanceDiagnosticGroup,
+): string[] {
+  return [
+    `${label} Diagnostics`,
+    `episodes: completed=${group.completedEpisodeCount} open=${group.openEpisodeCount} outcomes=${formatMetric(group.episodeOutcomes)} win_rate=${formatMetric(group.episodeWinRate)}`,
+    `episode_pnl_krw: average=${formatMetric(group.averageNetPnlKrw)} average_win=${formatMetric(group.averageWinKrw)} average_loss=${formatMetric(group.averageLossKrw)} payoff_ratio=${formatMetric(group.payoffRatio)} profit_factor=${formatMetric(group.profitFactor)}`,
+    `FIFO realization slices: count=${group.selectedSliceCount} outcomes=${formatMetric(group.sliceOutcomes)} win_rate=${formatMetric(group.sliceWinRate)}`,
+    `gross_realized_pnl_krw: ${formatMetric(group.grossRealizedPnlKrw)}`,
+    `realized_fee_impact_krw: ${formatMetric(group.realizedFeeImpactKrw)}`,
+    `net_realized_pnl_krw: ${formatMetric(group.netRealizedPnlKrw)}`,
+    `turnover_krw: ${formatMetric(group.turnoverKrw)}`,
+    `confirmed_fees_krw: ${formatMetric(group.confirmedFeesKrw)}`,
+    `fee_completeness: ${group.feeCompleteness}`,
+    `streaks: max_wins=${formatMetric(group.maxConsecutiveWins)} max_losses=${formatMetric(group.maxConsecutiveLosses)}`,
+    `holding_duration_ms: ${formatMetric(group.holdingDurationMs)}`,
+    `best_completed_episode: ${formatMetric(group.bestCompletedEpisode)}`,
+    `worst_completed_episode: ${formatMetric(group.worstCompletedEpisode)}`,
+    `entry_action_contribution: ${formatActionContributions(group.entryActionContribution)}`,
+    `exit_action_contribution: ${formatActionContributions(group.exitActionContribution)}`,
+    "",
+  ];
+}
+
+function formatActionContributions(
+  contributions: PerformanceDiagnosticGroup["entryActionContribution"],
+): string {
+  return Object.entries(contributions)
+    .map(
+      ([action, contribution]) =>
+        `${action}{slices=${contribution.sliceCount},quantity=${formatNumber(contribution.quantity)},gross=${formatMetric(contribution.grossPnlKrw)},net=${formatMetric(contribution.netPnlKrw)}}`,
+    )
+    .join(" ");
+}
+
+function formatRecentEpisodes(episodes: readonly PositionEpisode[]): string[] {
+  if (episodes.length === 0) return ["- none"];
+  return episodes.map((episode) =>
+    `- ${episode.id} | ${episode.market} | ${episode.openedAt} -> ${episode.closedAt ?? "open"} | gross=${formatNumber(episode.grossRealizedPnlKrw)} | fees=${formatNumber(episode.realizedFeeImpactKrw)} | net=${formatNumber(episode.netRealizedPnlKrw)} | holding_ms=${formatNumber(episode.holdingDurationMs)}`
+  );
+}
+
+function formatMetric<T>(metric: Metric<T>): string {
+  if (metric.status === "UNKNOWN") return `unknown(${metric.reasons.join(",")})`;
+  if (metric.status === "NOT_APPLICABLE") return `not_applicable(${metric.reason})`;
+  return formatMetricValue(metric.value);
+}
+
+function formatMetricValue(value: unknown): string {
+  if (typeof value === "number") return formatNumber(value);
+  if (typeof value === "string" || typeof value === "boolean") return String(value);
+  return stringifyFiniteJson(value, 0);
+}
+
+function compareRecentEpisodes(left: PositionEpisode, right: PositionEpisode): number {
+  return comparePerformanceTimestamps(
+    right.closedAt ?? right.openedAt,
+    left.closedAt ?? left.openedAt,
+  ) ||
+    right.id.localeCompare(left.id);
+}
+
+function stringifyFiniteJson(value: unknown, space: number = 2): string {
+  return JSON.stringify(
+    value,
+    (key, item: unknown) => {
+      if (typeof item === "number" && !Number.isFinite(item)) {
+        throw new Error(`Performance report metric ${key || "<root>"} must be finite.`);
+      }
+      return item;
+    },
+    space,
+  );
 }
 
 function formatMarket(market: MarketPerformanceResult): string[] {
@@ -158,7 +303,9 @@ function formatSnapshot(snapshot: PerformanceReadProvenance["openingSnapshot"]):
 }
 
 function formatNumber(value: number | null): string {
-  return value === null ? "unknown" : Number.isInteger(value) ? String(value) : String(value);
+  if (value === null) return "unknown";
+  if (!Number.isFinite(value)) return "unknown(non-finite)";
+  return String(value);
 }
 
 function requireArgument(values: ReadonlyMap<string, string>, key: string): string {

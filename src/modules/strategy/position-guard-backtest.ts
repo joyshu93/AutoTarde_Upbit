@@ -32,9 +32,21 @@ export interface PositionGuardBacktestInput {
   initialCashKrw: number;
   initialQuantity: number;
   initialAverageEntryPrice: number;
-  frames: PositionGuardBacktestFrame[];
+  frames: readonly PositionGuardBacktestFrame[];
   settings?: PositionGuardStrategySettings;
   execution?: PositionGuardBacktestExecutionModel;
+  researchExecutionPolicy?: PositionGuardBacktestResearchExecutionPolicy;
+}
+
+export interface PositionGuardBacktestResearchExecutionPolicy {
+  id: "NO_ADD";
+  suppressedActions: readonly ["ADD"] | readonly "ADD"[];
+}
+
+export interface PositionGuardBacktestResearchSuppression {
+  policyId: PositionGuardBacktestResearchExecutionPolicy["id"];
+  originalAction: "ADD";
+  reason: "ACTION_SUPPRESSED";
 }
 
 export interface PositionGuardBacktestState {
@@ -70,6 +82,7 @@ export interface PositionGuardBacktestFrameResult {
   skipReason: PositionGuardBacktestSkipReason | null;
   equityKrw: number;
   drawdownPct: number;
+  researchSuppression?: PositionGuardBacktestResearchSuppression | null;
 }
 
 export interface PositionGuardBacktestMetrics {
@@ -101,6 +114,7 @@ const DEFAULT_BACKTEST_EXECUTION: PositionGuardBacktestExecutionModel = {
 export function runPositionGuardBacktest(input: PositionGuardBacktestInput): PositionGuardBacktestResult {
   const settings = input.settings ?? DEFAULT_POSITION_GUARD_STRATEGY_SETTINGS;
   const execution = input.execution ?? DEFAULT_BACKTEST_EXECUTION;
+  const researchExecutionPolicy = validateResearchExecutionPolicy(input.researchExecutionPolicy);
   let state: PositionGuardBacktestState = {
     cashKrw: input.initialCashKrw,
     quantity: input.initialQuantity,
@@ -134,12 +148,15 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
       latestDecision,
     });
     const decision = decidePositionGuardCore(context);
-    const executionResult = applyDecision({
-      decision,
-      state,
-      execution,
-      minimumTradeValueKrw: Math.max(execution.minimumTradeValueKrw, settings.minimumTradeValueKrw),
-    });
+    const researchSuppression = getResearchSuppression(researchExecutionPolicy, decision.action);
+    const executionResult = researchSuppression
+      ? { state: cloneState(state), trade: null, skipReason: null }
+      : applyDecision({
+          decision,
+          state,
+          execution,
+          minimumTradeValueKrw: Math.max(execution.minimumTradeValueKrw, settings.minimumTradeValueKrw),
+        });
     state = executionResult.state;
     const equity = getEquity(state, frame.analysis.currentPrice);
     peakEquity = Math.max(peakEquity, equity);
@@ -173,6 +190,7 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
       skipReason: executionResult.skipReason,
       equityKrw: roundMoney(equity),
       drawdownPct,
+      ...(researchExecutionPolicy ? { researchSuppression } : {}),
     });
 
     latestDecision = {
@@ -194,6 +212,32 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
     frames: results,
     metrics,
     finalState: cloneState(state),
+  };
+}
+
+function validateResearchExecutionPolicy(
+  policy: PositionGuardBacktestResearchExecutionPolicy | undefined,
+): PositionGuardBacktestResearchExecutionPolicy | undefined {
+  if (!policy) return undefined;
+  if (
+    policy.id !== "NO_ADD" ||
+    policy.suppressedActions.length !== 1 ||
+    policy.suppressedActions[0] !== "ADD"
+  ) {
+    throw new Error("NO_ADD research execution policy may only suppress ADD.");
+  }
+  return policy;
+}
+
+function getResearchSuppression(
+  policy: PositionGuardBacktestResearchExecutionPolicy | undefined,
+  action: StrategyDecisionAction,
+): PositionGuardBacktestResearchSuppression | null {
+  if (!policy || action !== "ADD") return null;
+  return {
+    policyId: policy.id,
+    originalAction: action,
+    reason: "ACTION_SUPPRESSED",
   };
 }
 

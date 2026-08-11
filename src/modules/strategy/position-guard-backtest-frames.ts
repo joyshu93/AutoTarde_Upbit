@@ -32,6 +32,15 @@ const DEFAULT_MINIMUM_COMPLETED_CANDLES: Record<SupportedStrategyTimeframe, numb
   "4h": 200,
   "1d": 200,
 };
+const ISO_TIMESTAMP =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})?$/;
+const NANOSECONDS_PER_MILLISECOND = 1_000_000n;
+
+type BacktestTimestamp = {
+  epochMilliseconds: number;
+  epochNanoseconds: bigint;
+  exactTimestamp: string;
+};
 
 export function buildPositionGuardBacktestFrames(
   input: BuildPositionGuardBacktestFramesInput,
@@ -45,25 +54,25 @@ export function buildPositionGuardBacktestFrames(
     "4h": sortCandles(input.fourHourCandles),
     "1d": sortCandles(input.oneDayCandles),
   };
-  const startMs = input.startAt === undefined ? null : toUtcMs(input.startAt, "startAt");
-  const endMs = input.endAt === undefined ? null : toUtcMs(input.endAt, "endAt");
+  const start = input.startAt === undefined ? null : parseTimestamp(input.startAt, "startAt");
+  const end = input.endAt === undefined ? null : parseTimestamp(input.endAt, "endAt");
   const frames: PositionGuardBacktestAnalysisFrame[] = [];
 
   for (const decisionCandle of sortedCandles["1h"]) {
-    const decisionMs = toUtcMs(decisionCandle.closeTime, "1h closeTime");
-    if (startMs !== null && decisionMs < startMs) continue;
-    if (endMs !== null && decisionMs > endMs) continue;
+    const decision = parseTimestamp(decisionCandle.closeTime, "1h closeTime");
+    if (start !== null && decision.epochNanoseconds < start.epochNanoseconds) continue;
+    if (end !== null && decision.epochNanoseconds > end.epochNanoseconds) continue;
 
     const completed = {
-      "1h": getCompletedCandles(sortedCandles["1h"], decisionMs),
-      "4h": getCompletedCandles(sortedCandles["4h"], decisionMs),
-      "1d": getCompletedCandles(sortedCandles["1d"], decisionMs),
+      "1h": getCompletedCandles(sortedCandles["1h"], decision.epochNanoseconds),
+      "4h": getCompletedCandles(sortedCandles["4h"], decision.epochNanoseconds),
+      "1d": getCompletedCandles(sortedCandles["1d"], decision.epochNanoseconds),
     };
     if (!hasMinimumCompletedCandles(completed, minimumCompletedCandles)) {
       continue;
     }
 
-    const generatedAt = new Date(decisionMs).toISOString();
+    const generatedAt = decision.exactTimestamp;
     const snapshot: PositionGuardMarketSnapshot = {
       asset: input.asset,
       market: input.market,
@@ -71,7 +80,7 @@ export function buildPositionGuardBacktestFrames(
       ticker: {
         tradePrice: decisionCandle.closePrice,
         tradeTimeUtc: generatedAt,
-        exchangeTimestampMs: decisionMs,
+        exchangeTimestampMs: decision.epochMilliseconds,
         fetchedAt: generatedAt,
       },
       timeframes: {
@@ -103,14 +112,19 @@ export function buildPositionGuardBacktestFrames(
 }
 
 function sortCandles(candles: readonly StrategyMarketCandle[]): StrategyMarketCandle[] {
-  return [...candles].sort((left, right) => toUtcMs(left.closeTime, "closeTime") - toUtcMs(right.closeTime, "closeTime"));
+  return [...candles].sort((left, right) => compareEpochNanoseconds(
+    parseTimestamp(left.closeTime, "closeTime").epochNanoseconds,
+    parseTimestamp(right.closeTime, "closeTime").epochNanoseconds,
+  ));
 }
 
 function getCompletedCandles(
   candles: readonly StrategyMarketCandle[],
-  cutoffMs: number,
+  cutoffEpochNanoseconds: bigint,
 ): StrategyMarketCandle[] {
-  return candles.filter((candle) => toUtcMs(candle.closeTime, "closeTime") <= cutoffMs);
+  return candles.filter(
+    (candle) => parseTimestamp(candle.closeTime, "closeTime").epochNanoseconds <= cutoffEpochNanoseconds,
+  );
 }
 
 function hasMinimumCompletedCandles(
@@ -126,12 +140,57 @@ function getLatestCloseTime(candles: readonly StrategyMarketCandle[]): string | 
   return candles[candles.length - 1]?.closeTime ?? null;
 }
 
-function toUtcMs(value: string, label: string): number {
-  const normalized = /(?:Z|[+-]\d{2}:\d{2})$/.test(value) ? value : `${value}Z`;
-  const timestamp = Date.parse(normalized);
-  if (Number.isNaN(timestamp)) {
+function parseTimestamp(value: string, label: string): BacktestTimestamp {
+  const match = ISO_TIMESTAMP.exec(value);
+  if (!match) {
     throw new Error(`Invalid PositionGuard backtest ${label}: ${value}`);
   }
 
-  return timestamp;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const fraction = match[7] ?? "";
+  const explicitTimezone = match[8];
+  const timezone = explicitTimezone ?? "Z";
+  if (
+    month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month) ||
+    hour > 23 || minute > 59 || second > 59 || !isValidTimezone(timezone)
+  ) {
+    throw new Error(`Invalid PositionGuard backtest ${label}: ${value}`);
+  }
+
+  const wholeSecond = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}${timezone}`;
+  const wholeSecondMs = Date.parse(wholeSecond);
+  if (!Number.isFinite(wholeSecondMs)) {
+    throw new Error(`Invalid PositionGuard backtest ${label}: ${value}`);
+  }
+
+  const fractionNanoseconds = BigInt(fraction.padEnd(9, "0") || "0");
+  return {
+    epochMilliseconds: wholeSecondMs + Number(fraction.padEnd(3, "0").slice(0, 3) || "0"),
+    epochNanoseconds: BigInt(wholeSecondMs) * NANOSECONDS_PER_MILLISECOND + fractionNanoseconds,
+    exactTimestamp: explicitTimezone === undefined ? `${value}Z` : value,
+  };
+}
+
+function compareEpochNanoseconds(left: bigint, right: bigint): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function isValidTimezone(timezone: string): boolean {
+  if (timezone === "Z") return true;
+  const offsetHour = Number(timezone.slice(1, 3));
+  const offsetMinute = Number(timezone.slice(4, 6));
+  return offsetMinute <= 59 && (offsetHour < 14 || (offsetHour === 14 && offsetMinute === 0));
+}
+
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) {
+    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    return leapYear ? 29 : 28;
+  }
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }

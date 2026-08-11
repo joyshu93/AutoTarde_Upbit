@@ -31,6 +31,10 @@ The system of record is:
 
 Telegram is not a truth source for balances, positions, or fills.
 
+Research evaluation output is not a trading truth source. `report:strategy-evaluation` is LIVE-only and may read selected persisted LIVE execution evidence plus caller-supplied immutable local candle datasets to diagnose observed attribution and simulated counterfactuals, but it must not update balances, positions, orders, fills, risk, execution state, or strategy settings. Selected-stream and opening-inventory evidence must remain separate, as must observed, simulated, and modeled evidence classes.
+
+An artifact produced by the manually invoked `research:candles` command is analysis evidence, not trading truth, a backtest result, or a trade recommendation. BTC and ETH acquisition is independent, uses only unauthenticated Upbit public candle endpoints, and records explicit requested-range, collection-time, source, market, and canonical SHA-256 provenance. It must not read private credentials or Telegram secrets, open operational SQLite, overwrite an existing artifact, or inspect or mutate operational state.
+
 ## Execution Modes
 - `DRY_RUN`: default mode; no live order transmission is permitted
 - `LIVE`: implemented as a gated capability but disabled by default
@@ -126,3 +130,8 @@ When startup recovery confirms unresolved portfolio drift against persisted stat
 - every transition into or out of `DEGRADED` must be explicit and inspectable
 - every scheduler-triggered cycle must leave inspectable run history without becoming portfolio truth
 - live-send capability must stay behind a separate safety gate even after implementation exists
+- research evaluation must remain isolated from app, execution, scheduler, Telegram, reconciliation, exchange, and runtime dependency graphs; it may open the operational SQLite database only with `readOnly: true`, must reject non-LIVE observed filters, and must not use a network fallback for absent or unusable candle data
+- immutable research candle acquisition must remain isolated from app, execution, scheduler, Telegram, reconciliation, private exchange, orders, migrations, operational SQLite, and runtime dependency graphs; only an explicit operator invocation may call unauthenticated Upbit public candle endpoints
+- research candle acquisition must require explicit asset, history start, end, new output path, page size, and page limit; it must checksum-verify provenance, refuse overwrite, fail rather than silently truncate coverage, and leave no completed destination artifact after failure
+- omitted candle datasets must remain `DATASET_UNAVAILABLE`; supplied schema-valid but inadequate or non-overlapping datasets must remain structured `DATASET_UNUSABLE` evidence, while malformed, checksum-invalid, or asset/market-mismatched datasets fail explicitly
+- performance evidence must preserve exact offset/nanosecond instant ordering, separate selected-stream from opening-inventory attribution, distinguish persisted from usable marks, and declare whether modeled cost and FIFO outcome metrics cover all simulated fills or selected-stream FIFO evidence

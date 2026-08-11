@@ -70,6 +70,75 @@ test("performance calculator orders mixed-offset fills by their parsed instant",
   assert.deepEqual(result.warnings, []);
 });
 
+test("performance calculator orders mixed-offset nanosecond fills before using FIFO", () => {
+  const result = calculatePerformance({
+    fills: [
+      fill("a-later-sell", "KRW-BTC", "ask", 110, 1, 0, "2026-08-01T01:00:00.000000200Z"),
+      fill(
+        "z-earlier-buy",
+        "KRW-BTC",
+        "bid",
+        100,
+        1,
+        0,
+        "2026-08-01T10:00:00.000000100+09:00",
+      ),
+    ],
+  });
+
+  const btc = market(result, "KRW-BTC");
+  assert.equal(btc.realizedPnlKrw, 10);
+  assert.equal(btc.unmatchedSellQuantity, 0);
+  assert.deepEqual(result.warnings, []);
+});
+
+test("performance calculator rejects opposite-side fills at the same exact instant", () => {
+  assert.throws(
+    () =>
+      calculatePerformance({
+        fills: [
+          fill(
+            "z-buy",
+            "KRW-BTC",
+            "bid",
+            100,
+            1,
+            0,
+            "2026-08-01T10:00:00.000000100+09:00",
+          ),
+          fill("a-sell", "KRW-BTC", "ask", 110, 1, 0, "2026-08-01T01:00:00.000000100Z"),
+        ],
+      }),
+    /Ambiguous opposite-side fills for KRW-BTC at the same instant/,
+  );
+});
+
+test("performance calculator uses fill id as the same-side FIFO tie-break", () => {
+  const result = calculatePerformance({
+    fills: [
+      fill(
+        "z-expensive-buy",
+        "KRW-BTC",
+        "bid",
+        120,
+        1,
+        0,
+        "2026-08-01T10:00:00.000000100+09:00",
+      ),
+      fill("a-cheap-buy", "KRW-BTC", "bid", 100, 1, 0, "2026-08-01T01:00:00.000000100Z"),
+      fill("later-sell", "KRW-BTC", "ask", 110, 1, 0, "2026-08-01T01:00:00.000000200Z"),
+    ],
+    markPrices: [{ market: "KRW-BTC", priceKrw: 120 }],
+  });
+
+  const btc = market(result, "KRW-BTC");
+  assert.equal(btc.realizedPnlKrw, 10);
+  assert.equal(btc.unmatchedSellQuantity, 0);
+  assert.equal(btc.remainingQuantity, 1);
+  assert.equal(btc.remainingCostKrw, 120);
+  assert.deepEqual(result.warnings, []);
+});
+
 test("performance calculator normalizes decimal quantity residuals within tolerance", () => {
   const result = calculatePerformance({
     fills: [
@@ -157,6 +226,25 @@ test("performance calculator rejects non-finite or non-positive persisted values
       }),
     /feeKrw must be a finite non-negative number or null/,
   );
+});
+
+test("performance calculator consistently rejects invalid exact timestamps", () => {
+  const invalidTimestamps = [
+    "2026-02-30T00:00:00.000Z",
+    "2026-08-01T00:00:00.0000000000Z",
+    "2026-08-01T00:00:00.000+14:01",
+    "2026-08-01T00:00:00.000",
+  ];
+
+  for (const filledAt of invalidTimestamps) {
+    assert.throws(
+      () =>
+        calculatePerformance({
+          fills: [fill("invalid-time", "KRW-BTC", "bid", 1, 1, 0, filledAt)],
+        }),
+      /Fill invalid-time filledAt must be a valid timestamp\./,
+    );
+  }
 });
 
 function fill(

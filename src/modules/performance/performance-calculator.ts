@@ -1,3 +1,9 @@
+import {
+  comparePerformanceTimestamps,
+  parsePerformanceTimestamp,
+  performanceTimestampEpochNanoseconds,
+} from "./performance-timestamp.js";
+
 export type PerformanceMarket = "KRW-BTC" | "KRW-ETH";
 export type PerformanceFillSide = "bid" | "ask";
 
@@ -120,9 +126,8 @@ export function calculatePerformance(
     }
   }
 
-  const orderedFills = [...input.fills].sort(
-    (left, right) =>
-      Date.parse(left.filledAt) - Date.parse(right.filledAt) || left.id.localeCompare(right.id),
+  const orderedFills = [...input.fills].sort((left, right) =>
+    comparePerformanceTimestamps(left.filledAt, right.filledAt) || left.id.localeCompare(right.id),
   );
   for (const fill of orderedFills) {
     const state = getState(states, fill.market);
@@ -340,10 +345,11 @@ function validateInput(
     if (fill.feeKrw !== null && (!Number.isFinite(fill.feeKrw) || fill.feeKrw < 0)) {
       throw new Error(`Fill ${fill.id} feeKrw must be a finite non-negative number or null.`);
     }
-    if (!Number.isFinite(Date.parse(fill.filledAt))) {
+    if (parsePerformanceTimestamp(fill.filledAt) === null) {
       throw new Error(`Fill ${fill.id} filledAt must be a valid timestamp.`);
     }
   }
+  rejectAmbiguousInstants(fills);
   for (const position of openingPositions) {
     assertPositive(position.quantity, `Opening position ${position.market} quantity`);
     if (position.averagePriceKrw !== null) {
@@ -356,6 +362,21 @@ function validateInput(
   for (const mark of markPrices) {
     if (mark.priceKrw !== null) {
       assertPositive(mark.priceKrw, `Mark ${mark.market} priceKrw`);
+    }
+  }
+}
+
+function rejectAmbiguousInstants(fills: readonly PerformanceFill[]): void {
+  const sidesByInstant = new Map<string, Set<PerformanceFillSide>>();
+  for (const fill of fills) {
+    const key = `${fill.market}:${performanceTimestampEpochNanoseconds(fill.filledAt)}`;
+    const sides = sidesByInstant.get(key) ?? new Set<PerformanceFillSide>();
+    sides.add(fill.side);
+    sidesByInstant.set(key, sides);
+    if (sides.size > 1) {
+      throw new Error(
+        `Ambiguous opposite-side fills for ${fill.market} at the same instant ${fill.filledAt}.`,
+      );
     }
   }
 }

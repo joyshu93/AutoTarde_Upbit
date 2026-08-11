@@ -3,11 +3,21 @@ import { DatabaseSync } from "node:sqlite";
 import type { ExecutionMode, OrderOrigin } from "../../domain/types.js";
 import type {
   PerformanceCalculationInput,
-  PerformanceFill,
   PerformanceMarkPrice,
   PerformanceMarket,
   PerformanceOpeningPosition,
 } from "./performance-calculator.js";
+import type { PerformanceMarkObservation } from "./performance-diagnostics.js";
+import type {
+  PerformanceDecisionAction,
+  PerformanceTradeFill,
+} from "./performance-trade-matcher.js";
+import {
+  compareEpochNanoseconds,
+  comparePerformanceTimestamps,
+  parsePerformanceTimestamp,
+  performanceTimestampEpochNanoseconds,
+} from "./performance-timestamp.js";
 
 export type PerformanceReadFilters = {
   databasePath: string;
@@ -31,19 +41,32 @@ export type PerformanceReadProvenance = {
   lastFillAt: string | null;
   openingSnapshot: PerformanceSnapshotProvenance | null;
   markSnapshot: PerformanceSnapshotProvenance | null;
+  markObservationCount: number;
+  firstMarkObservationAt: string | null;
+  lastMarkObservationAt: string | null;
+  markObservationSnapshots: readonly PerformanceSnapshotProvenance[];
 };
 
 export type PerformanceReadResult = {
   input: PerformanceCalculationInput;
+  tradeFills: readonly PerformanceTradeFill[];
+  markObservations: readonly PerformanceMarkObservation[];
   provenance: PerformanceReadProvenance;
 };
 
 type FillRow = {
   id: unknown;
+  order_id: unknown;
+  order_strategy_decision_id: unknown;
+  order_exchange_account_id: unknown;
   market: unknown;
   side: unknown;
   order_market: unknown;
   order_side: unknown;
+  decision_id: unknown;
+  decision_exchange_account_id: unknown;
+  decision_market: unknown;
+  decision_action: unknown;
   price: unknown;
   volume: unknown;
   fee_currency: unknown;
@@ -62,7 +85,7 @@ type TimestampValidatedFillRow = {
   row: FillRow;
   id: string;
   filledAt: string;
-  filledEpoch: number;
+  filledEpochNanoseconds: bigint;
 };
 
 type PersistedPosition = {
@@ -80,14 +103,23 @@ export function readPerformanceInput(filters: PerformanceReadFilters): Performan
     const firstFillAt = fills[0]?.filledAt ?? null;
     const lastFillAt = fills.at(-1)?.filledAt ?? null;
     const snapshots = readSnapshots(db, normalizedFilters.exchangeAccountId);
-    const openingSnapshot = normalizedFilters.from === undefined
+    const openingSnapshotCandidate = normalizedFilters.from === undefined
       ? firstFillAt === null
         ? null
         : selectSnapshot(snapshots, "<", firstFillAt)
       : selectSnapshot(snapshots, "<=", normalizedFilters.from);
-    const markSnapshot = normalizedFilters.to === undefined
+    const markSnapshotCandidate = normalizedFilters.to === undefined
       ? snapshots.at(-1) ?? null
-      : selectSnapshot(snapshots, "<=", normalizedFilters.to);
+      : selectSnapshot(snapshots, "<", normalizedFilters.to);
+    const markObservationCandidates = selectMarkObservationSnapshots(snapshots, normalizedFilters);
+    const openingSnapshot = openingSnapshotCandidate === null
+      ? null
+      : normalizeSnapshot(openingSnapshotCandidate);
+    const markSnapshot = markSnapshotCandidate === null
+      ? null
+      : normalizeSnapshot(markSnapshotCandidate);
+    const markObservationSnapshots = markObservationCandidates.map(normalizeSnapshot);
+    const markObservations = markObservationSnapshots.map(toMarkObservation);
 
     return {
       input: {
@@ -99,6 +131,8 @@ export function readPerformanceInput(filters: PerformanceReadFilters): Performan
           ? []
           : parseMarkPrices(markSnapshot.positionsJson, markSnapshot.id),
       },
+      tradeFills: fills,
+      markObservations,
       provenance: {
         filters: {
           databasePath: normalizedFilters.databasePath,
@@ -114,6 +148,12 @@ export function readPerformanceInput(filters: PerformanceReadFilters): Performan
         lastFillAt,
         openingSnapshot: toSnapshotProvenance(openingSnapshot),
         markSnapshot: toSnapshotProvenance(markSnapshot),
+        markObservationCount: markObservations.length,
+        firstMarkObservationAt: markObservations[0]?.capturedAt ?? null,
+        lastMarkObservationAt: markObservations.at(-1)?.capturedAt ?? null,
+        markObservationSnapshots: markObservationSnapshots.map((snapshot) =>
+          toSnapshotProvenance(snapshot) as PerformanceSnapshotProvenance
+        ),
       },
     };
   } finally {
@@ -121,14 +161,21 @@ export function readPerformanceInput(filters: PerformanceReadFilters): Performan
   }
 }
 
-function readFills(db: DatabaseSync, filters: PerformanceReadFilters): PerformanceFill[] {
+function readFills(db: DatabaseSync, filters: PerformanceReadFilters): PerformanceTradeFill[] {
   const rows = db.prepare(`
     SELECT
       f.id,
+      o.id AS order_id,
+      o.strategy_decision_id AS order_strategy_decision_id,
+      o.exchange_account_id AS order_exchange_account_id,
       f.market,
       f.side,
       o.market AS order_market,
       o.side AS order_side,
+      d.id AS decision_id,
+      d.exchange_account_id AS decision_exchange_account_id,
+      d.market AS decision_market,
+      d.action AS decision_action,
       f.price,
       f.volume,
       f.fee_currency,
@@ -136,6 +183,7 @@ function readFills(db: DatabaseSync, filters: PerformanceReadFilters): Performan
       f.filled_at
     FROM fills f
     INNER JOIN orders o ON o.id = f.order_id
+    LEFT JOIN strategy_decisions d ON d.id = o.strategy_decision_id
     WHERE o.exchange_account_id = ?
       AND o.execution_mode = ?
       AND o.origin = ?
@@ -145,17 +193,22 @@ function readFills(db: DatabaseSync, filters: PerformanceReadFilters): Performan
     filters.origin,
   ) as unknown as FillRow[];
 
-  const fromEpoch = filters.from === undefined ? null : Date.parse(filters.from);
-  const toEpoch = filters.to === undefined ? null : Date.parse(filters.to);
+  const fromEpoch = filters.from === undefined
+    ? null
+    : performanceTimestampEpochNanoseconds(filters.from);
+  const toEpoch = filters.to === undefined
+    ? null
+    : performanceTimestampEpochNanoseconds(filters.to);
   return rows
     .map((row) => validateFillTimestamp(row))
-    .filter(({ filledEpoch }) => {
-      return (fromEpoch === null || filledEpoch >= fromEpoch) &&
-        (toEpoch === null || filledEpoch < toEpoch);
+    .filter(({ filledEpochNanoseconds }) => {
+      return (fromEpoch === null || filledEpochNanoseconds >= fromEpoch) &&
+        (toEpoch === null || filledEpochNanoseconds < toEpoch);
     })
     .sort(
       (left, right) =>
-        left.filledEpoch - right.filledEpoch || left.id.localeCompare(right.id),
+        compareEpochNanoseconds(left.filledEpochNanoseconds, right.filledEpochNanoseconds) ||
+        left.id.localeCompare(right.id),
     )
     .map(({ row, id, filledAt }) => normalizeFill(row, id, filledAt));
 }
@@ -163,10 +216,16 @@ function readFills(db: DatabaseSync, filters: PerformanceReadFilters): Performan
 function validateFillTimestamp(row: FillRow): TimestampValidatedFillRow {
   const id = requireString(row.id, "fill.id");
   const filledAt = normalizeExplicitIsoTimestamp(row.filled_at, `Fill ${id} filled_at`);
-  return { row, id, filledAt, filledEpoch: Date.parse(filledAt) };
+  const filledEpochNanoseconds = performanceTimestampEpochNanoseconds(filledAt);
+  return { row, id, filledAt, filledEpochNanoseconds };
 }
 
-function normalizeFill(row: FillRow, id: string, filledAt: string): PerformanceFill {
+function normalizeFill(row: FillRow, id: string, filledAt: string): PerformanceTradeFill {
+  const orderId = requireString(row.order_id, `Order id for fill ${id}`);
+  const orderAccountId = requireString(
+    row.order_exchange_account_id,
+    `Order account for fill ${id}`,
+  );
   const market = parseMarket(row.market, `Fill ${id} market`);
   const orderMarket = parseMarket(row.order_market, `Order market for fill ${id}`);
   const side = row.side === "bid" || row.side === "ask"
@@ -181,6 +240,17 @@ function normalizeFill(row: FillRow, id: string, filledAt: string): PerformanceF
   if (side !== orderSide) {
     throw new Error(`Fill ${id} side ${side} does not match order side ${orderSide}.`);
   }
+  const strategyDecisionId = row.order_strategy_decision_id === null
+    ? null
+    : requireString(row.order_strategy_decision_id, `Order ${orderId} strategy_decision_id`);
+  const decisionAction = validateDecisionLink({
+    row,
+    orderId,
+    orderAccountId,
+    orderMarket,
+    orderSide,
+    strategyDecisionId,
+  });
   const feeAmount = row.fee_amount === null
     ? null
     : parseNonNegativeNumericString(row.fee_amount, `Fill ${id} fee_amount`);
@@ -190,6 +260,9 @@ function normalizeFill(row: FillRow, id: string, filledAt: string): PerformanceF
 
   return {
     id,
+    orderId,
+    strategyDecisionId,
+    decisionAction,
     market,
     side,
     priceKrw: parsePositiveNumericString(row.price, `Fill ${id} price`),
@@ -199,10 +272,62 @@ function normalizeFill(row: FillRow, id: string, filledAt: string): PerformanceF
   };
 }
 
+function validateDecisionLink(input: {
+  row: FillRow;
+  orderId: string;
+  orderAccountId: string;
+  orderMarket: PerformanceMarket;
+  orderSide: "bid" | "ask";
+  strategyDecisionId: string | null;
+}): PerformanceDecisionAction | null {
+  if (input.strategyDecisionId === null) return null;
+  if (input.row.decision_id === null) {
+    throw new Error(
+      `Order ${input.orderId} references missing strategy decision ${input.strategyDecisionId}.`,
+    );
+  }
+  const decisionId = requireString(input.row.decision_id, `Decision id for order ${input.orderId}`);
+  if (decisionId !== input.strategyDecisionId) {
+    throw new Error(`Decision ${decisionId} does not match order ${input.orderId} link.`);
+  }
+  const decisionAccountId = requireString(
+    input.row.decision_exchange_account_id,
+    `Decision account for order ${input.orderId}`,
+  );
+  if (decisionAccountId !== input.orderAccountId) {
+    throw new Error(
+      `Order ${input.orderId} decision account ${decisionAccountId} does not match order account ${input.orderAccountId}.`,
+    );
+  }
+  const decisionMarket = parseMarket(
+    input.row.decision_market,
+    `Decision market for order ${input.orderId}`,
+  );
+  if (decisionMarket !== input.orderMarket) {
+    throw new Error(
+      `Order ${input.orderId} decision market ${decisionMarket} does not match order market ${input.orderMarket}.`,
+    );
+  }
+  const action = input.row.decision_action;
+  if (action === "HOLD") {
+    throw new Error(`Order ${input.orderId} decision action HOLD cannot be linked to a fill.`);
+  }
+  if (action !== "ENTER" && action !== "ADD" && action !== "REDUCE" && action !== "EXIT") {
+    throw new Error(`Order ${input.orderId} decision action must be ENTER, ADD, REDUCE, or EXIT.`);
+  }
+  const expectedSide = action === "ENTER" || action === "ADD" ? "bid" : "ask";
+  if (expectedSide !== input.orderSide) {
+    throw new Error(
+      `Order ${input.orderId} decision action ${action} contradicts ${input.orderSide} order side.`,
+    );
+  }
+  return action;
+}
+
 function readSnapshots(
   db: DatabaseSync,
   exchangeAccountId: string,
-): NormalizedSnapshot[] {
+): TimestampValidatedSnapshot[] {
   const rows = db.prepare(`
     SELECT id, captured_at, source, positions_json
     FROM position_snapshots
@@ -212,35 +337,74 @@ function readSnapshots(
     .map((row) => {
       const id = requireString(row.id, "position_snapshot.id");
       return {
+        row,
         id,
         capturedAt: normalizeExplicitIsoTimestamp(
           row.captured_at,
           `Position snapshot ${id} captured_at`,
         ),
-        source: requireString(row.source, `Position snapshot ${id} source`),
-        positionsJson: requireString(row.positions_json, `Position snapshot ${id} positions_json`),
       };
     })
     .sort(
       (left, right) =>
-        Date.parse(left.capturedAt) - Date.parse(right.capturedAt) ||
+        comparePerformanceTimestamps(left.capturedAt, right.capturedAt) ||
         left.id.localeCompare(right.id),
     );
 }
 
 function selectSnapshot(
-  snapshots: readonly NormalizedSnapshot[],
+  snapshots: readonly TimestampValidatedSnapshot[],
   comparator: "<" | "<=",
   boundary: string,
-): NormalizedSnapshot | null {
-  const boundaryEpoch = Date.parse(boundary);
+): TimestampValidatedSnapshot | null {
   return snapshots.filter((snapshot) => {
-    const capturedEpoch = Date.parse(snapshot.capturedAt);
-    return comparator === "<" ? capturedEpoch < boundaryEpoch : capturedEpoch <= boundaryEpoch;
+    const comparison = comparePerformanceTimestamps(snapshot.capturedAt, boundary);
+    return comparator === "<" ? comparison < 0 : comparison <= 0;
   }).at(-1) ?? null;
 }
 
+function selectMarkObservationSnapshots(
+  snapshots: readonly TimestampValidatedSnapshot[],
+  filters: PerformanceReadFilters,
+): TimestampValidatedSnapshot[] {
+  return snapshots.filter((snapshot) => {
+    return (filters.from === undefined ||
+      comparePerformanceTimestamps(snapshot.capturedAt, filters.from) >= 0) &&
+      (filters.to === undefined ||
+        comparePerformanceTimestamps(snapshot.capturedAt, filters.to) < 0);
+  });
+}
+
+function normalizeSnapshot(snapshot: TimestampValidatedSnapshot): NormalizedSnapshot {
+  return {
+    id: snapshot.id,
+    capturedAt: snapshot.capturedAt,
+    source: requireString(snapshot.row.source, `Position snapshot ${snapshot.id} source`),
+    positionsJson: requireString(
+      snapshot.row.positions_json,
+      `Position snapshot ${snapshot.id} positions_json`,
+    ),
+  };
+}
+
+function toMarkObservation(snapshot: NormalizedSnapshot): PerformanceMarkObservation {
+  const prices: Partial<Record<PerformanceMarket, number>> = {};
+  for (const mark of parseMarkPrices(snapshot.positionsJson, snapshot.id)) {
+    if (mark.priceKrw !== null) prices[mark.market] = mark.priceKrw;
+  }
+  return {
+    snapshotId: snapshot.id,
+    capturedAt: snapshot.capturedAt,
+    prices,
+  };
+}
+
 type NormalizedSnapshot = PerformanceSnapshotProvenance & { positionsJson: string };
+type TimestampValidatedSnapshot = {
+  row: SnapshotRow;
+  id: string;
+  capturedAt: string;
+};
 
 function toSnapshotProvenance(
   snapshot: NormalizedSnapshot | null,
@@ -329,7 +493,7 @@ function validateFilters(filters: PerformanceReadFilters): PerformanceReadFilter
   if (
     from !== undefined &&
     to !== undefined &&
-    Date.parse(from) >= Date.parse(to)
+    comparePerformanceTimestamps(from, to) >= 0
   ) {
     throw new Error("from must be earlier than to.");
   }
@@ -357,34 +521,11 @@ function requireString(value: unknown, label: string): string {
 
 export function normalizeExplicitIsoTimestamp(value: unknown, label: string): string {
   const timestamp = requireString(value, label);
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/.exec(
-    timestamp,
-  );
-  if (match === null || !hasValidIsoComponents(match) || !Number.isFinite(Date.parse(timestamp))) {
+  const parsed = parsePerformanceTimestamp(timestamp);
+  if (parsed === null) {
     throw new Error(`${label} must be an ISO-8601 timestamp with an explicit timezone.`);
   }
-  return new Date(timestamp).toISOString();
-}
-
-function hasValidIsoComponents(match: RegExpExecArray): boolean {
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const hour = Number(match[4]);
-  const minute = Number(match[5]);
-  const second = Number(match[6]);
-  const timezone = match[7];
-  if (
-    !Number.isInteger(year) || month < 1 || month > 12 || day < 1 ||
-    day > new Date(Date.UTC(year, month, 0)).getUTCDate() || hour > 23 ||
-    minute > 59 || second > 59 || timezone === undefined
-  ) {
-    return false;
-  }
-  if (timezone === "Z") return true;
-  const offsetHour = Number(timezone.slice(1, 3));
-  const offsetMinute = Number(timezone.slice(4, 6));
-  return offsetHour <= 23 && offsetMinute <= 59;
+  return parsed.normalized;
 }
 
 function parsePositiveNumericString(value: unknown, label: string): number {

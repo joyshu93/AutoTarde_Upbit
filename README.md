@@ -300,11 +300,66 @@ Bound the report to a half-open `[from,to)` period and request stable JSON outpu
 npm run report:performance -- --database ./var/company-live.sqlite --exchange-account primary --mode LIVE --origin STRATEGY --from 2026-08-01T00:00:00.000Z --to 2026-08-10T00:00:00.000Z --json
 ```
 
-All four selection arguments are required: `--database`, `--exchange-account`, `--mode`, and `--origin`. Optional `--from` is inclusive and `--to` is exclusive. With `--from`, opening inventory comes from the latest position snapshot at or before that instant; without it, the latest snapshot before the first selected fill is used. Marks come from the latest snapshot at or before `--to`, or the latest snapshot when `--to` is omitted.
+All four selection arguments are required: `--database`, `--exchange-account`, `--mode`, and `--origin`. Optional `--from` is inclusive and `--to` is exclusive. Timestamps require an explicit timezone and support zero through nine fractional-second digits. Ordering and range checks preserve nanosecond precision instead of relying on `Date.parse()` millisecond truncation. With `--from`, opening inventory comes from the latest position snapshot at or before that instant; without it, the latest snapshot before the first selected fill is used. Marks come from the latest snapshot strictly before `--to`, or the latest snapshot when `--to` is omitted.
 
 The command opens the existing SQLite file directly with `readOnly: true`. It does not apply migrations, create a database, call Upbit or Telegram, run reconciliation or strategy, start scheduler work, mutate order lifecycle state, or transmit orders. Missing costs, fees, unmatched sells, and unavailable marks remain explicit warnings or `unknown`; they are not silently replaced with zero.
 
+The professional diagnostics section keeps two analysis units separate. The default win rate and average-trade metrics use only completed flat-to-flat position episodes; FIFO realization-slice outcomes are reported separately so partial exits are not counted as independent completed trades. It reports BTC, ETH, and combined episode statistics, gross and net realized PnL, confirmed fee evidence and completeness, payoff ratio, profit factor, streaks, holding durations, best/worst episodes, strategy entry/exit action contribution, cumulative realized-PnL drawdown, and persisted-snapshot mark drawdown. Mark curves use only each snapshot's own stored mark, never interpolation or a future observation, and expose `persistedObservationCount`, `usableObservationCount`, usable `sampleCount`, and `maxObservationGapMs`.
+
+The JSON output preserves explicit `KNOWN`, `UNKNOWN`, and `NOT_APPLICABLE` metric states and includes auditable FIFO slices, position episodes, per-market curves, recent completed episodes, filters, fill range, and snapshot provenance. The text output summarizes the same definitions without hiding raw identifiers or completeness warnings.
+
 The result is performance attributed to the selected order stream and its reported opening inventory. It is not total account return and does not treat deposits, withdrawals, unrelated order origins, or external balance changes as strategy profit.
+
+## Immutable Research Candle Acquisition
+
+Collect BTC and ETH research evidence independently before running an integrated comparison. Each invocation requires all six acquisition arguments; there are no hidden range or pagination defaults.
+
+```powershell
+npm.cmd run research:candles -- --asset BTC --history-start 2025-01-01T00:00:00.000Z --end 2026-08-11T00:00:00.000Z --output ./var/research/krw-btc-20250101-20260811.json --page-size 200 --page-limit 100
+npm.cmd run research:candles -- --asset ETH --history-start 2025-01-01T00:00:00.000Z --end 2026-08-11T00:00:00.000Z --output ./var/research/krw-eth-20250101-20260811.json --page-size 200 --page-limit 100
+```
+
+The required arguments are `--asset BTC|ETH`, `--history-start <explicit-timezone ISO-8601>`, `--end <explicit-timezone ISO-8601>`, `--output <new local JSON path>`, `--page-size <integer 1..200>`, and `--page-limit <positive integer>`. The command uses only unauthenticated Upbit public candle endpoints, and only when an operator manually invokes it. It does not read credentials or Telegram secrets, open operational SQLite, import the application runtime, or inspect or mutate balances, positions, orders, fills, risk, execution state, reconciliation, scheduler, or Telegram state.
+
+The output is an immutable local JSON artifact containing completed `1h`, `4h`, and `1d` candles plus explicit asset, market, requested range, collection time, fixed source `upbit-public-historical-candles`, and a canonical lowercase SHA-256 checksum. Publication uses a verified temporary artifact and refuses to overwrite an existing destination, including an output-path race. A failure leaves no completed destination artifact.
+
+After both independent artifacts exist, supply those exact paths to `report:strategy-evaluation` as `--btc-dataset` and `--eth-dataset`, together with the required per-asset initial states and explicit `BASELINE`/`NO_ADD` analysis inputs shown below. Collection creates analysis evidence only: it does not run a backtest, recommend a trade, establish trading truth, change strategy rules, or enable live execution.
+
+## Integrated Strategy Evaluation
+
+`report:strategy-evaluation` is a research-only, read-only evaluation that keeps observed order-stream attribution, simulated counterfactuals, and modeled-cost scenarios as separate evidence classes. It diagnoses the available evidence; it does not change PositionGuard rules, runtime wiring, execution state, orders, scheduler work, Telegram, reconciliation, exchange behavior, or live-order configuration. It opens the existing operational SQLite file with `readOnly: true` and never applies migrations, creates a database, calls Upbit or Telegram, or performs a network fallback.
+
+Run the observed-only evaluation with the exact required filters:
+
+```powershell
+npm run report:strategy-evaluation -- --database ./var/company-live.sqlite --exchange-account-id primary --execution-mode LIVE --origin STRATEGY --from 2026-08-01T00:00:00.000Z --to 2026-08-10T00:00:00.000Z --format json
+```
+
+`--database`, `--exchange-account-id`, `--execution-mode`, and `--origin` are required. The integrated CLI is LIVE-only: `--execution-mode LIVE` is required and `DRY_RUN` is rejected because the observed section is `OBSERVED_LIVE_ATTRIBUTION`. `--origin` is `STRATEGY`, `OPERATOR`, or `RECOVERY`; `--format` is `text` (the default) or `json`. Optional `--from` is inclusive and `--to` is exclusive, forming `[from,to)` with explicit-timezone ISO timestamps compared at nanosecond precision. The result is selected-order-stream attribution, not total account return.
+
+Observed-only mode never reads a candle dataset. Both BTC and ETH instead report `DATASET_UNAVAILABLE` in the simulated, cost, regime, and excursion sections, and the report records a structured evidence gap rather than fetching candle data.
+
+To evaluate one or both immutable local datasets, provide a paired initial state for every supplied asset plus explicit scenarios, minimum order value, and cost cells. For example:
+
+```powershell
+npm run report:strategy-evaluation -- --database ./var/company-live.sqlite --exchange-account-id primary --execution-mode LIVE --origin STRATEGY --btc-dataset ./var/research/krw-btc-20250101-20260811.json --btc-initial-state '{"cashKrw":1000000,"quantity":0,"averageEntryPriceKrw":0}' --eth-dataset ./var/research/krw-eth-20250101-20260811.json --eth-initial-state '{"cashKrw":1000000,"quantity":0,"averageEntryPriceKrw":0}' --scenarios '["BASELINE","NO_ADD"]' --minimum-order-value-krw 5000 --cost-cells '[{"id":"base","feeRate":0.0005,"slippageRate":0},{"id":"stress","feeRate":0.001,"slippageRate":0.002}]' --format json
+```
+
+`BASELINE` replays the unmodified historical strategy decisions. `NO_ADD` retains an `ADD` decision and diagnostics but suppresses only its simulated execution, then replays the full later path from the same initial state. `MODELED_COST_SCENARIO` results use the caller-supplied fee/slippage grid; the first caller-ordered cost cell is the explicit base simulation assumption. Simulated BTC and ETH use independent capital (`INDEPENDENT_PER_ASSET_NOT_A_PORTFOLIO`), and observed, simulated, and modeled results are never summed or presented as a combined portfolio return. A `COUNTERFACTUAL_SCENARIO_DELTA` interpretation compares `metrics.totalReturnPct` ratios and reports `(NO_ADD - BASELINE) * 100` as percentage points, not as an unscaled return ratio or percent change.
+
+A dataset is local JSON with provenance `schemaVersion`, asset, matching KRW market, `historyStartAt`, `endAt`, `collectedAt`, source, and lowercase SHA-256 checksum, plus completed, ordered `1h`, `4h`, and `1d` candles. The checksum covers a canonicalized dataset excluding the declared checksum. Candle times require explicit timezones and exact nominal durations. Frame construction compares exact epoch nanoseconds, preserves the decision candle's original offset/nanosecond `closeTime` in `generatedAt` and source provenance, and includes only candles completed no later than that exact decision instant. Counterfactual fills preserve those exact timestamps. FIFO orders fills by exact instant and then stable fill ID for same-side ties; opposite-side fills for one market at the same exact instant are rejected as ambiguous.
+
+No supplied path produces `DATASET_UNAVAILABLE`; that status means the asset's dataset option was omitted. A supplied, schema-valid dataset that cannot create frames produces structured `DATASET_UNUSABLE` sections in `simulatedCounterfactuals`, `costSensitivity`, `regimeAnalysis`, and `excursionAnalysis`, plus a `DATASET_UNUSABLE` evidence gap. Its `reasonCode` is `EMPTY_TIMEFRAME_CANDLES`, `INSUFFICIENT_COMPLETED_CANDLES`, or `NO_OVERLAPPING_REPLAY_WINDOW`, and no scenario, cell, or analysis output is fabricated. Malformed JSON, invalid provenance/checksum, or asset/market mismatch still fails explicitly. The evaluator never collects or downloads a replacement.
+
+The JSON report has `provenance`, `observedLive`, `simulatedCounterfactuals`, `costSensitivity`, `regimeAnalysis`, `excursionAnalysis`, `evidenceGaps`, and `interpretation` sections. It rejects `NaN`, infinity, `BigInt`, `undefined`, cycles, and other non-JSON values before formatting. Metrics preserve `KNOWN`, `UNKNOWN`, and `NOT_APPLICABLE` rather than substituting zero.
+
+Observed source accounting is explicit. `observedLive.attribution.totals` contains only `SELECTED_STREAM` realization slices, while `observedLive.attribution.openingInventoryTotals` contains only left-censored `OPENING` slices. Entry attribution is under `actionDimensions.entry.sourceContributions.SELECTED_STREAM`; exit attribution keeps `actionDimensions.exit.sourceContributions.SELECTED_STREAM` and `.OPENING` separate. These totals and attribution views must not be summed. FIFO realization slices remain distinct from completed flat-to-flat position episodes, which define the default win-rate and average-trade unit.
+
+Persisted mark coverage is reported by `observedLive.diagnostics.markPnlCurve.persistedObservationCount` and `usableObservationCount` (with the same fields on each `marketMarkPnlCurves` entry). No persisted observations emit `MARK_DATA_UNAVAILABLE`; persisted observations with none usable emit `MARK_DATA_UNUSABLE`; a usable strict subset emits `MARK_DATA_PARTIAL`. Unavailable curves are `NOT_APPLICABLE`, while unusable or partial evidence keeps the affected mark metrics `UNKNOWN`; no interpolation or future mark is substituted.
+
+Each `costSensitivity.assets[].cells[]` row states its scopes. `costMetricScope: "ALL_SIMULATED_FILLS"` means `turnoverKrw` and `modeledFeesKrw` include every simulated fill, including fills against opening inventory. `fifoOutcomeMetricScope: "SELECTED_STREAM_FIFO"` means `completedEpisodeCount`, `episodeWinRate`, and `profitFactor` remain selected-stream FIFO outcomes. `tradeCount`, `totalReturnPct`, `finalEquityKrw`, and `maxDrawdownPct` retain the full replay semantics recorded by the cell.
+
+Sample support is an interpretation aid, not a statistical-significance claim: fewer than 10 observations is `INSUFFICIENT`, 10 through 29 is `PRELIMINARY`, and 30 or more is `SUPPORTED`. MAE/MFE applies only to completed simulated episodes with locally available, completed 1h OHLC evidence; its KRW values are per-unit price deltas from the first entry fill, not total-position PnL. Intrabar ordering is unknowable from OHLC, so excursions do not simulate stops or infer execution paths; incomplete interval coverage remains `UNKNOWN` with an evidence gap.
 
 ## Local DRY_RUN Script
 
