@@ -258,6 +258,339 @@ test("SQLite performance reader applies persisted filters and [from,to) snapshot
   }
 });
 
+test("SQLite performance reader recovers one exact persisted order fee without overriding fill evidence", async () => {
+  const databasePath = await createPerformanceFixture("single-order-fee-recovery");
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.prepare(`
+      UPDATE fills
+      SET exchange_fill_id = ?, fee_currency = NULL, fee_amount = NULL
+      WHERE id = ?
+    `).run("trade-in-period", "fill-in-period");
+    db.prepare("UPDATE orders SET exchange_response_json = ? WHERE id = ?").run(
+      JSON.stringify({
+        market: "KRW-BTC",
+        side: "ask",
+        paid_fee: "0.055",
+        trades_count: 1,
+        trades: [{
+          uuid: "trade-in-period",
+          market: "KRW-BTC",
+          side: "ask",
+          price: "110",
+          volume: "0.1",
+          fee: "0.055",
+        }],
+      }),
+      "order-in-period",
+    );
+    db.prepare("UPDATE orders SET exchange_response_json = ? WHERE id = ?").run(
+      JSON.stringify({
+        market: "KRW-BTC",
+        side: "bid",
+        paid_fee: "999",
+        trades: [{
+          uuid: "ignored-because-fill-fee-exists",
+          market: "KRW-BTC",
+          side: "bid",
+          price: "100",
+          volume: "0.1",
+        }],
+      }),
+      "order-before-period",
+    );
+  } finally {
+    db.close();
+  }
+
+  try {
+    const result = readPerformanceInput({
+      ...baseFilters(databasePath),
+      from: "2026-07-31T00:00:00.000Z",
+      to: "2026-08-02T00:00:00.000Z",
+    });
+    assert.equal(result.tradeFills.find((fill) => fill.id === "fill-in-period")?.feeKrw, 0.055);
+    assert.equal(result.tradeFills.find((fill) => fill.id === "fill-before-period")?.feeKrw, 0.01);
+    assert.deepEqual(Reflect.get(result.provenance, "feeEvidence"), {
+      persistedFillFeeCount: 1,
+      recoveredOrderPaidFeeCount: 1,
+      unknownFeeCount: 0,
+    });
+    assert.deepEqual(Reflect.get(result.provenance, "dataQualityWarnings"), []);
+  } finally {
+    await cleanupPerformanceDatabase(databasePath);
+  }
+});
+
+test("SQLite performance reader keeps legacy schemas readable when fee recovery columns are absent", async () => {
+  const databasePath = path.resolve(
+    process.cwd(),
+    `.tmp-performance-legacy-fee-schema-${Date.now()}-${Math.random().toString(16).slice(2)}.sqlite`,
+  );
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.exec(`
+      CREATE TABLE position_snapshots (
+        id TEXT PRIMARY KEY,
+        exchange_account_id TEXT NOT NULL,
+        captured_at TEXT NOT NULL,
+        source TEXT NOT NULL,
+        positions_json TEXT NOT NULL
+      );
+      CREATE TABLE strategy_decisions (
+        id TEXT PRIMARY KEY,
+        exchange_account_id TEXT NOT NULL,
+        market TEXT NOT NULL,
+        action TEXT NOT NULL
+      );
+      CREATE TABLE orders (
+        id TEXT PRIMARY KEY,
+        strategy_decision_id TEXT,
+        exchange_account_id TEXT NOT NULL,
+        market TEXT NOT NULL,
+        side TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        execution_mode TEXT NOT NULL
+      );
+      CREATE TABLE fills (
+        id TEXT PRIMARY KEY,
+        order_id TEXT NOT NULL,
+        market TEXT NOT NULL,
+        side TEXT NOT NULL,
+        price TEXT NOT NULL,
+        volume TEXT NOT NULL,
+        fee_currency TEXT,
+        fee_amount TEXT,
+        filled_at TEXT NOT NULL
+      );
+      INSERT INTO orders VALUES
+        ('legacy-order-known', NULL, 'primary', 'KRW-BTC', 'bid', 'STRATEGY', 'LIVE'),
+        ('legacy-order-unknown', NULL, 'primary', 'KRW-BTC', 'ask', 'STRATEGY', 'LIVE');
+      INSERT INTO fills VALUES
+        ('legacy-fill-known', 'legacy-order-known', 'KRW-BTC', 'bid', '100', '0.1', 'KRW', '0.01', '2026-08-01T01:00:00.000Z'),
+        ('legacy-fill-unknown', 'legacy-order-unknown', 'KRW-BTC', 'ask', '110', '0.1', NULL, NULL, '2026-08-01T02:00:00.000Z');
+    `);
+  } finally {
+    db.close();
+  }
+
+  try {
+    const result = readPerformanceInput(baseFilters(databasePath));
+    assert.deepEqual(result.tradeFills.map((fill) => fill.feeKrw), [0.01, null]);
+    assert.deepEqual(result.provenance.feeEvidence, {
+      persistedFillFeeCount: 1,
+      recoveredOrderPaidFeeCount: 0,
+      unknownFeeCount: 1,
+    });
+    assert.equal(result.provenance.dataQualityWarnings[0]?.code, "MISSING_ORDER_FEE_EVIDENCE");
+  } finally {
+    await cleanupPerformanceDatabase(databasePath);
+  }
+});
+
+test("SQLite performance reader leaves ambiguous malformed and mismatched order fee evidence unknown", async () => {
+  const cases = [
+    {
+      label: "multiple-local-fills",
+      response: {
+        market: "KRW-BTC",
+        side: "ask",
+        paid_fee: "0.055",
+        trades: [{ uuid: "trade-in-period", market: "KRW-BTC", side: "ask", price: "110", volume: "0.1" }],
+      },
+      code: "AMBIGUOUS_ORDER_FEE_EVIDENCE",
+      extraLocalFill: true,
+    },
+    {
+      label: "multiple-trades",
+      response: {
+        market: "KRW-BTC",
+        side: "ask",
+        paid_fee: "0.055",
+        trades: [
+          { uuid: "trade-in-period", market: "KRW-BTC", side: "ask", price: "110", volume: "0.1" },
+          { uuid: "another-trade", market: "KRW-BTC", side: "ask", price: "110", volume: "0.1" },
+        ],
+      },
+      code: "AMBIGUOUS_ORDER_FEE_EVIDENCE",
+      extraLocalFill: false,
+    },
+    {
+      label: "malformed",
+      response: "not-json",
+      code: "MALFORMED_ORDER_FEE_EVIDENCE",
+      extraLocalFill: false,
+    },
+    {
+      label: "mismatch",
+      response: {
+        market: "KRW-BTC",
+        side: "ask",
+        paid_fee: "0.055",
+        trades: [{
+          uuid: "trade-in-period",
+          market: "KRW-BTC",
+          side: "ask",
+          price: "111",
+          volume: "0.1",
+        }],
+      },
+      code: "MISMATCHED_ORDER_FEE_EVIDENCE",
+      extraLocalFill: false,
+    },
+    {
+      label: "precision-mismatch",
+      response: {
+        market: "KRW-BTC",
+        side: "ask",
+        paid_fee: "0.055",
+        trades: [{
+          uuid: "trade-in-period",
+          market: "KRW-BTC",
+          side: "ask",
+          price: "110.0000000000000000001",
+          volume: "0.1",
+        }],
+      },
+      code: "MISMATCHED_ORDER_FEE_EVIDENCE",
+      extraLocalFill: false,
+    },
+    {
+      label: "partial-trades-count",
+      response: {
+        market: "KRW-BTC",
+        side: "ask",
+        paid_fee: "0.055",
+        trades_count: 2,
+        trades: [{
+          uuid: "trade-in-period",
+          market: "KRW-BTC",
+          side: "ask",
+          price: "110",
+          volume: "0.1",
+        }],
+      },
+      code: "AMBIGUOUS_ORDER_FEE_EVIDENCE",
+      extraLocalFill: false,
+    },
+    {
+      label: "contradictory-trade-fee",
+      response: {
+        market: "KRW-BTC",
+        side: "ask",
+        paid_fee: "0.055",
+        trades_count: 1,
+        trades: [{
+          uuid: "trade-in-period",
+          market: "KRW-BTC",
+          side: "ask",
+          price: "110",
+          volume: "0.1",
+          fee: "0.054",
+        }],
+      },
+      code: "MISMATCHED_ORDER_FEE_EVIDENCE",
+      extraLocalFill: false,
+    },
+  ] as const;
+
+  for (const fixture of cases) {
+    const databasePath = await createPerformanceFixture(`fee-${fixture.label}`);
+    const db = new DatabaseSync(databasePath);
+    try {
+      db.prepare(`
+        UPDATE fills
+        SET exchange_fill_id = ?, fee_currency = NULL, fee_amount = NULL
+        WHERE id = ?
+      `).run("trade-in-period", "fill-in-period");
+      db.prepare("UPDATE orders SET exchange_response_json = ? WHERE id = ?").run(
+        fixture.response === "not-json" ? fixture.response : JSON.stringify(fixture.response),
+        "order-in-period",
+      );
+      if (fixture.extraLocalFill) {
+        db.prepare(`
+          INSERT INTO fills (
+            id, order_id, exchange_fill_id, market, side, price, volume,
+            fee_currency, fee_amount, filled_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+        `).run(
+          "fill-in-period-extra",
+          "order-in-period",
+          "trade-in-period-extra",
+          "KRW-BTC",
+          "ask",
+          "110",
+          "0.01",
+          "2026-08-01T12:00:01.000Z",
+        );
+      }
+    } finally {
+      db.close();
+    }
+
+    try {
+      const result = readPerformanceInput({
+        ...baseFilters(databasePath),
+        from: "2026-08-01T00:00:00.000Z",
+        to: "2026-08-02T00:00:00.000Z",
+      });
+      assert.equal(result.tradeFills.find((fill) => fill.id === "fill-in-period")?.feeKrw, null);
+      assert.equal(
+        Reflect.get(result.provenance, "feeEvidence")?.unknownFeeCount,
+        fixture.extraLocalFill ? 2 : 1,
+      );
+      assert.equal(
+        Reflect.get(result.provenance, "dataQualityWarnings")?.[0]?.code,
+        fixture.code,
+      );
+    } finally {
+      await cleanupPerformanceDatabase(databasePath);
+    }
+  }
+});
+
+test("SQLite performance reader keeps period opening and exposes a strict pre-fill attribution baseline", async () => {
+  const databasePath = await createPerformanceFixture("strict-attribution-opening");
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.prepare(`
+      INSERT INTO position_snapshots (
+        id, exchange_account_id, captured_at, source, positions_json
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(
+      "position-same-time-as-first-fill",
+      "primary",
+      "2026-08-01T12:00:00.000Z",
+      "RECONCILIATION",
+      positionsJson("9", "999", "999", "0", "190", "190"),
+    );
+  } finally {
+    db.close();
+  }
+
+  try {
+    const result = readPerformanceInput({
+      ...baseFilters(databasePath),
+      from: "2026-08-01T12:00:00.000Z",
+      to: "2026-08-02T00:00:00.000Z",
+    });
+    assert.deepEqual(result.input.openingPositions, [
+      { market: "KRW-BTC", quantity: 9, averagePriceKrw: 999 },
+    ]);
+    assert.deepEqual(Reflect.get(result, "attributionInput")?.openingPositions, [
+      { market: "KRW-BTC", quantity: 0.5, averagePriceKrw: 90 },
+      { market: "KRW-ETH", quantity: 1, averagePriceKrw: 190 },
+    ]);
+    assert.deepEqual(Reflect.get(result.provenance, "attributionOpeningSnapshot"), {
+      id: "position-opening-boundary",
+      capturedAt: "2026-08-01T00:00:00.000Z",
+      source: "RECONCILIATION",
+    });
+  } finally {
+    await cleanupPerformanceDatabase(databasePath);
+  }
+});
+
 test("SQLite performance reader enriches fills with validated strategy decision evidence", async () => {
   const databasePath = await createPerformanceFixture("decision-evidence");
   const db = new DatabaseSync(databasePath);
@@ -900,11 +1233,13 @@ async function createPerformanceFixture(label: string): Promise<string> {
         market TEXT NOT NULL,
         side TEXT NOT NULL,
         origin TEXT NOT NULL,
-        execution_mode TEXT NOT NULL
+        execution_mode TEXT NOT NULL,
+        exchange_response_json TEXT
       );
       CREATE TABLE fills (
         id TEXT PRIMARY KEY,
         order_id TEXT NOT NULL,
+        exchange_fill_id TEXT,
         market TEXT NOT NULL,
         side TEXT NOT NULL,
         price TEXT NOT NULL,

@@ -186,6 +186,47 @@ test("integrated evaluation CLI validates explicit simulation JSON without monet
   );
 });
 
+test("integrated evaluation CLI requires a complete explicit stability validation configuration", () => {
+  const args = [
+    ...simulationArgs("BTC", "./btc.json"),
+    "--validation-windows",
+    '[{"id":"w1","from":"2026-07-30T09:00:00+09:00","to":"2026-07-31T09:00:00+09:00"}]',
+    "--validation-frame-interval-ms", "3600000",
+    "--validation-comparison-tolerance-pp", "0.000001",
+    "--validation-minimum-windows", "1",
+  ];
+  const parsed = parseIntegratedStrategyEvaluationArgs(args);
+
+  assert.deepEqual(parsed.stabilityValidation, {
+    windows: [{
+      id: "w1",
+      from: "2026-07-30T00:00:00.000Z",
+      to: "2026-07-31T00:00:00.000Z",
+    }],
+    expectedFrameIntervalMs: 3_600_000,
+    comparisonTolerancePercentagePoints: 0.000001,
+    minimumEvaluableWindows: 1,
+  });
+  assert.equal(parseIntegratedStrategyEvaluationArgs(requiredArgs()).stabilityValidation, null);
+  assert.throws(
+    () => parseIntegratedStrategyEvaluationArgs([
+      ...simulationArgs("BTC", "./btc.json"),
+      "--validation-windows", "[]",
+    ]),
+    /requires --validation-frame-interval-ms/,
+  );
+  assert.throws(
+    () => parseIntegratedStrategyEvaluationArgs([
+      ...requiredArgs(),
+      "--validation-windows", '[{"id":"w","from":"2026-01-01T00:00:00Z","to":"2026-01-02T00:00:00Z"}]',
+      "--validation-frame-interval-ms", "3600000",
+      "--validation-comparison-tolerance-pp", "0",
+      "--validation-minimum-windows", "1",
+    ]),
+    /requires simulation datasets/,
+  );
+});
+
 test("Task 6 candle fixtures use exact timeframe durations", () => {
   const dataset = createDataset("BTC");
   const expectedDurationMs: Record<ResearchCandleTimeframe, number> = {
@@ -423,11 +464,25 @@ test("fixture datasets produce deterministic independent-capital evidence in tex
         assert.ok(first.costSensitivity.assets.every((asset) => asset.status === "AVAILABLE"));
         assert.ok(first.regimeAnalysis.assets.every((asset) => asset.status === "AVAILABLE"));
         assert.ok(first.excursionAnalysis.assets.every((asset) => asset.status === "AVAILABLE"));
+        assert.ok(first.addDiagnostics.assets.every((asset) => asset.status === "AVAILABLE"));
+        for (const asset of first.addDiagnostics.assets) {
+          if (asset.status !== "AVAILABLE") continue;
+          assert.equal(asset.analyses.length, 2);
+          assert.ok(asset.analyses.every((entry) => entry.analysis.causalClaim === false));
+          assert.ok(asset.analyses.every((entry) => entry.postDecisionExcursions.causalClaim === false));
+          assert.ok(asset.analyses.every((entry) =>
+            entry.postDecisionExcursions.exposures.length === entry.analysis.exposures.length));
+        }
+        assert.equal(first.evidenceGaps.some((gap) =>
+          gap.code === "POST_DECISION_EXCURSION_NOT_IMPLEMENTED"), false);
+        assert.equal(first.evidenceGaps.some((gap) =>
+          gap.code === "COST_FEE_ATTRIBUTION_NOT_IMPLEMENTED"), false);
         assert.equal(Object.hasOwn(first.simulatedCounterfactuals, "portfolioReturnPct"), false);
         assert.equal(Object.hasOwn(first.costSensitivity, "portfolioReturnPct"), false);
         assert.match(text, /OBSERVED_LIVE_ATTRIBUTION/);
         assert.match(text, /SIMULATED_COUNTERFACTUAL/);
         assert.match(text, /MODELED_COST_SCENARIO/);
+        assert.match(text, /ADD Decision Diagnostics/);
         assert.match(text, /INDEPENDENT_PER_ASSET_NOT_A_PORTFOLIO/);
         for (const finding of first.interpretation) {
           for (const metricId of finding.metricIds) {
@@ -508,6 +563,71 @@ test("summarized cost cells retain cost and FIFO outcome metric scopes", async (
           assert.equal(cell.costMetricScope, "ALL_SIMULATED_FILLS");
           assert.equal(cell.fifoOutcomeMetricScope, "SELECTED_STREAM_FIFO");
         }
+      },
+    ),
+  );
+});
+
+test("ADD diagnostics reports a missing BASELINE or NO_ADD pair instead of an empty available analysis", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase("add-scenario-pair"),
+    cleanupFixture,
+    async (databasePath) => withFixtureResource(
+      () => writeDatasetFixture("BTC", "add-scenario-pair"),
+      (btcPath) => rm(path.dirname(btcPath), { recursive: true, force: true }),
+      async (btcPath) => {
+        const options = parseIntegratedStrategyEvaluationArgs(
+          replaceArg(
+            replaceArg(simulationArgs("BTC", btcPath), "--database", databasePath),
+            "--scenarios",
+            '["BASELINE"]',
+          ),
+        );
+
+        const report = await buildIntegratedStrategyEvaluation(options);
+        const btc = report.addDiagnostics.assets.find((asset) => asset.asset === "BTC");
+
+        assert.equal(btc?.status, "SCENARIO_PAIR_UNAVAILABLE");
+        assert.match(btc?.message ?? "", /BASELINE and NO_ADD/);
+      },
+    ),
+  );
+});
+
+test("integrated evaluation exposes optional anchored forward stability by asset and cost cell", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase("stability-integration"),
+    cleanupFixture,
+    async (databasePath) => withFixtureResource(
+      () => writeDatasetFixture("BTC", "stability-integration", {
+        candleCounts: { "1h": 230, "4h": 230, "1d": 230 },
+      }),
+      (btcPath) => rm(path.dirname(btcPath), { recursive: true, force: true }),
+      async (btcPath) => {
+        const options = parseIntegratedStrategyEvaluationArgs([
+          ...replaceArg(simulationArgs("BTC", btcPath), "--database", databasePath),
+          "--validation-windows",
+          '[{"id":"w1","from":"2026-07-30T00:00:00Z","to":"2026-07-31T00:00:00Z"},{"id":"w2","from":"2026-07-31T00:00:00Z","to":"2026-08-01T00:00:00Z"}]',
+          "--validation-frame-interval-ms", "3600000",
+          "--validation-comparison-tolerance-pp", "0.000001",
+          "--validation-minimum-windows", "2",
+        ]);
+
+        const report = await buildIntegratedStrategyEvaluation(options);
+        assert.equal(report.stabilityValidation?.evidenceKind, "SIMULATED_COUNTERFACTUAL_STABILITY");
+        const btc = report.stabilityValidation?.assets.find((item) => item.asset === "BTC");
+        assert.equal(btc?.status, "AVAILABLE");
+        if (btc?.status !== "AVAILABLE") throw new Error("Expected available BTC stability.");
+        assert.equal(btc.analyses.length, 2);
+        assert.ok(btc.analyses.every((analysis) => analysis.windows.length === 2));
+        assert.equal(btc.analyses[0]?.pathSemantics, "CONTINUOUS_FORWARD_PATH_NO_WINDOW_RESET");
+        const textReport = formatIntegratedStrategyEvaluation(report, "text");
+        assert.match(textReport, /BTC stability cost observed-fee: overall=/);
+        assert.match(textReport, /BTC stability observed-fee\/w1: classification=/);
+        assert.match(textReport, /completed_episodes=baseline:\d+,no_add:\d+/);
+        assert.match(textReport, /policy_exposure=\d+; coverage=/);
+        assert.match(textReport, /Anchored Forward Stability/);
+        assert.deepEqual(JSON.parse(formatIntegratedStrategyEvaluation(report, "json")), report);
       },
     ),
   );
@@ -790,11 +910,15 @@ async function withFixtureResource<T, R>(
   }
 }
 
-async function writeDatasetFixture(asset: "BTC" | "ETH", suffix = "fixture-mode"): Promise<string> {
+async function writeDatasetFixture(
+  asset: "BTC" | "ETH",
+  suffix = "fixture-mode",
+  options: Parameters<typeof createDataset>[1] = {},
+): Promise<string> {
   const directory = path.join(TMP_ROOT, suffix);
   await mkdir(directory, { recursive: true });
   const filePath = path.join(directory, `${asset.toLowerCase()}.json`);
-  await writeFile(filePath, JSON.stringify(createDataset(asset)), "utf8");
+  await writeFile(filePath, JSON.stringify(createDataset(asset, options)), "utf8");
   return filePath;
 }
 

@@ -40,15 +40,36 @@ export type PerformanceReadProvenance = {
   firstFillAt: string | null;
   lastFillAt: string | null;
   openingSnapshot: PerformanceSnapshotProvenance | null;
+  attributionOpeningSnapshot: PerformanceSnapshotProvenance | null;
   markSnapshot: PerformanceSnapshotProvenance | null;
   markObservationCount: number;
   firstMarkObservationAt: string | null;
   lastMarkObservationAt: string | null;
   markObservationSnapshots: readonly PerformanceSnapshotProvenance[];
+  feeEvidence: PerformanceFeeEvidenceProvenance;
+  dataQualityWarnings: readonly PerformanceDataQualityWarning[];
+};
+
+export type PerformanceFeeEvidenceProvenance = {
+  persistedFillFeeCount: number;
+  recoveredOrderPaidFeeCount: number;
+  unknownFeeCount: number;
+};
+
+export type PerformanceDataQualityWarning = {
+  code:
+    | "AMBIGUOUS_ORDER_FEE_EVIDENCE"
+    | "MALFORMED_ORDER_FEE_EVIDENCE"
+    | "MISMATCHED_ORDER_FEE_EVIDENCE"
+    | "MISSING_ORDER_FEE_EVIDENCE";
+  fillId: string;
+  orderId: string;
+  message: string;
 };
 
 export type PerformanceReadResult = {
   input: PerformanceCalculationInput;
+  attributionInput: PerformanceCalculationInput;
   tradeFills: readonly PerformanceTradeFill[];
   markObservations: readonly PerformanceMarkObservation[];
   provenance: PerformanceReadProvenance;
@@ -59,6 +80,8 @@ type FillRow = {
   order_id: unknown;
   order_strategy_decision_id: unknown;
   order_exchange_account_id: unknown;
+  order_exchange_response_json: unknown;
+  exchange_fill_id: unknown;
   market: unknown;
   side: unknown;
   order_market: unknown;
@@ -88,6 +111,18 @@ type TimestampValidatedFillRow = {
   filledEpochNanoseconds: bigint;
 };
 
+type PerformanceFillReadResult = {
+  fills: PerformanceTradeFill[];
+  feeEvidence: PerformanceFeeEvidenceProvenance;
+  dataQualityWarnings: PerformanceDataQualityWarning[];
+};
+
+type ResolvedFee = {
+  feeKrw: number | null;
+  source: "PERSISTED_FILL" | "ORDER_PAID_FEE" | "UNKNOWN";
+  warning: PerformanceDataQualityWarning | null;
+};
+
 type PersistedPosition = {
   market?: unknown;
   quantity?: unknown;
@@ -99,7 +134,8 @@ export function readPerformanceInput(filters: PerformanceReadFilters): Performan
   const normalizedFilters = validateFilters(filters);
   const db = new DatabaseSync(normalizedFilters.databasePath, { readOnly: true });
   try {
-    const fills = readFills(db, normalizedFilters);
+    const fillRead = readFills(db, normalizedFilters);
+    const fills = fillRead.fills;
     const firstFillAt = fills[0]?.filledAt ?? null;
     const lastFillAt = fills.at(-1)?.filledAt ?? null;
     const snapshots = readSnapshots(db, normalizedFilters.exchangeAccountId);
@@ -108,6 +144,9 @@ export function readPerformanceInput(filters: PerformanceReadFilters): Performan
         ? null
         : selectSnapshot(snapshots, "<", firstFillAt)
       : selectSnapshot(snapshots, "<=", normalizedFilters.from);
+    const attributionOpeningSnapshotCandidate = firstFillAt === null
+      ? null
+      : selectSnapshot(snapshots, "<", firstFillAt);
     const markSnapshotCandidate = normalizedFilters.to === undefined
       ? snapshots.at(-1) ?? null
       : selectSnapshot(snapshots, "<", normalizedFilters.to);
@@ -115,21 +154,37 @@ export function readPerformanceInput(filters: PerformanceReadFilters): Performan
     const openingSnapshot = openingSnapshotCandidate === null
       ? null
       : normalizeSnapshot(openingSnapshotCandidate);
+    const attributionOpeningSnapshot = attributionOpeningSnapshotCandidate === null
+      ? null
+      : normalizeSnapshot(attributionOpeningSnapshotCandidate);
     const markSnapshot = markSnapshotCandidate === null
       ? null
       : normalizeSnapshot(markSnapshotCandidate);
     const markObservationSnapshots = markObservationCandidates.map(normalizeSnapshot);
     const markObservations = markObservationSnapshots.map(toMarkObservation);
+    const openingPositions = openingSnapshot === null
+      ? []
+      : parseOpeningPositions(openingSnapshot.positionsJson, openingSnapshot.id);
+    const attributionOpeningPositions = attributionOpeningSnapshot === null
+      ? []
+      : parseOpeningPositions(
+          attributionOpeningSnapshot.positionsJson,
+          attributionOpeningSnapshot.id,
+        );
+    const markPrices = markSnapshot === null
+      ? []
+      : parseMarkPrices(markSnapshot.positionsJson, markSnapshot.id);
 
     return {
       input: {
         fills,
-        openingPositions: openingSnapshot === null
-          ? []
-          : parseOpeningPositions(openingSnapshot.positionsJson, openingSnapshot.id),
-        markPrices: markSnapshot === null
-          ? []
-          : parseMarkPrices(markSnapshot.positionsJson, markSnapshot.id),
+        openingPositions,
+        markPrices,
+      },
+      attributionInput: {
+        fills,
+        openingPositions: attributionOpeningPositions,
+        markPrices,
       },
       tradeFills: fills,
       markObservations,
@@ -147,6 +202,7 @@ export function readPerformanceInput(filters: PerformanceReadFilters): Performan
         firstFillAt,
         lastFillAt,
         openingSnapshot: toSnapshotProvenance(openingSnapshot),
+        attributionOpeningSnapshot: toSnapshotProvenance(attributionOpeningSnapshot),
         markSnapshot: toSnapshotProvenance(markSnapshot),
         markObservationCount: markObservations.length,
         firstMarkObservationAt: markObservations[0]?.capturedAt ?? null,
@@ -154,6 +210,8 @@ export function readPerformanceInput(filters: PerformanceReadFilters): Performan
         markObservationSnapshots: markObservationSnapshots.map((snapshot) =>
           toSnapshotProvenance(snapshot) as PerformanceSnapshotProvenance
         ),
+        feeEvidence: fillRead.feeEvidence,
+        dataQualityWarnings: fillRead.dataQualityWarnings,
       },
     };
   } finally {
@@ -161,13 +219,21 @@ export function readPerformanceInput(filters: PerformanceReadFilters): Performan
   }
 }
 
-function readFills(db: DatabaseSync, filters: PerformanceReadFilters): PerformanceTradeFill[] {
+function readFills(db: DatabaseSync, filters: PerformanceReadFilters): PerformanceFillReadResult {
+  const orderExchangeResponseSelect = tableHasColumn(db, "orders", "exchange_response_json")
+    ? "o.exchange_response_json AS order_exchange_response_json"
+    : "NULL AS order_exchange_response_json";
+  const exchangeFillIdSelect = tableHasColumn(db, "fills", "exchange_fill_id")
+    ? "f.exchange_fill_id AS exchange_fill_id"
+    : "NULL AS exchange_fill_id";
   const rows = db.prepare(`
     SELECT
       f.id,
       o.id AS order_id,
       o.strategy_decision_id AS order_strategy_decision_id,
       o.exchange_account_id AS order_exchange_account_id,
+      ${orderExchangeResponseSelect},
+      ${exchangeFillIdSelect},
       f.market,
       f.side,
       o.market AS order_market,
@@ -199,7 +265,8 @@ function readFills(db: DatabaseSync, filters: PerformanceReadFilters): Performan
   const toEpoch = filters.to === undefined
     ? null
     : performanceTimestampEpochNanoseconds(filters.to);
-  return rows
+  const rowsByOrderId = groupRowsByOrderId(rows);
+  const selectedRows = rows
     .map((row) => validateFillTimestamp(row))
     .filter(({ filledEpochNanoseconds }) => {
       return (fromEpoch === null || filledEpochNanoseconds >= fromEpoch) &&
@@ -209,8 +276,36 @@ function readFills(db: DatabaseSync, filters: PerformanceReadFilters): Performan
       (left, right) =>
         compareEpochNanoseconds(left.filledEpochNanoseconds, right.filledEpochNanoseconds) ||
         left.id.localeCompare(right.id),
-    )
-    .map(({ row, id, filledAt }) => normalizeFill(row, id, filledAt));
+    );
+  const dataQualityWarnings: PerformanceDataQualityWarning[] = [];
+  let persistedFillFeeCount = 0;
+  let recoveredOrderPaidFeeCount = 0;
+  let unknownFeeCount = 0;
+  const fills = selectedRows.map(({ row, id, filledAt }) => {
+    const orderId = requireString(row.order_id, `Order id for fill ${id}`);
+    const resolvedFee = resolveFeeEvidence(row, id, orderId, rowsByOrderId.get(orderId) ?? []);
+    if (resolvedFee.source === "PERSISTED_FILL") persistedFillFeeCount += 1;
+    else if (resolvedFee.source === "ORDER_PAID_FEE") recoveredOrderPaidFeeCount += 1;
+    else unknownFeeCount += 1;
+    if (resolvedFee.warning !== null) dataQualityWarnings.push(resolvedFee.warning);
+    return normalizeFill(row, id, filledAt, resolvedFee.feeKrw);
+  });
+  return {
+    fills,
+    feeEvidence: { persistedFillFeeCount, recoveredOrderPaidFeeCount, unknownFeeCount },
+    dataQualityWarnings,
+  };
+}
+
+function tableHasColumn(
+  db: DatabaseSync,
+  table: "fills" | "orders",
+  column: string,
+): boolean {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{
+    name?: unknown;
+  }>;
+  return rows.some((row) => row.name === column);
 }
 
 function validateFillTimestamp(row: FillRow): TimestampValidatedFillRow {
@@ -220,7 +315,12 @@ function validateFillTimestamp(row: FillRow): TimestampValidatedFillRow {
   return { row, id, filledAt, filledEpochNanoseconds };
 }
 
-function normalizeFill(row: FillRow, id: string, filledAt: string): PerformanceTradeFill {
+function normalizeFill(
+  row: FillRow,
+  id: string,
+  filledAt: string,
+  feeKrw: number | null,
+): PerformanceTradeFill {
   const orderId = requireString(row.order_id, `Order id for fill ${id}`);
   const orderAccountId = requireString(
     row.order_exchange_account_id,
@@ -251,13 +351,6 @@ function normalizeFill(row: FillRow, id: string, filledAt: string): PerformanceT
     orderSide,
     strategyDecisionId,
   });
-  const feeAmount = row.fee_amount === null
-    ? null
-    : parseNonNegativeNumericString(row.fee_amount, `Fill ${id} fee_amount`);
-  const feeCurrency = row.fee_currency === null
-    ? null
-    : requireString(row.fee_currency, `Fill ${id} fee_currency`);
-
   return {
     id,
     orderId,
@@ -267,9 +360,182 @@ function normalizeFill(row: FillRow, id: string, filledAt: string): PerformanceT
     side,
     priceKrw: parsePositiveNumericString(row.price, `Fill ${id} price`),
     volume: parsePositiveNumericString(row.volume, `Fill ${id} volume`),
-    feeKrw: feeAmount === null || feeCurrency !== "KRW" ? null : feeAmount,
+    feeKrw,
     filledAt,
   };
+}
+
+function groupRowsByOrderId(rows: readonly FillRow[]): Map<string, FillRow[]> {
+  const grouped = new Map<string, FillRow[]>();
+  for (const row of rows) {
+    const orderId = typeof row.order_id === "string" ? row.order_id : "";
+    if (orderId === "") continue;
+    const orderRows = grouped.get(orderId) ?? [];
+    orderRows.push(row);
+    grouped.set(orderId, orderRows);
+  }
+  return grouped;
+}
+
+function resolveFeeEvidence(
+  row: FillRow,
+  fillId: string,
+  orderId: string,
+  orderRows: readonly FillRow[],
+): ResolvedFee {
+  if (row.fee_amount !== null) {
+    const feeAmount = parseNonNegativeNumericString(row.fee_amount, `Fill ${fillId} fee_amount`);
+    const feeCurrency = row.fee_currency === null
+      ? null
+      : requireString(row.fee_currency, `Fill ${fillId} fee_currency`);
+    return {
+      feeKrw: feeCurrency === "KRW" ? feeAmount : null,
+      source: feeCurrency === "KRW" ? "PERSISTED_FILL" : "UNKNOWN",
+      warning: feeCurrency === "KRW"
+        ? null
+        : feeWarning(
+            "MISMATCHED_ORDER_FEE_EVIDENCE",
+            fillId,
+            orderId,
+            `Fill ${fillId} persisted fee currency is not KRW.`,
+          ),
+    };
+  }
+  if (orderRows.length !== 1) {
+    return unknownFee(
+      "AMBIGUOUS_ORDER_FEE_EVIDENCE",
+      fillId,
+      orderId,
+      `Order ${orderId} has ${orderRows.length} local fills; order-level paid_fee is not assigned.`,
+    );
+  }
+  if (typeof row.order_exchange_response_json !== "string" || row.order_exchange_response_json === "") {
+    return unknownFee(
+      "MISSING_ORDER_FEE_EVIDENCE",
+      fillId,
+      orderId,
+      `Order ${orderId} has no persisted exchange response for fee recovery.`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.order_exchange_response_json);
+  } catch {
+    return unknownFee(
+      "MALFORMED_ORDER_FEE_EVIDENCE",
+      fillId,
+      orderId,
+      `Order ${orderId} exchange response is not valid JSON.`,
+    );
+  }
+  if (!isRecord(parsed) || !Array.isArray(parsed.trades)) {
+    return unknownFee(
+      "MALFORMED_ORDER_FEE_EVIDENCE",
+      fillId,
+      orderId,
+      `Order ${orderId} exchange response must contain a trades array.`,
+    );
+  }
+  if (parsed.trades.length !== 1) {
+    return unknownFee(
+      "AMBIGUOUS_ORDER_FEE_EVIDENCE",
+      fillId,
+      orderId,
+      `Order ${orderId} has ${parsed.trades.length} persisted trades; exact single-fill fee recovery is unavailable.`,
+    );
+  }
+  if (
+    Object.hasOwn(parsed, "trades_count")
+    && parsed.trades_count !== 1
+  ) {
+    return unknownFee(
+      "AMBIGUOUS_ORDER_FEE_EVIDENCE",
+      fillId,
+      orderId,
+      `Order ${orderId} trades_count does not prove one complete persisted trade.`,
+    );
+  }
+  const trade = parsed.trades[0];
+  const exchangeFillId = row.exchange_fill_id;
+  if (
+    !isRecord(trade) ||
+    typeof exchangeFillId !== "string" || exchangeFillId === "" ||
+    trade.uuid !== exchangeFillId ||
+    trade.market !== row.market || parsed.market !== row.market ||
+    trade.side !== row.side || parsed.side !== row.side ||
+    !decimalStringsEqual(trade.price, row.price) ||
+    !decimalStringsEqual(trade.volume, row.volume)
+  ) {
+    return unknownFee(
+      "MISMATCHED_ORDER_FEE_EVIDENCE",
+      fillId,
+      orderId,
+      `Order ${orderId} trade evidence does not exactly match fill ${fillId}.`,
+    );
+  }
+  const paidFee = parseOptionalNonNegativeNumericString(parsed.paid_fee);
+  if (paidFee === null) {
+    return unknownFee(
+      "MALFORMED_ORDER_FEE_EVIDENCE",
+      fillId,
+      orderId,
+      `Order ${orderId} paid_fee must be a finite non-negative numeric string.`,
+    );
+  }
+  if (isRecord(trade) && Object.hasOwn(trade, "fee") && !decimalStringsEqual(trade.fee, parsed.paid_fee)) {
+    return unknownFee(
+      "MISMATCHED_ORDER_FEE_EVIDENCE",
+      fillId,
+      orderId,
+      `Order ${orderId} per-trade fee contradicts paid_fee.`,
+    );
+  }
+  return { feeKrw: paidFee, source: "ORDER_PAID_FEE", warning: null };
+}
+
+function unknownFee(
+  code: PerformanceDataQualityWarning["code"],
+  fillId: string,
+  orderId: string,
+  message: string,
+): ResolvedFee {
+  return { feeKrw: null, source: "UNKNOWN", warning: feeWarning(code, fillId, orderId, message) };
+}
+
+function feeWarning(
+  code: PerformanceDataQualityWarning["code"],
+  fillId: string,
+  orderId: string,
+  message: string,
+): PerformanceDataQualityWarning {
+  return { code, fillId, orderId, message };
+}
+
+function parseOptionalNonNegativeNumericString(value: unknown): number | null {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function decimalStringsEqual(left: unknown, right: unknown): boolean {
+  if (typeof left !== "string" || typeof right !== "string") return false;
+  const leftCanonical = canonicalDecimalString(left);
+  const rightCanonical = canonicalDecimalString(right);
+  return leftCanonical !== null && leftCanonical === rightCanonical;
+}
+
+function canonicalDecimalString(value: string): string | null {
+  const match = /^([+-]?)(\d+)(?:\.(\d*))?$/u.exec(value.trim());
+  if (!match) return null;
+  const sign = match[1] === "-" ? "-" : "";
+  const integer = (match[2] ?? "").replace(/^0+(?=\d)/u, "") || "0";
+  const fraction = (match[3] ?? "").replace(/0+$/u, "");
+  const magnitude = fraction === "" ? integer : `${integer}.${fraction}`;
+  return magnitude === "0" ? "0" : `${sign}${magnitude}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function validateDecisionLink(input: {

@@ -99,15 +99,15 @@ export function buildPerformanceReport(options: PerformanceReportOptions): Perfo
   const readResult = readPerformanceInput(options);
   const diagnostics = diagnosePerformance({
     fills: readResult.tradeFills,
-    ...(readResult.input.openingPositions === undefined
+    ...(readResult.attributionInput.openingPositions === undefined
       ? {}
-      : { openingPositions: readResult.input.openingPositions }),
+      : { openingPositions: readResult.attributionInput.openingPositions }),
     markObservations: readResult.markObservations,
     policy: { breakevenToleranceKrw: PERFORMANCE_BREAKEVEN_TOLERANCE_KRW },
   });
   return {
     provenance: readResult.provenance,
-    performance: calculatePerformance(readResult.input),
+    performance: calculatePerformance(readResult.attributionInput),
     diagnostics,
     recentCompletedEpisodes: diagnostics.matchResult.episodes
       .filter((episode) => episode.status === "COMPLETED")
@@ -136,6 +136,12 @@ export function formatPerformanceReport(
     `first_fill_at: ${report.provenance.firstFillAt ?? "none"}`,
     `last_fill_at: ${report.provenance.lastFillAt ?? "none"}`,
     `opening_snapshot: ${formatSnapshot(report.provenance.openingSnapshot)}`,
+    `attribution_opening_snapshot: ${formatSnapshot(report.provenance.attributionOpeningSnapshot)}`,
+    `fee_evidence: persisted=${report.provenance.feeEvidence.persistedFillFeeCount}; recovered_order_paid_fee=${report.provenance.feeEvidence.recoveredOrderPaidFeeCount}; unknown=${report.provenance.feeEvidence.unknownFeeCount}`,
+    `data_quality_warnings: ${report.provenance.dataQualityWarnings.length}`,
+    ...report.provenance.dataQualityWarnings.map(
+      (warning) => `- ${warning.code} | fill=${warning.fillId} | order=${warning.orderId} | ${warning.message}`,
+    ),
     `mark_snapshot: ${formatSnapshot(report.provenance.markSnapshot)}`,
     `mark_observations: ${report.provenance.markObservationCount}`,
     `first_mark_observation_at: ${report.provenance.firstMarkObservationAt ?? "none"}`,

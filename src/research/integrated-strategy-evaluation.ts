@@ -19,6 +19,14 @@ import {
   type SampleSupportStatus,
 } from "../modules/performance/performance-attribution.js";
 import {
+  analyzeAddDecisionExposures,
+  type AddDecisionDiagnosticsResult,
+} from "../modules/performance/performance-add-diagnostics.js";
+import {
+  analyzeAddPostDecisionExcursions,
+  type AddPostDecisionExcursionResult,
+} from "../modules/performance/performance-add-excursions.js";
+import {
   diagnosePerformance,
   type PerformanceDiagnosticsResult,
 } from "../modules/performance/performance-diagnostics.js";
@@ -35,6 +43,12 @@ import {
   type CostScenario,
   type CostSensitivityCell,
 } from "../modules/performance/performance-sensitivity.js";
+import {
+  validatePerformanceStability,
+  type PerformanceStabilityResult,
+  type StabilityScenarioPath,
+  type StabilityValidationWindow,
+} from "../modules/performance/performance-stability-validation.js";
 import {
   readResearchCandleDataset,
   type ResearchCandleDataset,
@@ -75,10 +89,18 @@ export type IntegratedSimulationOptions = {
   assets: Partial<Record<SupportedAsset, SimulationAssetOptions>>;
 };
 
+export type IntegratedStabilityValidationOptions = {
+  windows: readonly StabilityValidationWindow[];
+  expectedFrameIntervalMs: number;
+  comparisonTolerancePercentagePoints: number;
+  minimumEvaluableWindows: number;
+};
+
 export type IntegratedStrategyEvaluationOptions = {
   observed: PerformanceReadFilters;
   format: IntegratedEvaluationFormat;
   simulation: IntegratedSimulationOptions | null;
+  stabilityValidation: IntegratedStabilityValidationOptions | null;
 };
 
 export type IntegratedDatasetProvenance = {
@@ -248,6 +270,59 @@ export type ExcursionAnalysisSection = {
   assets: readonly (UnavailableAssetSection | UnusableAssetSection | AvailableExcursionAssetSection)[];
 };
 
+export type AddDecisionDiagnosticsEntry = {
+  costScenarioId: string;
+  analysis: AddDecisionDiagnosticsResult;
+  postDecisionExcursions: AddPostDecisionExcursionResult;
+};
+
+export type AvailableAddDiagnosticsAssetSection = {
+  asset: SupportedAsset;
+  market: SupportedMarket;
+  status: "AVAILABLE";
+  evidenceKind: "SIMULATED_COUNTERFACTUAL";
+  analyses: readonly AddDecisionDiagnosticsEntry[];
+};
+
+export type UnavailableAddDiagnosticsAssetSection = {
+  asset: SupportedAsset;
+  market: SupportedMarket;
+  status: "SCENARIO_PAIR_UNAVAILABLE";
+  evidenceKind: "SIMULATED_COUNTERFACTUAL";
+  message: string;
+};
+
+export type AddDiagnosticsSection = {
+  evidenceKind: "SIMULATED_COUNTERFACTUAL";
+  assets: readonly (
+    UnavailableAssetSection | UnusableAssetSection | AvailableAddDiagnosticsAssetSection
+    | UnavailableAddDiagnosticsAssetSection
+  )[];
+};
+
+export type AvailableStabilityAssetSection = {
+  asset: SupportedAsset;
+  market: SupportedMarket;
+  status: "AVAILABLE";
+  evidenceKind: "SIMULATED_COUNTERFACTUAL_STABILITY";
+  analyses: readonly PerformanceStabilityResult[];
+};
+
+export type UnavailableStabilityAssetSection = {
+  asset: SupportedAsset;
+  market: SupportedMarket;
+  status: "DATASET_UNAVAILABLE" | "DATASET_UNUSABLE";
+  evidenceKind: "SIMULATED_COUNTERFACTUAL_STABILITY";
+  message: string;
+};
+
+export type StabilityValidationSection = {
+  evidenceKind: "SIMULATED_COUNTERFACTUAL_STABILITY";
+  windows: readonly StabilityValidationWindow[];
+  assets: readonly (AvailableStabilityAssetSection | UnavailableStabilityAssetSection)[];
+  statisticalSignificanceClaim: false;
+};
+
 export type IntegratedEvidenceKind =
   | "OBSERVED_LIVE_ATTRIBUTION"
   | "SIMULATED_COUNTERFACTUAL"
@@ -283,6 +358,8 @@ export type IntegratedStrategyEvaluationReport = {
   costSensitivity: CostSensitivitySection;
   regimeAnalysis: RegimeAnalysisSection;
   excursionAnalysis: ExcursionAnalysisSection;
+  addDiagnostics: AddDiagnosticsSection;
+  stabilityValidation?: StabilityValidationSection;
   evidenceGaps: readonly IntegratedEvidenceGap[];
   interpretation: readonly InterpretationFinding[];
 };
@@ -298,6 +375,11 @@ type AssetEvaluation = {
   costs: UnusableCostAssetSection | AvailableCostAssetSection;
   regimes: UnusableAssetSection | AvailableRegimeAssetSection;
   excursions: UnusableAssetSection | AvailableExcursionAssetSection;
+  addDiagnostics:
+    | UnusableAssetSection
+    | AvailableAddDiagnosticsAssetSection
+    | UnavailableAddDiagnosticsAssetSection;
+  stability: AvailableStabilityAssetSection | UnavailableStabilityAssetSection;
   gaps: IntegratedEvidenceGap[];
 };
 
@@ -312,6 +394,12 @@ const SAMPLE_POLICY = {
   supportedFrom: 30 as const,
   statisticalSignificanceClaim: false as const,
 };
+const ADD_DIAGNOSTIC_GAP_CODES = new Set([
+  "COST_FEE_ATTRIBUTION_INCOMPLETE",
+  "BASELINE_EXECUTED_ADD_FILL_MISSING",
+  "BASELINE_ADD_EPISODE_MISSING",
+  "COMPLETED_EPISODE_NET_PNL_UNKNOWN",
+]);
 
 export function parseIntegratedStrategyEvaluationArgs(
   argv: readonly string[],
@@ -331,6 +419,10 @@ export function parseIntegratedStrategyEvaluationArgs(
     "scenarios",
     "minimum-order-value-krw",
     "cost-cells",
+    "validation-windows",
+    "validation-frame-interval-ms",
+    "validation-comparison-tolerance-pp",
+    "validation-minimum-windows",
   ]);
   const values = new Map<string, string>();
   for (let index = 0; index < argv.length; index += 1) {
@@ -365,7 +457,10 @@ export function parseIntegratedStrategyEvaluationArgs(
     if (simulationKeys.some((key) => values.has(key))) {
       throw new Error("Simulation arguments require at least one local dataset.");
     }
-    return { observed, format, simulation: null };
+    if (hasAnyStabilityArgument(values)) {
+      throw new Error("Stability validation requires simulation datasets.");
+    }
+    return { observed, format, simulation: null, stabilityValidation: null };
   }
 
   const assets: Partial<Record<SupportedAsset, SimulationAssetOptions>> = {};
@@ -392,10 +487,17 @@ export function parseIntegratedStrategyEvaluationArgs(
     "minimum-order-value-krw",
   );
   const costScenarios = parseCostScenarios(requireSimulationArgument(values, "cost-cells"));
+  const simulation = {
+    scenarios,
+    minimumOrderValueKrw,
+    costScenarios,
+    assets,
+  };
   return {
     observed,
     format,
-    simulation: { scenarios, minimumOrderValueKrw, costScenarios, assets },
+    simulation,
+    stabilityValidation: parseStabilityValidation(values, scenarios),
   };
 }
 
@@ -411,9 +513,9 @@ export async function buildIntegratedStrategyEvaluation(
   const observedRead = readObserved(options.observed);
   const observedDiagnostics = diagnosePerformance({
     fills: observedRead.tradeFills,
-    ...(observedRead.input.openingPositions === undefined
+    ...(observedRead.attributionInput.openingPositions === undefined
       ? {}
-      : { openingPositions: observedRead.input.openingPositions }),
+      : { openingPositions: observedRead.attributionInput.openingPositions }),
     markObservations: observedRead.markObservations,
     policy: { breakevenToleranceKrw: 1e-9 },
   });
@@ -427,7 +529,7 @@ export async function buildIntegratedStrategyEvaluation(
     selectedExecutionMode: options.observed.executionMode,
     selectedOrigin: options.observed.origin,
     provenance: observedRead.provenance,
-    performance: calculatePerformance(observedRead.input),
+    performance: calculatePerformance(observedRead.attributionInput),
     diagnostics: observedDiagnostics,
     attribution: observedAttribution,
     disclaimer: OBSERVED_DISCLAIMER,
@@ -441,7 +543,13 @@ export async function buildIntegratedStrategyEvaluation(
       const dataset = await readDataset(assetOptions.datasetPath);
       assetEvaluations.set(
         asset,
-        evaluateAsset(asset, assetOptions, dataset, options.simulation),
+        evaluateAsset(
+          asset,
+          assetOptions,
+          dataset,
+          options.simulation,
+          options.stabilityValidation,
+        ),
       );
     }
   }
@@ -464,6 +572,22 @@ export async function buildIntegratedStrategyEvaluation(
   });
   const regimeAssets = ASSETS.map((asset) => assetEvaluations.get(asset)?.regimes ?? unavailable(asset));
   const excursionAssets = ASSETS.map((asset) => assetEvaluations.get(asset)?.excursions ?? unavailable(asset));
+  const addDiagnosticAssets = ASSETS.map(
+    (asset) => assetEvaluations.get(asset)?.addDiagnostics ?? unavailable(asset),
+  );
+  const stabilityAssets = options.stabilityValidation === null
+    ? []
+    : ASSETS.map((asset): AvailableStabilityAssetSection | UnavailableStabilityAssetSection => {
+        const evaluation = assetEvaluations.get(asset);
+        if (evaluation) return evaluation.stability;
+        return {
+          asset,
+          market: getMarketForAsset(asset),
+          status: "DATASET_UNAVAILABLE",
+          evidenceKind: "SIMULATED_COUNTERFACTUAL_STABILITY",
+          message: `No immutable local ${asset} dataset was supplied; stability validation was not run.`,
+        };
+      });
   const datasetGaps = ASSETS
     .filter((asset) => !assetEvaluations.has(asset))
     .map(datasetUnavailableGap);
@@ -504,6 +628,17 @@ export async function buildIntegratedStrategyEvaluation(
     },
     regimeAnalysis: { evidenceKind: "SIMULATED_COUNTERFACTUAL", assets: regimeAssets },
     excursionAnalysis: { evidenceKind: "SIMULATED_COUNTERFACTUAL", assets: excursionAssets },
+    addDiagnostics: { evidenceKind: "SIMULATED_COUNTERFACTUAL", assets: addDiagnosticAssets },
+    ...(options.stabilityValidation === null
+      ? {}
+      : {
+          stabilityValidation: {
+            evidenceKind: "SIMULATED_COUNTERFACTUAL_STABILITY" as const,
+            windows: options.stabilityValidation.windows,
+            assets: stabilityAssets,
+            statisticalSignificanceClaim: false as const,
+          },
+        }),
     evidenceGaps,
     interpretation: buildInterpretation(observedAttribution, simulationAssets),
   };
@@ -549,6 +684,16 @@ export function formatIntegratedStrategyEvaluation(
     "[Excursion Analysis]",
     JSON.stringify(report.excursionAnalysis, null, 2),
     "",
+    "[ADD Decision Diagnostics]",
+    JSON.stringify(report.addDiagnostics, null, 2),
+    ...(report.stabilityValidation === undefined
+      ? []
+      : [
+          "",
+          "[Anchored Forward Stability]",
+          JSON.stringify(report.stabilityValidation, null, 2),
+        ]),
+    "",
     "[Evidence Gaps]",
     JSON.stringify(report.evidenceGaps, null, 2),
     "",
@@ -591,6 +736,23 @@ function formatHumanSummary(report: IntegratedStrategyEvaluationReport): string[
     }
   }
 
+  for (const assetSection of report.stabilityValidation?.assets ?? []) {
+    if (assetSection.status !== "AVAILABLE") {
+      lines.push(`${assetSection.asset} stability: status=${assetSection.status}; ${assetSection.message}`);
+      continue;
+    }
+    for (const analysis of assetSection.analyses) {
+      lines.push(
+        `${assetSection.asset} stability cost ${analysis.costScenarioId}: overall=${analysis.overall.classification}; evaluable=${analysis.overall.evaluableWindowCount}; better=${analysis.overall.betterWindowCount}; tied=${analysis.overall.tiedWindowCount}; worse=${analysis.overall.worseWindowCount}; no_policy_exposure=${analysis.overall.noPolicyExposureWindowCount}; insufficient=${analysis.overall.insufficientWindowCount}`,
+      );
+      for (const window of analysis.windows) {
+        lines.push(
+          `${assetSection.asset} stability ${analysis.costScenarioId}/${window.window.id}: classification=${window.classification}; delta_pp=${window.returnDeltaPercentagePoints ?? "unknown"}; baseline_return_pct=${window.baseline.periodReturnPct ?? "unknown"}; no_add_return_pct=${window.noAdd.periodReturnPct ?? "unknown"}; completed_episodes=baseline:${window.sampleSupport.baselineCompletedEpisodeCount},no_add:${window.sampleSupport.noAddCompletedEpisodeCount}; policy_exposure=${window.sampleSupport.policyExposureCount}; coverage=${window.coverage.status}(${window.coverage.observedFrameCount}/${window.coverage.expectedFrameCount})`,
+        );
+      }
+    }
+  }
+
   const gapCodes = [...new Set(report.evidenceGaps.map((gap) => gap.code))];
   lines.push(`Evidence gaps: count=${report.evidenceGaps.length}; codes=${gapCodes.join(",") || "none"}`);
   for (const finding of report.interpretation) {
@@ -606,6 +768,7 @@ function evaluateAsset(
   assetOptions: SimulationAssetOptions,
   dataset: ResearchCandleDataset,
   simulationOptions: IntegratedSimulationOptions,
+  stabilityOptions: IntegratedStabilityValidationOptions | null,
 ): AssetEvaluation {
   const market = getMarketForAsset(asset);
   if (dataset.provenance.asset !== asset) {
@@ -673,8 +836,33 @@ function evaluateAsset(
     datasetSha256: dataset.provenance.sha256,
     cells: sensitivity.cells.map((cell) => summarizeCostCell(cell)),
   };
+  const stability: AvailableStabilityAssetSection = {
+    asset,
+    market,
+    status: "AVAILABLE",
+    evidenceKind: "SIMULATED_COUNTERFACTUAL_STABILITY",
+    analyses: stabilityOptions === null
+      ? []
+      : simulationOptions.costScenarios.map((costScenario) => {
+          const paths = sensitivity.cells
+            .filter((cell) => cell.costScenario.id === costScenario.id)
+            .map((cell) => toStabilityPath(cell, assetOptions.initialState, frames));
+          return validatePerformanceStability({
+            asset,
+            market,
+            costScenarioId: costScenario.id,
+            expectedFrameIntervalMs: stabilityOptions.expectedFrameIntervalMs,
+            comparisonTolerancePercentagePoints:
+              stabilityOptions.comparisonTolerancePercentagePoints,
+            minimumEvaluableWindows: stabilityOptions.minimumEvaluableWindows,
+            windows: stabilityOptions.windows.map((window) => ({ ...window })),
+            paths,
+          });
+        }),
+  };
   const regimeEntries: RegimeAnalysisEntry[] = [];
   const excursionEntries: ExcursionAnalysisEntry[] = [];
+  const addDiagnosticEntries: AddDecisionDiagnosticsEntry[] = [];
   const gaps: IntegratedEvidenceGap[] = [];
   for (const cell of sensitivity.cells) {
     const regime = analyzePerformanceRegimes({
@@ -722,6 +910,86 @@ function evaluateAsset(
     })));
   }
 
+  for (const costScenario of simulationOptions.costScenarios) {
+    const cells = sensitivity.cells.filter((cell) => cell.costScenario.id === costScenario.id);
+    const baseline = cells.find((cell) => cell.scenario === "BASELINE");
+    const noAdd = cells.find((cell) => cell.scenario === "NO_ADD");
+    if (!baseline || !noAdd) continue;
+    const analysis = analyzeAddDecisionExposures({
+      asset,
+      market,
+      breakevenToleranceKrw: 1e-9,
+      baseline: {
+        scenario: "BASELINE",
+        sourceFrames: baseline.sourceFrames,
+        frames: baseline.counterfactual.legacyBacktest.result.frames,
+        fills: baseline.counterfactual.fills,
+        matchResult: baseline.counterfactual.matchResult,
+      },
+      noAdd: {
+        scenario: "NO_ADD",
+        sourceFrames: noAdd.sourceFrames,
+        frames: noAdd.counterfactual.legacyBacktest.result.frames,
+        fills: noAdd.counterfactual.fills,
+        matchResult: noAdd.counterfactual.matchResult,
+      },
+    });
+    const postDecisionExcursions = analyzeAddPostDecisionExcursions({
+      asset,
+      market,
+      dataset,
+      exposures: analysis.exposures,
+      baselineFills: baseline.counterfactual.fills,
+      baselineMatchResult: baseline.counterfactual.matchResult,
+    });
+    addDiagnosticEntries.push({
+      costScenarioId: costScenario.id,
+      analysis,
+      postDecisionExcursions,
+    });
+    gaps.push(...analysis.warnings
+      .filter((item) => ADD_DIAGNOSTIC_GAP_CODES.has(item.code))
+      .map((item): IntegratedEvidenceGap => ({
+        code: item.code,
+        severity: item.severity,
+        evidenceKind: "SIMULATED_COUNTERFACTUAL",
+        scope: "ADD_DECISION_DIAGNOSTICS",
+        asset,
+        market,
+        scenario: null,
+        costScenarioId: costScenario.id,
+        affectedMetrics: item.code === "COST_FEE_ATTRIBUTION_INCOMPLETE"
+          ? ["costAndFeeImpact"]
+          : ["addDiagnostics"],
+        evidenceIds: item.evidenceIds,
+        message: item.message,
+      })));
+    const unknownExcursions = new Map<string, string[]>();
+    for (const exposure of postDecisionExcursions.exposures) {
+      if (exposure.status !== "UNKNOWN" || exposure.reason === null) continue;
+      const ids = unknownExcursions.get(exposure.reason) ?? [];
+      ids.push(exposure.exposureId);
+      unknownExcursions.set(exposure.reason, ids);
+    }
+    for (const [reason, evidenceIds] of unknownExcursions) {
+      gaps.push({
+        code: `ADD_POST_DECISION_EXCURSION_${reason}`,
+        severity: "WARNING",
+        evidenceKind: "SIMULATED_COUNTERFACTUAL",
+        scope: "ADD_DECISION_DIAGNOSTICS",
+        asset,
+        market,
+        scenario: null,
+        costScenarioId: costScenario.id,
+        affectedMetrics: ["postDecisionExcursions"],
+        evidenceIds,
+        message: `${evidenceIds.length} ADD exposure(s) have UNKNOWN post-decision excursion evidence: ${reason}.`,
+      });
+    }
+  }
+  const hasAddScenarioPair = simulationOptions.scenarios.includes("BASELINE")
+    && simulationOptions.scenarios.includes("NO_ADD");
+
   return {
     datasetProvenance,
     simulation: {
@@ -750,7 +1018,64 @@ function evaluateAsset(
       evidenceKind: "SIMULATED_COUNTERFACTUAL",
       analyses: excursionEntries,
     },
+    addDiagnostics: hasAddScenarioPair
+      ? {
+          asset,
+          market,
+          status: "AVAILABLE",
+          evidenceKind: "SIMULATED_COUNTERFACTUAL",
+          analyses: addDiagnosticEntries,
+        }
+      : {
+          asset,
+          market,
+          status: "SCENARIO_PAIR_UNAVAILABLE",
+          evidenceKind: "SIMULATED_COUNTERFACTUAL",
+          message: "ADD diagnostics require both BASELINE and NO_ADD scenarios; no comparison was performed.",
+        },
+    stability,
     gaps,
+  };
+}
+
+function toStabilityPath(
+  cell: CostSensitivityCell,
+  initialState: SimulationInitialState,
+  sourceFrames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][],
+): StabilityScenarioPath {
+  const firstPrice = sourceFrames[0]?.analysis.currentPrice;
+  if (firstPrice === undefined || !Number.isFinite(firstPrice) || firstPrice <= 0) {
+    throw new Error("Stability validation requires a positive first-frame price.");
+  }
+  const initialEquityKrw = initialState.cashKrw + initialState.quantity * firstPrice;
+  if (!Number.isFinite(initialEquityKrw) || initialEquityKrw <= 0) {
+    throw new Error("Stability validation initial equity must be positive and finite.");
+  }
+  return {
+    scenario: cell.scenario,
+    initialEquityKrw,
+    frames: cell.counterfactual.legacyBacktest.result.frames.map((frame) => ({
+      generatedAt: frame.generatedAt,
+      equityKrw: frame.equityKrw,
+      decisionAction: frame.decision.action,
+      policyExposure: frame.researchSuppression === null
+        || frame.researchSuppression === undefined
+        ? null
+        : "ADD_SUPPRESSED",
+    })),
+    fills: cell.counterfactual.fills.map((fill) => ({
+      id: fill.id,
+      filledAt: fill.filledAt,
+      priceKrw: fill.priceKrw,
+      volume: fill.volume,
+      feeKrw: fill.feeKrw,
+    })),
+    episodes: cell.counterfactual.matchResult.episodes.map((episode) => ({
+      id: episode.id,
+      openedAt: episode.openedAt,
+      closedAt: episode.closedAt,
+      status: episode.status,
+    })),
   };
 }
 
@@ -778,6 +1103,14 @@ function buildUnusableAssetEvaluation(
     costs: { ...common, evidenceKind: "MODELED_COST_SCENARIO" },
     regimes: { ...common, evidenceKind: "SIMULATED_COUNTERFACTUAL" },
     excursions: { ...common, evidenceKind: "SIMULATED_COUNTERFACTUAL" },
+    addDiagnostics: { ...common, evidenceKind: "SIMULATED_COUNTERFACTUAL" },
+    stability: {
+      asset,
+      market,
+      status: "DATASET_UNUSABLE",
+      evidenceKind: "SIMULATED_COUNTERFACTUAL_STABILITY",
+      message,
+    },
     gaps: [{
       code: "DATASET_UNUSABLE",
       severity: "WARNING",
@@ -787,7 +1120,7 @@ function buildUnusableAssetEvaluation(
       market,
       scenario: null,
       costScenarioId: null,
-      affectedMetrics: ["simulatedCounterfactuals", "costSensitivity", "regimeAnalysis", "excursionAnalysis"],
+      affectedMetrics: ["simulatedCounterfactuals", "costSensitivity", "regimeAnalysis", "excursionAnalysis", "addDiagnostics"],
       evidenceIds: [dataset.provenance.sha256],
       message,
     }],
@@ -914,7 +1247,7 @@ function datasetUnavailableGap(asset: SupportedAsset): IntegratedEvidenceGap {
     market: getMarketForAsset(asset),
     scenario: null,
     costScenarioId: null,
-    affectedMetrics: ["simulatedCounterfactuals", "costSensitivity", "regimeAnalysis", "excursionAnalysis"],
+    affectedMetrics: ["simulatedCounterfactuals", "costSensitivity", "regimeAnalysis", "excursionAnalysis", "addDiagnostics"],
     evidenceIds: [],
     message: `No immutable local ${asset} dataset was supplied; actual counterfactual evidence is unavailable and no network fallback was attempted.`,
   };
@@ -1083,6 +1416,76 @@ function parseCostScenarios(value: string): CostScenario[] {
     result.push({ id, feeRate, slippageRate });
   }
   return result;
+}
+
+const STABILITY_ARGUMENTS = [
+  "validation-windows",
+  "validation-frame-interval-ms",
+  "validation-comparison-tolerance-pp",
+  "validation-minimum-windows",
+] as const;
+
+function hasAnyStabilityArgument(values: ReadonlyMap<string, string>): boolean {
+  return STABILITY_ARGUMENTS.some((key) => values.has(key));
+}
+
+function parseStabilityValidation(
+  values: ReadonlyMap<string, string>,
+  scenarios: readonly CounterfactualScenario[],
+): IntegratedStabilityValidationOptions | null {
+  if (!hasAnyStabilityArgument(values)) return null;
+  for (const key of STABILITY_ARGUMENTS) {
+    if (!values.has(key)) throw new Error(`Stability validation requires --${key}.`);
+  }
+  if (!scenarios.includes("BASELINE") || !scenarios.includes("NO_ADD")) {
+    throw new Error("Stability validation requires BASELINE and NO_ADD scenarios.");
+  }
+  const parsedWindows = parseJson(requireArgument(values, "validation-windows"), "--validation-windows");
+  if (!Array.isArray(parsedWindows) || parsedWindows.length === 0) {
+    throw new Error("--validation-windows must be a non-empty JSON array.");
+  }
+  const windows = parsedWindows.map((item, index): StabilityValidationWindow => {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`--validation-windows[${index}] must be an object.`);
+    }
+    const record = item as Record<string, unknown>;
+    assertExactKeys(record, ["id", "from", "to"], `--validation-windows[${index}]`);
+    const id = requireNonEmpty(record.id, `--validation-windows[${index}].id`);
+    const fromValue = requireNonEmpty(record.from, `--validation-windows[${index}].from`);
+    const toValue = requireNonEmpty(record.to, `--validation-windows[${index}].to`);
+    let from: string;
+    let to: string;
+    try {
+      from = normalizeExplicitIsoTimestamp(fromValue, `--validation-windows[${index}].from`);
+      to = normalizeExplicitIsoTimestamp(toValue, `--validation-windows[${index}].to`);
+    } catch {
+      throw new Error(`--validation-windows[${index}] timestamps require an explicit ISO-8601 timezone.`);
+    }
+    return { id, from, to };
+  });
+  return {
+    windows,
+    expectedFrameIntervalMs: parsePositiveSafeInteger(
+      requireArgument(values, "validation-frame-interval-ms"),
+      "validation-frame-interval-ms",
+    ),
+    comparisonTolerancePercentagePoints: parseFiniteNonNegativeNumber(
+      requireArgument(values, "validation-comparison-tolerance-pp"),
+      "validation-comparison-tolerance-pp",
+    ),
+    minimumEvaluableWindows: parsePositiveSafeInteger(
+      requireArgument(values, "validation-minimum-windows"),
+      "validation-minimum-windows",
+    ),
+  };
+}
+
+function parsePositiveSafeInteger(value: string, label: string): number {
+  const parsed = Number(value);
+  if (value.trim().length === 0 || !Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${label} must be a positive safe integer.`);
+  }
+  return parsed;
 }
 
 function parseJson(value: string, label: string): unknown {

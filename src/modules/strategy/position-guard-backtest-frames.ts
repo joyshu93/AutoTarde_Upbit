@@ -42,6 +42,11 @@ type BacktestTimestamp = {
   exactTimestamp: string;
 };
 
+type IndexedCandle = {
+  candle: StrategyMarketCandle;
+  timestamp: BacktestTimestamp;
+};
+
 export function buildPositionGuardBacktestFrames(
   input: BuildPositionGuardBacktestFramesInput,
 ): PositionGuardBacktestAnalysisFrame[] {
@@ -49,28 +54,31 @@ export function buildPositionGuardBacktestFrames(
     ...DEFAULT_MINIMUM_COMPLETED_CANDLES,
     ...input.minimumCompletedCandles,
   };
-  const sortedCandles = {
-    "1h": sortCandles(input.oneHourCandles),
-    "4h": sortCandles(input.fourHourCandles),
-    "1d": sortCandles(input.oneDayCandles),
+  const indexedCandles = {
+    "1h": indexCandles(input.oneHourCandles),
+    "4h": indexCandles(input.fourHourCandles),
+    "1d": indexCandles(input.oneDayCandles),
   };
   const start = input.startAt === undefined ? null : parseTimestamp(input.startAt, "startAt");
   const end = input.endAt === undefined ? null : parseTimestamp(input.endAt, "endAt");
   const frames: PositionGuardBacktestAnalysisFrame[] = [];
+  const completedCounts: Record<SupportedStrategyTimeframe, number> = {
+    "1h": 0,
+    "4h": 0,
+    "1d": 0,
+  };
 
-  for (const decisionCandle of sortedCandles["1h"]) {
-    const decision = parseTimestamp(decisionCandle.closeTime, "1h closeTime");
+  for (const indexedDecisionCandle of indexedCandles["1h"]) {
+    const decisionCandle = indexedDecisionCandle.candle;
+    const decision = indexedDecisionCandle.timestamp;
     if (start !== null && decision.epochNanoseconds < start.epochNanoseconds) continue;
     if (end !== null && decision.epochNanoseconds > end.epochNanoseconds) continue;
 
-    const completed = {
-      "1h": getCompletedCandles(sortedCandles["1h"], decision.epochNanoseconds),
-      "4h": getCompletedCandles(sortedCandles["4h"], decision.epochNanoseconds),
-      "1d": getCompletedCandles(sortedCandles["1d"], decision.epochNanoseconds),
-    };
-    if (!hasMinimumCompletedCandles(completed, minimumCompletedCandles)) {
+    advanceCompletedCounts(indexedCandles, completedCounts, decision.epochNanoseconds);
+    if (!hasMinimumCompletedCandles(completedCounts, minimumCompletedCandles)) {
       continue;
     }
+    const completed = materializeCompletedCandles(indexedCandles, completedCounts);
 
     const generatedAt = decision.exactTimestamp;
     const snapshot: PositionGuardMarketSnapshot = {
@@ -111,29 +119,53 @@ export function buildPositionGuardBacktestFrames(
   return frames;
 }
 
-function sortCandles(candles: readonly StrategyMarketCandle[]): StrategyMarketCandle[] {
-  return [...candles].sort((left, right) => compareEpochNanoseconds(
-    parseTimestamp(left.closeTime, "closeTime").epochNanoseconds,
-    parseTimestamp(right.closeTime, "closeTime").epochNanoseconds,
+function indexCandles(candles: readonly StrategyMarketCandle[]): IndexedCandle[] {
+  return candles.map((sourceCandle) => {
+    const { closeTime, ...candleWithoutCloseTime } = sourceCandle;
+    return {
+      candle: { ...candleWithoutCloseTime, closeTime },
+      timestamp: parseTimestamp(closeTime, "closeTime"),
+    };
+  }).sort((left, right) => compareEpochNanoseconds(
+    left.timestamp.epochNanoseconds,
+    right.timestamp.epochNanoseconds,
   ));
 }
 
-function getCompletedCandles(
-  candles: readonly StrategyMarketCandle[],
+function advanceCompletedCounts(
+  indexedCandles: Record<SupportedStrategyTimeframe, IndexedCandle[]>,
+  completedCounts: Record<SupportedStrategyTimeframe, number>,
   cutoffEpochNanoseconds: bigint,
-): StrategyMarketCandle[] {
-  return candles.filter(
-    (candle) => parseTimestamp(candle.closeTime, "closeTime").epochNanoseconds <= cutoffEpochNanoseconds,
-  );
+): void {
+  for (const timeframe of ["1h", "4h", "1d"] as const) {
+    const candles = indexedCandles[timeframe];
+    while (
+      completedCounts[timeframe] < candles.length &&
+      candles[completedCounts[timeframe]]!.timestamp.epochNanoseconds <= cutoffEpochNanoseconds
+    ) {
+      completedCounts[timeframe] += 1;
+    }
+  }
+}
+
+function materializeCompletedCandles(
+  indexedCandles: Record<SupportedStrategyTimeframe, IndexedCandle[]>,
+  completedCounts: Record<SupportedStrategyTimeframe, number>,
+): Record<SupportedStrategyTimeframe, StrategyMarketCandle[]> {
+  return {
+    "1h": indexedCandles["1h"].slice(0, completedCounts["1h"]).map(({ candle }) => candle),
+    "4h": indexedCandles["4h"].slice(0, completedCounts["4h"]).map(({ candle }) => candle),
+    "1d": indexedCandles["1d"].slice(0, completedCounts["1d"]).map(({ candle }) => candle),
+  };
 }
 
 function hasMinimumCompletedCandles(
-  completed: Record<SupportedStrategyTimeframe, StrategyMarketCandle[]>,
+  completedCounts: Record<SupportedStrategyTimeframe, number>,
   minimumCompletedCandles: Record<SupportedStrategyTimeframe, number>,
 ): boolean {
-  return completed["1h"].length >= minimumCompletedCandles["1h"] &&
-    completed["4h"].length >= minimumCompletedCandles["4h"] &&
-    completed["1d"].length >= minimumCompletedCandles["1d"];
+  return completedCounts["1h"] >= minimumCompletedCandles["1h"] &&
+    completedCounts["4h"] >= minimumCompletedCandles["4h"] &&
+    completedCounts["1d"] >= minimumCompletedCandles["1d"];
 }
 
 function getLatestCloseTime(candles: readonly StrategyMarketCandle[]): string | null {

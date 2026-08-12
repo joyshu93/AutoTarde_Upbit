@@ -208,6 +208,40 @@ test("position guard backtest frame builder defaults to 200 completed candles in
   assert.ok(frames.every((frame) => frame.source.candleCounts["1d"] >= 200));
 });
 
+test("position guard backtest frame builder reads each candle close timestamp once", () => {
+  let closeTimeReadCount = 0;
+  const tracked = (candle: StrategyMarketCandle): StrategyMarketCandle => {
+    const closeTime = candle.closeTime;
+    return Object.defineProperty({ ...candle }, "closeTime", {
+      enumerable: true,
+      configurable: false,
+      get() {
+        closeTimeReadCount += 1;
+        return closeTime;
+      },
+    });
+  };
+  const oneHourCandles = createCandleSeries("1h", 6, "2026-04-20T06:00:00.000Z").map(tracked);
+  const fourHourCandles = createCandleSeries("4h", 3, "2026-04-20T04:00:00.000Z").map(tracked);
+  const oneDayCandles = createCandleSeries("1d", 2, "2026-04-20T00:00:00.000Z").map(tracked);
+
+  const frames = buildPositionGuardBacktestFrames({
+    asset: "BTC",
+    market: "KRW-BTC",
+    oneHourCandles,
+    fourHourCandles,
+    oneDayCandles,
+    minimumCompletedCandles: {
+      "1h": 1,
+      "4h": 1,
+      "1d": 1,
+    },
+  });
+
+  assert.ok(frames.length > 0);
+  assert.equal(closeTimeReadCount, oneHourCandles.length + fourHourCandles.length + oneDayCandles.length);
+});
+
 function createCandleSeries(
   timeframe: "1h" | "4h" | "1d",
   count: number,

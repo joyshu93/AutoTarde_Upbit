@@ -118,6 +118,12 @@ Windows Task Scheduler helper scripts may register manual-only launch entries fo
 Startup recovery is read-only against exchange truth and must never create or cancel orders.
 When startup recovery confirms unresolved portfolio drift against persisted state, the operator state may move into `DEGRADED` without enabling any live path.
 
+Read-only performance diagnostics may derive a missing fee only from exact persisted single-fill exchange-response evidence and may use a strictly pre-fill snapshot to classify external opening inventory. These are report-time evidence transformations only: they must not repair the operational DB, create synthetic orders or fills, call Upbit, or change strategy/runtime state.
+
+Optional `NO_ADD` stability validation is an offline counterfactual diagnostic over explicit non-overlapping periods and continuous forward paths. It is not a live strategy rule, an automatic optimization step, or evidence that future returns are guaranteed.
+
+ADD exposure diagnostics are descriptive offline evidence only. Same-instant BASELINE/NO_ADD pairing, regime labels, and associated completed-episode outcomes must not be described as proof that ADD caused profit or loss, and unsupported post-decision excursion or fee attribution must remain explicitly unknown.
+
 ## Design Consequences
 - every order must have an explicit lifecycle record
 - every fill must be recoverable from reconciliation
@@ -135,3 +141,4 @@ When startup recovery confirms unresolved portfolio drift against persisted stat
 - research candle acquisition must require explicit asset, history start, end, new output path, page size, and page limit; it must checksum-verify provenance, refuse overwrite, fail rather than silently truncate coverage, and leave no completed destination artifact after failure
 - omitted candle datasets must remain `DATASET_UNAVAILABLE`; supplied schema-valid but inadequate or non-overlapping datasets must remain structured `DATASET_UNUSABLE` evidence, while malformed, checksum-invalid, or asset/market-mismatched datasets fail explicitly
 - performance evidence must preserve exact offset/nanosecond instant ordering, separate selected-stream from opening-inventory attribution, distinguish persisted from usable marks, and declare whether modeled cost and FIFO outcome metrics cover all simulated fills or selected-stream FIFO evidence
+- ADD contribution diagnostics are descriptive counterfactual research only: they attribute exact FIFO slices entered by a simulated ADD fill and use complete persisted candle intervals for post-decision MAE/MFE; they do not establish causality, alter strategy rules, or enter the live execution graph
