@@ -19,6 +19,20 @@ import {
   type SampleSupportStatus,
 } from "../modules/performance/performance-attribution.js";
 import {
+  APPROVED_ADD_POLICY_EVALUATION_THRESHOLDS,
+  evaluateAddPolicyCandidate,
+  type AddPolicyAffectedFrameRange,
+  type AddPolicyCandidate,
+  type AddPolicyCandidateEvaluationResult,
+  type AddPolicyEvaluationObservation,
+  type AddPolicyEvaluationWindow,
+} from "../modules/performance/performance-add-policy-evaluation.js";
+import {
+  analyzePositionGuardFeatureCoverage,
+  type CandleCoverageGap,
+  type PositionGuardFeatureCoverage,
+} from "../modules/performance/performance-candle-coverage.js";
+import {
   analyzeAddDecisionExposures,
   type AddDecisionDiagnosticsResult,
 } from "../modules/performance/performance-add-diagnostics.js";
@@ -27,9 +41,22 @@ import {
   type AddPostDecisionExcursionResult,
 } from "../modules/performance/performance-add-excursions.js";
 import {
+  analyzeAddLossAttribution,
+  type AddLossAttributionResult,
+  type AddPolicySuppressionEvidence,
+} from "../modules/performance/performance-add-loss-attribution.js";
+import {
+  classifyAddHoldoutHypotheses,
+  type AddHoldoutHypothesisResult,
+} from "../modules/performance/performance-add-holdout-hypothesis.js";
+import {
   diagnosePerformance,
   type PerformanceDiagnosticsResult,
 } from "../modules/performance/performance-diagnostics.js";
+import {
+  createVerifiedNoTradeCoverage,
+  type VerifiedNoTradeCoverage,
+} from "../modules/performance/performance-hourly-coverage.js";
 import {
   analyzePerformanceExcursions,
   type PerformanceExcursionResult,
@@ -62,9 +89,14 @@ import {
   type PerformanceReadProvenance,
   type PerformanceReadResult,
 } from "../modules/performance/sqlite-performance-reader.js";
-import { comparePerformanceTimestamps } from "../modules/performance/performance-timestamp.js";
+import {
+  compareEpochNanoseconds,
+  comparePerformanceTimestamps,
+  parsePerformanceTimestamp,
+} from "../modules/performance/performance-timestamp.js";
 import { buildPositionGuardBacktestFrames } from "../modules/strategy/position-guard-backtest-frames.js";
 import type {
+  PositionGuardBacktestFrameResult,
   PositionGuardBacktestMetrics,
   PositionGuardBacktestState,
 } from "../modules/strategy/position-guard-backtest.js";
@@ -111,6 +143,7 @@ export type IntegratedDatasetProvenance = {
   dataset: ResearchDatasetProvenance;
   initialState: SimulationInitialState;
   frameCount: number;
+  featureCoverage?: PositionGuardFeatureCoverage;
 };
 
 export type IntegratedProvenance = {
@@ -147,7 +180,7 @@ export type ObservedEvaluationSection = {
 export type CounterfactualScenarioSummary = {
   evidenceKind: "SIMULATED_COUNTERFACTUAL";
   scenario: CounterfactualScenario;
-  executionPolicyId: "NO_ADD" | null;
+  executionPolicyId: Exclude<CounterfactualScenario, "BASELINE"> | null;
   costScenario: CostScenario;
   initialState: SimulationInitialState;
   finalState: PositionGuardBacktestState;
@@ -323,6 +356,77 @@ export type StabilityValidationSection = {
   statisticalSignificanceClaim: false;
 };
 
+export type ConditionalAddPolicyUnavailableReason =
+  | "ALL_CONDITIONAL_SCENARIOS_REQUIRED"
+  | "BASELINE_AND_NO_ADD_ANCHORS_REQUIRED"
+  | "EXACTLY_THREE_VALIDATION_WINDOWS_REQUIRED"
+  | "BASE_COST_CELL_REQUIRED"
+  | "STRESS_COST_CELL_REQUIRED";
+
+export type ConditionalAddPolicyAssetSection = {
+  asset: SupportedAsset;
+  market: SupportedMarket;
+  status: "AVAILABLE";
+  datasetSha256: string;
+  policySupportCostRole: "BASE";
+  candidates: readonly AddPolicyCandidateEvaluationResult[];
+} | {
+  asset: SupportedAsset;
+  market: SupportedMarket;
+  status: "DATASET_UNAVAILABLE" | "DATASET_UNUSABLE";
+  message: string;
+  candidates: readonly [];
+};
+
+export type ConditionalAddPolicyEvaluationSection = {
+  evidenceKind: "SIMULATED_CONDITIONAL_ADD_POLICY_EVALUATION";
+  status: "AVAILABLE" | "UNAVAILABLE";
+  reasonCodes: readonly ConditionalAddPolicyUnavailableReason[];
+  requestedCandidates: readonly AddPolicyCandidate[];
+  requiredCandidates: readonly AddPolicyCandidate[];
+  requiredAnchors: readonly ["BASELINE", "NO_ADD"];
+  windows: readonly StabilityValidationWindow[];
+  assets: readonly ConditionalAddPolicyAssetSection[];
+  deploymentApproval: false;
+  warning: string;
+};
+
+export type AddLossAttributionSection = {
+  evidenceKind: "SIMULATED_COUNTERFACTUAL";
+  analysisKind: "ADD_LOSS_ATTRIBUTION_AND_HOLDOUT_HYPOTHESIS";
+  selectedFlowAttribution: true;
+  causalClaim: false;
+  deploymentApproval: false;
+  provenance: {
+    selectedFlow: PerformanceReadProvenance["filters"];
+    datasets: readonly {
+      asset: SupportedAsset;
+      market: SupportedMarket;
+      path: string;
+      sha256: string;
+      source: string;
+      historyStartAt: string;
+      endAt: string;
+    }[];
+    costScenarioIds: readonly string[];
+    attributionCostScenarioId: string;
+    validationWindowIds: readonly string[];
+    candidateIds: readonly AddPolicyCandidate[];
+    policySuppressionEvidence: readonly {
+      asset: SupportedAsset;
+      policies: readonly AddPolicySuppressionEvidence[];
+    }[];
+    suppressionEvidenceIds: readonly string[];
+  };
+  assets: readonly AddLossAttributionResult[];
+  holdoutHypotheses: AddHoldoutHypothesisResult;
+  warnings: readonly [
+    "Selected-flow attribution; not account return.",
+    "Descriptive association only; not causal proof.",
+    "Future-holdout classification is not deployment approval and does not change strategy or runtime behavior.",
+  ];
+};
+
 export type IntegratedEvidenceKind =
   | "OBSERVED_LIVE_ATTRIBUTION"
   | "SIMULATED_COUNTERFACTUAL"
@@ -360,6 +464,8 @@ export type IntegratedStrategyEvaluationReport = {
   excursionAnalysis: ExcursionAnalysisSection;
   addDiagnostics: AddDiagnosticsSection;
   stabilityValidation?: StabilityValidationSection;
+  conditionalAddPolicyEvaluation?: ConditionalAddPolicyEvaluationSection;
+  addLossAttribution?: AddLossAttributionSection;
   evidenceGaps: readonly IntegratedEvidenceGap[];
   interpretation: readonly InterpretationFinding[];
 };
@@ -380,6 +486,8 @@ type AssetEvaluation = {
     | AvailableAddDiagnosticsAssetSection
     | UnavailableAddDiagnosticsAssetSection;
   stability: AvailableStabilityAssetSection | UnavailableStabilityAssetSection;
+  conditionalCandidates: readonly AddPolicyCandidateEvaluationResult[];
+  policySuppressionEvidence: readonly AddPolicySuppressionEvidence[];
   gaps: IntegratedEvidenceGap[];
 };
 
@@ -387,6 +495,13 @@ const ASSETS = ["BTC", "ETH"] as const satisfies readonly SupportedAsset[];
 const OBSERVED_DISCLAIMER = "Selected order-stream attribution; not total account return." as const;
 const CAPITAL_SEMANTICS = "INDEPENDENT_PER_ASSET_NOT_A_PORTFOLIO" as const;
 const REQUIRED_COMPLETED_CANDLES = 200;
+const CONDITIONAL_ADD_CANDIDATES = [
+  "ADD_RISK_CLEAR",
+  "ADD_HIGH_ALIGNMENT",
+  "ADD_CORE_TREND",
+] as const satisfies readonly AddPolicyCandidate[];
+const CONDITIONAL_ADD_WARNING =
+  "Favorable offline research results are not deployment approval; any strategy change requires separate design, review, DRY_RUN/shadow validation, and an explicit deployment decision.";
 const SAMPLE_POLICY = {
   id: "OBSERVATION_COUNT_V1" as const,
   insufficientBelow: 10 as const,
@@ -400,6 +515,20 @@ const ADD_DIAGNOSTIC_GAP_CODES = new Set([
   "BASELINE_ADD_EPISODE_MISSING",
   "COMPLETED_EPISODE_NET_PNL_UNKNOWN",
 ]);
+
+type ConditionalAddPolicyConfiguration = {
+  baseCost: CostScenario;
+  stressCost: CostScenario;
+  windows: readonly StabilityValidationWindow[];
+  expectedFrameIntervalMs: number;
+};
+
+type ConditionalAddPolicyReadiness = {
+  requested: boolean;
+  requestedCandidates: AddPolicyCandidate[];
+  reasonCodes: ConditionalAddPolicyUnavailableReason[];
+  configuration: ConditionalAddPolicyConfiguration | null;
+};
 
 export function parseIntegratedStrategyEvaluationArgs(
   argv: readonly string[],
@@ -534,6 +663,10 @@ export async function buildIntegratedStrategyEvaluation(
     attribution: observedAttribution,
     disclaimer: OBSERVED_DISCLAIMER,
   };
+  const conditionalReadiness = assessConditionalAddPolicyReadiness(
+    options.simulation,
+    options.stabilityValidation,
+  );
 
   const assetEvaluations = new Map<SupportedAsset, AssetEvaluation>();
   if (options.simulation !== null) {
@@ -549,6 +682,7 @@ export async function buildIntegratedStrategyEvaluation(
           dataset,
           options.simulation,
           options.stabilityValidation,
+          conditionalReadiness.configuration,
         ),
       );
     }
@@ -602,6 +736,18 @@ export async function buildIntegratedStrategyEvaluation(
     return provenance === undefined ? [] : [provenance];
   });
   const baseCostScenario = options.simulation?.costScenarios[0] ?? null;
+  const conditionalAddPolicyEvaluation = buildConditionalAddPolicySection(
+    conditionalReadiness,
+    options.stabilityValidation,
+    assetEvaluations,
+  );
+  const addLossAttribution = buildAddLossAttributionSection({
+    conditionalAddPolicyEvaluation,
+    observedProvenance: observedRead.provenance,
+    simulation: options.simulation,
+    stabilityValidation: options.stabilityValidation,
+    assetEvaluations,
+  });
   const report: IntegratedStrategyEvaluationReport = {
     provenance: {
       observed: observedRead.provenance,
@@ -639,6 +785,10 @@ export async function buildIntegratedStrategyEvaluation(
             statisticalSignificanceClaim: false as const,
           },
         }),
+    ...(conditionalAddPolicyEvaluation === null
+      ? {}
+      : { conditionalAddPolicyEvaluation }),
+    ...(addLossAttribution === null ? {} : { addLossAttribution }),
     evidenceGaps,
     interpretation: buildInterpretation(observedAttribution, simulationAssets),
   };
@@ -693,6 +843,13 @@ export function formatIntegratedStrategyEvaluation(
           "[Anchored Forward Stability]",
           JSON.stringify(report.stabilityValidation, null, 2),
         ]),
+    ...(report.conditionalAddPolicyEvaluation === undefined
+      ? []
+      : [
+          "",
+          "[Conditional ADD Policy Evaluation]",
+          JSON.stringify(report.conditionalAddPolicyEvaluation, null, 2),
+        ]),
     "",
     "[Evidence Gaps]",
     JSON.stringify(report.evidenceGaps, null, 2),
@@ -710,7 +867,6 @@ function formatHumanSummary(report: IntegratedStrategyEvaluationReport): string[
     `Observed filters: database=${observedFilters.databasePath}; account=${observedFilters.exchangeAccountId}; mode=${observedFilters.executionMode}; origin=${observedFilters.origin}; period=[${observedFilters.from ?? "unbounded"},${observedFilters.to ?? "unbounded"})`,
     `Observed scope: ${report.observedLive.disclaimer}`,
   ];
-
   for (const assetSection of report.simulatedCounterfactuals.assets) {
     if (assetSection.status !== "AVAILABLE") {
       lines.push(`${assetSection.asset} simulation: status=${assetSection.status}; ${assetSection.message}`);
@@ -724,6 +880,17 @@ function formatHumanSummary(report: IntegratedStrategyEvaluationReport): string[
       lines.push(
         `${assetSection.asset} dataset: path=${dataset.path}; sha256=${dataset.sha256}; source=${dataset.dataset.source}; period=[${dataset.dataset.historyStartAt},${dataset.dataset.endAt}]; frames=${dataset.frameCount}`,
       );
+      if (dataset.featureCoverage) {
+        lines.push(
+          `${assetSection.asset} feature coverage: continuity=${dataset.featureCoverage.status}; affected_frames=${dataset.featureCoverage.affectedFrameCount}; continuity_policy=${dataset.featureCoverage.continuityPolicy}`,
+        );
+        for (const timeframe of ["1h", "4h", "1d"] as const) {
+          const coverage = dataset.featureCoverage.timeframes[timeframe];
+          lines.push(
+            `${assetSection.asset} dataset ${timeframe}: source_cadence=${coverage.sourceCadenceStatus}; sequence=${coverage.sourceSequenceStatus}; clock_grid=${coverage.clockGridStatus}; observed=${coverage.sourceObservedCandleCount}; expected=${coverage.sourceExpectedCandleCount}; no_trade_intervals=${coverage.sourceNoTradeIntervalCount}; raw_missing=${coverage.sourceMissingCandleCount}; duplicate=${coverage.sourceDuplicateCandleCount}; off_grid=${coverage.sourceOffGridCandleCount}; recursive_input=${coverage.lookbackContinuityStatus}; affected_frames=${coverage.affectedFrameCount}`,
+          );
+        }
+      }
     }
   }
 
@@ -753,6 +920,29 @@ function formatHumanSummary(report: IntegratedStrategyEvaluationReport): string[
     }
   }
 
+  const conditional = report.conditionalAddPolicyEvaluation;
+  if (conditional !== undefined) {
+    lines.push(
+      `Conditional ADD Policy Evaluation: status=${conditional.status}; candidates=${conditional.requestedCandidates.join(",") || "none"}; reasons=${conditional.reasonCodes.join(",") || "none"}`,
+    );
+    for (const asset of conditional.assets) {
+      if (asset.status !== "AVAILABLE") {
+        lines.push(`${asset.asset} conditional ADD: status=${asset.status}; ${asset.message}`);
+        continue;
+      }
+      for (const candidate of asset.candidates) {
+        lines.push(
+          `${asset.asset} conditional ADD ${candidate.candidate}: status=${candidate.status}; policy_exposed_completed_episodes=${candidate.gates.policyExposedCompletedEpisodes.fullPathObservedCount}; coverage=${candidate.gates.frameCoverage.status}; feature_continuity=${candidate.gates.frameCoverage.fullPath.featureLookbackContinuityStatus}; feature_affected_frames=${candidate.gates.frameCoverage.fullPath.featureLookbackAffectedFrameCount}; base_return=${candidate.gates.fullPathNetReturn.status}; stress_windows=${candidate.gates.stressWindowReturn.status}`,
+        );
+      }
+    }
+    lines.push(`Conditional ADD warning: ${conditional.warning}`);
+  }
+
+  if (report.addLossAttribution !== undefined) {
+    lines.push(...formatAddLossAttributionSummary(report.addLossAttribution));
+  }
+
   const gapCodes = [...new Set(report.evidenceGaps.map((gap) => gap.code))];
   lines.push(`Evidence gaps: count=${report.evidenceGaps.length}; codes=${gapCodes.join(",") || "none"}`);
   for (const finding of report.interpretation) {
@@ -763,12 +953,336 @@ function formatHumanSummary(report: IntegratedStrategyEvaluationReport): string[
   return lines;
 }
 
+function formatAddLossAttributionSummary(section: AddLossAttributionSection): string[] {
+  const lines = ["ADD Loss Attribution"];
+  for (const asset of section.assets) {
+    lines.push(
+      `${asset.asset} ADD totals: executed=${asset.aggregate.executedAddCount}; fully_realized=${asset.aggregate.fullyRealizedAddCount}; partially_realized=${asset.aggregate.partiallyRealizedAddCount}; unrealized=${asset.aggregate.unrealizedAddCount}; known_net_denominator=${asset.aggregate.knownNetContributionCount}/${asset.aggregate.executedAddCount}; net=${formatAggregateMetric(asset.aggregate.netRealizedContributionKrw)}; fee=${formatAggregateMetric(asset.aggregate.confirmedFeeImpactKrw)}; net_completeness=${asset.aggregate.netRealizedContributionKrw.completeness}; fee_completeness=${asset.aggregate.confirmedFeeImpactKrw.completeness}`,
+    );
+    const losses = [
+      ...asset.cohorts.byRegime,
+      ...asset.cohorts.byAtrShock,
+      ...asset.cohorts.byWeakeningStage,
+      ...asset.cohorts.byTrendAlignmentScore,
+      ...asset.cohorts.byAddOrdinal,
+    ].filter((cohort) =>
+      cohort.knownNetContributionCount > 0
+      && cohort.netRealizedContributionKrw.knownSubtotal.status === "KNOWN"
+      && cohort.netRealizedContributionKrw.knownSubtotal.value < 0
+    ).sort((left, right) => {
+      const leftValue = left.netRealizedContributionKrw.knownSubtotal.status === "KNOWN"
+        ? left.netRealizedContributionKrw.knownSubtotal.value
+        : 0;
+      const rightValue = right.netRealizedContributionKrw.knownSubtotal.status === "KNOWN"
+        ? right.netRealizedContributionKrw.knownSubtotal.value
+        : 0;
+      return leftValue - rightValue
+        || left.dimension.localeCompare(right.dimension)
+        || left.value.localeCompare(right.value);
+    }).slice(0, 3);
+    if (losses.length === 0) {
+      lines.push(`${asset.asset} loss cohorts: none with known negative net contribution`);
+    } else {
+      for (const cohort of losses) {
+        lines.push(
+          `${asset.asset} loss cohort ${cohort.dimension}=${cohort.value}: known_net_denominator=${cohort.knownNetContributionCount}/${cohort.executedAddCount}; known_net_subtotal=${formatMetric(cohort.netRealizedContributionKrw.knownSubtotal)}; net=${formatAggregateMetric(cohort.netRealizedContributionKrw)}; fee=${formatAggregateMetric(cohort.confirmedFeeImpactKrw)}; net_completeness=${cohort.netRealizedContributionKrw.completeness}; fee_completeness=${cohort.confirmedFeeImpactKrw.completeness}`,
+        );
+      }
+    }
+    for (const policy of asset.policySuppressedCohorts) {
+      lines.push(
+        `${asset.asset} policy suppressed ${policy.policyId}: executed=${policy.metrics.executedAddCount}; known_net_denominator=${policy.metrics.knownNetContributionCount}/${policy.metrics.executedAddCount}; net=${formatAggregateMetric(policy.metrics.netRealizedContributionKrw)}; fee=${formatAggregateMetric(policy.metrics.confirmedFeeImpactKrw)}; evidence=${policy.suppressionEvidenceIds.length}`,
+      );
+    }
+  }
+  for (const hypothesis of section.holdoutHypotheses.hypotheses) {
+    lines.push(
+      `Cross-asset holdout ${hypothesis.candidate}: status=${hypothesis.status}; reasons=${hypothesis.reasonCodes.join(",") || "none"}`,
+    );
+  }
+  lines.push(...section.warnings.map((warning) => `ADD warning: ${warning}`));
+  return lines;
+}
+
+function formatAggregateMetric(metric: AddLossAttributionResult["aggregate"]["netRealizedContributionKrw"]): string {
+  if (metric.total.status === "KNOWN") return String(metric.total.value);
+  if (metric.total.status === "UNKNOWN") return `unknown(${metric.total.reasons.join(",")})`;
+  return `not_applicable(${metric.total.reason})`;
+}
+
+function formatMetric(metric: AddLossAttributionResult["aggregate"]["netRealizedContributionKrw"]["knownSubtotal"]): string {
+  if (metric.status === "KNOWN") return String(metric.value);
+  if (metric.status === "UNKNOWN") return `unknown(${metric.reasons.join(",")})`;
+  return `not_applicable(${metric.reason})`;
+}
+
+export type AddPolicySuppressionReplay = {
+  policyId: AddPolicyCandidate;
+  frames: readonly Pick<PositionGuardBacktestFrameResult, "generatedAt" | "researchSuppression">[];
+};
+
+export function extractAddPolicySuppressionEvidence(
+  asset: SupportedAsset,
+  replays: readonly AddPolicySuppressionReplay[],
+): AddPolicySuppressionEvidence[] {
+  const market = getMarketForAsset(asset);
+  const seenPolicies = new Set<AddPolicyCandidate>();
+  return replays.map(({ policyId, frames }) => {
+    if (seenPolicies.has(policyId)) throw new Error(`Duplicate ADD policy suppression replay ${policyId}.`);
+    seenPolicies.add(policyId);
+    const seenInstants = new Set<string>();
+    const suppressedDecisions = frames.flatMap((frame) => {
+      const suppression = frame.researchSuppression;
+      if (suppression === null || suppression === undefined) return [];
+      if (suppression.policyId !== policyId) {
+        throw new Error(`ADD policy suppression replay ${policyId} contains ${suppression.policyId} evidence.`);
+      }
+      const frameTime = requirePerformanceTimestamp(frame.generatedAt, `${policyId} replay frame generatedAt`);
+      const suppressionTime = requirePerformanceTimestamp(
+        suppression.generatedAt,
+        `${policyId} research suppression generatedAt`,
+      );
+      if (compareEpochNanoseconds(frameTime.epochNanoseconds, suppressionTime.epochNanoseconds) !== 0) {
+        throw new Error(`ADD policy suppression replay ${policyId} frame and suppression timestamps differ.`);
+      }
+      if (seenInstants.has(suppressionTime.normalized)) {
+        throw new Error(`Duplicate ADD policy suppression instant ${policyId}:${suppressionTime.normalized}.`);
+      }
+      seenInstants.add(suppressionTime.normalized);
+      return [{
+        generatedAt: suppressionTime.normalized,
+        evidenceIds: [
+          `research-suppression:${asset}:${market}:${policyId}:${suppressionTime.normalized}:${suppression.reason}`,
+        ],
+      }];
+    }).sort((left, right) =>
+      comparePerformanceTimestamps(left.generatedAt, right.generatedAt)
+      || left.evidenceIds[0]!.localeCompare(right.evidenceIds[0]!)
+    );
+    return { policyId, suppressedDecisions };
+  });
+}
+
+function buildAddLossAttributionSection(input: {
+  conditionalAddPolicyEvaluation: ConditionalAddPolicyEvaluationSection | null;
+  observedProvenance: PerformanceReadProvenance;
+  simulation: IntegratedSimulationOptions | null;
+  stabilityValidation: IntegratedStabilityValidationOptions | null;
+  assetEvaluations: ReadonlyMap<SupportedAsset, AssetEvaluation>;
+}): AddLossAttributionSection | null {
+  if (
+    input.conditionalAddPolicyEvaluation?.status !== "AVAILABLE"
+    || input.simulation === null
+    || input.stabilityValidation === null
+    || !CONDITIONAL_ADD_CANDIDATES.every((candidate) =>
+      input.simulation?.scenarios.includes(candidate)
+    )
+    || !input.simulation.scenarios.includes("BASELINE")
+    || !input.simulation.scenarios.includes("NO_ADD")
+  ) {
+    return null;
+  }
+  const baseCostScenario = input.simulation.costScenarios[0];
+  if (baseCostScenario === undefined) return null;
+
+  const attributions: AddLossAttributionResult[] = [];
+  const candidateEvaluations: AddPolicyCandidateEvaluationResult[] = [];
+  for (const asset of ASSETS) {
+    const evaluation = input.assetEvaluations.get(asset);
+    if (
+      evaluation === undefined
+      || evaluation.addDiagnostics.status !== "AVAILABLE"
+      || evaluation.policySuppressionEvidence.length !== CONDITIONAL_ADD_CANDIDATES.length
+      || evaluation.conditionalCandidates.length !== CONDITIONAL_ADD_CANDIDATES.length
+    ) {
+      return null;
+    }
+    const diagnostics = evaluation.addDiagnostics.analyses.find(
+      (analysis) => analysis.costScenarioId === baseCostScenario.id,
+    );
+    if (diagnostics === undefined) return null;
+    attributions.push(analyzeAddLossAttribution({
+      asset,
+      market: getMarketForAsset(asset),
+      breakevenToleranceKrw: 1e-9,
+      diagnostics: diagnostics.analysis,
+      excursions: diagnostics.postDecisionExcursions,
+      policySuppressionEvidence: evaluation.policySuppressionEvidence,
+    }));
+    candidateEvaluations.push(...evaluation.conditionalCandidates);
+  }
+
+  const suppressionEvidenceIds = attributions.flatMap((asset) =>
+    asset.policySuppressedCohorts.flatMap((policy) => policy.suppressionEvidenceIds)
+  );
+  return {
+    evidenceKind: "SIMULATED_COUNTERFACTUAL",
+    analysisKind: "ADD_LOSS_ATTRIBUTION_AND_HOLDOUT_HYPOTHESIS",
+    selectedFlowAttribution: true,
+    causalClaim: false,
+    deploymentApproval: false,
+    provenance: {
+      selectedFlow: { ...input.observedProvenance.filters },
+      datasets: ASSETS.map((asset) => input.assetEvaluations.get(asset)!.datasetProvenance).map(
+        (dataset) => ({
+          asset: dataset.asset,
+          market: dataset.market,
+          path: dataset.path,
+          sha256: dataset.sha256,
+          source: dataset.dataset.source,
+          historyStartAt: dataset.dataset.historyStartAt,
+          endAt: dataset.dataset.endAt,
+        }),
+      ),
+      costScenarioIds: input.simulation.costScenarios.map((cost) => cost.id),
+      attributionCostScenarioId: baseCostScenario.id,
+      validationWindowIds: input.stabilityValidation.windows.map((window) => window.id),
+      candidateIds: [...CONDITIONAL_ADD_CANDIDATES],
+      policySuppressionEvidence: ASSETS.map((asset) => ({
+        asset,
+        policies: input.assetEvaluations.get(asset)!.policySuppressionEvidence.map((policy) => ({
+          policyId: policy.policyId,
+          suppressedDecisions: policy.suppressedDecisions.map((decision) => ({
+            generatedAt: decision.generatedAt,
+            evidenceIds: [...decision.evidenceIds],
+          })),
+        })),
+      })),
+      suppressionEvidenceIds,
+    },
+    assets: attributions,
+    holdoutHypotheses: classifyIntegratedAddHoldoutHypotheses(attributions, candidateEvaluations),
+    warnings: [
+      "Selected-flow attribution; not account return.",
+      "Descriptive association only; not causal proof.",
+      "Future-holdout classification is not deployment approval and does not change strategy or runtime behavior.",
+    ],
+  };
+}
+
+function classifyIntegratedAddHoldoutHypotheses(
+  attributions: readonly AddLossAttributionResult[],
+  candidateEvaluations: readonly AddPolicyCandidateEvaluationResult[],
+): AddHoldoutHypothesisResult {
+  return classifyAddHoldoutHypotheses({
+    attributions,
+    candidateEvaluations,
+  });
+}
+
+function assessConditionalAddPolicyReadiness(
+  simulation: IntegratedSimulationOptions | null,
+  stability: IntegratedStabilityValidationOptions | null,
+): ConditionalAddPolicyReadiness {
+  const requestedCandidates = simulation?.scenarios.filter(
+    (scenario): scenario is AddPolicyCandidate => CONDITIONAL_ADD_CANDIDATES.includes(
+      scenario as AddPolicyCandidate,
+    ),
+  ) ?? [];
+  if (requestedCandidates.length === 0) {
+    return { requested: false, requestedCandidates, reasonCodes: [], configuration: null };
+  }
+
+  const reasonCodes: ConditionalAddPolicyUnavailableReason[] = [];
+  if (!CONDITIONAL_ADD_CANDIDATES.every((candidate) => requestedCandidates.includes(candidate))) {
+    reasonCodes.push("ALL_CONDITIONAL_SCENARIOS_REQUIRED");
+  }
+  if (!simulation?.scenarios.includes("BASELINE") || !simulation.scenarios.includes("NO_ADD")) {
+    reasonCodes.push("BASELINE_AND_NO_ADD_ANCHORS_REQUIRED");
+  }
+  if (stability === null || stability.windows.length !== 3) {
+    reasonCodes.push("EXACTLY_THREE_VALIDATION_WINDOWS_REQUIRED");
+  }
+  const baseCost = simulation?.costScenarios[0];
+  const stressCost = simulation?.costScenarios.find(
+    (cell) => cell.id !== baseCost?.id && cell.feeRate === 0.001 && cell.slippageRate === 0.002,
+  );
+  if (!isValidConditionalBaseCost(baseCost)) reasonCodes.push("BASE_COST_CELL_REQUIRED");
+  if (stressCost === undefined) reasonCodes.push("STRESS_COST_CELL_REQUIRED");
+
+  return {
+    requested: true,
+    requestedCandidates,
+    reasonCodes,
+    configuration: reasonCodes.length === 0 && stability !== null && baseCost && stressCost
+      ? {
+          baseCost: { ...baseCost },
+          stressCost: { ...stressCost },
+          windows: stability.windows.map((window) => ({ ...window })),
+          expectedFrameIntervalMs: stability.expectedFrameIntervalMs,
+        }
+      : null,
+  };
+}
+
+function isValidConditionalBaseCost(cost: CostScenario | undefined): cost is CostScenario {
+  return cost !== undefined
+    && cost.id.trim().length > 0
+    && cost.feeRate === 0.0005
+    && Number.isFinite(cost.slippageRate)
+    && cost.slippageRate >= 0
+    && cost.slippageRate < 1;
+}
+
+function buildConditionalAddPolicySection(
+  readiness: ConditionalAddPolicyReadiness,
+  stability: IntegratedStabilityValidationOptions | null,
+  evaluations: ReadonlyMap<SupportedAsset, AssetEvaluation>,
+): ConditionalAddPolicyEvaluationSection | null {
+  if (!readiness.requested) return null;
+  const common = {
+    evidenceKind: "SIMULATED_CONDITIONAL_ADD_POLICY_EVALUATION" as const,
+    reasonCodes: [...readiness.reasonCodes],
+    requestedCandidates: [...readiness.requestedCandidates],
+    requiredCandidates: [...CONDITIONAL_ADD_CANDIDATES],
+    requiredAnchors: ["BASELINE", "NO_ADD"] as const,
+    windows: stability?.windows.map((window) => ({ ...window })) ?? [],
+    deploymentApproval: false as const,
+    warning: CONDITIONAL_ADD_WARNING,
+  };
+  if (readiness.configuration === null) {
+    return { ...common, status: "UNAVAILABLE", assets: [] };
+  }
+
+  const assets = ASSETS.map((asset): ConditionalAddPolicyAssetSection => {
+    const evaluation = evaluations.get(asset);
+    if (evaluation === undefined) {
+      return {
+        asset,
+        market: getMarketForAsset(asset),
+        status: "DATASET_UNAVAILABLE",
+        message: `No immutable local ${asset} dataset was supplied; conditional ADD evaluation was not run.`,
+        candidates: [],
+      };
+    }
+    if (evaluation.simulation.status === "DATASET_UNUSABLE") {
+      return {
+        asset,
+        market: getMarketForAsset(asset),
+        status: "DATASET_UNUSABLE",
+        message: evaluation.simulation.message,
+        candidates: [],
+      };
+    }
+    return {
+      asset,
+      market: getMarketForAsset(asset),
+      status: "AVAILABLE",
+      datasetSha256: evaluation.datasetProvenance.sha256,
+      policySupportCostRole: "BASE",
+      candidates: evaluation.conditionalCandidates,
+    };
+  });
+  return { ...common, status: "AVAILABLE", assets };
+}
+
 function evaluateAsset(
   asset: SupportedAsset,
   assetOptions: SimulationAssetOptions,
   dataset: ResearchCandleDataset,
   simulationOptions: IntegratedSimulationOptions,
   stabilityOptions: IntegratedStabilityValidationOptions | null,
+  conditionalConfiguration: ConditionalAddPolicyConfiguration | null,
 ): AssetEvaluation {
   const market = getMarketForAsset(asset);
   if (dataset.provenance.asset !== asset) {
@@ -784,6 +1298,16 @@ function evaluateAsset(
     fourHourCandles: dataset.candles["4h"],
     oneDayCandles: dataset.candles["1d"],
   });
+  const featureCoverage = conditionalConfiguration === null
+    ? null
+    : analyzePositionGuardFeatureCoverage({
+        dataset,
+        frames: frames.map((frame) => ({
+          generatedAt: frame.generatedAt,
+          latestCloseTime: { ...frame.source.latestCloseTime },
+        })),
+        requiredLookbackCandles: REQUIRED_COMPLETED_CANDLES,
+      });
   const datasetProvenance: IntegratedDatasetProvenance = {
     asset,
     market,
@@ -792,6 +1316,7 @@ function evaluateAsset(
     dataset: { ...dataset.provenance },
     initialState: { ...assetOptions.initialState },
     frameCount: frames.length,
+    ...(featureCoverage === null ? {} : { featureCoverage }),
   };
   if (frames.length === 0) {
     return buildUnusableAssetEvaluation(assetOptions, dataset, datasetProvenance);
@@ -846,6 +1371,7 @@ function evaluateAsset(
       : simulationOptions.costScenarios.map((costScenario) => {
           const paths = sensitivity.cells
             .filter((cell) => cell.costScenario.id === costScenario.id)
+            .filter(isLegacyStabilityCell)
             .map((cell) => toStabilityPath(cell, assetOptions.initialState, frames));
           return validatePerformanceStability({
             asset,
@@ -864,7 +1390,9 @@ function evaluateAsset(
   const excursionEntries: ExcursionAnalysisEntry[] = [];
   const addDiagnosticEntries: AddDecisionDiagnosticsEntry[] = [];
   const gaps: IntegratedEvidenceGap[] = [];
+  const verifiedNoTradeCoverage = buildVerifiedNoTradeCoverage(dataset, featureCoverage);
   for (const cell of sensitivity.cells) {
+    if (!isLegacyStabilityCell(cell)) continue;
     const regime = analyzePerformanceRegimes({
       asset,
       market,
@@ -879,6 +1407,7 @@ function evaluateAsset(
       dataset,
       fills: cell.counterfactual.fills,
       matchResult: cell.counterfactual.matchResult,
+      ...(verifiedNoTradeCoverage === undefined ? {} : { verifiedNoTradeCoverage }),
     });
     regimeEntries.push({ costScenarioId: cell.costScenario.id, analysis: regime });
     excursionEntries.push({ costScenarioId: cell.costScenario.id, analysis: excursion });
@@ -941,6 +1470,7 @@ function evaluateAsset(
       exposures: analysis.exposures,
       baselineFills: baseline.counterfactual.fills,
       baselineMatchResult: baseline.counterfactual.matchResult,
+      ...(verifiedNoTradeCoverage === undefined ? {} : { verifiedNoTradeCoverage }),
     });
     addDiagnosticEntries.push({
       costScenarioId: costScenario.id,
@@ -989,6 +1519,32 @@ function evaluateAsset(
   }
   const hasAddScenarioPair = simulationOptions.scenarios.includes("BASELINE")
     && simulationOptions.scenarios.includes("NO_ADD");
+  let conditionalCandidates: ReturnType<typeof buildConditionalCandidateEvaluations> = [];
+  let policySuppressionEvidence: AddPolicySuppressionEvidence[] = [];
+  if (conditionalConfiguration !== null) {
+    if (featureCoverage === null) {
+      throw new Error("Conditional ADD evaluation requires feature coverage evidence.");
+    }
+    conditionalCandidates = buildConditionalCandidateEvaluations(
+      asset,
+      sensitivity.cells,
+      assetOptions.initialState,
+      frames,
+      featureCoverage,
+      conditionalConfiguration,
+    );
+    policySuppressionEvidence = extractAddPolicySuppressionEvidence(
+      asset,
+      CONDITIONAL_ADD_CANDIDATES.map((policyId) => ({
+        policyId,
+        frames: requireCostCell(
+          sensitivity.cells,
+          policyId,
+          conditionalConfiguration.baseCost.id,
+        ).counterfactual.legacyBacktest.result.frames,
+      })),
+    );
+  }
 
   return {
     datasetProvenance,
@@ -1034,12 +1590,14 @@ function evaluateAsset(
           message: "ADD diagnostics require both BASELINE and NO_ADD scenarios; no comparison was performed.",
         },
     stability,
+    conditionalCandidates,
+    policySuppressionEvidence,
     gaps,
   };
 }
 
 function toStabilityPath(
-  cell: CostSensitivityCell,
+  cell: CostSensitivityCell & { scenario: "BASELINE" | "NO_ADD" },
   initialState: SimulationInitialState,
   sourceFrames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][],
 ): StabilityScenarioPath {
@@ -1079,6 +1637,685 @@ function toStabilityPath(
   };
 }
 
+function isLegacyStabilityCell(
+  cell: CostSensitivityCell,
+): cell is CostSensitivityCell & { scenario: "BASELINE" | "NO_ADD" } {
+  return cell.scenario === "BASELINE" || cell.scenario === "NO_ADD";
+}
+
+function buildVerifiedNoTradeCoverage(
+  dataset: ResearchCandleDataset,
+  featureCoverage: PositionGuardFeatureCoverage | null,
+): VerifiedNoTradeCoverage | undefined {
+  if (featureCoverage === null) return undefined;
+  const oneHour = featureCoverage.timeframes["1h"];
+  if (oneHour.sourceSequenceStatus !== "COMPLETE" || oneHour.sourceBlockingAnomalyCount !== 0) {
+    return undefined;
+  }
+  return createVerifiedNoTradeCoverage({
+    sourceBoundary: {
+      historyStartAt: dataset.provenance.historyStartAt,
+      endAt: dataset.provenance.endAt,
+    },
+    observedIntervals: dataset.candles["1h"].map((candle) => ({
+      openTime: candle.openTime,
+      closeTime: candle.closeTime,
+    })),
+  });
+}
+
+function buildConditionalCandidateEvaluations(
+  asset: SupportedAsset,
+  cells: readonly CostSensitivityCell[],
+  initialState: SimulationInitialState,
+  sourceFrames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][],
+  featureCoverage: PositionGuardFeatureCoverage,
+  configuration: ConditionalAddPolicyConfiguration,
+): AddPolicyCandidateEvaluationResult[] {
+  return CONDITIONAL_ADD_CANDIDATES.map((candidate) => {
+    const baseCandidateCell = requireCostCell(cells, candidate, configuration.baseCost.id);
+    const fullPathObservations = buildFullPathObservations(cells, candidate, configuration);
+    const windows = configuration.windows.map((window) => buildCandidateWindow(
+      cells,
+      candidate,
+      initialState,
+      sourceFrames,
+      featureCoverage,
+      configuration,
+      window,
+      baseCandidateCell,
+    ));
+    return evaluateAddPolicyCandidate({
+      asset,
+      candidate,
+      baseSlippageRate: configuration.baseCost.slippageRate,
+      thresholds: { ...APPROVED_ADD_POLICY_EVALUATION_THRESHOLDS },
+      fullPath: {
+        coverage: calculateFullPathCadenceCoverage(
+          sourceFrames,
+          configuration.expectedFrameIntervalMs,
+          featureCoverage.affectedFrameRanges,
+          featureCoverage.timeframes["1h"].sourceNoTradeRanges,
+        ),
+        policyExposedCompletedEpisodeCount: countPolicyExposedCompletedEpisodes(
+          baseCandidateCell,
+          null,
+        ),
+        observations: fullPathObservations,
+      },
+      windows,
+    });
+  });
+}
+
+function buildFullPathObservations(
+  cells: readonly CostSensitivityCell[],
+  candidate: AddPolicyCandidate,
+  configuration: ConditionalAddPolicyConfiguration,
+): AddPolicyEvaluationObservation[] {
+  return ([
+    ["BASE", configuration.baseCost],
+    ["STRESS", configuration.stressCost],
+  ] as const).flatMap(([costRole, cost]) =>
+    ([candidate, "BASELINE", "NO_ADD"] as const).map((scenario) => {
+      const cell = requireCostCell(cells, scenario, cost.id);
+      return {
+        scenario,
+        costRole,
+        costScenarioId: cost.id,
+        feeRate: cost.feeRate,
+        slippageRate: cost.slippageRate,
+        totalReturnPct: cell.totalReturnPct,
+        maxDrawdownPct: cell.maxDrawdownPct,
+      };
+    })
+  );
+}
+
+function buildCandidateWindow(
+  cells: readonly CostSensitivityCell[],
+  candidate: AddPolicyCandidate,
+  initialState: SimulationInitialState,
+  sourceFrames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][],
+  featureCoverage: PositionGuardFeatureCoverage,
+  configuration: ConditionalAddPolicyConfiguration,
+  window: StabilityValidationWindow,
+  baseCandidateCell: CostSensitivityCell,
+): AddPolicyEvaluationWindow {
+  const from = requirePerformanceTimestamp(window.from, `Window ${window.id} from`);
+  const to = requirePerformanceTimestamp(window.to, `Window ${window.id} to`);
+  const coverage = calculateConditionalAddCadenceCoverage({
+    from: from.normalized,
+    to: to.normalized,
+    replayStartAt: sourceFrames[0]?.generatedAt ?? from.normalized,
+    expectedFrameIntervalMs: configuration.expectedFrameIntervalMs,
+    frames: sourceFrames,
+    featureLookbackAffectedRanges: featureCoverage.affectedFrameRanges,
+    noTradeFrameRanges: featureCoverage.timeframes["1h"].sourceNoTradeRanges,
+  });
+  const observations = ([
+    ["BASE", configuration.baseCost],
+    ["STRESS", configuration.stressCost],
+  ] as const).flatMap(([costRole, cost]) =>
+    ([candidate, "BASELINE", "NO_ADD"] as const).map((scenario) => {
+      const cell = requireCostCell(cells, scenario, cost.id);
+      const metrics = sliceContinuousReplayWindow(
+        cell,
+        initialState,
+        sourceFrames,
+        from.epochNanoseconds,
+        to.epochNanoseconds,
+      );
+      return {
+        scenario,
+        costRole,
+        costScenarioId: cost.id,
+        feeRate: cost.feeRate,
+        slippageRate: cost.slippageRate,
+        totalReturnPct: metrics.totalReturnPct,
+        maxDrawdownPct: metrics.maxDrawdownPct,
+      };
+    })
+  );
+  return {
+    id: window.id,
+    from: from.normalized,
+    to: to.normalized,
+    coverage: {
+      ...coverage,
+    },
+    policyExposedCompletedEpisodeCount: countPolicyExposedCompletedEpisodes(
+      baseCandidateCell,
+      { from: from.epochNanoseconds, to: to.epochNanoseconds },
+    ),
+    observations,
+  };
+}
+
+export function calculateConditionalAddCadenceCoverage(input: {
+  from: string;
+  to: string;
+  replayStartAt?: string;
+  expectedFrameIntervalMs: number;
+  frames: readonly { generatedAt: string }[];
+  featureLookbackAffectedRanges: readonly AddPolicyAffectedFrameRange[];
+  noTradeFrameRanges: readonly CandleCoverageGap[];
+}): AddPolicyEvaluationWindow["coverage"] {
+  if (!Number.isSafeInteger(input.expectedFrameIntervalMs) || input.expectedFrameIntervalMs <= 0) {
+    throw new Error("Conditional ADD expectedFrameIntervalMs must be a positive safe integer.");
+  }
+  const from = requirePerformanceTimestamp(input.from, "Conditional ADD cadence from");
+  const to = requirePerformanceTimestamp(input.to, "Conditional ADD cadence to");
+  const replayStart = requirePerformanceTimestamp(
+    input.replayStartAt ?? input.from,
+    "Conditional ADD cadence replayStartAt",
+  );
+  if (replayStart.epochNanoseconds > from.epochNanoseconds) {
+    throw new Error("Conditional ADD cadence replayStartAt must be at or before from.");
+  }
+  const intervalNanoseconds = BigInt(input.expectedFrameIntervalMs) * 1_000_000n;
+  const durationNanoseconds = to.epochNanoseconds - from.epochNanoseconds;
+  if (durationNanoseconds <= 0n || durationNanoseconds % intervalNanoseconds !== 0n) {
+    throw new Error("Conditional ADD cadence range must be a positive multiple of expectedFrameIntervalMs.");
+  }
+  const expectedFrameCount = Number(durationNanoseconds / intervalNanoseconds);
+  if (!Number.isSafeInteger(expectedFrameCount) || expectedFrameCount <= 0) {
+    throw new Error("Conditional ADD cadence expected frame count must be a positive safe integer.");
+  }
+  const allObservedInstants = input.frames.map((frame) =>
+    requirePerformanceTimestamp(frame.generatedAt, "Source frame generatedAt").epochNanoseconds
+  );
+  const allNoTradeInstants = validateNoTradeFrameRanges({
+    ranges: input.noTradeFrameRanges,
+    observedInstants: new Set(allObservedInstants),
+    intervalNanoseconds,
+    label: "Conditional ADD cadence noTradeFrameRanges",
+  });
+  const observedInstants = allObservedInstants.flatMap((instant) => {
+    return isWithinWindow(instant, from.epochNanoseconds, to.epochNanoseconds)
+      ? [instant]
+      : [];
+  });
+  const noTradeInstants = sliceNoTradeFrameInstants({
+    instants: allNoTradeInstants,
+    firstExpectedInstant: from.epochNanoseconds,
+    endExclusiveInstant: to.epochNanoseconds,
+  });
+  const windowCadence = buildConditionalAddCadenceDetail({
+    firstExpectedInstant: from.epochNanoseconds,
+    intervalNanoseconds,
+    expectedFrameCount,
+    observedInstants,
+    noTradeInstants,
+    adjacentObservedInstants: new Set(allObservedInstants),
+  });
+  const upstreamDuration = from.epochNanoseconds - replayStart.epochNanoseconds;
+  if (upstreamDuration % intervalNanoseconds !== 0n) {
+    throw new Error("Conditional ADD cadence upstream range must align to expectedFrameIntervalMs.");
+  }
+  const upstreamExpectedFrameCount = Number(upstreamDuration / intervalNanoseconds);
+  const upstreamObservedInstants = allObservedInstants.flatMap((instant) => {
+    return isWithinWindow(
+      instant,
+      replayStart.epochNanoseconds,
+      from.epochNanoseconds,
+    ) ? [instant] : [];
+  });
+  const upstreamNoTradeInstants = sliceNoTradeFrameInstants({
+    instants: allNoTradeInstants,
+    firstExpectedInstant: replayStart.epochNanoseconds,
+    endExclusiveInstant: from.epochNanoseconds,
+  });
+  const upstream = buildConditionalAddCadenceDetail({
+    firstExpectedInstant: replayStart.epochNanoseconds,
+    intervalNanoseconds,
+    expectedFrameCount: upstreamExpectedFrameCount,
+    observedInstants: upstreamObservedInstants,
+    noTradeInstants: upstreamNoTradeInstants,
+    adjacentObservedInstants: new Set(allObservedInstants),
+  });
+  const complete = windowCadence.windowSequenceContinuityStatus === "COMPLETE"
+    && upstream.windowSequenceContinuityStatus === "COMPLETE";
+  const featureLookbackAffectedRanges = sliceAffectedFrameRanges(
+    input.featureLookbackAffectedRanges,
+    from.epochNanoseconds,
+    to.epochNanoseconds,
+    intervalNanoseconds,
+  );
+  const featureLookbackAffectedFrameCount = featureLookbackAffectedRanges.reduce(
+    (sum, range) => sum + range.affectedFrameCount,
+    0,
+  );
+  const featureLookbackContinuityStatus = featureLookbackAffectedFrameCount === 0
+    ? "COMPLETE"
+    : "INCOMPLETE";
+  return {
+    ...windowCadence,
+    status: complete && featureLookbackContinuityStatus === "COMPLETE" ? "COMPLETE" : "INCOMPLETE",
+    windowCadenceStatus: windowCadence.status,
+    windowSequenceContinuityStatus: windowCadence.windowSequenceContinuityStatus,
+    windowClockGridStatus: windowCadence.windowClockGridStatus,
+    upstreamStateContinuityStatus: upstream.windowSequenceContinuityStatus,
+    featureLookbackContinuityStatus,
+    upstreamExpectedFrameCount,
+    upstreamObservedFrameCount: upstream.observedFrameCount,
+    upstreamSequenceContinuityStatus: upstream.windowSequenceContinuityStatus,
+    upstreamClockGridStatus: upstream.windowClockGridStatus,
+    upstreamNoTradeFrameCount: upstream.noTradeFrameCount,
+    upstreamNoTradeRanges: upstream.noTradeRanges,
+    upstreamFirstExpectedFrameAt: upstreamExpectedFrameCount === 0 ? null : formatCadenceInstant(replayStart.epochNanoseconds),
+    upstreamEndExclusiveAt: upstreamExpectedFrameCount === 0 ? null : formatCadenceInstant(from.epochNanoseconds),
+    upstreamMissingFrameCount: upstream.missingFrameCount,
+    upstreamDuplicateFrameCount: upstream.duplicateFrameCount,
+    upstreamOffGridFrameCount: upstream.offGridFrameCount,
+    upstreamMissingRanges: upstream.missingRanges,
+    upstreamDuplicateInstants: upstream.duplicateInstants,
+    upstreamOffGridInstants: upstream.offGridInstants,
+    featureLookbackAffectedFrameCount,
+    featureLookbackAffectedRanges,
+  };
+}
+
+function calculateFullPathCadenceCoverage(
+  frames: readonly { generatedAt: string }[],
+  expectedFrameIntervalMs: number,
+  featureLookbackAffectedRanges: readonly AddPolicyAffectedFrameRange[],
+  noTradeFrameRanges: readonly CandleCoverageGap[],
+): AddPolicyEvaluationWindow["coverage"] {
+  if (!Number.isSafeInteger(expectedFrameIntervalMs) || expectedFrameIntervalMs <= 0) {
+    throw new Error("Conditional ADD expectedFrameIntervalMs must be a positive safe integer.");
+  }
+  const instants = frames.map((frame) =>
+    requirePerformanceTimestamp(frame.generatedAt, "Full-path source frame generatedAt").epochNanoseconds
+  ).sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+  const first = instants[0];
+  const last = instants.at(-1);
+  if (first === undefined || last === undefined) {
+    throw new Error("Conditional ADD full-path cadence requires at least one source frame.");
+  }
+  const intervalNanoseconds = BigInt(expectedFrameIntervalMs) * 1_000_000n;
+  const allNoTradeInstants = validateNoTradeFrameRanges({
+    ranges: noTradeFrameRanges,
+    observedInstants: new Set(instants),
+    intervalNanoseconds,
+    label: "Conditional ADD full-path noTradeFrameRanges",
+  });
+  const expectedFrameCount = Number((last - first) / intervalNanoseconds + 1n);
+  if (!Number.isSafeInteger(expectedFrameCount) || expectedFrameCount <= 0) {
+    throw new Error("Conditional ADD full-path expected frame count must be a positive safe integer.");
+  }
+  const cadence = buildConditionalAddCadenceDetail({
+    firstExpectedInstant: first,
+    intervalNanoseconds,
+    expectedFrameCount,
+    observedInstants: instants,
+    noTradeInstants: sliceNoTradeFrameInstants({
+      instants: allNoTradeInstants,
+      firstExpectedInstant: first,
+      endExclusiveInstant: last + intervalNanoseconds,
+    }),
+    adjacentObservedInstants: new Set(instants),
+  });
+  return {
+    ...cadence,
+    windowCadenceStatus: cadence.status,
+    windowSequenceContinuityStatus: cadence.windowSequenceContinuityStatus,
+    windowClockGridStatus: cadence.windowClockGridStatus,
+    upstreamStateContinuityStatus: "COMPLETE",
+    featureLookbackContinuityStatus: featureLookbackAffectedRanges.length === 0 ? "COMPLETE" : "INCOMPLETE",
+    upstreamMissingFrameCount: 0,
+    upstreamExpectedFrameCount: 0,
+    upstreamObservedFrameCount: 0,
+    upstreamSequenceContinuityStatus: "COMPLETE",
+    upstreamClockGridStatus: "DENSE",
+    upstreamNoTradeFrameCount: 0,
+    upstreamNoTradeRanges: [],
+    upstreamFirstExpectedFrameAt: null,
+    upstreamEndExclusiveAt: null,
+    upstreamDuplicateFrameCount: 0,
+    upstreamOffGridFrameCount: 0,
+    upstreamMissingRanges: [],
+    upstreamDuplicateInstants: [],
+    upstreamOffGridInstants: [],
+    featureLookbackAffectedFrameCount: featureLookbackAffectedRanges.reduce(
+      (sum, range) => sum + range.affectedFrameCount,
+      0,
+    ),
+    featureLookbackAffectedRanges: featureLookbackAffectedRanges.map((range) => ({ ...range })),
+    status: cadence.windowSequenceContinuityStatus === "COMPLETE" && featureLookbackAffectedRanges.length === 0
+      ? "COMPLETE"
+      : "INCOMPLETE",
+  };
+}
+
+type ConditionalAddCadenceDetail = Pick<
+  AddPolicyEvaluationWindow["coverage"],
+  | "status"
+  | "windowSequenceContinuityStatus"
+  | "windowClockGridStatus"
+  | "expectedFrameCount"
+  | "observedFrameCount"
+  | "noTradeFrameCount"
+  | "noTradeRanges"
+  | "missingFrameCount"
+  | "duplicateFrameCount"
+  | "offGridFrameCount"
+  | "missingRanges"
+  | "expectedFrameIntervalMs"
+  | "firstExpectedFrameAt"
+  | "endExclusiveAt"
+  | "duplicateInstants"
+  | "offGridInstants"
+>;
+
+function buildConditionalAddCadenceDetail(input: {
+  firstExpectedInstant: bigint;
+  intervalNanoseconds: bigint;
+  expectedFrameCount: number;
+  observedInstants: readonly bigint[];
+  noTradeInstants: ReadonlySet<bigint>;
+  adjacentObservedInstants?: ReadonlySet<bigint>;
+}): ConditionalAddCadenceDetail {
+  const expectedInstants = Array.from({ length: input.expectedFrameCount }, (_, index) =>
+    input.firstExpectedInstant + BigInt(index) * input.intervalNanoseconds
+  );
+  const expectedSet = new Set(expectedInstants);
+  const observedSet = new Set(input.observedInstants);
+  for (const instant of input.noTradeInstants) {
+    if (observedSet.has(instant)) {
+      throw new Error("Conditional ADD cadence cannot classify an observed frame as no-trade.");
+    }
+  }
+  const observedCounts = new Map<bigint, number>();
+  for (const instant of input.observedInstants) {
+    observedCounts.set(instant, (observedCounts.get(instant) ?? 0) + 1);
+  }
+  const observedExpectedInstants = expectedInstants.filter((instant) => observedSet.has(instant));
+  const noTradeExpectedInstants = expectedInstants.filter((instant) => input.noTradeInstants.has(instant));
+  const missingInstants = expectedInstants.filter((instant) =>
+    !observedSet.has(instant) && !input.noTradeInstants.has(instant)
+  );
+  const duplicateFrameCount = input.observedInstants.length - observedSet.size;
+  const offGridFrameCount = input.observedInstants.filter((instant) => !expectedSet.has(instant)).length;
+  const duplicateInstants = [...observedCounts.entries()]
+    .filter(([, count]) => count > 1)
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([instant, occurrenceCount]) => ({ observedAt: formatCadenceInstant(instant), occurrenceCount }));
+  const offGridInstants = [...observedCounts.entries()]
+    .filter(([instant]) => !expectedSet.has(instant))
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([instant, occurrenceCount]) => ({ observedAt: formatCadenceInstant(instant), occurrenceCount }));
+  const missingRanges = groupConditionalAddCadenceGaps(
+    missingInstants,
+    input.adjacentObservedInstants ?? observedSet,
+    input.intervalNanoseconds,
+  );
+  const noTradeRanges = groupConditionalAddCadenceGaps(
+    noTradeExpectedInstants,
+    input.adjacentObservedInstants ?? observedSet,
+    input.intervalNanoseconds,
+  );
+  const sequenceComplete = missingInstants.length === 0
+    && duplicateFrameCount === 0
+    && offGridFrameCount === 0;
+  const rawCadenceComplete = sequenceComplete && noTradeExpectedInstants.length === 0;
+  const clockGridStatus = duplicateFrameCount > 0 || offGridFrameCount > 0 || missingInstants.length > 0
+    ? "ANOMALOUS"
+    : noTradeExpectedInstants.length > 0
+      ? "SPARSE_BY_CONTRACT"
+      : "DENSE";
+
+  return {
+    status: rawCadenceComplete ? "COMPLETE" : "INCOMPLETE",
+    windowSequenceContinuityStatus: sequenceComplete ? "COMPLETE" : "INCOMPLETE",
+    windowClockGridStatus: clockGridStatus,
+    expectedFrameIntervalMs: Number(input.intervalNanoseconds / 1_000_000n),
+    firstExpectedFrameAt: formatCadenceInstant(input.firstExpectedInstant),
+    endExclusiveAt: formatCadenceInstant(
+      input.firstExpectedInstant + BigInt(input.expectedFrameCount) * input.intervalNanoseconds,
+    ),
+    expectedFrameCount: input.expectedFrameCount,
+    observedFrameCount: observedExpectedInstants.length,
+    noTradeFrameCount: noTradeExpectedInstants.length,
+    noTradeRanges,
+    missingFrameCount: missingInstants.length,
+    duplicateFrameCount,
+    offGridFrameCount,
+    missingRanges,
+    duplicateInstants,
+    offGridInstants,
+  };
+}
+
+function validateNoTradeFrameRanges(input: {
+  ranges: readonly CandleCoverageGap[];
+  observedInstants: ReadonlySet<bigint>;
+  intervalNanoseconds: bigint;
+  label: string;
+}): Set<bigint> {
+  const instants = new Set<bigint>();
+  let previousLast: bigint | null = null;
+  for (const [index, range] of input.ranges.entries()) {
+    const first = requirePerformanceTimestamp(
+      range.firstMissingCloseTime,
+      `${input.label}[${index}] firstMissingCloseTime`,
+    ).epochNanoseconds;
+    const last = requirePerformanceTimestamp(
+      range.lastMissingCloseTime,
+      `${input.label}[${index}] lastMissingCloseTime`,
+    ).epochNanoseconds;
+    if (!Number.isSafeInteger(range.missingCandleCount) || range.missingCandleCount <= 0) {
+      throw new Error(`${input.label}[${index}] missingCandleCount must be a positive safe integer.`);
+    }
+    const span = last - first;
+    if (span < 0n || span % input.intervalNanoseconds !== 0n
+      || span / input.intervalNanoseconds + 1n !== BigInt(range.missingCandleCount)) {
+      throw new Error(`${input.label}[${index}] timestamp span must match missingCandleCount.`);
+    }
+    if (first % input.intervalNanoseconds !== 0n) {
+      throw new Error(`${input.label}[${index}] must align to expectedFrameIntervalMs.`);
+    }
+    if (previousLast !== null && first <= previousLast) {
+      throw new Error(`${input.label} ranges must be strictly ordered and non-overlapping.`);
+    }
+    if (previousLast !== null && first - previousLast === input.intervalNanoseconds) {
+      throw new Error(`${input.label} ranges must be canonical and non-adjacent.`);
+    }
+    for (let instant = first; instant <= last; instant += input.intervalNanoseconds) {
+      if (input.observedInstants.has(instant)) {
+        throw new Error("Conditional ADD cadence cannot classify an observed frame as no-trade.");
+      }
+      instants.add(instant);
+    }
+    previousLast = last;
+  }
+  return instants;
+}
+
+function sliceNoTradeFrameInstants(input: {
+  instants: ReadonlySet<bigint>;
+  firstExpectedInstant: bigint;
+  endExclusiveInstant: bigint;
+}): Set<bigint> {
+  return new Set([...input.instants].filter((instant) =>
+    isWithinWindow(instant, input.firstExpectedInstant, input.endExclusiveInstant)
+  ));
+}
+
+function groupConditionalAddCadenceGaps(
+  missingInstants: readonly bigint[],
+  observedInstants: ReadonlySet<bigint>,
+  intervalNanoseconds: bigint,
+): AddPolicyEvaluationWindow["coverage"]["missingRanges"] {
+  const ranges: AddPolicyEvaluationWindow["coverage"]["missingRanges"] = [];
+  for (const missingInstant of missingInstants) {
+    const previous = ranges.at(-1);
+    if (previous !== undefined) {
+      const previousLast = requirePerformanceTimestamp(
+        previous.lastMissingAt,
+        "Conditional ADD cadence lastMissingAt",
+      ).epochNanoseconds;
+      if (missingInstant - previousLast === intervalNanoseconds) {
+        previous.lastMissingAt = formatCadenceInstant(missingInstant);
+        previous.missingFrameCount += 1;
+        previous.nextObservedAt = observedInstants.has(missingInstant + intervalNanoseconds)
+          ? formatCadenceInstant(missingInstant + intervalNanoseconds)
+          : null;
+        continue;
+      }
+    }
+
+    ranges.push({
+      firstMissingAt: formatCadenceInstant(missingInstant),
+      lastMissingAt: formatCadenceInstant(missingInstant),
+      missingFrameCount: 1,
+      previousObservedAt: observedInstants.has(missingInstant - intervalNanoseconds)
+        ? formatCadenceInstant(missingInstant - intervalNanoseconds)
+        : null,
+      nextObservedAt: observedInstants.has(missingInstant + intervalNanoseconds)
+        ? formatCadenceInstant(missingInstant + intervalNanoseconds)
+        : null,
+    });
+  }
+  return ranges;
+}
+
+function sliceAffectedFrameRanges(
+  ranges: readonly AddPolicyAffectedFrameRange[],
+  from: bigint,
+  to: bigint,
+  intervalNanoseconds: bigint,
+): AddPolicyAffectedFrameRange[] {
+  const affected: bigint[] = [];
+  for (const range of ranges) {
+    const first = requirePerformanceTimestamp(
+      range.firstFrameAt,
+      "Conditional ADD feature coverage firstFrameAt",
+    ).epochNanoseconds;
+    const last = requirePerformanceTimestamp(
+      range.lastFrameAt,
+      "Conditional ADD feature coverage lastFrameAt",
+    ).epochNanoseconds;
+    for (let instant = first; instant <= last; instant += intervalNanoseconds) {
+      if (isWithinWindow(instant, from, to)) affected.push(instant);
+    }
+  }
+  const sliced: AddPolicyAffectedFrameRange[] = [];
+  for (const instant of affected.sort((left, right) => left < right ? -1 : left > right ? 1 : 0)) {
+    const previous = sliced.at(-1);
+    if (previous !== undefined) {
+      const previousLast = requirePerformanceTimestamp(
+        previous.lastFrameAt,
+        "Conditional ADD feature coverage lastFrameAt",
+      ).epochNanoseconds;
+      if (instant - previousLast === intervalNanoseconds) {
+        previous.lastFrameAt = formatCadenceInstant(instant);
+        previous.affectedFrameCount += 1;
+        continue;
+      }
+    }
+    sliced.push({
+      firstFrameAt: formatCadenceInstant(instant),
+      lastFrameAt: formatCadenceInstant(instant),
+      affectedFrameCount: 1,
+    });
+  }
+  return sliced;
+}
+
+function formatCadenceInstant(epochNanoseconds: bigint): string {
+  const nanosecondsPerSecond = 1_000_000_000n;
+  const nanosecondsPerMillisecond = 1_000_000n;
+  const seconds = epochNanoseconds / nanosecondsPerSecond;
+  const fractionalNanoseconds = epochNanoseconds % nanosecondsPerSecond;
+  const prefix = new Date(Number(seconds * 1_000n)).toISOString().slice(0, 19);
+  if (fractionalNanoseconds % nanosecondsPerMillisecond === 0n) {
+    const milliseconds = fractionalNanoseconds / nanosecondsPerMillisecond;
+    return `${prefix}.${milliseconds.toString().padStart(3, "0")}Z`;
+  }
+  return `${prefix}.${fractionalNanoseconds.toString().padStart(9, "0")}Z`;
+}
+
+function sliceContinuousReplayWindow(
+  cell: CostSensitivityCell,
+  initialState: SimulationInitialState,
+  sourceFrames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][],
+  from: bigint,
+  to: bigint,
+): { totalReturnPct: number; maxDrawdownPct: number } {
+  const firstPrice = sourceFrames[0]?.analysis.currentPrice;
+  if (firstPrice === undefined || !Number.isFinite(firstPrice) || firstPrice <= 0) {
+    throw new Error("Conditional ADD evaluation requires a positive first-frame price.");
+  }
+  const initialEquity = initialState.cashKrw + initialState.quantity * firstPrice;
+  if (!Number.isFinite(initialEquity) || initialEquity <= 0) {
+    throw new Error("Conditional ADD evaluation initial equity must be finite and positive.");
+  }
+  let startEquity = initialEquity;
+  const equities: number[] = [];
+  for (const frame of cell.counterfactual.legacyBacktest.result.frames) {
+    const timestamp = requirePerformanceTimestamp(frame.generatedAt, "Replay frame generatedAt");
+    if (timestamp.epochNanoseconds < from) startEquity = frame.equityKrw;
+    if (isWithinWindow(timestamp.epochNanoseconds, from, to)) equities.push(frame.equityKrw);
+  }
+  const endEquity = equities.at(-1) ?? startEquity;
+  const totalReturnPct = (endEquity - startEquity) / startEquity;
+  let peak = startEquity;
+  let maxDrawdownPct = 0;
+  for (const equity of equities) {
+    peak = Math.max(peak, equity);
+    maxDrawdownPct = Math.max(maxDrawdownPct, peak > 0 ? (peak - equity) / peak : 0);
+  }
+  if (!Number.isFinite(totalReturnPct) || !Number.isFinite(maxDrawdownPct)) {
+    throw new Error("Conditional ADD window metrics must be finite.");
+  }
+  return { totalReturnPct, maxDrawdownPct };
+}
+
+function countPolicyExposedCompletedEpisodes(
+  cell: CostSensitivityCell,
+  window: { from: bigint; to: bigint } | null,
+): number {
+  const exposureInstants = cell.counterfactual.legacyBacktest.result.frames.flatMap((frame) =>
+    frame.researchPolicyEvaluation?.outcome === "ALLOW" && frame.trade?.action === "ADD"
+      ? [requirePerformanceTimestamp(frame.generatedAt, "Policy exposure generatedAt").epochNanoseconds]
+      : []
+  );
+  return cell.counterfactual.matchResult.episodes.filter((episode) => {
+    if (episode.status !== "COMPLETED" || episode.closedAt === null) return false;
+    const openedAt = requirePerformanceTimestamp(episode.openedAt, `Episode ${episode.id} openedAt`)
+      .epochNanoseconds;
+    const closedAt = requirePerformanceTimestamp(episode.closedAt, `Episode ${episode.id} closedAt`)
+      .epochNanoseconds;
+    if (window !== null && !isWithinWindow(closedAt, window.from, window.to)) return false;
+    return exposureInstants.some((instant) => instant >= openedAt && instant <= closedAt);
+  }).length;
+}
+
+function requireCostCell(
+  cells: readonly CostSensitivityCell[],
+  scenario: CounterfactualScenario,
+  costScenarioId: string,
+): CostSensitivityCell {
+  const matches = cells.filter(
+    (cell) => cell.scenario === scenario && cell.costScenario.id === costScenarioId,
+  );
+  if (matches.length !== 1) {
+    throw new Error(`Conditional ADD evaluation requires exactly one ${scenario}/${costScenarioId} cell.`);
+  }
+  return matches[0]!;
+}
+
+function requirePerformanceTimestamp(value: string, label: string) {
+  const parsed = parsePerformanceTimestamp(value);
+  if (parsed === null) throw new Error(`${label} requires an explicit timezone.`);
+  return parsed;
+}
+
+function isWithinWindow(value: bigint, from: bigint, to: bigint): boolean {
+  return compareEpochNanoseconds(value, from) >= 0 && compareEpochNanoseconds(value, to) < 0;
+}
+
 function buildUnusableAssetEvaluation(
   assetOptions: SimulationAssetOptions,
   dataset: ResearchCandleDataset,
@@ -1111,6 +2348,8 @@ function buildUnusableAssetEvaluation(
       evidenceKind: "SIMULATED_COUNTERFACTUAL_STABILITY",
       message,
     },
+    conditionalCandidates: [],
+    policySuppressionEvidence: [],
     gaps: [{
       code: "DATASET_UNUSABLE",
       severity: "WARNING",
@@ -1205,6 +2444,29 @@ function mapObservedGaps(attribution: ObservedAttributionResult): IntegratedEvid
 function mapObservedMarkGaps(diagnostics: PerformanceDiagnosticsResult): IntegratedEvidenceGap[] {
   const persisted = diagnostics.markPnlCurve.persistedObservationCount;
   const usable = diagnostics.markPnlCurve.usableObservationCount;
+  const exclusions = diagnostics.markPnlCurve.excludedObservations.filter((exclusion) =>
+    exclusion.metricScopes.includes("GROSS")
+  );
+  const evidenceIds = [...new Set(exclusions.map((exclusion) => exclusion.snapshotId))];
+  const reasonCounts = new Map<string, number>();
+  const grossReasonCodes = new Set([
+    "MISSING_ACTIVE_POSITION_MARK",
+    "INCOMPLETE_ACQUISITION_COST",
+    "INCOMPLETE_REALIZED_GROSS_ATTRIBUTION",
+  ]);
+  for (const exclusion of exclusions) {
+    for (const reason of exclusion.reasonCodes) {
+      if (!grossReasonCodes.has(reason)) continue;
+      reasonCounts.set(reason, (reasonCounts.get(reason) ?? 0) + 1);
+    }
+  }
+  const exclusionSummary = [...reasonCounts.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([reason, count]) => `${reason}=${count}`)
+    .join(",");
+  const provenanceSuffix = exclusions.length === 0
+    ? ""
+    : ` excluded_snapshot_count=${evidenceIds.length}; exclusion_reasons=${exclusionSummary}.`;
   let code: "MARK_DATA_UNAVAILABLE" | "MARK_DATA_UNUSABLE" | "MARK_DATA_PARTIAL";
   let message: string;
   if (persisted === 0) {
@@ -1212,10 +2474,11 @@ function mapObservedMarkGaps(diagnostics: PerformanceDiagnosticsResult): Integra
     message = "No persisted mark observations were selected (persisted=0, usable=0); mark-based PnL and drawdown remain not applicable without interpolation or a future observation.";
   } else if (usable === 0) {
     code = "MARK_DATA_UNUSABLE";
-    message = `Persisted mark observations cannot value the selected stream (persisted=${persisted}, usable=0); mark-based PnL and drawdown remain unknown without interpolation or a future observation.`;
+    message = `Persisted mark observations cannot value the selected stream (persisted=${persisted}, usable=0); mark-based PnL and drawdown remain unknown without interpolation or a future observation.${provenanceSuffix}`;
   } else if (usable < persisted) {
+    if (evidenceIds.length === 0) return [];
     code = "MARK_DATA_PARTIAL";
-    message = `Persisted mark evidence is only partially usable (persisted=${persisted}, usable=${usable}); mark-based PnL and drawdown retain the diagnostics metric state without interpolation or a future observation.`;
+    message = `Persisted mark evidence is only partially usable (persisted=${persisted}, usable=${usable}); mark-based PnL and drawdown retain the diagnostics metric state without interpolation or a future observation.${provenanceSuffix}`;
   } else {
     return [];
   }
@@ -1232,7 +2495,7 @@ function mapObservedMarkGaps(diagnostics: PerformanceDiagnosticsResult): Integra
       "observedLive.diagnostics.markPnlCurve",
       "observedLive.diagnostics.marketMarkPnlCurves",
     ],
-    evidenceIds: [],
+    evidenceIds,
     message,
   }];
 }
@@ -1380,7 +2643,13 @@ function parseScenarios(value: string): CounterfactualScenario[] {
   const result: CounterfactualScenario[] = [];
   const seen = new Set<string>();
   for (const scenario of parsed) {
-    if (scenario !== "BASELINE" && scenario !== "NO_ADD") {
+    if (
+      scenario !== "BASELINE"
+      && scenario !== "NO_ADD"
+      && scenario !== "ADD_RISK_CLEAR"
+      && scenario !== "ADD_HIGH_ALIGNMENT"
+      && scenario !== "ADD_CORE_TREND"
+    ) {
       throw new Error(`Unsupported scenario ${String(scenario)}.`);
     }
     if (seen.has(scenario)) throw new Error(`Duplicate scenario ${scenario}.`);

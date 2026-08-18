@@ -6,6 +6,7 @@ import {
 } from "../src/modules/performance/performance-sensitivity.js";
 import type { PositionGuardStructureAnalysis } from "../src/modules/strategy/position-guard-core.js";
 import type { PositionGuardBacktestFrame } from "../src/modules/strategy/position-guard-backtest.js";
+import type { CounterfactualScenario } from "../src/modules/performance/strategy-counterfactual.js";
 import { test } from "./harness.js";
 
 test("cost sensitivity preserves strategy and cell order deterministically", () => {
@@ -20,6 +21,39 @@ test("cost sensitivity preserves strategy and cell order deterministically", () 
   assert.deepEqual(second, first);
   assert.deepEqual(first.scenarios, input.scenarios);
   assert.deepEqual(first.costScenarios, input.costScenarios);
+});
+
+test("cost sensitivity produces every five-scenario-by-cost cell exactly once", () => {
+  const scenarios = [
+    "ADD_HIGH_ALIGNMENT",
+    "BASELINE",
+    "ADD_CORE_TREND",
+    "NO_ADD",
+    "ADD_RISK_CLEAR",
+  ] as const satisfies readonly CounterfactualScenario[];
+
+  const result = runCostSensitivity(createInput(scenarios));
+
+  assert.deepEqual(result.scenarios, scenarios);
+  assert.deepEqual(
+    result.cells.map((cell) => `${cell.scenario}:${cell.costScenario.id}`),
+    [
+      "ADD_HIGH_ALIGNMENT:HIGH",
+      "ADD_HIGH_ALIGNMENT:ZERO",
+      "BASELINE:HIGH",
+      "BASELINE:ZERO",
+      "ADD_CORE_TREND:HIGH",
+      "ADD_CORE_TREND:ZERO",
+      "NO_ADD:HIGH",
+      "NO_ADD:ZERO",
+      "ADD_RISK_CLEAR:HIGH",
+      "ADD_RISK_CLEAR:ZERO",
+    ],
+  );
+  assert.equal(
+    new Set(result.cells.map((cell) => `${cell.scenario}:${cell.costScenario.id}`)).size,
+    scenarios.length * result.costScenarios.length,
+  );
 });
 
 test("cost sensitivity rejects empty duplicate and invalid cells", () => {

@@ -1,6 +1,12 @@
 import { getMarketForAsset, type SupportedAsset, type SupportedMarket } from "../../domain/types.js";
 import type { AddDecisionExposure } from "./performance-add-diagnostics.js";
+import type { CandleCoverageGap } from "./performance-candle-coverage.js";
 import type { Metric } from "./performance-diagnostics.js";
+import {
+  assertVerifiedNoTradeCoverage,
+  partitionHourlyCoverage,
+  type VerifiedNoTradeCoverage,
+} from "./performance-hourly-coverage.js";
 import type { ResearchCandle, ResearchCandleDataset } from "./research-candle-dataset.js";
 import type {
   PerformanceTradeFill,
@@ -26,6 +32,8 @@ export type AddExcursionReason =
 export type AddExcursionCoverage = {
   expectedIntervalCount: number;
   observedIntervalCount: number;
+  verifiedNoTradeIntervalCount: number;
+  verifiedNoTradeRanges: readonly CandleCoverageGap[];
   missingIntervals: readonly string[];
 };
 
@@ -61,6 +69,7 @@ export type AddPostDecisionExcursionInput = {
   exposures: readonly AddDecisionExposure[];
   baselineFills: readonly PerformanceTradeFill[];
   baselineMatchResult: PerformanceTradeMatchResult;
+  verifiedNoTradeCoverage?: VerifiedNoTradeCoverage;
 };
 
 export type AddPostDecisionExcursionResult = {
@@ -92,7 +101,14 @@ export function analyzeAddPostDecisionExcursions(
     asset: input.asset,
     market: input.market,
     timeframe: "1h",
-    exposures: input.exposures.map((exposure) => analyzeExposure(exposure, episodes, fills, candles, input.dataset)),
+    exposures: input.exposures.map((exposure) => analyzeExposure(
+      exposure,
+      episodes,
+      fills,
+      candles,
+      input.dataset,
+      input.verifiedNoTradeCoverage,
+    )),
   };
 }
 
@@ -102,6 +118,7 @@ function analyzeExposure(
   fills: ReadonlyMap<string, PerformanceTradeFill>,
   candles: readonly ResearchCandle[],
   dataset: ResearchCandleDataset,
+  verifiedNoTradeCoverage: AddPostDecisionExcursionInput["verifiedNoTradeCoverage"],
 ): AddPostDecisionExcursion {
   requireTimestamp(exposure.generatedAt, "ADD decision timestamp");
   const provenance = provenanceOf(dataset);
@@ -143,26 +160,60 @@ function analyzeExposure(
     return unavailable(exposure.id, "DECISION_AND_EPISODE_CLOSE_SAME_INSTANT", evidence, provenance);
   }
 
-  const expected = expectedIntervals(decisionNs, closeNs);
-  if (expected.length === 0) {
+  const expectedIntervalCount = Number((closeNs - decisionNs) / HOUR_NANOSECONDS);
+  if (!Number.isSafeInteger(expectedIntervalCount) || expectedIntervalCount < 0) {
+    throw new Error("ADD excursion expected interval count must be a non-negative safe integer.");
+  }
+  if (expectedIntervalCount === 0) {
     return unavailable(exposure.id, "NO_COMPLETED_HOURLY_INTERVALS_IN_WINDOW", evidence, provenance);
   }
-  const byInterval = new Map(candles.map((candle) => [intervalKey(candle.openTime, candle.closeTime), candle]));
-  const observed = expected.map((interval) => byInterval.get(interval)).filter((candle): candle is ResearchCandle => candle !== undefined);
-  const missingIntervals = expected.filter((interval) => !byInterval.has(interval));
+  const coverageToNs = decisionNs + BigInt(expectedIntervalCount) * HOUR_NANOSECONDS;
+  const coverageTo = formatTimestamp(coverageToNs);
+  const observed = candles.filter((candle) =>
+    performanceTimestampEpochNanoseconds(candle.openTime) >= decisionNs
+    && performanceTimestampEpochNanoseconds(candle.closeTime) <= coverageToNs);
+  const sourceBoundary = verifiedNoTradeCoverage?.sourceBoundary ?? {
+    historyStartAt: exposure.generatedAt,
+    endAt: coverageTo,
+  };
+  if (verifiedNoTradeCoverage !== undefined) {
+    assertVerifiedNoTradeCoverage(verifiedNoTradeCoverage);
+    validateNoTradeSourceBoundary(verifiedNoTradeCoverage.sourceBoundary, dataset);
+  }
+  const partition = partitionHourlyCoverage({
+    from: exposure.generatedAt,
+    to: coverageTo,
+    sourceBoundary,
+    observedIntervals: observed.map((candle) => ({
+      openTime: candle.openTime,
+      closeTime: candle.closeTime,
+    })),
+    verifiedNoTradeRanges: verifiedNoTradeCoverage?.ranges ?? [],
+  });
   const coverage = {
-    expectedIntervalCount: expected.length,
-    observedIntervalCount: observed.length,
-    missingIntervals,
+    expectedIntervalCount: partition.expectedIntervalCount,
+    observedIntervalCount: partition.observedIntervalCount,
+    verifiedNoTradeIntervalCount: partition.verifiedNoTradeIntervalCount,
+    verifiedNoTradeRanges: partition.verifiedNoTradeRanges.map(copyGap),
+    missingIntervals: [...partition.unexplainedMissingIntervals],
   };
   const observedEvidence = {
     ...evidence,
     candleIntervals: observed.map((candle) => intervalKey(candle.openTime, candle.closeTime)),
   };
-  if (missingIntervals.length > 0) {
+  if (partition.unexplainedMissingIntervalCount > 0) {
     return unavailable(
       exposure.id,
       "MISSING_EXPECTED_HOURLY_CANDLE_COVERAGE",
+      observedEvidence,
+      provenance,
+      coverage,
+    );
+  }
+  if (observed.length === 0) {
+    return unavailable(
+      exposure.id,
+      "NO_COMPLETED_HOURLY_INTERVALS_IN_WINDOW",
       observedEvidence,
       provenance,
       coverage,
@@ -290,12 +341,26 @@ function validateMatchedAddFill(fill: PerformanceTradeFill, decisionAt: string):
   if (comparePerformanceTimestamps(fill.filledAt, decisionAt) !== 0) throw new Error(`Fill ${fill.id} does not match the ADD decision instant.`);
 }
 
-function expectedIntervals(start: bigint, end: bigint): string[] {
-  const result: string[] = [];
-  for (let open = start; open + HOUR_NANOSECONDS <= end; open += HOUR_NANOSECONDS) {
-    result.push(`${formatTimestamp(open)}/${formatTimestamp(open + HOUR_NANOSECONDS)}`);
+function validateNoTradeSourceBoundary(
+  boundary: NonNullable<AddPostDecisionExcursionInput["verifiedNoTradeCoverage"]>["sourceBoundary"],
+  dataset: ResearchCandleDataset,
+): void {
+  if (
+    comparePerformanceTimestamps(boundary.historyStartAt, dataset.provenance.historyStartAt) !== 0
+    || comparePerformanceTimestamps(boundary.endAt, dataset.provenance.endAt) !== 0
+  ) {
+    throw new Error("Verified no-trade sourceBoundary must match ADD dataset provenance boundaries.");
   }
-  return result;
+}
+
+function copyGap(range: CandleCoverageGap): CandleCoverageGap {
+  return {
+    firstMissingCloseTime: range.firstMissingCloseTime,
+    lastMissingCloseTime: range.lastMissingCloseTime,
+    missingCandleCount: range.missingCandleCount,
+    previousObservedCloseTime: range.previousObservedCloseTime,
+    nextObservedCloseTime: range.nextObservedCloseTime,
+  };
 }
 
 function unavailable(

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { readFile, readdir } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 
 import type { UpbitCandleSnapshot } from "../src/modules/exchange/upbit/contracts.js";
 import {
@@ -199,6 +199,85 @@ test("research candle acquisition statically imports only its approved pure and 
     "./research-candle-dataset.js",
   ]);
 });
+
+test("conditional ADD research stays outside runtime and operational import graphs", async () => {
+  const srcRoot = join(process.cwd(), "src");
+  const sourceFiles = await listTypeScriptFiles(srcRoot);
+  const integrated = join(srcRoot, "research", "integrated-strategy-evaluation.ts");
+  const lossAttribution = join(srcRoot, "modules", "performance", "performance-add-loss-attribution.ts");
+  const holdoutHypothesis = join(srcRoot, "modules", "performance", "performance-add-holdout-hypothesis.ts");
+  const protectedModules = new Set([lossAttribution, holdoutHypothesis]);
+  const approvedImporters = new Map([
+    [lossAttribution, new Set([integrated, holdoutHypothesis])],
+    [holdoutHypothesis, new Set([integrated])],
+  ]);
+  const reachable = await collectRelativeImportGraph([lossAttribution, holdoutHypothesis]);
+  const forbiddenPath = /(?:^|\/)(?:app|execution|exchange|reconciliation|telegram|runtime|db|research)(?:\/|$)/;
+
+  assert.ok(reachable.has(lossAttribution));
+  assert.ok(reachable.has(holdoutHypothesis));
+  assert.ok(reachable.has(join(srcRoot, "modules", "performance", "performance-add-policy-evaluation.ts")));
+  assert.ok(reachable.has(join(srcRoot, "modules", "performance", "performance-add-diagnostics.ts")));
+  for (const filePath of reachable) {
+    const relative = filePath.slice(srcRoot.length + 1).replaceAll("\\", "/");
+    assert.equal(
+      forbiddenPath.test(relative),
+      false,
+      `conditional ADD pure graph reached forbidden source ${relative}`,
+    );
+  }
+
+  const violations: string[] = [];
+  for (const importer of sourceFiles) {
+    const imports = await readRelativeImports(importer);
+    for (const imported of imports) {
+      if (!protectedModules.has(imported)) continue;
+      if (!(approvedImporters.get(imported)?.has(importer) ?? false)) {
+        violations.push(
+          `${importer.slice(srcRoot.length + 1).replaceAll("\\", "/")} -> ${imported.slice(srcRoot.length + 1).replaceAll("\\", "/")}`,
+        );
+      }
+    }
+  }
+  assert.deepEqual(violations.sort(), []);
+
+  const integratedImports = await readRelativeImports(integrated);
+  assert.ok(integratedImports.includes(lossAttribution));
+  assert.ok(integratedImports.includes(holdoutHypothesis));
+});
+
+async function collectRelativeImportGraph(roots: readonly string[]): Promise<Set<string>> {
+  const visited = new Set<string>();
+  const pending = [...roots];
+  while (pending.length > 0) {
+    const filePath = pending.shift()!;
+    if (visited.has(filePath)) continue;
+    visited.add(filePath);
+    for (const imported of await readRelativeImports(filePath)) {
+      if (!visited.has(imported)) pending.push(imported);
+    }
+  }
+  return visited;
+}
+
+async function readRelativeImports(filePath: string): Promise<string[]> {
+  const source = await readFile(filePath, "utf8");
+  return [...source.matchAll(/from\s+["'](\.{1,2}\/[^"']+)["']/g)]
+    .map((match) => match[1]!)
+    .map((specifier) => resolve(dirname(filePath), specifier.replace(/\.js$/, ".ts")))
+    .sort();
+}
+
+async function listTypeScriptFiles(directory: string): Promise<string[]> {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const files = await Promise.all(entries.map((entry) => {
+    const entryPath = join(directory, entry.name);
+    return entry.isDirectory()
+      ? listTypeScriptFiles(entryPath)
+      : Promise.resolve(entry.name.endsWith(".ts") ? [entryPath] : []);
+  }));
+  return files.flat().sort();
+}
 
 function acquisitionInput(
   overrides: Partial<Parameters<typeof acquireUpbitResearchCandleDataset>[1]> = {},

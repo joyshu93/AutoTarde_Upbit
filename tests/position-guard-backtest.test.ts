@@ -7,8 +7,17 @@ import {
 import {
   runPositionGuardBacktest,
   type PositionGuardBacktestFrame,
+  type PositionGuardBacktestResearchExecutionPolicy,
 } from "../src/modules/strategy/position-guard-backtest.js";
 import { test } from "./harness.js";
+
+const publicResearchPolicyContract: readonly PositionGuardBacktestResearchExecutionPolicy[] = [
+  { id: "NO_ADD", suppressedActions: ["ADD"] },
+  { id: "ADD_RISK_CLEAR" },
+  { id: "ADD_HIGH_ALIGNMENT" },
+  { id: "ADD_CORE_TREND" },
+];
+void publicResearchPolicyContract;
 
 test("position guard backtest replays buys and exits with trading costs", () => {
   const result = runPositionGuardBacktest({
@@ -371,26 +380,251 @@ test("position guard backtest rejects invalid research policy actions", () => {
   );
 });
 
-function createAddReplayInput() {
-  const strongAddAnalysis: Partial<PositionGuardStructureAnalysis> = {
-    regime: "BULL_TREND",
-    currentPrice: 100_000,
-    entryPath: "RECLAIM",
-    reclaimStructure: true,
-    trendAlignmentScore: 4,
-    recoveryQualityScore: 4,
-    volumeRecovery: true,
-    macdImproving: true,
-    rsiRecovery: true,
-  };
+test("conditional ADD policies suppress each failing boundary with contemporaneous evidence", () => {
+  const policyCases = [
+    [
+      "ADD_RISK_CLEAR",
+      { atrShock: true },
+      "ATR_SHOCK",
+      { atrShock: true, weakeningStage: "NONE", trendAlignmentScore: 4, regime: "BULL_TREND" },
+    ],
+    [
+      "ADD_RISK_CLEAR",
+      { weakeningStage: "SOFT" },
+      "WEAKENING_PRESENT",
+      { atrShock: false, weakeningStage: "SOFT", trendAlignmentScore: 4, regime: "BULL_TREND" },
+    ],
+    [
+      "ADD_HIGH_ALIGNMENT",
+      { trendAlignmentScore: 3 },
+      "TREND_ALIGNMENT_BELOW_4",
+      { atrShock: false, weakeningStage: "NONE", trendAlignmentScore: 3, regime: "BULL_TREND" },
+    ],
+    [
+      "ADD_CORE_TREND",
+      { regime: "EARLY_RECOVERY" },
+      "REGIME_NOT_CORE_TREND",
+      { atrShock: false, weakeningStage: "NONE", trendAlignmentScore: 4, regime: "EARLY_RECOVERY" },
+    ],
+  ] as const;
 
+  for (const [policyId, analysisOverrides, reason, analysisSnapshot] of policyCases) {
+    const generatedAt = "2026-04-20T01:00:00.000Z";
+    const input = createAddReplayInput([
+      createFrame(generatedAt, {
+        ...strongAddAnalysis,
+        ...analysisOverrides,
+      }),
+    ]);
+    const result = runPositionGuardBacktest({
+      ...input,
+      researchExecutionPolicy: { id: policyId },
+    });
+
+    assert.equal(result.frames[0]?.decision.action, "ADD", policyId);
+    assert.equal(result.frames[0]?.executed, false, policyId);
+    assert.equal(result.frames[0]?.trade, null, policyId);
+    assert.equal(result.frames[0]?.skipReason, null, policyId);
+    assert.deepEqual(result.frames[0]?.researchSuppression, {
+      policyId,
+      originalAction: "ADD",
+      reason,
+      generatedAt,
+      analysisSnapshot,
+    });
+  }
+});
+
+test("conditional ADD policies execute at their exact passing boundaries", () => {
+  const policyCases = [
+    ["ADD_RISK_CLEAR", { atrShock: false, weakeningStage: "NONE" }],
+    ["ADD_HIGH_ALIGNMENT", { trendAlignmentScore: 4 }],
+    ["ADD_CORE_TREND", { trendAlignmentScore: 4, regime: "BULL_TREND" }],
+    ["ADD_CORE_TREND", { trendAlignmentScore: 4, regime: "PULLBACK_IN_UPTREND" }],
+  ] as const;
+
+  for (const [policyId, analysisOverrides] of policyCases) {
+    const result = runPositionGuardBacktest({
+      ...createAddReplayInput([
+        createFrame("2026-04-20T01:00:00.000Z", {
+          ...strongAddAnalysis,
+          ...analysisOverrides,
+        }),
+      ]),
+      researchExecutionPolicy: { id: policyId },
+    });
+
+    assert.equal(result.frames[0]?.decision.action, "ADD", policyId);
+    assert.equal(result.frames[0]?.executed, true, policyId);
+    assert.equal(result.frames[0]?.trade?.action, "ADD", policyId);
+    assert.equal(result.frames[0]?.researchSuppression, null, policyId);
+  }
+});
+
+test("conditional ADD policies emit explicit ALLOW evidence only for ADD decisions", () => {
+  const generatedAt = "2026-04-20T01:00:00.000Z";
+  const result = runPositionGuardBacktest({
+    ...createAddReplayInput([
+      createFrame(generatedAt, strongAddAnalysis),
+    ]),
+    execution: { feeRate: 0.0005, slippageRate: 0, minimumTradeValueKrw: 1_000_000 },
+    researchExecutionPolicy: { id: "ADD_CORE_TREND" },
+  });
+
+  assert.equal(result.frames[0]?.decision.action, "ADD");
+  assert.equal(result.frames[0]?.trade, null);
+  assert.equal(result.frames[0]?.skipReason, "BELOW_MINIMUM_TRADE_VALUE");
+  assert.deepEqual(
+    (result.frames[0] as { researchPolicyEvaluation?: unknown }).researchPolicyEvaluation,
+    {
+      policyId: "ADD_CORE_TREND",
+      originalAction: "ADD",
+      outcome: "ALLOW",
+      reason: "CONDITIONS_MET",
+      generatedAt,
+      analysisSnapshot: {
+        atrShock: false,
+        weakeningStage: "NONE",
+        trendAlignmentScore: 4,
+        regime: "BULL_TREND",
+      },
+    },
+  );
+});
+
+test("conditional ADD suppression drives full replay without mutating source frames", () => {
+  const input = createAddReplayInput([
+    createFrame("2026-04-20T01:00:00.000Z", {
+      ...strongAddAnalysis,
+      trendAlignmentScore: 3,
+    }),
+    createFrame("2026-04-20T02:00:00.000Z", strongAddAnalysis),
+  ]);
+  const sourceBefore = structuredClone(input.frames);
+  const baseline = runPositionGuardBacktest(input);
+  const first = runPositionGuardBacktest({
+    ...input,
+    researchExecutionPolicy: { id: "ADD_HIGH_ALIGNMENT" },
+  });
+  const second = runPositionGuardBacktest({
+    ...input,
+    researchExecutionPolicy: { id: "ADD_HIGH_ALIGNMENT" },
+  });
+
+  assert.equal(first.frames[0]?.decision.action, "ADD");
+  assert.equal(first.frames[0]?.executed, false);
+  assert.notDeepEqual(first.frames[1]?.startingState, baseline.frames[1]?.startingState);
+  assert.deepEqual(input.frames, sourceBefore);
+  assert.deepEqual(second, first);
+});
+
+test("position guard backtest rejects unknown conditional ADD policy IDs", () => {
+  assert.throws(
+    () => runPositionGuardBacktest({
+      ...createAddReplayInput(),
+      researchExecutionPolicy: { id: "ADD_UNKNOWN" } as never,
+    }),
+    /Invalid research execution policy ADD_UNKNOWN/,
+  );
+});
+
+test("conditional ADD policies reject forbidden suppression fields", () => {
+  assert.throws(
+    () => runPositionGuardBacktest({
+      ...createAddReplayInput(),
+      researchExecutionPolicy: {
+        id: "ADD_RISK_CLEAR",
+        suppressedActions: ["ADD"],
+      } as never,
+    }),
+    /ADD_RISK_CLEAR.*must not define suppressedActions/,
+  );
+});
+
+test("conditional ADD policies reject malformed policy analysis fields", () => {
+  const malformedCases = [
+    ["trendAlignmentScore", Number.NaN],
+    ["trendAlignmentScore", Number.POSITIVE_INFINITY],
+    ["atrShock", "false"],
+    ["weakeningStage", "UNKNOWN"],
+    ["regime", "UNKNOWN"],
+  ] as const;
+
+  for (const [field, value] of malformedCases) {
+    const input = createAddReplayInput([
+      createFrame("2026-04-20T01:00:00.000Z", {
+        ...strongAddAnalysis,
+        [field]: value,
+      } as never),
+    ]);
+
+    assert.throws(
+      () => runPositionGuardBacktest({
+        ...input,
+        researchExecutionPolicy: { id: "ADD_CORE_TREND" },
+      }),
+      new RegExp(`Invalid conditional ADD analysis ${field}`),
+      field,
+    );
+  }
+});
+
+test("conditional ADD suppression reasons follow strict first-failure precedence", () => {
+  const precedenceCases = [
+    [
+      { atrShock: true, weakeningStage: "SOFT", trendAlignmentScore: 3, regime: "EARLY_RECOVERY" },
+      "ATR_SHOCK",
+    ],
+    [
+      { atrShock: false, weakeningStage: "SOFT", trendAlignmentScore: 3, regime: "EARLY_RECOVERY" },
+      "WEAKENING_PRESENT",
+    ],
+    [
+      { atrShock: false, weakeningStage: "NONE", trendAlignmentScore: 3, regime: "EARLY_RECOVERY" },
+      "TREND_ALIGNMENT_BELOW_4",
+    ],
+    [
+      { atrShock: false, weakeningStage: "NONE", trendAlignmentScore: 4, regime: "EARLY_RECOVERY" },
+      "REGIME_NOT_CORE_TREND",
+    ],
+  ] as const;
+
+  for (const [analysisOverrides, expectedReason] of precedenceCases) {
+    const result = runPositionGuardBacktest({
+      ...createAddReplayInput([
+        createFrame("2026-04-20T01:00:00.000Z", {
+          ...strongAddAnalysis,
+          ...analysisOverrides,
+        }),
+      ]),
+      researchExecutionPolicy: { id: "ADD_CORE_TREND" },
+    });
+
+    assert.equal(result.frames[0]?.decision.action, "ADD");
+    assert.equal(result.frames[0]?.researchSuppression?.reason, expectedReason);
+  }
+});
+
+const strongAddAnalysis: Partial<PositionGuardStructureAnalysis> = {
+  regime: "BULL_TREND",
+  currentPrice: 100_000,
+  entryPath: "RECLAIM",
+  reclaimStructure: true,
+  trendAlignmentScore: 4,
+  recoveryQualityScore: 4,
+  volumeRecovery: true,
+  macdImproving: true,
+  rsiRecovery: true,
+};
+
+function createAddReplayInput(frames?: readonly PositionGuardBacktestFrame[]) {
   return {
     asset: "BTC" as const,
     market: "KRW-BTC" as const,
     initialCashKrw: 600_000,
     initialQuantity: 4,
     initialAverageEntryPrice: 100_000,
-    frames: [
+    frames: frames ?? [
       createFrame("2026-04-20T01:00:00.000Z", strongAddAnalysis),
       createFrame("2026-04-20T02:00:00.000Z", strongAddAnalysis),
       createFrame("2026-04-20T03:00:00.000Z", strongAddAnalysis),

@@ -4,6 +4,8 @@ import {
   analyzePerformanceExcursions,
   type PerformanceExcursionInput,
 } from "../src/modules/performance/performance-excursions.js";
+import type { CandleCoverageGap } from "../src/modules/performance/performance-candle-coverage.js";
+import { createVerifiedNoTradeCoverage } from "../src/modules/performance/performance-hourly-coverage.js";
 import type {
   ResearchCandle,
   ResearchCandleDataset,
@@ -74,6 +76,32 @@ test("excursion coverage compares mixed timezone boundaries as exact nanosecond 
   assert.equal(result.episodes[0]?.candleCount, 3);
 });
 
+test("legacy excursion callers keep conservative boundary results for non-whole-hour episodes", () => {
+  const fills = completedEpisodeFills().map((fill) => fill.side === "ask"
+    ? { ...fill, filledAt: "2026-04-20T03:30:00.000Z" }
+    : fill);
+  const result = analyzeExcursions({
+    dataset: createDataset([
+      candle("2026-04-20T01:00:00Z", "2026-04-20T02:00:00Z", 90, 110),
+      candle("2026-04-20T02:00:00Z", "2026-04-20T03:00:00Z", 85, 120),
+    ]),
+    fills,
+    matchResult: matchPerformanceTrades({ fills }),
+  });
+
+  assert.deepEqual(result.episodes[0]?.maeKrw, {
+    status: "UNKNOWN",
+    reasons: ["MISSING_EXIT_BOUNDARY_COVERAGE"],
+  });
+  assert.deepEqual(result.episodes[0]?.coverage, {
+    expectedIntervalCount: 2,
+    observedIntervalCount: 2,
+    verifiedNoTradeIntervalCount: 0,
+    verifiedNoTradeRanges: [],
+    unexplainedMissingIntervals: [],
+  });
+});
+
 test("excursion metrics are unknown for missing entry, exit, or internal 1h coverage", () => {
   const fills = completedEpisodeFills();
   const matchResult = matchPerformanceTrades({ fills });
@@ -113,6 +141,74 @@ test("excursion metrics are unknown for missing entry, exit, or internal 1h cove
     reasons: ["MISSING_INTERNAL_CANDLE_COVERAGE"],
   });
   assert.equal(missingInternal.episodes[0]?.candleCount, 2);
+});
+
+test("excursion analysis accepts verified internal no-trade coverage without fabricating OHLC", () => {
+  const fills = completedEpisodeFills();
+  const result = analyzeExcursions({
+    dataset: createDataset([
+      candle("2026-04-20T01:00:00Z", "2026-04-20T02:00:00Z", 90, 110),
+      candle("2026-04-20T03:00:00Z", "2026-04-20T04:00:00Z", 95, 125),
+    ]),
+    fills,
+    matchResult: matchPerformanceTrades({ fills }),
+    verifiedNoTradeCoverage: verifiedNoTradeCoverage([
+      noTradeGap("2026-04-20T03:00:00Z", "2026-04-20T03:00:00Z", 1),
+    ]),
+  });
+
+  const episode = result.episodes[0];
+  assert.ok(episode);
+  assert.deepEqual(episode.maeKrw, { status: "KNOWN", value: -10 });
+  assert.deepEqual(episode.mfeKrw, { status: "KNOWN", value: 25 });
+  assert.equal(episode.candleCount, 2);
+  assert.deepEqual(episode.coverage, {
+    expectedIntervalCount: 3,
+    observedIntervalCount: 2,
+    verifiedNoTradeIntervalCount: 1,
+    verifiedNoTradeRanges: [{
+      firstMissingCloseTime: "2026-04-20T03:00:00.000000000Z",
+      lastMissingCloseTime: "2026-04-20T03:00:00.000000000Z",
+      missingCandleCount: 1,
+      previousObservedCloseTime: "2026-04-20T02:00:00.000000000Z",
+      nextObservedCloseTime: "2026-04-20T04:00:00.000000000Z",
+    }],
+    unexplainedMissingIntervals: [],
+  });
+  assert.equal(
+    result.evidenceGaps.some((item) => item.code === "MISSING_INTERNAL_CANDLE_COVERAGE"),
+    false,
+  );
+});
+
+test("excursion analysis rejects no-trade evidence on entry or exit fill boundaries", () => {
+  const fills = completedEpisodeFills();
+  const base = {
+    dataset: createDataset([
+      candle("2026-04-20T02:00:00Z", "2026-04-20T03:00:00Z", 90, 110),
+    ]),
+    fills,
+    matchResult: matchPerformanceTrades({ fills }),
+  };
+
+  assert.throws(
+    () => analyzeExcursions({
+      ...base,
+      verifiedNoTradeCoverage: verifiedNoTradeCoverage([
+        noTradeGap("2026-04-20T02:00:00Z", "2026-04-20T02:00:00Z", 1),
+      ]),
+    }),
+    /entry fill boundary/i,
+  );
+  assert.throws(
+    () => analyzeExcursions({
+      ...base,
+      verifiedNoTradeCoverage: verifiedNoTradeCoverage([
+        noTradeGap("2026-04-20T04:00:00Z", "2026-04-20T04:00:00Z", 1),
+      ]),
+    }),
+    /exit fill boundary/i,
+  );
 });
 
 test("excursion analysis excludes open episodes and opening inventory with explicit gaps", () => {
@@ -431,6 +527,46 @@ function createDataset(candles: readonly ResearchCandle[]): ResearchCandleDatase
       sha256: "a".repeat(64),
     },
     candles: { "1h": [...candles], "4h": [], "1d": [] },
+  };
+}
+
+function verifiedNoTradeCoverage(ranges: readonly CandleCoverageGap[]) {
+  const sourceBoundary = {
+    historyStartAt: "2026-04-19T00:00:00.000Z",
+    endAt: "2026-04-21T00:00:00.000Z",
+  } as const;
+  return createVerifiedNoTradeCoverage({
+    sourceBoundary,
+    observedIntervals: observedIntervalsExcludingGaps(sourceBoundary, ranges),
+  });
+}
+
+function observedIntervalsExcludingGaps(
+  boundary: { historyStartAt: string; endAt: string },
+  ranges: readonly CandleCoverageGap[],
+) {
+  const result: { openTime: string; closeTime: string }[] = [];
+  for (let open = Date.parse(boundary.historyStartAt); open < Date.parse(boundary.endAt); open += 3_600_000) {
+    const close = open + 3_600_000;
+    if (!ranges.some((range) => close >= Date.parse(range.firstMissingCloseTime)
+      && close <= Date.parse(range.lastMissingCloseTime))) {
+      result.push({ openTime: new Date(open).toISOString(), closeTime: new Date(close).toISOString() });
+    }
+  }
+  return result;
+}
+
+function noTradeGap(
+  firstMissingCloseTime: string,
+  lastMissingCloseTime: string,
+  missingCandleCount: number,
+): CandleCoverageGap {
+  return {
+    firstMissingCloseTime,
+    lastMissingCloseTime,
+    missingCandleCount,
+    previousObservedCloseTime: new Date(Date.parse(firstMissingCloseTime) - 3_600_000).toISOString(),
+    nextObservedCloseTime: new Date(Date.parse(lastMissingCloseTime) + 3_600_000).toISOString(),
   };
 }
 

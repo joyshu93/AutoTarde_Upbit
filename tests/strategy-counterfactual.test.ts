@@ -8,6 +8,7 @@ import {
 import {
   runCounterfactualScenarios,
   type CounterfactualInput,
+  type CounterfactualScenario,
 } from "../src/modules/performance/strategy-counterfactual.js";
 import { test } from "./harness.js";
 
@@ -49,6 +50,67 @@ test("counterfactual scenario order is stable and empty or duplicate scenarios r
   assert.throws(
     () => runCounterfactualScenarios(createCounterfactualInput(["BASELINE", "BASELINE"])),
     /Duplicate counterfactual scenario BASELINE/,
+  );
+});
+
+test("counterfactual maps all five scenarios to Task 1 policies in caller order", () => {
+  const scenarios = [
+    "ADD_CORE_TREND",
+    "BASELINE",
+    "ADD_RISK_CLEAR",
+    "NO_ADD",
+    "ADD_HIGH_ALIGNMENT",
+  ] as const satisfies readonly CounterfactualScenario[];
+
+  const result = runCounterfactualScenarios(createCounterfactualInput(scenarios));
+
+  assert.deepEqual(
+    result.map(({ scenario, executionPolicy }) => [scenario, executionPolicy]),
+    [
+      ["ADD_CORE_TREND", { id: "ADD_CORE_TREND" }],
+      ["BASELINE", null],
+      ["ADD_RISK_CLEAR", { id: "ADD_RISK_CLEAR" }],
+      ["NO_ADD", { id: "NO_ADD", suppressedActions: ["ADD"] }],
+      ["ADD_HIGH_ALIGNMENT", { id: "ADD_HIGH_ALIGNMENT" }],
+    ],
+  );
+});
+
+test("counterfactual conditional scenarios produce stable scenario-qualified fill ids", () => {
+  const scenarios = [
+    "ADD_RISK_CLEAR",
+    "ADD_HIGH_ALIGNMENT",
+    "ADD_CORE_TREND",
+  ] as const satisfies readonly CounterfactualScenario[];
+
+  const first = runCounterfactualScenarios(createCounterfactualInput(scenarios));
+  const second = runCounterfactualScenarios(createCounterfactualInput(scenarios));
+
+  assert.deepEqual(second, first);
+  assert.deepEqual(
+    first.map((result) => result.fills[0]?.id),
+    [
+      "counterfactual:ADD_RISK_CLEAR:BTC:2026-04-20T01:00:00.000Z:0:ADD:bid:fill",
+      "counterfactual:ADD_HIGH_ALIGNMENT:BTC:2026-04-20T01:00:00.000Z:0:ADD:bid:fill",
+      "counterfactual:ADD_CORE_TREND:BTC:2026-04-20T01:00:00.000Z:0:ADD:bid:fill",
+    ],
+  );
+});
+
+test("counterfactual rejects duplicate conditional and unknown scenario ids", () => {
+  const duplicate = [
+    "ADD_RISK_CLEAR",
+    "ADD_RISK_CLEAR",
+  ] as const satisfies readonly CounterfactualScenario[];
+  const unknown = ["ADD_FUTURE_KNOWLEDGE"] as unknown as readonly CounterfactualScenario[];
+
+  assert.throws(
+    () => runCounterfactualScenarios(createCounterfactualInput(duplicate)),
+    /Duplicate counterfactual scenario ADD_RISK_CLEAR/,
+  );
+  assert.throws(
+    () => runCounterfactualScenarios(createCounterfactualInput(unknown)),
+    /Invalid counterfactual scenario ADD_FUTURE_KNOWLEDGE/,
   );
 });
 

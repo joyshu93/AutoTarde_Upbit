@@ -38,16 +38,73 @@ export interface PositionGuardBacktestInput {
   researchExecutionPolicy?: PositionGuardBacktestResearchExecutionPolicy;
 }
 
-export interface PositionGuardBacktestResearchExecutionPolicy {
-  id: "NO_ADD";
-  suppressedActions: readonly ["ADD"] | readonly "ADD"[];
-}
+export type PositionGuardBacktestResearchExecutionPolicyId =
+  | "NO_ADD"
+  | "ADD_RISK_CLEAR"
+  | "ADD_HIGH_ALIGNMENT"
+  | "ADD_CORE_TREND";
 
-export interface PositionGuardBacktestResearchSuppression {
-  policyId: PositionGuardBacktestResearchExecutionPolicy["id"];
+type PositionGuardBacktestConditionalAddPolicyId = Exclude<
+  PositionGuardBacktestResearchExecutionPolicyId,
+  "NO_ADD"
+>;
+
+export type PositionGuardBacktestResearchExecutionPolicy<
+  TId extends PositionGuardBacktestResearchExecutionPolicyId = PositionGuardBacktestResearchExecutionPolicyId,
+> = TId extends "NO_ADD"
+  ? {
+      id: "NO_ADD";
+      suppressedActions: readonly ["ADD"] | readonly "ADD"[];
+    }
+  : {
+      id: TId;
+      suppressedActions?: never;
+    };
+
+interface PositionGuardBacktestNoAddSuppression {
+  policyId: "NO_ADD";
   originalAction: "ADD";
   reason: "ACTION_SUPPRESSED";
 }
+
+interface PositionGuardBacktestConditionalAddSuppression {
+  policyId: PositionGuardBacktestConditionalAddPolicyId;
+  originalAction: "ADD";
+  reason:
+    | "ATR_SHOCK"
+    | "WEAKENING_PRESENT"
+    | "TREND_ALIGNMENT_BELOW_4"
+    | "REGIME_NOT_CORE_TREND";
+  generatedAt: string;
+  analysisSnapshot: Pick<
+    PositionGuardStructureAnalysis,
+    "atrShock" | "weakeningStage" | "trendAlignmentScore" | "regime"
+  >;
+}
+
+export type PositionGuardBacktestResearchSuppression =
+  | PositionGuardBacktestNoAddSuppression
+  | PositionGuardBacktestConditionalAddSuppression;
+
+type PositionGuardBacktestConditionalAddPolicyEvidence = {
+  policyId: PositionGuardBacktestConditionalAddPolicyId;
+  originalAction: "ADD";
+  generatedAt: string;
+  analysisSnapshot: Pick<
+    PositionGuardStructureAnalysis,
+    "atrShock" | "weakeningStage" | "trendAlignmentScore" | "regime"
+  >;
+}
+
+export type PositionGuardBacktestConditionalAddPolicyEvaluation =
+  | (PositionGuardBacktestConditionalAddPolicyEvidence & {
+      outcome: "ALLOW";
+      reason: "CONDITIONS_MET";
+    })
+  | (PositionGuardBacktestConditionalAddPolicyEvidence & {
+      outcome: "SUPPRESS";
+      reason: PositionGuardBacktestConditionalAddSuppression["reason"];
+    });
 
 export interface PositionGuardBacktestState {
   cashKrw: number;
@@ -83,6 +140,7 @@ export interface PositionGuardBacktestFrameResult {
   equityKrw: number;
   drawdownPct: number;
   researchSuppression?: PositionGuardBacktestResearchSuppression | null;
+  researchPolicyEvaluation?: PositionGuardBacktestConditionalAddPolicyEvaluation | null;
 }
 
 export interface PositionGuardBacktestMetrics {
@@ -139,6 +197,7 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
   const results: PositionGuardBacktestFrameResult[] = [];
 
   for (const frame of input.frames) {
+    validateConditionalAddAnalysis(researchExecutionPolicy, frame.analysis);
     const startingState = cloneState(state);
     const context = buildContext({
       input,
@@ -148,7 +207,17 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
       latestDecision,
     });
     const decision = decidePositionGuardCore(context);
-    const researchSuppression = getResearchSuppression(researchExecutionPolicy, decision.action);
+    const researchPolicyEvaluation = getConditionalAddPolicyEvaluation(
+      researchExecutionPolicy,
+      decision.action,
+      frame,
+    );
+    const researchSuppression = getResearchSuppression(
+      researchExecutionPolicy,
+      decision.action,
+      frame,
+      researchPolicyEvaluation,
+    );
     const executionResult = researchSuppression
       ? { state: cloneState(state), trade: null, skipReason: null }
       : applyDecision({
@@ -191,6 +260,9 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
       equityKrw: roundMoney(equity),
       drawdownPct,
       ...(researchExecutionPolicy ? { researchSuppression } : {}),
+      ...(researchExecutionPolicy && researchExecutionPolicy.id !== "NO_ADD"
+        ? { researchPolicyEvaluation }
+        : {}),
     });
 
     latestDecision = {
@@ -219,26 +291,125 @@ function validateResearchExecutionPolicy(
   policy: PositionGuardBacktestResearchExecutionPolicy | undefined,
 ): PositionGuardBacktestResearchExecutionPolicy | undefined {
   if (!policy) return undefined;
-  if (
-    policy.id !== "NO_ADD" ||
-    policy.suppressedActions.length !== 1 ||
-    policy.suppressedActions[0] !== "ADD"
-  ) {
-    throw new Error("NO_ADD research execution policy may only suppress ADD.");
+
+  switch (policy.id) {
+    case "NO_ADD":
+      if (policy.suppressedActions.length !== 1 || policy.suppressedActions[0] !== "ADD") {
+        throw new Error("NO_ADD research execution policy may only suppress ADD.");
+      }
+      return policy;
+    case "ADD_RISK_CLEAR":
+    case "ADD_HIGH_ALIGNMENT":
+    case "ADD_CORE_TREND":
+      if ("suppressedActions" in policy) {
+        throw new Error(`${policy.id} research execution policy must not define suppressedActions.`);
+      }
+      return policy;
+    default:
+      throw new Error(`Invalid research execution policy ${String((policy as { id?: unknown }).id)}.`);
   }
-  return policy;
 }
 
 function getResearchSuppression(
   policy: PositionGuardBacktestResearchExecutionPolicy | undefined,
   action: StrategyDecisionAction,
+  frame: PositionGuardBacktestFrame,
+  conditionalEvaluation: PositionGuardBacktestConditionalAddPolicyEvaluation | null,
 ): PositionGuardBacktestResearchSuppression | null {
   if (!policy || action !== "ADD") return null;
+  if (policy.id === "NO_ADD") {
+    return {
+      policyId: policy.id,
+      originalAction: action,
+      reason: "ACTION_SUPPRESSED",
+    };
+  }
+
+  if (conditionalEvaluation?.outcome !== "SUPPRESS") return null;
+
   return {
     policyId: policy.id,
     originalAction: action,
-    reason: "ACTION_SUPPRESSED",
+    reason: conditionalEvaluation.reason,
+    generatedAt: conditionalEvaluation.generatedAt,
+    analysisSnapshot: conditionalEvaluation.analysisSnapshot,
   };
+}
+
+function getConditionalAddPolicyEvaluation(
+  policy: PositionGuardBacktestResearchExecutionPolicy | undefined,
+  action: StrategyDecisionAction,
+  frame: PositionGuardBacktestFrame,
+): PositionGuardBacktestConditionalAddPolicyEvaluation | null {
+  if (!policy || policy.id === "NO_ADD" || action !== "ADD") return null;
+
+  const reason = getConditionalAddSuppressionReason(policy.id, frame.analysis);
+  const evidence = {
+    policyId: policy.id,
+    originalAction: action,
+    generatedAt: frame.generatedAt,
+    analysisSnapshot: {
+      atrShock: frame.analysis.atrShock,
+      weakeningStage: frame.analysis.weakeningStage,
+      trendAlignmentScore: frame.analysis.trendAlignmentScore,
+      regime: frame.analysis.regime,
+    },
+  } as const;
+  if (reason === null) {
+    return { ...evidence, outcome: "ALLOW", reason: "CONDITIONS_MET" };
+  }
+  return {
+    ...evidence,
+    outcome: "SUPPRESS",
+    reason,
+  };
+}
+
+function validateConditionalAddAnalysis(
+  policy: PositionGuardBacktestResearchExecutionPolicy | undefined,
+  analysis: PositionGuardStructureAnalysis,
+): void {
+  if (!policy || policy.id === "NO_ADD") return;
+  if (!Number.isFinite(analysis.trendAlignmentScore)) {
+    throw new Error("Invalid conditional ADD analysis trendAlignmentScore: expected a finite number.");
+  }
+  if (typeof analysis.atrShock !== "boolean") {
+    throw new Error("Invalid conditional ADD analysis atrShock: expected a boolean.");
+  }
+  if (
+    analysis.weakeningStage !== "NONE" &&
+    analysis.weakeningStage !== "SOFT" &&
+    analysis.weakeningStage !== "CLEAR" &&
+    analysis.weakeningStage !== "FAILURE"
+  ) {
+    throw new Error("Invalid conditional ADD analysis weakeningStage.");
+  }
+  if (
+    analysis.regime !== "BULL_TREND" &&
+    analysis.regime !== "PULLBACK_IN_UPTREND" &&
+    analysis.regime !== "EARLY_RECOVERY" &&
+    analysis.regime !== "RECLAIM_ATTEMPT" &&
+    analysis.regime !== "RANGE" &&
+    analysis.regime !== "WEAK_DOWNTREND" &&
+    analysis.regime !== "BREAKDOWN_RISK"
+  ) {
+    throw new Error("Invalid conditional ADD analysis regime.");
+  }
+}
+
+function getConditionalAddSuppressionReason(
+  policyId: PositionGuardBacktestConditionalAddPolicyId,
+  analysis: PositionGuardStructureAnalysis,
+): PositionGuardBacktestConditionalAddSuppression["reason"] | null {
+  if (analysis.atrShock) return "ATR_SHOCK";
+  if (analysis.weakeningStage !== "NONE") return "WEAKENING_PRESENT";
+  if (policyId === "ADD_RISK_CLEAR") return null;
+  if (analysis.trendAlignmentScore < 4) return "TREND_ALIGNMENT_BELOW_4";
+  if (policyId === "ADD_HIGH_ALIGNMENT") return null;
+  if (analysis.regime !== "BULL_TREND" && analysis.regime !== "PULLBACK_IN_UPTREND") {
+    return "REGIME_NOT_CORE_TREND";
+  }
+  return null;
 }
 
 function buildContext(input: {

@@ -40,6 +40,7 @@ const DISCLAIMER =
   "This is selected order stream performance; it is not total account return." as const;
 export const PERFORMANCE_BREAKEVEN_TOLERANCE_KRW = 1e-9;
 const RECENT_COMPLETED_EPISODE_LIMIT = 10;
+const RECENT_MARK_EXCLUSION_LIMIT = 5;
 
 export function parsePerformanceReportArgs(argv: readonly string[]): PerformanceReportOptions {
   const values = new Map<string, string>();
@@ -167,6 +168,7 @@ export function formatPerformanceReport(
     "Curves And Drawdowns",
     `Realized curve: ${report.diagnostics.realizedPnlCurve.equityDefinition}; observation_frequency=${report.diagnostics.realizedPnlCurve.observationFrequency}; max_gross_drawdown_krw=${formatMetric(report.diagnostics.realizedPnlCurve.maxGrossDrawdownKrw)}; max_net_drawdown_krw=${formatMetric(report.diagnostics.realizedPnlCurve.maxNetDrawdownKrw)}`,
     `Snapshot mark curve: ${report.diagnostics.markPnlCurve.equityDefinition}; observation_frequency=${report.diagnostics.markPnlCurve.observationFrequency}; ${formatMarkCoverage(report.diagnostics.markPnlCurve, "; ")}; max_observation_gap_ms=${formatNumber(report.diagnostics.markPnlCurve.maxObservationGapMs)}; max_gross_drawdown_krw=${formatMetric(report.diagnostics.markPnlCurve.maxGrossDrawdownKrw)}; max_net_drawdown_krw=${formatMetric(report.diagnostics.markPnlCurve.maxNetDrawdownKrw)}`,
+    ...formatMarkExclusions(report.diagnostics.markPnlCurve),
     `KRW-BTC realized drawdown: gross=${formatMetric(report.diagnostics.marketRealizedPnlCurves["KRW-BTC"].maxGrossDrawdownKrw)} net=${formatMetric(report.diagnostics.marketRealizedPnlCurves["KRW-BTC"].maxNetDrawdownKrw)}`,
     `KRW-BTC snapshot mark drawdown: gross=${formatMetric(report.diagnostics.marketMarkPnlCurves["KRW-BTC"].maxGrossDrawdownKrw)} net=${formatMetric(report.diagnostics.marketMarkPnlCurves["KRW-BTC"].maxNetDrawdownKrw)} ${formatMarkCoverage(report.diagnostics.marketMarkPnlCurves["KRW-BTC"], " ")}`,
     `KRW-ETH realized drawdown: gross=${formatMetric(report.diagnostics.marketRealizedPnlCurves["KRW-ETH"].maxGrossDrawdownKrw)} net=${formatMetric(report.diagnostics.marketRealizedPnlCurves["KRW-ETH"].maxNetDrawdownKrw)}`,
@@ -189,16 +191,36 @@ export function formatPerformanceReport(
   return lines.join("\n");
 }
 
+function formatMarkExclusions(
+  curve: PerformanceDiagnosticsResult["markPnlCurve"],
+): string[] {
+  const exclusions = curve.excludedObservations;
+  if (exclusions.length === 0) return ["Excluded mark observations: 0"];
+  const recent = exclusions.slice(-RECENT_MARK_EXCLUSION_LIMIT).reverse();
+  return [
+    `Excluded mark observations: ${exclusions.length} (showing newest ${recent.length})`,
+    ...recent.map((exclusion) =>
+      `- ${exclusion.snapshotId} | ${exclusion.capturedAt} | ${exclusion.market} | ${exclusion.metricScopes.join(",")} | ${exclusion.reasonCodes.join(",")}`
+    ),
+    "Full exclusion manifest is retained in JSON output.",
+  ];
+}
+
 function formatMarkCoverage(
   curve: PerformanceDiagnosticsResult["markPnlCurve"],
   separator: string,
 ): string {
+  const grossExcludedSnapshotCount = new Set(
+    curve.excludedObservations
+      .filter((item) => item.metricScopes.includes("GROSS"))
+      .map((item) => item.snapshotId),
+  ).size;
   const coverage =
     curve.persistedObservationCount === 0
       ? "UNAVAILABLE"
       : curve.usableObservationCount === 0
         ? "UNUSABLE"
-        : curve.usableObservationCount < curve.persistedObservationCount
+        : grossExcludedSnapshotCount > 0
           ? "PARTIAL"
           : "COMPLETE";
   return [

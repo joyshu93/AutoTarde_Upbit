@@ -41,6 +41,28 @@ test("position guard backtest frame builder excludes future candles at each deci
   assert.equal(frames[0]?.source.candleCounts["1h"], 3);
 });
 
+test("position guard backtest frame builder never synthesizes frames across a sparse 1h gap", () => {
+  const frames = buildPositionGuardBacktestFrames({
+    asset: "BTC",
+    market: "KRW-BTC",
+    oneHourCandles: [
+      createCandle("1h", "2026-04-20T00:00:00.000Z", 100),
+      createCandle("1h", "2026-04-20T02:00:00.000Z", 102),
+    ],
+    fourHourCandles: [createCandle("4h", "2026-04-19T20:00:00.000Z", 98)],
+    oneDayCandles: [createCandle("1d", "2026-04-19T00:00:00.000Z", 95)],
+    minimumCompletedCandles: { "1h": 1, "4h": 1, "1d": 1 },
+  });
+
+  assert.deepEqual(frames.map((frame) => frame.generatedAt), [
+    "2026-04-20T01:00:00.000Z",
+    "2026-04-20T03:00:00.000Z",
+  ]);
+  assert.deepEqual(frames.map((frame) => frame.source.candleCounts["1h"]), [1, 2]);
+  assert.equal(frames[1]?.source.latestCloseTime["4h"], "2026-04-20T00:00:00.000Z");
+  assert.equal(frames[1]?.source.latestCloseTime["1d"], "2026-04-20T00:00:00.000Z");
+});
+
 test("position guard backtest frame builder excludes a mixed-timezone candle one nanosecond after the decision", () => {
   const decisionCandle = createCandle("1h", "2026-04-20T02:00:00.000Z", 101);
   decisionCandle.closeTime = "2026-04-20T12:00:00.000000100+09:00";

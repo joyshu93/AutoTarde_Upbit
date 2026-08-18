@@ -103,6 +103,23 @@ export type MarkPnlPoint = {
   drawdownKrw: number;
 };
 
+export type MarkValuationMetricScope = "GROSS" | "NET";
+
+export type MarkValuationExclusionReason =
+  | "MISSING_ACTIVE_POSITION_MARK"
+  | "INCOMPLETE_ACQUISITION_COST"
+  | "INCOMPLETE_REALIZED_GROSS_ATTRIBUTION"
+  | "INCOMPLETE_REMAINING_BUY_FEE"
+  | "INCOMPLETE_REALIZED_NET_ATTRIBUTION";
+
+export type MarkObservationExclusion = {
+  snapshotId: string;
+  capturedAt: string;
+  market: PerformanceMarket;
+  metricScopes: readonly MarkValuationMetricScope[];
+  reasonCodes: readonly MarkValuationExclusionReason[];
+};
+
 export type RealizedPnlCurveDiagnostics = {
   equityDefinition: "CUMULATIVE_SELECTED_STREAM_REALIZED_PNL_KRW";
   observationFrequency: "SELL_FILL_EPOCH";
@@ -123,6 +140,7 @@ export type MarkPnlCurveDiagnostics = {
   usableObservationCount: number;
   sampleCount: number;
   maxObservationGapMs: number | null;
+  excludedObservations: readonly MarkObservationExclusion[];
 };
 
 export type PerformanceDiagnosticsResult = {
@@ -167,11 +185,11 @@ export function diagnosePerformance(
       buildRealizedCurve(normalizedInput, [market], failures.has(market)),
     ]),
   ) as Record<PerformanceMarket, RealizedPnlCurveDiagnostics>;
-  const markPnlCurve = buildMarkCurve(normalizedInput, MARKETS, failures.size > 0);
+  const markPnlCurve = buildMarkCurve(normalizedInput, MARKETS, failures);
   const marketMarkPnlCurves = Object.fromEntries(
     MARKETS.map((market) => [
       market,
-      buildMarkCurve(normalizedInput, [market], failures.has(market)),
+      buildMarkCurve(normalizedInput, [market], failures),
     ]),
   ) as Record<PerformanceMarket, MarkPnlCurveDiagnostics>;
   const warnings: string[] = [];
@@ -366,7 +384,7 @@ function buildRealizedCurve(
 function buildMarkCurve(
   input: NormalizedDiagnosticsInput,
   markets: readonly PerformanceMarket[],
-  attributionFailed: boolean,
+  attributionFailedMarkets: ReadonlySet<PerformanceMarket>,
 ): MarkPnlCurveDiagnostics {
   const observations = [...(input.markObservations ?? [])].sort(
     (left, right) => comparePerformanceTimestamps(left.capturedAt, right.capturedAt) ||
@@ -383,19 +401,22 @@ function buildMarkCurve(
       usableObservationCount: 0,
       sampleCount: 0,
       maxObservationGapMs: null,
+      excludedObservations: [],
       gross: notApplicable("NO_MARK_OBSERVATIONS"),
       net: notApplicable("NO_MARK_OBSERVATIONS"),
       maxGrossDrawdownKrw: notApplicable("NO_MARK_OBSERVATIONS"),
       maxNetDrawdownKrw: notApplicable("NO_MARK_OBSERVATIONS"),
     };
   }
-  if (attributionFailed) {
+  const affectedMarkets = markets.filter((market) => attributionFailedMarkets.has(market));
+  if (affectedMarkets.length > 0) {
     const metric = unknown<readonly MarkPnlPoint[]>(["ATTRIBUTION_FAILURE"]);
     return {
       ...persistedBase,
       usableObservationCount: 0,
       sampleCount: 0,
       maxObservationGapMs: null,
+      excludedObservations: attributionFailureExclusions(observations, affectedMarkets),
       gross: metric,
       net: metric,
       maxGrossDrawdownKrw: unknown(["ATTRIBUTION_FAILURE"]),
@@ -405,10 +426,12 @@ function buildMarkCurve(
   const grossPoints: MarkPnlPoint[] = [];
   const netPoints: MarkPnlPoint[] = [];
   const usableTimestamps: string[] = [];
+  const exclusions: MarkObservationExclusion[] = [];
   let grossFailure: string | null = null;
   let netFailure: string | null = null;
   for (const observation of observations) {
     const valued = valueAtObservation(input, observation, markets);
+    exclusions.push(...valued.exclusions);
     if (valued.gross === null) {
       grossFailure = "MISSING_MARK_OR_COST";
     } else {
@@ -444,6 +467,7 @@ function buildMarkCurve(
     usableObservationCount: usableTimestamps.length,
     sampleCount: usableTimestamps.length,
     maxObservationGapMs: maximumTimestampGap(usableTimestamps),
+    excludedObservations: normalizeMarkExclusions(exclusions),
     gross,
     net,
     maxGrossDrawdownKrw:
@@ -461,7 +485,7 @@ function valueAtObservation(
   input: NormalizedDiagnosticsInput,
   observation: PerformanceMarkObservation,
   markets: readonly PerformanceMarket[],
-): { gross: number | null; net: number | null } {
+): MarkValuationResult {
   const fills = input.fills.filter(
     (fill) => comparePerformanceTimestamps(fill.filledAt, observation.capturedAt) <= 0,
   );
@@ -472,6 +496,9 @@ function valueAtObservation(
   );
   let gross = 0;
   let net = 0;
+  let grossAvailable = true;
+  let netAvailable = true;
+  const exclusions: MarkObservationExclusion[] = [];
   for (const market of markets) {
     const marketBuys = fills.filter((fill) => fill.market === market && fill.side === "bid");
     const marketSlices = slices.filter((slice) => slice.market === market);
@@ -496,20 +523,140 @@ function valueAtObservation(
       : null;
     const realizedGross = sum(marketSlices.map((slice) => slice.grossPnlBeforeFeesKrw ?? Number.NaN));
     const realizedNet = sum(marketSlices.map((slice) => slice.netRealizedPnlKrw ?? Number.NaN));
-    if (![acquisitionCost, realizedGross].every(Number.isFinite)) {
-      return { gross: null, net: null };
+    const reasons = new Map<MarkValuationExclusionReason, Set<MarkValuationMetricScope>>();
+    if (!Number.isFinite(acquisitionCost)) {
+      addMarkExclusionReason(reasons, "INCOMPLETE_ACQUISITION_COST", ["GROSS", "NET"]);
+    }
+    if (!Number.isFinite(realizedGross)) {
+      addMarkExclusionReason(
+        reasons,
+        "INCOMPLETE_REALIZED_GROSS_ATTRIBUTION",
+        ["GROSS", "NET"],
+      );
     }
     if (remainingQuantity > 0 && observation.prices[market] === undefined) {
-      return { gross: null, net: null };
+      addMarkExclusionReason(reasons, "MISSING_ACTIVE_POSITION_MARK", ["GROSS", "NET"]);
+    }
+    if (remainingBuyFees === null || !Number.isFinite(remainingBuyFees)) {
+      addMarkExclusionReason(reasons, "INCOMPLETE_REMAINING_BUY_FEE", ["NET"]);
+    }
+    if (!Number.isFinite(realizedNet)) {
+      addMarkExclusionReason(reasons, "INCOMPLETE_REALIZED_NET_ATTRIBUTION", ["NET"]);
+    }
+    if (reasons.size > 0) {
+      exclusions.push(markObservationExclusion(observation, market, reasons));
     }
     const markValue = remainingQuantity * (observation.prices[market] ?? 0);
-    gross += realizedGross + markValue - acquisitionCost;
-    if (remainingBuyFees === null || !Number.isFinite(remainingBuyFees) || !Number.isFinite(realizedNet)) {
-      return { gross, net: null };
+    const marketGrossAvailable =
+      Number.isFinite(acquisitionCost) &&
+      Number.isFinite(realizedGross) &&
+      !(remainingQuantity > 0 && observation.prices[market] === undefined);
+    const marketNetAvailable =
+      marketGrossAvailable &&
+      remainingBuyFees !== null &&
+      Number.isFinite(remainingBuyFees) &&
+      Number.isFinite(realizedNet);
+    if (marketGrossAvailable) {
+      gross += realizedGross + markValue - acquisitionCost;
+    } else {
+      grossAvailable = false;
+      netAvailable = false;
     }
-    net += realizedNet + markValue - acquisitionCost - remainingBuyFees;
+    if (marketNetAvailable) {
+      net += realizedNet + markValue - acquisitionCost - remainingBuyFees;
+    } else {
+      netAvailable = false;
+    }
   }
-  return { gross, net };
+  return {
+    gross: grossAvailable ? gross : null,
+    net: netAvailable ? net : null,
+    exclusions: normalizeMarkExclusions(exclusions),
+  };
+}
+
+type MarkValuationResult = {
+  gross: number | null;
+  net: number | null;
+  exclusions: readonly MarkObservationExclusion[];
+};
+
+function addMarkExclusionReason(
+  reasons: Map<MarkValuationExclusionReason, Set<MarkValuationMetricScope>>,
+  reason: MarkValuationExclusionReason,
+  scopes: readonly MarkValuationMetricScope[],
+): void {
+  const stored = reasons.get(reason) ?? new Set<MarkValuationMetricScope>();
+  for (const scope of scopes) stored.add(scope);
+  reasons.set(reason, stored);
+}
+
+function markObservationExclusion(
+  observation: PerformanceMarkObservation,
+  market: PerformanceMarket,
+  reasons: ReadonlyMap<MarkValuationExclusionReason, ReadonlySet<MarkValuationMetricScope>>,
+): MarkObservationExclusion {
+  const reasonCodes = [...reasons.keys()].sort();
+  const metricScopes = [...new Set([...reasons.values()].flatMap((scopes) => [...scopes]))].sort();
+  return {
+    snapshotId: observation.snapshotId,
+    capturedAt: observation.capturedAt,
+    market,
+    metricScopes,
+    reasonCodes,
+  };
+}
+
+function normalizeMarkExclusions(
+  exclusions: readonly MarkObservationExclusion[],
+): readonly MarkObservationExclusion[] {
+  const unique = new Map<string, MarkObservationExclusion>();
+  for (const exclusion of exclusions) {
+    const metricScopes = [...exclusion.metricScopes].sort();
+    const reasonCodes = [...exclusion.reasonCodes].sort();
+    const normalized = { ...exclusion, metricScopes, reasonCodes };
+    const key = [
+      performanceTimestampEpochNanoseconds(normalized.capturedAt).toString(),
+      normalized.snapshotId,
+      normalized.market,
+      metricScopes.join(","),
+      reasonCodes.join(","),
+    ].join("|");
+    unique.set(key, normalized);
+  }
+  return [...unique.values()]
+    .sort(
+      (left, right) =>
+        comparePerformanceTimestamps(left.capturedAt, right.capturedAt) ||
+        left.snapshotId.localeCompare(right.snapshotId) ||
+        left.market.localeCompare(right.market) ||
+        left.metricScopes.join(",").localeCompare(right.metricScopes.join(",")) ||
+        left.reasonCodes.join(",").localeCompare(right.reasonCodes.join(",")),
+    )
+    .map((exclusion) => ({
+      ...exclusion,
+      metricScopes: [...exclusion.metricScopes],
+      reasonCodes: [...exclusion.reasonCodes],
+    }));
+}
+
+function attributionFailureExclusions(
+  observations: readonly PerformanceMarkObservation[],
+  affectedMarkets: readonly PerformanceMarket[],
+): readonly MarkObservationExclusion[] {
+  const exclusions = observations.flatMap((observation) =>
+    affectedMarkets.map((market) => ({
+      snapshotId: observation.snapshotId,
+      capturedAt: observation.capturedAt,
+      market,
+      metricScopes: ["GROSS", "NET"] as const,
+      reasonCodes: [
+        "INCOMPLETE_REALIZED_GROSS_ATTRIBUTION",
+        "INCOMPLETE_REALIZED_NET_ATTRIBUTION",
+      ] as const,
+    })),
+  );
+  return normalizeMarkExclusions(exclusions);
 }
 
 function actionContributions(

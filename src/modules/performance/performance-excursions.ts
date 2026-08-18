@@ -1,5 +1,11 @@
 import { getMarketForAsset, type SupportedMarket } from "../../domain/types.js";
+import type { CandleCoverageGap } from "./performance-candle-coverage.js";
 import type { Metric } from "./performance-diagnostics.js";
+import {
+  assertVerifiedNoTradeCoverage,
+  partitionHourlyCoverage,
+  type VerifiedNoTradeCoverage,
+} from "./performance-hourly-coverage.js";
 import type { CounterfactualScenario } from "./strategy-counterfactual.js";
 import type {
   ResearchCandle,
@@ -49,6 +55,13 @@ export type EpisodeExcursion = {
     entryAt: string;
     exitAt: string;
   };
+  coverage: {
+    expectedIntervalCount: number;
+    observedIntervalCount: number;
+    verifiedNoTradeIntervalCount: number;
+    verifiedNoTradeRanges: readonly CandleCoverageGap[];
+    unexplainedMissingIntervals: readonly string[];
+  };
   maeKrw: Metric<number>;
   mfeKrw: Metric<number>;
   maePct: Metric<number>;
@@ -70,6 +83,7 @@ export type PerformanceExcursionInput = {
   dataset: ResearchCandleDataset;
   fills: readonly PerformanceTradeFill[];
   matchResult: PerformanceTradeMatchResult;
+  verifiedNoTradeCoverage?: VerifiedNoTradeCoverage;
 };
 
 export type PerformanceExcursionResult = {
@@ -133,6 +147,7 @@ export function analyzePerformanceExcursions(
       input.dataset,
       fillById,
       evidenceGaps,
+      input.verifiedNoTradeCoverage,
     ));
 
   return {
@@ -152,6 +167,7 @@ function analyzeEpisode(
   dataset: ResearchCandleDataset,
   fillById: ReadonlyMap<string, PerformanceTradeFill>,
   evidenceGaps: ExcursionEvidenceGap[],
+  verifiedNoTradeCoverage: PerformanceExcursionInput["verifiedNoTradeCoverage"],
 ): EpisodeExcursion {
   const entryFillId = episode.entryFillIds[0];
   if (!entryFillId) throw new Error(`Completed episode ${episode.id} has no entry fill.`);
@@ -166,11 +182,55 @@ function analyzeEpisode(
     && comparePerformanceTimestamps(candle.closeTime, episode.closedAt) <= 0);
   const first = intervalCandles[0];
   const last = intervalCandles[intervalCandles.length - 1];
+  const openedAt = performanceTimestampEpochNanoseconds(episode.openedAt);
+  const closedAt = performanceTimestampEpochNanoseconds(episode.closedAt);
+  const completeLegacyIntervals = (closedAt - openedAt) / HOUR_NANOSECONDS;
+  const legacyCoverageTo = openedAt + completeLegacyIntervals * HOUR_NANOSECONDS;
+  const legacyNonWholeHour = verifiedNoTradeCoverage === undefined && legacyCoverageTo !== closedAt;
+  if (verifiedNoTradeCoverage !== undefined) {
+    assertVerifiedNoTradeCoverage(verifiedNoTradeCoverage);
+    validateNoTradeSourceBoundary(verifiedNoTradeCoverage.sourceBoundary, dataset);
+    rejectFillBoundaryNoTrade(episode, verifiedNoTradeCoverage.ranges);
+  }
+  const coverage = verifiedNoTradeCoverage === undefined && completeLegacyIntervals === 0n
+    ? {
+      expectedIntervalCount: 0,
+      observedIntervalCount: 0,
+      verifiedNoTradeIntervalCount: 0,
+      unexplainedMissingIntervalCount: 0,
+      observedIntervals: [] as readonly string[],
+      verifiedNoTradeIntervals: [] as readonly string[],
+      verifiedNoTradeRanges: [] as readonly CandleCoverageGap[],
+      unexplainedMissingIntervals: [] as readonly string[],
+    }
+    : partitionHourlyCoverage({
+      from: episode.openedAt,
+      to: verifiedNoTradeCoverage === undefined ? formatTimestamp(legacyCoverageTo) : episode.closedAt,
+      sourceBoundary: verifiedNoTradeCoverage?.sourceBoundary ?? {
+        historyStartAt: episode.openedAt,
+        endAt: formatTimestamp(legacyCoverageTo),
+      },
+      observedIntervals: intervalCandles
+        .filter((candle) => performanceTimestampEpochNanoseconds(candle.closeTime) <= (
+          verifiedNoTradeCoverage === undefined ? legacyCoverageTo : closedAt
+        ))
+        .map((candle) => ({ openTime: candle.openTime, closeTime: candle.closeTime })),
+      verifiedNoTradeRanges: verifiedNoTradeCoverage?.ranges ?? [],
+    });
   const reasons: ExcursionGapCode[] = [];
   if (!first || comparePerformanceTimestamps(first.openTime, episode.openedAt) !== 0) {
     reasons.push("MISSING_ENTRY_BOUNDARY_COVERAGE");
   }
-  if (hasInternalGap(intervalCandles)) reasons.push("MISSING_INTERNAL_CANDLE_COVERAGE");
+  const firstInterval = intervalKey(openedAt, openedAt + HOUR_NANOSECONDS);
+  const lastInterval = intervalKey(closedAt - HOUR_NANOSECONDS, closedAt);
+  if (
+    legacyNonWholeHour
+      ? hasInternalGap(intervalCandles)
+      : coverage.unexplainedMissingIntervals.some((interval) =>
+        interval !== firstInterval && interval !== lastInterval)
+  ) {
+    reasons.push("MISSING_INTERNAL_CANDLE_COVERAGE");
+  }
   if (!last || comparePerformanceTimestamps(last.closeTime, episode.closedAt) !== 0) {
     reasons.push("MISSING_EXIT_BOUNDARY_COVERAGE");
   }
@@ -201,6 +261,13 @@ function analyzeEpisode(
       exitFillIds: [...episode.exitFillIds],
       entryAt: episode.openedAt,
       exitAt: episode.closedAt,
+    },
+    coverage: {
+      expectedIntervalCount: coverage.expectedIntervalCount,
+      observedIntervalCount: coverage.observedIntervalCount,
+      verifiedNoTradeIntervalCount: coverage.verifiedNoTradeIntervalCount,
+      verifiedNoTradeRanges: coverage.verifiedNoTradeRanges.map(copyGap),
+      unexplainedMissingIntervals: [...coverage.unexplainedMissingIntervals],
     },
     ...metrics,
     candleCount: intervalCandles.length,
@@ -535,6 +602,56 @@ function hasInternalGap(candles: readonly ResearchCandle[]): boolean {
     }
   }
   return false;
+}
+
+function validateNoTradeSourceBoundary(
+  boundary: NonNullable<PerformanceExcursionInput["verifiedNoTradeCoverage"]>["sourceBoundary"],
+  dataset: ResearchCandleDataset,
+): void {
+  if (
+    comparePerformanceTimestamps(boundary.historyStartAt, dataset.provenance.historyStartAt) !== 0
+    || comparePerformanceTimestamps(boundary.endAt, dataset.provenance.endAt) !== 0
+  ) {
+    throw new Error("Verified no-trade sourceBoundary must match dataset provenance boundaries.");
+  }
+}
+
+function rejectFillBoundaryNoTrade(
+  episode: PositionEpisode & { status: "COMPLETED"; closedAt: string },
+  ranges: readonly CandleCoverageGap[],
+): void {
+  const entryBoundaryClose = performanceTimestampEpochNanoseconds(episode.openedAt) + HOUR_NANOSECONDS;
+  const exitBoundaryClose = performanceTimestampEpochNanoseconds(episode.closedAt);
+  for (const range of ranges) {
+    const first = performanceTimestampEpochNanoseconds(range.firstMissingCloseTime);
+    const last = performanceTimestampEpochNanoseconds(range.lastMissingCloseTime);
+    if (entryBoundaryClose >= first && entryBoundaryClose <= last) {
+      throw new Error(`Verified no-trade evidence covers episode ${episode.id} entry fill boundary.`);
+    }
+    if (exitBoundaryClose >= first && exitBoundaryClose <= last) {
+      throw new Error(`Verified no-trade evidence covers episode ${episode.id} exit fill boundary.`);
+    }
+  }
+}
+
+function copyGap(range: CandleCoverageGap): CandleCoverageGap {
+  return {
+    firstMissingCloseTime: range.firstMissingCloseTime,
+    lastMissingCloseTime: range.lastMissingCloseTime,
+    missingCandleCount: range.missingCandleCount,
+    previousObservedCloseTime: range.previousObservedCloseTime,
+    nextObservedCloseTime: range.nextObservedCloseTime,
+  };
+}
+
+function intervalKey(open: bigint, close: bigint): string {
+  return `${formatTimestamp(open)}/${formatTimestamp(close)}`;
+}
+
+function formatTimestamp(epochNanoseconds: bigint): string {
+  const seconds = epochNanoseconds / 1_000_000_000n;
+  const nanoseconds = epochNanoseconds % 1_000_000_000n;
+  return `${new Date(Number(seconds * 1_000n)).toISOString().slice(0, 19)}.${nanoseconds.toString().padStart(9, "0")}Z`;
 }
 
 function gap(

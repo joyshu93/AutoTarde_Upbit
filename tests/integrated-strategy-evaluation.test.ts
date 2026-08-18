@@ -13,10 +13,13 @@ import {
 import {
   buildInterpretation,
   buildIntegratedStrategyEvaluation,
+  calculateConditionalAddCadenceCoverage,
+  extractAddPolicySuppressionEvidence,
   formatIntegratedStrategyEvaluation,
   parseIntegratedStrategyEvaluationArgs,
   type IntegratedStrategyEvaluationReport,
 } from "../src/research/integrated-strategy-evaluation.js";
+import * as integratedStrategyEvaluation from "../src/research/integrated-strategy-evaluation.js";
 import { test } from "./harness.js";
 
 const TMP_ROOT = path.resolve(".tmp-db-tests", "integrated-strategy-evaluation");
@@ -28,6 +31,7 @@ const OBSERVED_MARK_CASES = [
     usable: 0,
     gapCode: "MARK_DATA_UNAVAILABLE",
     metricStatus: "NOT_APPLICABLE",
+    excludedSnapshotIds: [] as const,
   },
   {
     label: "unusable",
@@ -36,6 +40,7 @@ const OBSERVED_MARK_CASES = [
     usable: 0,
     gapCode: "MARK_DATA_UNUSABLE",
     metricStatus: "UNKNOWN",
+    excludedSnapshotIds: ["mark-snapshot-1"] as const,
   },
   {
     label: "partial",
@@ -44,6 +49,7 @@ const OBSERVED_MARK_CASES = [
     usable: 1,
     gapCode: "MARK_DATA_PARTIAL",
     metricStatus: "UNKNOWN",
+    excludedSnapshotIds: ["mark-snapshot-1"] as const,
   },
   {
     label: "complete",
@@ -52,6 +58,7 @@ const OBSERVED_MARK_CASES = [
     usable: 2,
     gapCode: null,
     metricStatus: "KNOWN",
+    excludedSnapshotIds: [] as const,
   },
 ] as const;
 
@@ -227,6 +234,502 @@ test("integrated evaluation CLI requires a complete explicit stability validatio
   );
 });
 
+test("integrated evaluation CLI accepts the complete conditional ADD research matrix explicitly", () => {
+  const parsed = parseIntegratedStrategyEvaluationArgs(conditionalSimulationArgs("BTC", "./btc.json"));
+
+  assert.deepEqual(parsed.simulation?.scenarios, [
+    "BASELINE",
+    "NO_ADD",
+    "ADD_RISK_CLEAR",
+    "ADD_HIGH_ALIGNMENT",
+    "ADD_CORE_TREND",
+  ]);
+  assert.equal(parsed.stabilityValidation?.windows.length, 3);
+  assert.deepEqual(parsed.simulation?.costScenarios, [
+    { id: "base", feeRate: 0.0005, slippageRate: 0.0003 },
+    { id: "stress", feeRate: 0.001, slippageRate: 0.002 },
+  ]);
+});
+
+test("conditional ADD suppression evidence comes only from candidate replay researchSuppression", () => {
+  const evidence = extractAddPolicySuppressionEvidence("BTC", [
+    {
+      policyId: "ADD_RISK_CLEAR",
+      frames: [
+        {
+          generatedAt: "2026-08-01T09:00:00+09:00",
+          researchSuppression: {
+            policyId: "ADD_RISK_CLEAR",
+            originalAction: "ADD",
+            reason: "ATR_SHOCK",
+            generatedAt: "2026-08-01T00:00:00.000Z",
+            analysisSnapshot: {
+              atrShock: true,
+              weakeningStage: "NONE",
+              trendAlignmentScore: 5,
+              regime: "BULL_TREND",
+            },
+          },
+        },
+        {
+          generatedAt: "2026-08-01T01:00:00.000Z",
+          researchSuppression: null,
+        },
+      ],
+    },
+    {
+      policyId: "ADD_HIGH_ALIGNMENT",
+      frames: [{
+        generatedAt: "2026-08-01T02:00:00.000Z",
+        researchSuppression: {
+          policyId: "ADD_HIGH_ALIGNMENT",
+          originalAction: "ADD",
+          reason: "TREND_ALIGNMENT_BELOW_4",
+          generatedAt: "2026-08-01T11:00:00+09:00",
+          analysisSnapshot: {
+            atrShock: false,
+            weakeningStage: "NONE",
+            trendAlignmentScore: 3,
+            regime: "PULLBACK_IN_UPTREND",
+          },
+        },
+      }],
+    },
+    {
+      policyId: "ADD_CORE_TREND",
+      frames: [],
+    },
+  ]);
+
+  assert.deepEqual(evidence, [
+    {
+      policyId: "ADD_RISK_CLEAR",
+      suppressedDecisions: [{
+        generatedAt: "2026-08-01T00:00:00.000Z",
+        evidenceIds: [
+          "research-suppression:BTC:KRW-BTC:ADD_RISK_CLEAR:2026-08-01T00:00:00.000Z:ATR_SHOCK",
+        ],
+      }],
+    },
+    {
+      policyId: "ADD_HIGH_ALIGNMENT",
+      suppressedDecisions: [{
+        generatedAt: "2026-08-01T02:00:00.000Z",
+        evidenceIds: [
+          "research-suppression:BTC:KRW-BTC:ADD_HIGH_ALIGNMENT:2026-08-01T02:00:00.000Z:TREND_ALIGNMENT_BELOW_4",
+        ],
+      }],
+    },
+    {
+      policyId: "ADD_CORE_TREND",
+      suppressedDecisions: [],
+    },
+  ]);
+});
+
+test("conditional ADD suppression evidence ids cannot collide across BTC and ETH", () => {
+  const replay = [{
+    policyId: "ADD_RISK_CLEAR" as const,
+    frames: [{
+      generatedAt: "2026-08-01T00:00:00.000Z",
+      researchSuppression: {
+        policyId: "ADD_RISK_CLEAR" as const,
+        originalAction: "ADD" as const,
+        reason: "ATR_SHOCK" as const,
+        generatedAt: "2026-08-01T00:00:00.000Z",
+        analysisSnapshot: {
+          atrShock: true,
+          weakeningStage: "NONE" as const,
+          trendAlignmentScore: 5,
+          regime: "BULL_TREND" as const,
+        },
+      },
+    }],
+  }];
+
+  const btcId = extractAddPolicySuppressionEvidence("BTC", replay)[0]!.suppressedDecisions[0]!.evidenceIds[0];
+  const ethId = extractAddPolicySuppressionEvidence("ETH", replay)[0]!.suppressedDecisions[0]!.evidenceIds[0];
+
+  assert.equal(btcId, "research-suppression:BTC:KRW-BTC:ADD_RISK_CLEAR:2026-08-01T00:00:00.000Z:ATR_SHOCK");
+  assert.equal(ethId, "research-suppression:ETH:KRW-ETH:ADD_RISK_CLEAR:2026-08-01T00:00:00.000Z:ATR_SHOCK");
+  assert.notEqual(btcId, ethId);
+});
+
+test("conditional ADD cadence coverage detects an off-grid replacement at exact epoch instants", () => {
+  const coverage = calculateConditionalAddCadenceCoverage({
+    from: "2026-07-30T09:00:00+09:00",
+    to: "2026-07-30T04:00:00Z",
+    expectedFrameIntervalMs: 3_600_000,
+    frames: [
+      { generatedAt: "2026-07-30T00:00:00.000Z" },
+      { generatedAt: "2026-07-30T01:00:00.000Z" },
+      { generatedAt: "2026-07-30T02:30:00.000Z" },
+      { generatedAt: "2026-07-30T03:00:00.000Z" },
+    ],
+    featureLookbackAffectedRanges: [],
+    noTradeFrameRanges: [],
+  });
+
+  assert.deepEqual(coverage, {
+    status: "INCOMPLETE",
+    expectedFrameIntervalMs: 3_600_000,
+    firstExpectedFrameAt: "2026-07-30T00:00:00.000Z",
+    endExclusiveAt: "2026-07-30T04:00:00.000Z",
+    expectedFrameCount: 4,
+    observedFrameCount: 3,
+    noTradeFrameCount: 0,
+    noTradeRanges: [],
+    missingFrameCount: 1,
+    duplicateFrameCount: 0,
+    offGridFrameCount: 1,
+    missingRanges: [{
+      firstMissingAt: "2026-07-30T02:00:00.000Z",
+      lastMissingAt: "2026-07-30T02:00:00.000Z",
+      missingFrameCount: 1,
+      previousObservedAt: "2026-07-30T01:00:00.000Z",
+      nextObservedAt: "2026-07-30T03:00:00.000Z",
+    }],
+    duplicateInstants: [],
+    offGridInstants: [{ observedAt: "2026-07-30T02:30:00.000Z", occurrenceCount: 1 }],
+    windowCadenceStatus: "INCOMPLETE",
+    windowSequenceContinuityStatus: "INCOMPLETE",
+    windowClockGridStatus: "ANOMALOUS",
+    upstreamStateContinuityStatus: "COMPLETE",
+    featureLookbackContinuityStatus: "COMPLETE",
+    upstreamExpectedFrameCount: 0,
+    upstreamObservedFrameCount: 0,
+    upstreamSequenceContinuityStatus: "COMPLETE",
+    upstreamClockGridStatus: "DENSE",
+    upstreamNoTradeFrameCount: 0,
+    upstreamNoTradeRanges: [],
+    upstreamFirstExpectedFrameAt: null,
+    upstreamEndExclusiveAt: null,
+    upstreamMissingFrameCount: 0,
+    upstreamDuplicateFrameCount: 0,
+    upstreamOffGridFrameCount: 0,
+    upstreamMissingRanges: [],
+    upstreamDuplicateInstants: [],
+    upstreamOffGridInstants: [],
+    featureLookbackAffectedFrameCount: 0,
+    featureLookbackAffectedRanges: [],
+  });
+});
+
+test("conditional ADD cadence coverage keeps duplicate actual frames blocking", () => {
+  const coverage = calculateConditionalAddCadenceCoverage({
+    from: "2026-07-30T00:00:00.000Z",
+    to: "2026-07-30T03:00:00.000Z",
+    expectedFrameIntervalMs: 3_600_000,
+    frames: [
+      { generatedAt: "2026-07-30T00:00:00.000Z" },
+      { generatedAt: "2026-07-30T01:00:00.000Z" },
+      { generatedAt: "2026-07-30T01:00:00.000Z" },
+      { generatedAt: "2026-07-30T02:00:00.000Z" },
+    ],
+    featureLookbackAffectedRanges: [],
+    noTradeFrameRanges: [],
+  });
+
+  assert.equal(coverage.status, "INCOMPLETE");
+  assert.equal(coverage.windowSequenceContinuityStatus, "INCOMPLETE");
+  assert.equal(coverage.windowClockGridStatus, "ANOMALOUS");
+  assert.equal(coverage.observedFrameCount, 3);
+  assert.equal(coverage.duplicateFrameCount, 1);
+  assert.deepEqual(coverage.duplicateInstants, [{
+    observedAt: "2026-07-30T01:00:00.000Z",
+    occurrenceCount: 2,
+  }]);
+});
+
+test("conditional ADD cadence coverage groups consecutive missing frames without interpolation", () => {
+  const coverage = calculateConditionalAddCadenceCoverage({
+    from: "2026-07-30T00:00:00.000Z",
+    to: "2026-07-30T08:00:00.000Z",
+    expectedFrameIntervalMs: 3_600_000,
+    frames: [
+      { generatedAt: "2026-07-30T00:00:00.000Z" },
+      { generatedAt: "2026-07-30T03:00:00.000Z" },
+      { generatedAt: "2026-07-30T04:00:00.000Z" },
+      { generatedAt: "2026-07-30T07:00:00.000Z" },
+    ],
+    featureLookbackAffectedRanges: [],
+    noTradeFrameRanges: [],
+  });
+
+  assert.deepEqual(coverage, {
+    status: "INCOMPLETE",
+    expectedFrameIntervalMs: 3_600_000,
+    firstExpectedFrameAt: "2026-07-30T00:00:00.000Z",
+    endExclusiveAt: "2026-07-30T08:00:00.000Z",
+    expectedFrameCount: 8,
+    observedFrameCount: 4,
+    noTradeFrameCount: 0,
+    noTradeRanges: [],
+    missingFrameCount: 4,
+    duplicateFrameCount: 0,
+    offGridFrameCount: 0,
+    missingRanges: [
+      {
+        firstMissingAt: "2026-07-30T01:00:00.000Z",
+        lastMissingAt: "2026-07-30T02:00:00.000Z",
+        missingFrameCount: 2,
+        previousObservedAt: "2026-07-30T00:00:00.000Z",
+        nextObservedAt: "2026-07-30T03:00:00.000Z",
+      },
+      {
+        firstMissingAt: "2026-07-30T05:00:00.000Z",
+        lastMissingAt: "2026-07-30T06:00:00.000Z",
+        missingFrameCount: 2,
+        previousObservedAt: "2026-07-30T04:00:00.000Z",
+        nextObservedAt: "2026-07-30T07:00:00.000Z",
+      },
+    ],
+    duplicateInstants: [],
+    offGridInstants: [],
+    windowCadenceStatus: "INCOMPLETE",
+    windowSequenceContinuityStatus: "INCOMPLETE",
+    windowClockGridStatus: "ANOMALOUS",
+    upstreamStateContinuityStatus: "COMPLETE",
+    featureLookbackContinuityStatus: "COMPLETE",
+    upstreamExpectedFrameCount: 0,
+    upstreamObservedFrameCount: 0,
+    upstreamSequenceContinuityStatus: "COMPLETE",
+    upstreamClockGridStatus: "DENSE",
+    upstreamNoTradeFrameCount: 0,
+    upstreamNoTradeRanges: [],
+    upstreamFirstExpectedFrameAt: null,
+    upstreamEndExclusiveAt: null,
+    upstreamMissingFrameCount: 0,
+    upstreamDuplicateFrameCount: 0,
+    upstreamOffGridFrameCount: 0,
+    upstreamMissingRanges: [],
+    upstreamDuplicateInstants: [],
+    upstreamOffGridInstants: [],
+    featureLookbackAffectedFrameCount: 0,
+    featureLookbackAffectedRanges: [],
+  });
+});
+
+test("conditional ADD cadence coverage rejects a complete window with incomplete upstream replay state", () => {
+  const coverage = calculateConditionalAddCadenceCoverage({
+    replayStartAt: "2026-07-30T00:00:00.000Z",
+    from: "2026-07-30T03:00:00.000Z",
+    to: "2026-07-30T06:00:00.000Z",
+    expectedFrameIntervalMs: 3_600_000,
+    frames: [
+      { generatedAt: "2026-07-30T00:00:00.000Z" },
+      { generatedAt: "2026-07-30T03:00:00.000Z" },
+      { generatedAt: "2026-07-30T04:00:00.000Z" },
+      { generatedAt: "2026-07-30T05:00:00.000Z" },
+    ],
+    featureLookbackAffectedRanges: [],
+    noTradeFrameRanges: [],
+  });
+
+  assert.equal(coverage.windowCadenceStatus, "COMPLETE");
+  assert.equal(coverage.missingFrameCount, 0);
+  assert.equal(coverage.upstreamStateContinuityStatus, "INCOMPLETE");
+  assert.equal(coverage.upstreamMissingFrameCount, 2);
+  assert.deepEqual(coverage.upstreamMissingRanges.map(({ firstMissingAt, lastMissingAt }) => ({
+    firstMissingAt,
+    lastMissingAt,
+  })), [{
+    firstMissingAt: "2026-07-30T01:00:00.000Z",
+    lastMissingAt: "2026-07-30T02:00:00.000Z",
+  }]);
+  assert.equal(
+    coverage.upstreamMissingRanges[0]?.nextObservedAt,
+    "2026-07-30T03:00:00.000Z",
+  );
+  assert.equal(coverage.status, "INCOMPLETE");
+});
+
+test("conditional ADD cadence treats approved sparse 1h closes as no-trade evidence", () => {
+  const coverage = calculateConditionalAddCadenceCoverage({
+    from: "2026-07-30T00:00:00.000Z",
+    to: "2026-07-30T06:00:00.000Z",
+    expectedFrameIntervalMs: 3_600_000,
+    frames: [
+      { generatedAt: "2026-07-30T00:00:00.000Z" },
+      { generatedAt: "2026-07-30T03:00:00.000Z" },
+      { generatedAt: "2026-07-30T04:00:00.000Z" },
+      { generatedAt: "2026-07-30T05:00:00.000Z" },
+    ],
+    featureLookbackAffectedRanges: [],
+    noTradeFrameRanges: [{
+      firstMissingCloseTime: "2026-07-30T01:00:00.000Z",
+      lastMissingCloseTime: "2026-07-30T02:00:00.000Z",
+      missingCandleCount: 2,
+      previousObservedCloseTime: "2026-07-30T00:00:00.000Z",
+      nextObservedCloseTime: "2026-07-30T03:00:00.000Z",
+    }],
+  });
+
+  assert.equal(coverage.status, "COMPLETE");
+  assert.equal(coverage.windowCadenceStatus, "INCOMPLETE");
+  assert.equal(coverage.windowSequenceContinuityStatus, "COMPLETE");
+  assert.equal(coverage.windowClockGridStatus, "SPARSE_BY_CONTRACT");
+  assert.equal(coverage.observedFrameCount, 4);
+  assert.equal(coverage.noTradeFrameCount, 2);
+  assert.equal(coverage.missingFrameCount, 0);
+  assert.deepEqual(coverage.noTradeRanges.map((range) => ({
+    firstMissingAt: range.firstMissingAt,
+    lastMissingAt: range.lastMissingAt,
+    missingFrameCount: range.missingFrameCount,
+  })), [{
+    firstMissingAt: "2026-07-30T01:00:00.000Z",
+    lastMissingAt: "2026-07-30T02:00:00.000Z",
+    missingFrameCount: 2,
+  }]);
+  assert.deepEqual(coverage.missingRanges, []);
+});
+
+test("conditional ADD cadence rejects no-trade collisions before inside and after the selected replay range", () => {
+  const base = {
+    from: "2026-07-30T03:00:00.000Z",
+    to: "2026-07-30T06:00:00.000Z",
+    replayStartAt: "2026-07-30T03:00:00.000Z",
+    expectedFrameIntervalMs: 3_600_000,
+    frames: [
+      { generatedAt: "2026-07-30T00:00:00.000Z" },
+      { generatedAt: "2026-07-30T03:00:00.000Z" },
+      { generatedAt: "2026-07-30T04:00:00.000Z" },
+      { generatedAt: "2026-07-30T05:00:00.000Z" },
+      { generatedAt: "2026-07-30T06:00:00.000Z" },
+    ],
+    featureLookbackAffectedRanges: [],
+  };
+  for (const closeTime of [
+    "2026-07-30T00:00:00.000Z",
+    "2026-07-30T03:00:00.000Z",
+    "2026-07-30T06:00:00.000Z",
+  ]) {
+    assert.throws(
+      () => calculateConditionalAddCadenceCoverage({
+        ...base,
+        noTradeFrameRanges: [{
+          firstMissingCloseTime: closeTime,
+          lastMissingCloseTime: closeTime,
+          missingCandleCount: 1,
+          previousObservedCloseTime: null,
+          nextObservedCloseTime: null,
+        }],
+      }),
+      /cannot classify an observed frame as no-trade/,
+    );
+  }
+});
+
+test("conditional ADD cadence rejects malformed and non-canonical no-trade range evidence", () => {
+  const base = {
+    from: "2026-07-30T00:00:00.000Z",
+    to: "2026-07-30T06:00:00.000Z",
+    expectedFrameIntervalMs: 3_600_000,
+    frames: [
+      { generatedAt: "2026-07-30T00:00:00.000Z" },
+      { generatedAt: "2026-07-30T03:00:00.000Z" },
+      { generatedAt: "2026-07-30T04:00:00.000Z" },
+      { generatedAt: "2026-07-30T05:00:00.000Z" },
+    ],
+    featureLookbackAffectedRanges: [],
+  };
+  const range = (firstMissingCloseTime: string, lastMissingCloseTime: string, missingCandleCount: number) => ({
+    firstMissingCloseTime,
+    lastMissingCloseTime,
+    missingCandleCount,
+    previousObservedCloseTime: null,
+    nextObservedCloseTime: null,
+  });
+
+  assert.throws(() => calculateConditionalAddCadenceCoverage({
+    ...base,
+    noTradeFrameRanges: [range("2026-07-30T01:00:00.000Z", "2026-07-30T02:00:00.000Z", 1)],
+  }), /timestamp span must match missingCandleCount/);
+  assert.throws(() => calculateConditionalAddCadenceCoverage({
+    ...base,
+    noTradeFrameRanges: [range("2026-07-30T01:30:00.000Z", "2026-07-30T01:30:00.000Z", 1)],
+  }), /must align to expectedFrameIntervalMs/);
+  assert.throws(() => calculateConditionalAddCadenceCoverage({
+    ...base,
+    noTradeFrameRanges: [
+      range("2026-07-30T01:00:00.000Z", "2026-07-30T02:00:00.000Z", 2),
+      range("2026-07-30T02:00:00.000Z", "2026-07-30T02:00:00.000Z", 1),
+    ],
+  }), /strictly ordered and non-overlapping/);
+  assert.throws(() => calculateConditionalAddCadenceCoverage({
+    ...base,
+    noTradeFrameRanges: [
+      range("2026-07-30T01:00:00.000Z", "2026-07-30T01:00:00.000Z", 1),
+      range("2026-07-30T02:00:00.000Z", "2026-07-30T02:00:00.000Z", 1),
+    ],
+  }), /must be canonical and non-adjacent/);
+});
+
+test("conditional ADD cadence clips no-trade evidence at selected boundaries without creating frames", () => {
+  const coverage = calculateConditionalAddCadenceCoverage({
+    from: "2026-07-30T03:00:00.000Z",
+    to: "2026-07-30T06:00:00.000Z",
+    replayStartAt: "2026-07-30T00:00:00.000Z",
+    expectedFrameIntervalMs: 3_600_000,
+    frames: [
+      { generatedAt: "2026-07-30T00:00:00.000Z" },
+    ],
+    featureLookbackAffectedRanges: [],
+    noTradeFrameRanges: [{
+      firstMissingCloseTime: "2026-07-30T01:00:00.000Z",
+      lastMissingCloseTime: "2026-07-30T07:00:00.000Z",
+      missingCandleCount: 7,
+      previousObservedCloseTime: "2026-07-30T00:00:00.000Z",
+      nextObservedCloseTime: null,
+    }],
+  });
+
+  assert.equal(coverage.status, "COMPLETE");
+  assert.equal(coverage.observedFrameCount, 0);
+  assert.equal(coverage.noTradeFrameCount, 3);
+  assert.equal(coverage.missingFrameCount, 0);
+  assert.deepEqual(coverage.noTradeRanges, [{
+    firstMissingAt: "2026-07-30T03:00:00.000Z",
+    lastMissingAt: "2026-07-30T05:00:00.000Z",
+    missingFrameCount: 3,
+    previousObservedAt: null,
+    nextObservedAt: null,
+  }]);
+  assert.equal(coverage.upstreamNoTradeFrameCount, 2);
+  assert.deepEqual(coverage.upstreamNoTradeRanges, [{
+    firstMissingAt: "2026-07-30T01:00:00.000Z",
+    lastMissingAt: "2026-07-30T02:00:00.000Z",
+    missingFrameCount: 2,
+    previousObservedAt: "2026-07-30T00:00:00.000Z",
+    nextObservedAt: null,
+  }]);
+});
+
+test("conditional ADD cadence ignores wholly outside no-trade ranges without synthesizing evidence", () => {
+  const coverage = calculateConditionalAddCadenceCoverage({
+    from: "2026-07-30T00:00:00.000Z",
+    to: "2026-07-30T03:00:00.000Z",
+    expectedFrameIntervalMs: 3_600_000,
+    frames: [
+      { generatedAt: "2026-07-30T00:00:00.000Z" },
+      { generatedAt: "2026-07-30T01:00:00.000Z" },
+      { generatedAt: "2026-07-30T02:00:00.000Z" },
+    ],
+    featureLookbackAffectedRanges: [],
+    noTradeFrameRanges: [{
+      firstMissingCloseTime: "2026-07-30T07:00:00.000Z",
+      lastMissingCloseTime: "2026-07-30T08:00:00.000Z",
+      missingCandleCount: 2,
+      previousObservedCloseTime: null,
+      nextObservedCloseTime: null,
+    }],
+  });
+
+  assert.equal(coverage.status, "COMPLETE");
+  assert.equal(coverage.noTradeFrameCount, 0);
+  assert.deepEqual(coverage.noTradeRanges, []);
+});
+
 test("Task 6 candle fixtures use exact timeframe durations", () => {
   const dataset = createDataset("BTC");
   const expectedDurationMs: Record<ResearchCandleTimeframe, number> = {
@@ -309,6 +812,10 @@ for (const fixture of OBSERVED_MARK_CASES) {
         assert.equal(curve.persistedObservationCount, fixture.persisted);
         assert.equal(curve.usableObservationCount, fixture.usable);
         assert.equal(curve.gross.status, fixture.metricStatus);
+        assert.deepEqual(
+          curve.excludedObservations.map((exclusion) => exclusion.snapshotId),
+          fixture.excludedSnapshotIds,
+        );
         assert.deepEqual(markGaps.map((gap) => gap.code), fixture.gapCode === null ? [] : [fixture.gapCode]);
         if (fixture.gapCode !== null) {
           const gap = markGaps[0];
@@ -316,7 +823,14 @@ for (const fixture of OBSERVED_MARK_CASES) {
             "observedLive.diagnostics.markPnlCurve",
             "observedLive.diagnostics.marketMarkPnlCurves",
           ]);
+          assert.deepEqual(gap?.evidenceIds, fixture.excludedSnapshotIds);
           assert.match(gap?.message ?? "", new RegExp(`persisted=${fixture.persisted}, usable=${fixture.usable}`));
+          if (fixture.excludedSnapshotIds.length > 0) {
+            assert.match(gap?.message ?? "", /MISSING_ACTIVE_POSITION_MARK=1/);
+            const text = formatIntegratedStrategyEvaluation(report, "text");
+            assert.doesNotMatch(text, /Observed mark exclusions:/);
+            assert.doesNotMatch(text, /Observed mark exclusion:/);
+          }
         }
         if (fixture.metricStatus === "UNKNOWN") {
           assert.deepEqual(curve.gross, { status: "UNKNOWN", reasons: ["MISSING_MARK_OR_COST"] });
@@ -326,6 +840,54 @@ for (const fixture of OBSERVED_MARK_CASES) {
     );
   });
 }
+
+test("same-epoch mark coalescing does not create a false partial-evidence gap", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase(
+      "mark-same-epoch-coalescing",
+      (db) => seedObservedMarkFixture(db, ["110", "110"], {
+        capturedAts: ["2026-08-01T02:00:00.000Z", "2026-08-01T11:00:00.000+09:00"],
+      }),
+    ),
+    cleanupFixture,
+    async (databasePath) => {
+      const report = await buildIntegratedStrategyEvaluation(
+        parseIntegratedStrategyEvaluationArgs(replaceArg(requiredArgs(), "--database", databasePath)),
+      );
+      const curve = report.observedLive.diagnostics.markPnlCurve;
+
+      assert.equal(curve.persistedObservationCount, 2);
+      assert.equal(curve.usableObservationCount, 1);
+      assert.deepEqual(
+        curve.excludedObservations.filter((item) => item.metricScopes.includes("GROSS")),
+        [],
+      );
+      assert.deepEqual(
+        report.evidenceGaps.filter((gap) => gap.code.startsWith("MARK_DATA_")),
+        [],
+      );
+    },
+  );
+});
+
+test("gross mark gaps do not attribute NET-only fee reasons", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase(
+      "mark-gross-reason-scope",
+      (db) => seedObservedMarkFixture(db, [null], { feeAmount: null }),
+    ),
+    cleanupFixture,
+    async (databasePath) => {
+      const report = await buildIntegratedStrategyEvaluation(
+        parseIntegratedStrategyEvaluationArgs(replaceArg(requiredArgs(), "--database", databasePath)),
+      );
+      const gap = report.evidenceGaps.find((item) => item.code === "MARK_DATA_UNUSABLE");
+
+      assert.match(gap?.message ?? "", /MISSING_ACTIVE_POSITION_MARK=1/);
+      assert.doesNotMatch(gap?.message ?? "", /INCOMPLETE_REMAINING_BUY_FEE/);
+    },
+  );
+});
 
 test("observed attribution keeps selected-stream and opening-inventory evidence separate", async () => {
   await withFixtureResource(
@@ -633,6 +1195,458 @@ test("integrated evaluation exposes optional anchored forward stability by asset
   );
 });
 
+test("conditional ADD evaluation reports a stable BTC and ETH candidate matrix without changing legacy analyses", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase("conditional-add-integration"),
+    cleanupFixture,
+    async (databasePath) => withFixtureResource(
+      () => writeDatasetFixture("BTC", "conditional-add-integration", {
+        commonCoverageDays: 260,
+      }),
+      (btcPath) => rm(path.dirname(btcPath), { recursive: true, force: true }),
+      async (btcPath) => {
+        const ethPath = await writeDatasetFixture("ETH", "conditional-add-integration", {
+          commonCoverageDays: 260,
+        });
+        const options = parseIntegratedStrategyEvaluationArgs([
+          ...replaceArg(requiredArgs(), "--database", databasePath),
+          "--btc-dataset", btcPath,
+          "--btc-initial-state", '{"cashKrw":1000000,"quantity":0,"averageEntryPriceKrw":0}',
+          "--eth-dataset", ethPath,
+          "--eth-initial-state", '{"cashKrw":2000000,"quantity":0,"averageEntryPriceKrw":0}',
+          ...conditionalResearchArgs(),
+        ]);
+
+        const first = await buildIntegratedStrategyEvaluation(options);
+        const second = await buildIntegratedStrategyEvaluation(options);
+        const firstJson = formatIntegratedStrategyEvaluation(first, "json");
+        const section = requireConditionalAddPolicyEvaluation(first);
+        const addLossAttribution = first.addLossAttribution;
+
+        assert.equal(firstJson, formatIntegratedStrategyEvaluation(second, "json"));
+        assert.equal(section.status, "AVAILABLE");
+        assert.equal(section.deploymentApproval, false);
+        assert.match(section.warning, /not deployment approval/i);
+        assert.deepEqual(section.windows.map((window) => window.id), ["W1", "W2", "W3"]);
+        assert.deepEqual(section.assets.map((asset) => [asset.asset, asset.status]), [
+          ["BTC", "AVAILABLE"],
+          ["ETH", "AVAILABLE"],
+        ]);
+        assert.ok(first.provenance.datasets.every((dataset) =>
+          dataset.featureCoverage !== undefined
+          && dataset.featureCoverage.status === "COMPLETE"
+          && dataset.featureCoverage.continuityPolicy === "GENERATED_CANDLES_SINCE_DATASET_START"));
+        for (const asset of section.assets) {
+          if (asset.status !== "AVAILABLE") continue;
+          assert.deepEqual(asset.candidates.map((candidate) => candidate.candidate), [
+            "ADD_RISK_CLEAR",
+            "ADD_HIGH_ALIGNMENT",
+            "ADD_CORE_TREND",
+          ]);
+          for (const candidate of asset.candidates) {
+            assert.deepEqual(Object.keys(candidate.costAnchors), ["BASE", "STRESS"]);
+            assert.equal(candidate.costAnchors.BASE.feeRate, 0.0005);
+            assert.equal(candidate.costAnchors.BASE.slippageRate, 0.0003);
+            assert.equal(candidate.costAnchors.STRESS.feeRate, 0.001);
+            assert.equal(candidate.costAnchors.STRESS.slippageRate, 0.002);
+            assert.equal(candidate.observations.fullPath.observations.length, 6);
+            assert.equal(candidate.observations.windows.length, 3);
+            assert.ok(Number.isSafeInteger(
+              candidate.gates.policyExposedCompletedEpisodes.fullPathObservedCount,
+            ));
+            assert.ok(candidate.gates.policyExposedCompletedEpisodes.windows.every((window) =>
+              Number.isSafeInteger(window.observedCount)));
+            assert.equal(candidate.gates.frameCoverage.fullPath.missingFrameCount, 0);
+            assert.deepEqual(candidate.gates.frameCoverage.fullPath.missingRanges, []);
+            assert.equal(candidate.gates.frameCoverage.fullPath.featureLookbackContinuityStatus, "COMPLETE");
+            assert.equal(candidate.gates.frameCoverage.fullPath.featureLookbackAffectedFrameCount, 0);
+            assert.ok(candidate.gates.frameCoverage.windows.every((window) =>
+              window.upstreamStateContinuityStatus === "COMPLETE"));
+          }
+        }
+
+        const legacyStabilityScenarios = first.stabilityValidation?.assets.flatMap((asset) =>
+          asset.status === "AVAILABLE"
+            ? asset.analyses.flatMap((analysis) => analysis.windows.flatMap((window) => [
+                window.baseline.scenario,
+                window.noAdd.scenario,
+              ]))
+            : []
+        ) ?? [];
+        assert.ok(legacyStabilityScenarios.every((scenario) =>
+          scenario === "BASELINE" || scenario === "NO_ADD"));
+        assert.ok(first.addDiagnostics.assets.every((asset) =>
+          asset.status !== "AVAILABLE" || asset.analyses.length === 2));
+
+        assert.ok(addLossAttribution, "full BTC/ETH conditional matrix must include ADD loss attribution");
+        assert.equal(addLossAttribution.selectedFlowAttribution, true);
+        assert.equal(addLossAttribution.causalClaim, false);
+        assert.equal(addLossAttribution.deploymentApproval, false);
+        assert.deepEqual(addLossAttribution.assets.map((item) => item.asset), ["BTC", "ETH"]);
+        assert.deepEqual(addLossAttribution.provenance.candidateIds, [
+          "ADD_RISK_CLEAR",
+          "ADD_HIGH_ALIGNMENT",
+          "ADD_CORE_TREND",
+        ]);
+        assert.deepEqual(addLossAttribution.provenance.validationWindowIds, ["W1", "W2", "W3"]);
+        assert.deepEqual(addLossAttribution.provenance.costScenarioIds, ["base", "stress"]);
+        assert.equal(addLossAttribution.provenance.attributionCostScenarioId, "base");
+        assert.equal(addLossAttribution.provenance.selectedFlow.databasePath, databasePath);
+        assert.deepEqual(
+          addLossAttribution.provenance.policySuppressionEvidence.map((item) => item.asset),
+          ["BTC", "ETH"],
+        );
+        assert.ok(addLossAttribution.provenance.policySuppressionEvidence.every((item) =>
+          item.policies.map((policy) => policy.policyId).join(",")
+            === "ADD_RISK_CLEAR,ADD_HIGH_ALIGNMENT,ADD_CORE_TREND"));
+        assert.deepEqual(
+          addLossAttribution.assets.flatMap((item) =>
+            item.policySuppressedCohorts.flatMap((policy) => policy.suppressionEvidenceIds)
+          ),
+          addLossAttribution.provenance.suppressionEvidenceIds,
+        );
+        assert.deepEqual(
+          addLossAttribution.holdoutHypotheses.hypotheses.map((item) => item.candidate),
+          ["ADD_CORE_TREND", "ADD_HIGH_ALIGNMENT", "ADD_RISK_CLEAR"],
+        );
+        const emptySuppressionCases = addLossAttribution.assets.flatMap((asset) =>
+          asset.policySuppressedCohorts
+            .filter((cohort) => cohort.suppressionEvidenceIds.length === 0)
+            .map((cohort) => ({ asset: asset.asset, policyId: cohort.policyId }))
+        );
+        assert.ok(emptySuppressionCases.length > 0, "fixture must exercise a configured policy with zero suppressions");
+        for (const empty of emptySuppressionCases) {
+          const hypothesis: (typeof addLossAttribution.holdoutHypotheses.hypotheses)[number] | undefined =
+            addLossAttribution.holdoutHypotheses.hypotheses.find(
+            (item) => item.candidate === empty.policyId,
+          );
+          assert.ok(hypothesis);
+          assert.equal(hypothesis.status, "INSUFFICIENT");
+          assert.ok(hypothesis.reasonCodes.includes(
+            empty.asset === "BTC"
+              ? "BTC_SUPPRESSED_CONTRIBUTION_INCOMPLETE"
+              : "ETH_SUPPRESSED_CONTRIBUTION_INCOMPLETE",
+          ));
+        }
+
+        const text = formatIntegratedStrategyEvaluation(first, "text");
+        assert.match(text, /Conditional ADD Policy Evaluation/);
+        assert.match(text, /ADD_RISK_CLEAR/);
+        assert.match(text, /policy_exposed_completed_episodes=/);
+        assert.match(text, /not deployment approval/i);
+        assert.match(text, /ADD Loss Attribution/);
+        assert.match(text, /BTC ADD totals:/);
+        assert.match(text, /ETH ADD totals:/);
+        assert.match(text, /known_net_denominator=/);
+        assert.match(text, /policy suppressed ADD_RISK_CLEAR:/);
+        assert.match(text, /Cross-asset holdout ADD_CORE_TREND:/);
+        assert.match(text, /selected-flow attribution; not account return/i);
+        assert.match(text, /not causal proof/i);
+        assert.doesNotMatch(text, /\n\[ADD Loss Attribution\]\n/);
+        assert.doesNotMatch(text, /"analysisKind": "ADD_LOSS_ATTRIBUTION_AND_HOLDOUT_HYPOTHESIS"/);
+        assert.deepEqual(JSON.parse(firstJson), first);
+
+        const boundedReport = structuredClone(first);
+        const boundedBtc = boundedReport.addLossAttribution?.assets.find((item) => item.asset === "BTC");
+        assert.ok(boundedBtc);
+        const negativeCohorts: Array<(typeof boundedBtc.cohorts.byRegime)[number]> = [1, 2, 3, 4].map((index) => ({
+          ...structuredClone(boundedBtc.aggregate),
+          dimension: "REGIME" as const,
+          value: `LOSS_${index}`,
+          executedAddCount: 1,
+          knownNetContributionCount: 1,
+          netRealizedContributionKrw: {
+            completeness: "COMPLETE" as const,
+            knownCount: 1,
+            unknownCount: 0,
+            knownSubtotal: { status: "KNOWN" as const, value: -index },
+            total: { status: "KNOWN" as const, value: -index },
+          },
+        }));
+        negativeCohorts.push({
+          ...structuredClone(boundedBtc.aggregate),
+          dimension: "REGIME" as const,
+          value: "PARTIAL_KNOWN_LOSS",
+          executedAddCount: 2,
+          knownNetContributionCount: 1,
+          netRealizedContributionKrw: {
+            completeness: "PARTIAL" as const,
+            knownCount: 1,
+            unknownCount: 1,
+            knownSubtotal: { status: "KNOWN" as const, value: -10 },
+            total: { status: "UNKNOWN" as const, reasons: ["INCOMPLETE_CONTRIBUTION_EVIDENCE"] },
+          },
+        });
+        (boundedBtc.cohorts as unknown as { byRegime: typeof negativeCohorts }).byRegime = negativeCohorts;
+        const boundedText = formatIntegratedStrategyEvaluation(boundedReport, "text");
+        const boundedLossLines = boundedText.split("\n").filter((line) =>
+          line.startsWith("BTC loss cohort REGIME="));
+        assert.equal(boundedLossLines.length, 3);
+        assert.match(boundedLossLines[0] ?? "", /PARTIAL_KNOWN_LOSS/);
+        assert.match(boundedLossLines[0] ?? "", /known_net_denominator=1\/2/);
+        assert.match(boundedLossLines[0] ?? "", /known_net_subtotal=-10/);
+        assert.match(boundedLossLines[0] ?? "", /net_completeness=PARTIAL/);
+        assert.match(boundedLossLines[1] ?? "", /LOSS_4/);
+        assert.match(boundedLossLines[2] ?? "", /LOSS_3/);
+        assert.doesNotMatch(boundedText, /BTC loss cohort REGIME=LOSS_2/);
+        assert.doesNotMatch(boundedText, /BTC loss cohort REGIME=LOSS_1/);
+      },
+    ),
+  );
+});
+
+test("conditional ADD evaluation preserves sparse source evidence without making no-trade intervals insufficient", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase("conditional-add-sparse-source"),
+    cleanupFixture,
+    async (databasePath) => withFixtureResource(
+      () => writeDatasetFixture("BTC", "conditional-add-sparse-source", {
+        commonCoverageDays: 260,
+        missingCloseTimes: {
+          "1h": ["2026-07-30T01:00:00.000Z", "2026-07-30T02:00:00.000Z"],
+        },
+      }),
+      (btcPath) => rm(path.dirname(btcPath), { recursive: true, force: true }),
+      async (btcPath) => {
+        const ethPath = await writeDatasetFixture("ETH", "conditional-add-sparse-source", {
+          commonCoverageDays: 260,
+        });
+        const options = parseIntegratedStrategyEvaluationArgs([
+          ...replaceArg(requiredArgs(), "--database", databasePath),
+          "--btc-dataset", btcPath,
+          "--btc-initial-state", '{"cashKrw":1000000,"quantity":0,"averageEntryPriceKrw":0}',
+          "--eth-dataset", ethPath,
+          "--eth-initial-state", '{"cashKrw":2000000,"quantity":0,"averageEntryPriceKrw":0}',
+          ...conditionalResearchArgs(),
+        ]);
+
+        const first = await buildIntegratedStrategyEvaluation(options);
+        const second = await buildIntegratedStrategyEvaluation(options);
+        const firstJson = formatIntegratedStrategyEvaluation(first, "json");
+        const text = formatIntegratedStrategyEvaluation(first, "text");
+        const btcDataset = first.provenance.datasets.find((dataset) => dataset.asset === "BTC");
+        const section = requireConditionalAddPolicyEvaluation(first);
+        const btcCandidates = section.assets.find((asset) => asset.asset === "BTC")?.candidates;
+
+        assert.ok(btcDataset?.featureCoverage);
+        assert.equal(btcDataset.featureCoverage.status, "COMPLETE");
+        assert.equal(btcDataset.featureCoverage.timeframes["1h"].sourceSequenceStatus, "COMPLETE");
+        assert.equal(btcDataset.featureCoverage.timeframes["1h"].clockGridStatus, "SPARSE_BY_CONTRACT");
+        assert.equal(btcDataset.featureCoverage.timeframes["1h"].sourceMissingCandleCount, 2);
+        assert.equal(btcDataset.featureCoverage.timeframes["1h"].sourceNoTradeIntervalCount, 2);
+        const expectedSourceNoTradeRange = [{
+          firstMissingCloseTime: "2026-07-30T01:00:00.000Z",
+          lastMissingCloseTime: "2026-07-30T02:00:00.000Z",
+          missingCandleCount: 2,
+          previousObservedCloseTime: "2026-07-30T00:00:00.000Z",
+          nextObservedCloseTime: "2026-07-30T03:00:00.000Z",
+        }];
+        assert.deepEqual(
+          btcDataset.featureCoverage.timeframes["1h"].sourceMissingRanges,
+          expectedSourceNoTradeRange,
+        );
+        assert.deepEqual(
+          btcDataset.featureCoverage.timeframes["1h"].sourceNoTradeRanges,
+          expectedSourceNoTradeRange,
+        );
+        assert.ok(btcCandidates && btcCandidates.length > 0);
+        for (const candidate of btcCandidates) {
+          assert.equal(candidate.gates.frameCoverage.status, "PASS");
+          assert.equal(candidate.gates.frameCoverage.fullPath.missingFrameCount, 0);
+          assert.equal(candidate.gates.frameCoverage.fullPath.noTradeFrameCount, 2);
+          assert.equal(candidate.gates.frameCoverage.fullPath.windowCadenceStatus, "INCOMPLETE");
+          assert.equal(candidate.gates.frameCoverage.fullPath.windowSequenceContinuityStatus, "COMPLETE");
+          assert.equal(candidate.gates.frameCoverage.fullPath.windowClockGridStatus, "SPARSE_BY_CONTRACT");
+          assert.deepEqual(candidate.gates.frameCoverage.fullPath.noTradeRanges, [{
+            firstMissingAt: "2026-07-30T01:00:00.000Z",
+            lastMissingAt: "2026-07-30T02:00:00.000Z",
+            missingFrameCount: 2,
+            previousObservedAt: "2026-07-30T00:00:00.000Z",
+            nextObservedAt: "2026-07-30T03:00:00.000Z",
+          }]);
+          const window = candidate.gates.frameCoverage.windows.find((item) => item.windowId === "W2");
+          assert.equal(window?.missingFrameCount, 0);
+          assert.equal(window?.noTradeFrameCount, 2);
+          assert.equal(window?.windowCadenceStatus, "INCOMPLETE");
+          assert.equal(window?.windowSequenceContinuityStatus, "COMPLETE");
+          assert.equal(window?.windowClockGridStatus, "SPARSE_BY_CONTRACT");
+          assert.deepEqual(window?.noTradeRanges, candidate.gates.frameCoverage.fullPath.noTradeRanges);
+          const laterWindow = candidate.gates.frameCoverage.windows.find((item) => item.windowId === "W3");
+          assert.equal(laterWindow?.windowCadenceStatus, "COMPLETE");
+          assert.equal(laterWindow?.windowSequenceContinuityStatus, "COMPLETE");
+          assert.equal(laterWindow?.windowClockGridStatus, "DENSE");
+          assert.equal(laterWindow?.upstreamStateContinuityStatus, "COMPLETE");
+          assert.equal(laterWindow?.upstreamSequenceContinuityStatus, "COMPLETE");
+          assert.equal(laterWindow?.upstreamClockGridStatus, "SPARSE_BY_CONTRACT");
+          assert.equal(laterWindow?.upstreamNoTradeFrameCount, 2);
+          assert.deepEqual(laterWindow?.upstreamNoTradeRanges, candidate.gates.frameCoverage.fullPath.noTradeRanges);
+        }
+        assert.match(text, /source_cadence=INCOMPLETE/);
+        assert.match(text, /sequence=COMPLETE/);
+        assert.match(text, /clock_grid=SPARSE_BY_CONTRACT/);
+        assert.match(text, /no_trade_intervals=2/);
+        assert.match(text, /raw_missing=2/);
+        assert.deepEqual(
+          first.evidenceGaps.filter((gap) =>
+            gap.code === "MISSING_INTERNAL_CANDLE_COVERAGE"
+            || gap.code === "ADD_POST_DECISION_EXCURSION_MISSING_EXPECTED_HOURLY_CANDLE_COVERAGE"
+          ),
+          [],
+          "verified source no-trade intervals must not surface as unexplained excursion gaps",
+        );
+        assert.equal(firstJson, formatIntegratedStrategyEvaluation(second, "json"));
+        assert.equal(text, formatIntegratedStrategyEvaluation(second, "text"));
+        assert.deepEqual(JSON.parse(firstJson), first);
+      },
+    ),
+  );
+});
+
+test("conditional ADD evaluation stays unavailable until every explicit prerequisite exists", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase("conditional-add-unavailable"),
+    cleanupFixture,
+    async (databasePath) => {
+      const options = parseIntegratedStrategyEvaluationArgs(replaceArg([
+        ...replaceArg(simulationArgs("BTC", "btc.json"), "--database", databasePath),
+        "--validation-windows",
+        '[{"id":"W1","from":"2026-07-29T12:00:00Z","to":"2026-07-30T00:00:00Z"},{"id":"W2","from":"2026-07-30T00:00:00Z","to":"2026-07-30T12:00:00Z"},{"id":"W3","from":"2026-07-30T12:00:00Z","to":"2026-07-31T00:00:00Z"}]',
+        "--validation-frame-interval-ms", "3600000",
+        "--validation-comparison-tolerance-pp", "0.000001",
+        "--validation-minimum-windows", "3",
+      ], "--scenarios", '["BASELINE","NO_ADD","ADD_RISK_CLEAR"]'));
+      const report = await buildIntegratedStrategyEvaluation(options, {
+        readDataset: async () => createDataset("BTC", {
+          candleCounts: { "1h": 0, "4h": 0, "1d": 0 },
+        }),
+      });
+      const section = requireConditionalAddPolicyEvaluation(report);
+
+      assert.equal(section.status, "UNAVAILABLE");
+      assert.deepEqual(section.reasonCodes, [
+        "ALL_CONDITIONAL_SCENARIOS_REQUIRED",
+      ]);
+      assert.equal(section.assets.length, 0);
+      assert.match(section.warning, /not deployment approval/i);
+    },
+  );
+});
+
+test("ADD loss attribution stays absent when the full conditional matrix is missing either asset", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase("add-loss-single-asset"),
+    cleanupFixture,
+    async (databasePath) => {
+      const options = parseIntegratedStrategyEvaluationArgs(
+        replaceArg(conditionalSimulationArgs("BTC", "fixture-btc.json"), "--database", databasePath),
+      );
+      const report = await buildIntegratedStrategyEvaluation(options, {
+        readDataset: async () => createDataset("BTC", { commonCoverageDays: 260 }),
+      });
+
+      assert.equal(report.conditionalAddPolicyEvaluation?.status, "AVAILABLE");
+      assert.equal(Object.hasOwn(report, "addLossAttribution"), false);
+    },
+  );
+});
+
+test("conditional ADD evaluation requires the first caller-ordered cost cell as its base", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase("conditional-add-base-provenance"),
+    cleanupFixture,
+    async (databasePath) => {
+      const options = parseIntegratedStrategyEvaluationArgs([
+        ...replaceArg(requiredArgs(), "--database", databasePath),
+        "--btc-dataset", "fixture-btc.json",
+        "--btc-initial-state", '{"cashKrw":1000000,"quantity":0,"averageEntryPriceKrw":0}',
+        ...conditionalResearchArgs().flatMap((value, index, values) => value === "--cost-cells"
+          ? [value, '[{"id":"not-base","feeRate":0.0004,"slippageRate":0.0001},{"id":"later-base","feeRate":0.0005,"slippageRate":0.0003},{"id":"stress","feeRate":0.001,"slippageRate":0.002}]']
+          : index > 0 && values[index - 1] === "--cost-cells" ? [] : [value]),
+      ]);
+      const report = await buildIntegratedStrategyEvaluation(options, {
+        readDataset: async () => createDataset("BTC", {
+          candleCounts: { "1h": 260, "4h": 260, "1d": 260 },
+        }),
+      });
+      const section = requireConditionalAddPolicyEvaluation(report);
+
+      assert.equal(section.status, "UNAVAILABLE");
+      assert.deepEqual(section.reasonCodes, ["BASE_COST_CELL_REQUIRED"]);
+    },
+  );
+});
+
+test("legacy report JSON shape is unchanged when conditional scenarios are absent", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase("legacy-shape"),
+    cleanupFixture,
+    async (databasePath) => {
+      const report = await buildIntegratedStrategyEvaluation(
+        parseIntegratedStrategyEvaluationArgs([
+          ...replaceArg(requiredArgs(), "--database", databasePath),
+          "--btc-dataset", "fixture-btc.json",
+          "--btc-initial-state", '{"cashKrw":1000000,"quantity":0,"averageEntryPriceKrw":0}',
+          ...sharedSimulationArgs(),
+        ]),
+        {
+          readDataset: async () => createDataset("BTC", {
+            candleCounts: { "1h": 260, "4h": 260, "1d": 260 },
+          }),
+        },
+      );
+      assert.equal(Object.hasOwn(report, "conditionalAddPolicyEvaluation"), false);
+      assert.equal(Object.hasOwn(report, "addLossAttribution"), false);
+      assert.equal(
+        report.provenance.datasets.some((dataset) => Object.hasOwn(dataset, "featureCoverage")),
+        false,
+      );
+      const text = formatIntegratedStrategyEvaluation(report, "text");
+      const legacyProjection = text.split("\n").filter((line) =>
+        !line.startsWith("Observed mark exclusions:")
+        && !line.startsWith("Observed mark exclusion:"),
+      ).join("\n");
+      assert.equal(text, legacyProjection, "optional ADD attribution must not change legacy text bytes");
+      assert.equal(
+        formatIntegratedStrategyEvaluation(structuredClone(report), "text"),
+        legacyProjection,
+      );
+    },
+  );
+});
+
+test("ADD attribution integration imports stay outside execution and writable runtime graphs", async () => {
+  const files = [
+    "src/research/integrated-strategy-evaluation.ts",
+    "src/modules/performance/performance-add-loss-attribution.ts",
+    "src/modules/performance/performance-add-holdout-hypothesis.ts",
+  ];
+  const forbidden = /(?:^|\/)(?:app|execution|exchange|reconciliation|telegram|runtime|db)(?:\/|$)/;
+  for (const file of files) {
+    const source = await readFile(path.resolve(file), "utf8");
+    const importSpecifiers = [...source.matchAll(/from\s+["']([^"']+)["']/g)].map((match) => match[1] ?? "");
+    for (const specifier of importSpecifiers) {
+      assert.equal(
+        forbidden.test(specifier.replaceAll("\\", "/")),
+        false,
+        `${file} must not import execution, exchange, reconciliation, Telegram, app/runtime, or writable DB modules: ${specifier}`,
+      );
+    }
+  }
+
+  const integratedSource = await readFile(
+    path.resolve("src/research/integrated-strategy-evaluation.ts"),
+    "utf8",
+  );
+  assert.match(
+    integratedSource,
+    /from "\.\.\/modules\/performance\/performance-add-loss-attribution\.js"/,
+  );
+  assert.match(
+    integratedSource,
+    /from "\.\.\/modules\/performance\/performance-add-holdout-hypothesis\.js"/,
+  );
+});
+
 test("dataset asset mismatch fails explicitly and finite JSON rejects unsupported values", async () => {
   await withFixtureResource(
     () => createDisposableDatabase("invalid-output"),
@@ -701,6 +1715,116 @@ function sharedSimulationArgs(): string[] {
     "--minimum-order-value-krw", "5000",
     "--cost-cells", "[{\"id\":\"observed-fee\",\"feeRate\":0.0005,\"slippageRate\":0},{\"id\":\"stress\",\"feeRate\":0.001,\"slippageRate\":0.002}]",
   ];
+}
+
+function conditionalSimulationArgs(asset: "BTC" | "ETH", datasetPath: string): string[] {
+  return [
+    ...simulationArgs(asset, datasetPath),
+    ...conditionalResearchArgs(),
+  ].reduce<string[]>((args, value, index, values) => {
+    if (!value.startsWith("--")) return args;
+    return replaceArg(args, value, values[index + 1]!);
+  }, simulationArgs(asset, datasetPath));
+}
+
+function conditionalResearchArgs(): string[] {
+  return [
+    "--scenarios",
+    '["BASELINE","NO_ADD","ADD_RISK_CLEAR","ADD_HIGH_ALIGNMENT","ADD_CORE_TREND"]',
+    "--cost-cells",
+    '[{"id":"base","feeRate":0.0005,"slippageRate":0.0003},{"id":"stress","feeRate":0.001,"slippageRate":0.002}]',
+    "--minimum-order-value-krw", "5000",
+    "--validation-windows",
+    '[{"id":"W1","from":"2026-07-29T12:00:00Z","to":"2026-07-30T00:00:00Z"},{"id":"W2","from":"2026-07-30T00:00:00Z","to":"2026-07-30T12:00:00Z"},{"id":"W3","from":"2026-07-30T12:00:00Z","to":"2026-07-31T00:00:00Z"}]',
+    "--validation-frame-interval-ms", "3600000",
+    "--validation-comparison-tolerance-pp", "0.000001",
+    "--validation-minimum-windows", "3",
+  ];
+}
+
+type ConditionalAddPolicyEvaluationFixture = {
+  status: "AVAILABLE" | "UNAVAILABLE";
+  reasonCodes: string[];
+  deploymentApproval: false;
+  warning: string;
+  windows: Array<{ id: string; from: string; to: string }>;
+  assets: Array<{
+    asset: "BTC" | "ETH";
+    status: "AVAILABLE" | "DATASET_UNAVAILABLE" | "DATASET_UNUSABLE";
+    candidates: Array<{
+      candidate: string;
+      costAnchors: Record<"BASE" | "STRESS", {
+        feeRate: number;
+        slippageRate: number;
+      }>;
+      observations: {
+        fullPath: { observations: unknown[] };
+        windows: unknown[];
+      };
+      gates: {
+        policyExposedCompletedEpisodes: {
+          fullPathObservedCount: number;
+          windows: Array<{ observedCount: number }>;
+        };
+        frameCoverage: {
+          status: "PASS" | "INSUFFICIENT";
+          fullPath: {
+            missingFrameCount: number;
+            noTradeFrameCount: number;
+            missingRanges: unknown[];
+            noTradeRanges: Array<{
+              firstMissingAt: string;
+              lastMissingAt: string;
+              missingFrameCount: number;
+              previousObservedAt: string | null;
+              nextObservedAt: string | null;
+            }>;
+            windowCadenceStatus: "COMPLETE" | "INCOMPLETE";
+            windowSequenceContinuityStatus: "COMPLETE" | "INCOMPLETE";
+            windowClockGridStatus: "DENSE" | "SPARSE_BY_CONTRACT" | "ANOMALOUS";
+            featureLookbackContinuityStatus: "COMPLETE" | "INCOMPLETE";
+            featureLookbackAffectedFrameCount: number;
+          };
+          windows: Array<{
+            windowId: string;
+            missingFrameCount: number;
+            noTradeFrameCount: number;
+            noTradeRanges: Array<{
+              firstMissingAt: string;
+              lastMissingAt: string;
+              missingFrameCount: number;
+              previousObservedAt: string | null;
+              nextObservedAt: string | null;
+            }>;
+            windowCadenceStatus: "COMPLETE" | "INCOMPLETE";
+            windowSequenceContinuityStatus: "COMPLETE" | "INCOMPLETE";
+            windowClockGridStatus: "DENSE" | "SPARSE_BY_CONTRACT" | "ANOMALOUS";
+            upstreamStateContinuityStatus: "COMPLETE" | "INCOMPLETE";
+            upstreamSequenceContinuityStatus: "COMPLETE" | "INCOMPLETE";
+            upstreamClockGridStatus: "DENSE" | "SPARSE_BY_CONTRACT" | "ANOMALOUS";
+            upstreamNoTradeFrameCount: number;
+            upstreamNoTradeRanges: Array<{
+              firstMissingAt: string;
+              lastMissingAt: string;
+              missingFrameCount: number;
+              previousObservedAt: string | null;
+              nextObservedAt: string | null;
+            }>;
+          }>;
+        };
+      };
+    }>;
+  }>;
+};
+
+function requireConditionalAddPolicyEvaluation(
+  report: IntegratedStrategyEvaluationReport,
+): ConditionalAddPolicyEvaluationFixture {
+  const section = (report as IntegratedStrategyEvaluationReport & {
+    conditionalAddPolicyEvaluation?: ConditionalAddPolicyEvaluationFixture;
+  }).conditionalAddPolicyEvaluation;
+  assert.ok(section, "Missing conditional ADD policy evaluation section.");
+  return section;
 }
 
 function replaceArg(args: readonly string[], key: string, value: string): string[] {
@@ -831,6 +1955,10 @@ function seedObservedSeparationFixture(db: DatabaseSync): void {
 function seedObservedMarkFixture(
   db: DatabaseSync,
   marks: readonly (string | null)[],
+  options: {
+    capturedAts?: readonly string[];
+    feeAmount?: string | null;
+  } = {},
 ): void {
   db.prepare(`
     INSERT INTO strategy_decisions (id, exchange_account_id, market, action)
@@ -861,7 +1989,7 @@ function seedObservedMarkFixture(
     "100",
     "1",
     "KRW",
-    "1",
+    options.feeAmount === undefined ? "1" : options.feeAmount,
     "2026-08-01T01:00:00.000Z",
   );
 
@@ -870,10 +1998,11 @@ function seedObservedMarkFixture(
     VALUES (?, ?, ?, ?, ?)
   `);
   for (const [index, markPrice] of marks.entries()) {
+    const capturedAt = options.capturedAts?.[index] ?? `2026-08-01T0${index + 2}:00:00.000Z`;
     insertSnapshot.run(
       `mark-snapshot-${index + 1}`,
       "primary",
-      `2026-08-01T0${index + 2}:00:00.000Z`,
+      capturedAt,
       "RECONCILIATION",
       JSON.stringify([{
         asset: "BTC",
@@ -883,7 +2012,7 @@ function seedObservedMarkFixture(
         markPrice,
         marketValue: null,
         exposureRatio: null,
-        capturedAt: `2026-08-01T0${index + 2}:00:00.000Z`,
+        capturedAt,
       }]),
     );
   }
@@ -927,6 +2056,8 @@ function createDataset(
   options: {
     candleCounts?: Partial<Record<ResearchCandleTimeframe, number>>;
     endOffsetsMs?: Partial<Record<ResearchCandleTimeframe, number>>;
+    commonCoverageDays?: number;
+    missingCloseTimes?: Partial<Record<ResearchCandleTimeframe, readonly string[]>>;
   } = {},
 ): ResearchCandleDataset {
   const market: ResearchCandle["market"] = asset === "BTC" ? "KRW-BTC" : "KRW-ETH";
@@ -937,9 +2068,11 @@ function createDataset(
     "1d": 24 * 60 * 60 * 1_000,
   };
   const candles = Object.fromEntries((["1h", "4h", "1d"] as const).map((timeframe) => {
-    const count = options.candleCounts?.[timeframe] ?? 200;
+    const count = options.commonCoverageDays === undefined
+      ? options.candleCounts?.[timeframe] ?? 200
+      : options.commonCoverageDays * (timeframe === "1h" ? 24 : timeframe === "4h" ? 6 : 1);
     const timeframeEndMs = endMs + (options.endOffsetsMs?.[timeframe] ?? 0);
-    return [
+    const generated = [
       timeframe,
       Array.from({ length: count }, (_, index) => fixtureCandle(
         market,
@@ -948,7 +2081,9 @@ function createDataset(
         new Date(timeframeEndMs - (count - 1 - index) * durationMs[timeframe]).toISOString(),
         100_000 + index * 100,
       )),
-    ];
+    ] as const;
+    const missingCloseTimes = new Set(options.missingCloseTimes?.[timeframe] ?? []);
+    return [timeframe, generated[1].filter((candle) => !missingCloseTimes.has(candle.closeTime))];
   })) as Record<ResearchCandleTimeframe, ResearchCandle[]>;
   const allCandles = Object.values(candles).flat();
   const historyStartMs = allCandles.length === 0

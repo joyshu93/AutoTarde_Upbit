@@ -1116,6 +1116,13 @@ test("performance report text distinguishes persisted marks from usable curve po
       persistedObservationCount: 3,
       usableObservationCount: 2,
       sampleCount: 2,
+      excludedObservations: [{
+        snapshotId: "snapshot-excluded-1",
+        capturedAt: "2026-08-01T03:00:00.000Z",
+        market: "KRW-BTC",
+        metricScopes: ["GROSS", "NET"],
+        reasonCodes: ["MISSING_ACTIVE_POSITION_MARK"],
+      }] as const,
     };
     const unusableEthCurve = {
       ...report.diagnostics.marketMarkPnlCurves["KRW-ETH"],
@@ -1149,7 +1156,31 @@ test("performance report text distinguishes persisted marks from usable curve po
       text,
       /Usable snapshot mark points require persisted snapshots with complete mark and cost evidence;/,
     );
+    assert.match(text, /Excluded mark observations: 1/);
+    assert.match(
+      text,
+      /snapshot-excluded-1 .* KRW-BTC .* GROSS,NET .* MISSING_ACTIVE_POSITION_MARK/,
+    );
+    assert.match(text, /Full exclusion manifest is retained in JSON output/);
     assert.doesNotMatch(text, /use each persisted snapshot mark/);
+
+    const coalescedText = formatPerformanceReport({
+      ...report,
+      diagnostics: {
+        ...report.diagnostics,
+        markPnlCurve: {
+          ...report.diagnostics.markPnlCurve,
+          persistedObservationCount: 2,
+          usableObservationCount: 1,
+          sampleCount: 1,
+          excludedObservations: [],
+        },
+      },
+    }, "text");
+    assert.match(
+      coalescedText,
+      /Snapshot mark curve: .*persisted_observation_count=2; usable_observation_count=1; curve_points=1; coverage=COMPLETE;/,
+    );
   } finally {
     await cleanupPerformanceDatabase(databasePath);
   }

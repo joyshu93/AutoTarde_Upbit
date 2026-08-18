@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   analyzeAddPostDecisionExcursions,
 } from "../src/modules/performance/performance-add-excursions.js";
+import type { CandleCoverageGap } from "../src/modules/performance/performance-candle-coverage.js";
+import { createVerifiedNoTradeCoverage } from "../src/modules/performance/performance-hourly-coverage.js";
 import type { AddDecisionExposure } from "../src/modules/performance/performance-add-diagnostics.js";
 import type { ResearchCandle, ResearchCandleDataset } from "../src/modules/performance/research-candle-dataset.js";
 import type {
@@ -46,12 +48,126 @@ test("ADD post-decision excursions remain unknown when an expected hourly interv
   assert.deepEqual(result.exposures[0]?.coverage, {
     expectedIntervalCount: 3,
     observedIntervalCount: 2,
+    verifiedNoTradeIntervalCount: 0,
+    verifiedNoTradeRanges: [],
     missingIntervals: ["2026-04-20T02:00:00.000000000Z/2026-04-20T03:00:00.000000000Z"],
   });
   assert.deepEqual(result.exposures[0]?.maeKrw, {
     status: "UNKNOWN",
     reasons: ["MISSING_EXPECTED_HOURLY_CANDLE_COVERAGE"],
   });
+});
+
+test("ADD post-decision excursions accept verified no-trade hours without synthetic extrema", () => {
+  const range = noTradeGap("2026-04-20T03:00:00Z", "2026-04-20T03:00:00Z", 1);
+  const result = analyzeAddPostDecisionExcursions({
+    ...input({
+      candles: [
+        candle("2026-04-20T01:00:00Z", "2026-04-20T02:00:00Z", 95, 110),
+        candle("2026-04-20T03:00:00Z", "2026-04-20T04:00:00Z", 98, 115),
+      ],
+    }),
+    verifiedNoTradeCoverage: verifiedNoTradeCoverage([range]),
+  });
+
+  assert.equal(result.exposures[0]?.status, "KNOWN");
+  assert.equal(result.exposures[0]?.reason, null);
+  assert.deepEqual(result.exposures[0]?.maeKrw, { status: "KNOWN", value: -5 });
+  assert.deepEqual(result.exposures[0]?.mfeKrw, { status: "KNOWN", value: 15 });
+  assert.deepEqual(result.exposures[0]?.coverage, {
+    expectedIntervalCount: 3,
+    observedIntervalCount: 2,
+    verifiedNoTradeIntervalCount: 1,
+    verifiedNoTradeRanges: [{
+      firstMissingCloseTime: "2026-04-20T03:00:00.000000000Z",
+      lastMissingCloseTime: "2026-04-20T03:00:00.000000000Z",
+      missingCandleCount: 1,
+      previousObservedCloseTime: "2026-04-20T02:00:00.000000000Z",
+      nextObservedCloseTime: "2026-04-20T04:00:00.000000000Z",
+    }],
+    missingIntervals: [],
+  });
+  assert.equal(result.exposures[0]?.evidence.candleIntervals.length, 2);
+});
+
+test("ADD all-no-trade windows remain non-known with coverage preserved", () => {
+  const range = noTradeGap("2026-04-20T02:00:00Z", "2026-04-20T04:00:00Z", 3);
+  const result = analyzeAddPostDecisionExcursions({
+    ...input({ candles: [] }),
+    verifiedNoTradeCoverage: verifiedNoTradeCoverage([range]),
+  });
+
+  assert.equal(result.exposures[0]?.status, "NOT_APPLICABLE");
+  assert.equal(result.exposures[0]?.reason, "NO_COMPLETED_HOURLY_INTERVALS_IN_WINDOW");
+  assert.deepEqual(result.exposures[0]?.coverage, {
+    expectedIntervalCount: 3,
+    observedIntervalCount: 0,
+    verifiedNoTradeIntervalCount: 3,
+    verifiedNoTradeRanges: [{
+      firstMissingCloseTime: "2026-04-20T02:00:00.000000000Z",
+      lastMissingCloseTime: "2026-04-20T04:00:00.000000000Z",
+      missingCandleCount: 3,
+      previousObservedCloseTime: null,
+      nextObservedCloseTime: null,
+    }],
+    missingIntervals: [],
+  });
+  assert.deepEqual(result.exposures[0]?.maeKrw, {
+    status: "NOT_APPLICABLE",
+    reason: "NO_COMPLETED_HOURLY_INTERVALS_IN_WINDOW",
+  });
+});
+
+test("ADD post-decision excursions reject source-derived no-trade collisions", () => {
+  const valid = input();
+  assert.throws(
+    () => analyzeAddPostDecisionExcursions({
+      ...valid,
+      verifiedNoTradeCoverage: verifiedNoTradeCoverage([
+        noTradeGap("2026-04-20T02:00:00Z", "2026-04-20T02:00:00Z", 1),
+      ]),
+    }),
+    /collision/i,
+  );
+});
+
+test("ADD post-decision non-comparable and open-episode reasons remain unchanged", () => {
+  const valid = input();
+  const divergent = analyzeAddPostDecisionExcursions({
+    ...valid,
+    exposures: [{ ...valid.exposures[0]!, pairingStatus: "PATH_DECISION_DIVERGED" }],
+  });
+  assert.equal(divergent.exposures[0]?.reason, "BASELINE_PATH_DECISION_DIVERGED");
+
+  const notExecuted = analyzeAddPostDecisionExcursions({
+    ...valid,
+    exposures: [{ ...valid.exposures[0]!, pairingStatus: "BASELINE_NOT_EXECUTED" }],
+  });
+  assert.equal(notExecuted.exposures[0]?.reason, "BASELINE_ADD_NOT_EXECUTED");
+
+  const episode = valid.baselineMatchResult.episodes[0]!;
+  const openEpisode: PositionEpisode = {
+    ...episode,
+    status: "OPEN",
+    closedAt: null,
+    exitFillIds: [],
+    remainingQuantity: 1,
+  };
+  const open = analyzeAddPostDecisionExcursions({
+    ...valid,
+    baselineFills: valid.baselineFills.filter((fill) => fill.side === "bid"),
+    baselineMatchResult: matchResult(openEpisode),
+    exposures: [{
+      ...valid.exposures[0]!,
+      baselineEpisode: {
+        episodeId: openEpisode.id,
+        status: "OPEN",
+        outcome: "UNKNOWN",
+        netRealizedPnlKrw: null,
+      },
+    }],
+  });
+  assert.equal(open.exposures[0]?.reason, "OPEN_POSITION_EPISODE");
 });
 
 test("ADD post-decision excursion is not applicable when decision and completed close are the same instant", () => {
@@ -224,6 +340,46 @@ function dataset(candles: ResearchCandle[]): ResearchCandleDataset {
       sha256: SHA256,
     },
     candles: { "1h": candles, "4h": [], "1d": [] },
+  };
+}
+
+function verifiedNoTradeCoverage(ranges: readonly CandleCoverageGap[]) {
+  const sourceBoundary = {
+    historyStartAt: "2026-04-20T00:00:00Z",
+    endAt: "2026-04-20T05:00:00Z",
+  } as const;
+  return createVerifiedNoTradeCoverage({
+    sourceBoundary,
+    observedIntervals: observedIntervalsExcludingGaps(sourceBoundary, ranges),
+  });
+}
+
+function observedIntervalsExcludingGaps(
+  boundary: { historyStartAt: string; endAt: string },
+  ranges: readonly CandleCoverageGap[],
+) {
+  const result: { openTime: string; closeTime: string }[] = [];
+  for (let open = Date.parse(boundary.historyStartAt); open < Date.parse(boundary.endAt); open += 3_600_000) {
+    const close = open + 3_600_000;
+    if (!ranges.some((range) => close >= Date.parse(range.firstMissingCloseTime)
+      && close <= Date.parse(range.lastMissingCloseTime))) {
+      result.push({ openTime: new Date(open).toISOString(), closeTime: new Date(close).toISOString() });
+    }
+  }
+  return result;
+}
+
+function noTradeGap(
+  firstMissingCloseTime: string,
+  lastMissingCloseTime: string,
+  missingCandleCount: number,
+): CandleCoverageGap {
+  return {
+    firstMissingCloseTime,
+    lastMissingCloseTime,
+    missingCandleCount,
+    previousObservedCloseTime: new Date(Date.parse(firstMissingCloseTime) - 3_600_000).toISOString(),
+    nextObservedCloseTime: new Date(Date.parse(lastMissingCloseTime) + 3_600_000).toISOString(),
   };
 }
 

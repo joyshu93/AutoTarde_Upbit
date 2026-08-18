@@ -4,6 +4,7 @@ import {
   type PositionGuardBacktestFrame,
   type PositionGuardBacktestInput,
   type PositionGuardBacktestResearchExecutionPolicy,
+  type PositionGuardBacktestResearchExecutionPolicyId,
   type PositionGuardBacktestResult,
 } from "../strategy/position-guard-backtest.js";
 import type { PerformanceOpeningPosition } from "./performance-calculator.js";
@@ -22,7 +23,11 @@ import {
   parsePerformanceTimestamp,
 } from "./performance-timestamp.js";
 
-export type CounterfactualScenario = "BASELINE" | "NO_ADD";
+export type CounterfactualScenario = "BASELINE" | PositionGuardBacktestResearchExecutionPolicyId;
+
+type CounterfactualExecutionPolicy = PositionGuardBacktestResearchExecutionPolicy<
+  PositionGuardBacktestResearchExecutionPolicyId
+>;
 
 export interface CounterfactualInput
   extends Omit<PositionGuardBacktestInput, "researchExecutionPolicy"> {
@@ -33,7 +38,7 @@ export interface CounterfactualInput
 export interface CounterfactualScenarioResult {
   evidenceKind: "SIMULATED_COUNTERFACTUAL";
   scenario: CounterfactualScenario;
-  executionPolicy: PositionGuardBacktestResearchExecutionPolicy | null;
+  executionPolicy: CounterfactualExecutionPolicy | null;
   sourceFrames: readonly PositionGuardBacktestFrame[];
   legacyBacktest: {
     label: "LEGACY_AVERAGE_COST_BACKTEST";
@@ -107,9 +112,7 @@ function validateCounterfactualInput(input: CounterfactualInput): void {
 
   const seen = new Set<CounterfactualScenario>();
   for (const scenario of input.scenarios) {
-    if (scenario !== "BASELINE" && scenario !== "NO_ADD") {
-      throw new Error(`Invalid counterfactual scenario ${String(scenario)}.`);
-    }
+    policyForScenario(scenario);
     if (seen.has(scenario)) {
       throw new Error(`Duplicate counterfactual scenario ${scenario}.`);
     }
@@ -138,10 +141,23 @@ function validateCounterfactualInput(input: CounterfactualInput): void {
 
 function policyForScenario(
   scenario: CounterfactualScenario,
-): PositionGuardBacktestResearchExecutionPolicy | null {
-  return scenario === "NO_ADD"
-    ? { id: "NO_ADD", suppressedActions: ["ADD"] }
-    : null;
+): CounterfactualExecutionPolicy | null {
+  switch (scenario) {
+    case "BASELINE":
+      return null;
+    case "NO_ADD":
+      return { id: "NO_ADD", suppressedActions: ["ADD"] };
+    case "ADD_RISK_CLEAR":
+      return { id: "ADD_RISK_CLEAR" };
+    case "ADD_HIGH_ALIGNMENT":
+      return { id: "ADD_HIGH_ALIGNMENT" };
+    case "ADD_CORE_TREND":
+      return { id: "ADD_CORE_TREND" };
+    default: {
+      const exhaustiveScenario: never = scenario;
+      throw new Error(`Invalid counterfactual scenario ${String(exhaustiveScenario)}.`);
+    }
+  }
 }
 
 function toPerformanceTradeFills(

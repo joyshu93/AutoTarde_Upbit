@@ -162,6 +162,7 @@ test("mark curve replays only persisted evidence available at each snapshot", ()
   assert.deepEqual(result.markPnlCurve.maxNetDrawdownKrw, known(12));
   assert.equal(result.markPnlCurve.sampleCount, 4);
   assert.equal(result.markPnlCurve.maxObservationGapMs, 2 * DAY);
+  assert.deepEqual(result.markPnlCurve.excludedObservations, []);
 });
 
 test("mark curve is explicitly unknown when an open selected position has no persisted mark", () => {
@@ -175,6 +176,136 @@ test("mark curve is explicitly unknown when an open selected position has no per
   assert.equal(result.markPnlCurve.gross.status, "UNKNOWN");
   assert.equal(result.markPnlCurve.net.status, "UNKNOWN");
   assert.equal(result.markPnlCurve.maxGrossDrawdownKrw.status, "UNKNOWN");
+  assert.deepEqual(result.markPnlCurve.excludedObservations, [
+    {
+      snapshotId: "missing-btc",
+      capturedAt: at(1),
+      market: "KRW-BTC",
+      metricScopes: ["GROSS", "NET"],
+      reasonCodes: ["MISSING_ACTIVE_POSITION_MARK"],
+    },
+  ]);
+});
+
+test("mark exclusion provenance keeps gross usable when only remaining buy fee is unknown", () => {
+  const result = diagnosePerformance({
+    fills: [fill("buy", "KRW-BTC", "bid", 100, 1, null, at(0), "ENTER")],
+    policy: { breakevenToleranceKrw: 0 },
+    markObservations: [{ snapshotId: "missing-fee", capturedAt: at(1), prices: { "KRW-BTC": 110 } }],
+  });
+
+  assert.equal(result.markPnlCurve.gross.status, "KNOWN");
+  assert.equal(result.markPnlCurve.net.status, "UNKNOWN");
+  assert.equal(result.markPnlCurve.usableObservationCount, 1);
+  assert.equal(result.markPnlCurve.sampleCount, 1);
+  assert.deepEqual(result.markPnlCurve.excludedObservations, [
+    {
+      snapshotId: "missing-fee",
+      capturedAt: at(1),
+      market: "KRW-BTC",
+      metricScopes: ["NET"],
+      reasonCodes: ["INCOMPLETE_REMAINING_BUY_FEE"],
+    },
+  ]);
+});
+
+test("mark exclusion provenance distinguishes non-finite acquisition and realized attribution", () => {
+  const acquisition = diagnosePerformance({
+    fills: [fill("overflow-buy", "KRW-BTC", "bid", 1e308, 1e308, 0, at(0), "ENTER")],
+    policy: { breakevenToleranceKrw: 0 },
+    markObservations: [{ snapshotId: "acquisition", capturedAt: at(1), prices: { "KRW-BTC": 1 } }],
+  });
+  const realized = diagnosePerformance({
+    fills: [
+      fill("buy", "KRW-BTC", "bid", 1, 1e308, 0, at(0), "ENTER"),
+      fill("sell", "KRW-BTC", "ask", 1e308, 1e308, 0, at(1), "EXIT"),
+    ],
+    policy: { breakevenToleranceKrw: 0 },
+    markObservations: [{ snapshotId: "realized", capturedAt: at(2), prices: {} }],
+  });
+
+  assert.deepEqual(acquisition.markPnlCurve.excludedObservations, [
+    {
+      snapshotId: "acquisition",
+      capturedAt: at(1),
+      market: "KRW-BTC",
+      metricScopes: ["GROSS", "NET"],
+      reasonCodes: ["INCOMPLETE_ACQUISITION_COST"],
+    },
+  ]);
+  assert.deepEqual(realized.markPnlCurve.excludedObservations, [
+    {
+      snapshotId: "realized",
+      capturedAt: at(2),
+      market: "KRW-BTC",
+      metricScopes: ["GROSS", "NET"],
+      reasonCodes: [
+        "INCOMPLETE_REALIZED_GROSS_ATTRIBUTION",
+        "INCOMPLETE_REALIZED_NET_ATTRIBUTION",
+      ],
+    },
+  ]);
+});
+
+test("mark exclusion provenance is sorted deterministically for combined and per-market curves", () => {
+  const result = diagnosePerformance({
+    fills: [
+      fill("btc-buy", "KRW-BTC", "bid", 100, 1, null, at(0), "ENTER"),
+      fill("eth-buy", "KRW-ETH", "bid", 200, 1, 0, at(0), "ENTER"),
+    ],
+    policy: { breakevenToleranceKrw: 0 },
+    markObservations: [
+      { snapshotId: "z-later", capturedAt: at(2), prices: { "KRW-BTC": 120 } },
+      { snapshotId: "a-earlier", capturedAt: at(1), prices: { "KRW-BTC": 110 } },
+    ],
+  });
+
+  assert.deepEqual(result.markPnlCurve.excludedObservations, [
+    {
+      snapshotId: "a-earlier",
+      capturedAt: at(1),
+      market: "KRW-BTC",
+      metricScopes: ["NET"],
+      reasonCodes: ["INCOMPLETE_REMAINING_BUY_FEE"],
+    },
+    {
+      snapshotId: "a-earlier",
+      capturedAt: at(1),
+      market: "KRW-ETH",
+      metricScopes: ["GROSS", "NET"],
+      reasonCodes: ["MISSING_ACTIVE_POSITION_MARK"],
+    },
+    {
+      snapshotId: "z-later",
+      capturedAt: at(2),
+      market: "KRW-BTC",
+      metricScopes: ["NET"],
+      reasonCodes: ["INCOMPLETE_REMAINING_BUY_FEE"],
+    },
+    {
+      snapshotId: "z-later",
+      capturedAt: at(2),
+      market: "KRW-ETH",
+      metricScopes: ["GROSS", "NET"],
+      reasonCodes: ["MISSING_ACTIVE_POSITION_MARK"],
+    },
+  ]);
+  assert.deepEqual(
+    result.marketMarkPnlCurves["KRW-BTC"].excludedObservations,
+    result.markPnlCurve.excludedObservations.filter((item) => item.market === "KRW-BTC"),
+  );
+  assert.deepEqual(
+    result.marketMarkPnlCurves["KRW-ETH"].excludedObservations,
+    result.markPnlCurve.excludedObservations.filter((item) => item.market === "KRW-ETH"),
+  );
+  assert.notStrictEqual(
+    result.markPnlCurve.excludedObservations,
+    result.marketMarkPnlCurves["KRW-BTC"].excludedObservations,
+  );
+  assert.notStrictEqual(
+    result.markPnlCurve.excludedObservations[0]?.metricScopes,
+    result.marketMarkPnlCurves["KRW-BTC"].excludedObservations[0]?.metricScopes,
+  );
 });
 
 test("mark curve counts only usable persisted observations and gaps per market", () => {
@@ -267,6 +398,7 @@ test("mark curve is not applicable when no persisted mark observations are suppl
     status: "NOT_APPLICABLE",
     reason: "NO_MARK_OBSERVATIONS",
   });
+  assert.deepEqual(result.markPnlCurve.excludedObservations, []);
 });
 
 test("diagnostics reports entry and exit action contribution independently", () => {
@@ -384,7 +516,7 @@ test("per-market mark curves preserve valid BTC evidence when ETH mark is missin
 });
 
 test("same-epoch identical mark observations are deduplicated deterministically", () => {
-  const fills = [fill("buy", "KRW-BTC", "bid", 100, 1, 0, at(0), "ENTER")];
+  const fills = [fill("buy", "KRW-BTC", "bid", 100, 1, null, at(0), "ENTER")];
   const result = diagnosePerformance({
     fills,
     policy: { breakevenToleranceKrw: 0 },
@@ -400,6 +532,15 @@ test("same-epoch identical mark observations are deduplicated deterministically"
   assert.equal(result.markPnlCurve.gross.status, "KNOWN");
   if (result.markPnlCurve.gross.status !== "KNOWN") throw new Error("Expected known mark curve.");
   assert.equal(result.markPnlCurve.gross.value[0]?.snapshotId, "a");
+  assert.deepEqual(result.markPnlCurve.excludedObservations, [
+    {
+      snapshotId: "a",
+      capturedAt: "2026-08-02T00:00:00.000Z",
+      market: "KRW-BTC",
+      metricScopes: ["NET"],
+      reasonCodes: ["INCOMPLETE_REMAINING_BUY_FEE"],
+    },
+  ]);
 });
 
 test("same-epoch conflicting mark observations are rejected instead of ID-ordered", () => {
@@ -513,16 +654,59 @@ test("attribution failures make the affected market and combined statistics unkn
   const fills = [
     fill("unmatched", "KRW-BTC", "ask", 100, 1, 0, at(0), "EXIT"),
     ...roundTrip("ignored", "KRW-BTC", 100, 120, at(1), at(2)),
+    ...roundTrip("eth-valid", "KRW-ETH", 200, 220, at(1), at(2)),
   ];
   const result = diagnosePerformance({
     fills,
     policy: { breakevenToleranceKrw: 0 },
+    markObservations: [
+      { snapshotId: "z-later", capturedAt: at(4), prices: {} },
+      { snapshotId: "a-earlier", capturedAt: at(3), prices: {} },
+    ],
   });
 
   assert.equal(result.markets["KRW-BTC"].episodeWinRate.status, "UNKNOWN");
   assert.equal(result.combined.netRealizedPnlKrw.status, "UNKNOWN");
   assert.equal(result.realizedPnlCurve.net.status, "UNKNOWN");
+  assert.equal(result.markPnlCurve.gross.status, "UNKNOWN");
+  assert.equal(result.markPnlCurve.net.status, "UNKNOWN");
+  assert.equal(result.markPnlCurve.persistedObservationCount, 2);
+  assert.equal(result.markPnlCurve.usableObservationCount, 0);
+  assert.equal(result.markPnlCurve.sampleCount, 0);
+  assert.equal(result.markPnlCurve.maxObservationGapMs, null);
+  assert.deepEqual(result.markPnlCurve.excludedObservations, [
+    attributionExclusion("a-earlier", at(3), "KRW-BTC"),
+    attributionExclusion("z-later", at(4), "KRW-BTC"),
+  ]);
+  assert.deepEqual(
+    result.marketMarkPnlCurves["KRW-BTC"].excludedObservations,
+    result.markPnlCurve.excludedObservations,
+  );
+  assert.notStrictEqual(
+    result.marketMarkPnlCurves["KRW-BTC"].excludedObservations,
+    result.markPnlCurve.excludedObservations,
+  );
+  assert.deepEqual(result.marketMarkPnlCurves["KRW-ETH"].excludedObservations, []);
+  assert.equal(result.marketMarkPnlCurves["KRW-ETH"].gross.status, "KNOWN");
+  assert.equal(result.marketMarkPnlCurves["KRW-ETH"].usableObservationCount, 2);
 });
+
+function attributionExclusion(
+  snapshotId: string,
+  capturedAt: string,
+  market: "KRW-BTC" | "KRW-ETH",
+) {
+  return {
+    snapshotId,
+    capturedAt,
+    market,
+    metricScopes: ["GROSS", "NET"],
+    reasonCodes: [
+      "INCOMPLETE_REALIZED_GROSS_ATTRIBUTION",
+      "INCOMPLETE_REALIZED_NET_ATTRIBUTION",
+    ],
+  };
+}
 
 function diagnose(fills: readonly PerformanceTradeFill[]) {
   return diagnosePerformance({
