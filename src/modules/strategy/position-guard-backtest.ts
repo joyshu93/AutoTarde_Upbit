@@ -7,9 +7,15 @@ import {
   type PositionGuardStrategySettings,
   type PositionGuardStructureAnalysis,
   type PreviousPositionGuardDecision,
+  type StrategyEntryPath,
   type StrategyMarketRegime,
 } from "./position-guard-core.js";
 import type { SupportedStrategyTimeframe } from "./market-structure.js";
+import { performanceTimestampEpochNanoseconds } from "../performance/performance-timestamp.js";
+import {
+  BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY,
+  type FrozenBroadLossCauseScenario,
+} from "./position-guard-research-manifest.js";
 
 export interface PositionGuardBacktestFrame {
   generatedAt: string;
@@ -36,18 +42,38 @@ export interface PositionGuardBacktestInput {
   settings?: PositionGuardStrategySettings;
   execution?: PositionGuardBacktestExecutionModel;
   researchExecutionPolicy?: PositionGuardBacktestResearchExecutionPolicy;
+  researchCarryInState?: PositionGuardBacktestResearchState;
+  executionTimingModel?: PositionGuardBacktestExecutionTimingModel;
 }
+
+export type PositionGuardBacktestExecutionTimingModel =
+  | "SAME_CLOSE_MODELED"
+  | "NEXT_FRAME_MODELED";
+
+export type PositionGuardBacktestFrozenResearchPolicyId = FrozenBroadLossCauseScenario;
 
 export type PositionGuardBacktestResearchExecutionPolicyId =
   | "NO_ADD"
   | "ADD_RISK_CLEAR"
   | "ADD_HIGH_ALIGNMENT"
+  | "ADD_CORE_TREND"
+  | PositionGuardBacktestFrozenResearchPolicyId;
+
+type PositionGuardBacktestConditionalAddPolicyId =
+  | "ADD_RISK_CLEAR"
+  | "ADD_HIGH_ALIGNMENT"
   | "ADD_CORE_TREND";
 
-type PositionGuardBacktestConditionalAddPolicyId = Exclude<
-  PositionGuardBacktestResearchExecutionPolicyId,
-  "NO_ADD"
->;
+export interface PositionGuardBacktestResearchState {
+  currentEpisodeAddCount: number;
+  currentEpisodeRealizedPnlKrw: number;
+  lastFullExitAt: string | null;
+  lastFullExitRealizedPnlKrw: number | null;
+  lastEntryPath: StrategyEntryPath | null;
+}
+
+export const POSITION_GUARD_RESEARCH_POLICY_MANIFEST =
+  BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY.policy;
 
 export type PositionGuardBacktestResearchExecutionPolicy<
   TId extends PositionGuardBacktestResearchExecutionPolicyId = PositionGuardBacktestResearchExecutionPolicyId,
@@ -106,6 +132,65 @@ export type PositionGuardBacktestConditionalAddPolicyEvaluation =
       reason: PositionGuardBacktestConditionalAddSuppression["reason"];
     });
 
+export type PositionGuardBacktestResearchInterventionReason =
+  | "CONDITIONS_MET"
+  | "RISK_REDUCING_DECISION_PRESERVED"
+  | "HTF_BREAKDOWN"
+  | "TREND_ALIGNMENT_BELOW_3"
+  | "WEAKENING_PRESENT"
+  | "REGIME_NOT_ENTRY_TREND"
+  | "ENTRY_PATH_NOT_PULLBACK"
+  | "PULLBACK_ZONE_MISSING"
+  | "REGIME_NOT_PULLBACK_IN_UPTREND"
+  | "TREND_ALIGNMENT_BELOW_4"
+  | "RECOVERY_QUALITY_BELOW_3"
+  | "ONE_HOUR_LOCATION_NOT_LOWER_OR_MIDDLE"
+  | "VOLUME_RECOVERY_MISSING"
+  | "MOMENTUM_RECOVERY_MISSING"
+  | "FAILED_RECLAIM_THESIS"
+  | "BEARISH_LOSS_THESIS"
+  | "POSITION_AT_LOSS"
+  | "EPISODE_ADD_LIMIT_REACHED"
+  | "ATR_SHOCK"
+  | "REGIME_NOT_CORE_TREND"
+  | "NON_POSITIVE_EXIT_12H_COOLDOWN"
+  | "SAME_ENTRY_PATH_24H_COOLDOWN";
+
+export interface PositionGuardBacktestResearchIntervention {
+  readonly scenario: PositionGuardBacktestFrozenResearchPolicyId;
+  readonly generatedAt: string;
+  readonly originalAction: StrategyDecisionAction;
+  readonly effectiveAction: StrategyDecisionAction;
+  readonly outcome: "ALLOW" | "SUPPRESS" | "OVERRIDE_EXIT";
+  readonly reason: PositionGuardBacktestResearchInterventionReason;
+  readonly evidence: Readonly<{
+    analysis: Readonly<Pick<
+      PositionGuardStructureAnalysis,
+      | "regime"
+      | "entryPath"
+      | "pullbackZone"
+      | "breakdown1d"
+      | "breakdown4h"
+      | "trendAlignmentScore"
+      | "recoveryQualityScore"
+      | "breakdownPressureScore"
+      | "weakeningStage"
+      | "failedReclaim"
+      | "bearishMomentumExpansion"
+      | "volumeRecovery"
+      | "macdImproving"
+      | "rsiRecovery"
+      | "atrShock"
+      | "currentPrice"
+      | "averageEntryPrice"
+      | "pnlPct"
+    >> & {
+      readonly oneHourLocation: PositionGuardStructureAnalysis["oneHourLocation"];
+    };
+    researchState: Readonly<PositionGuardBacktestResearchState>;
+  }>;
+}
+
 export interface PositionGuardBacktestState {
   cashKrw: number;
   quantity: number;
@@ -141,7 +226,31 @@ export interface PositionGuardBacktestFrameResult {
   drawdownPct: number;
   researchSuppression?: PositionGuardBacktestResearchSuppression | null;
   researchPolicyEvaluation?: PositionGuardBacktestConditionalAddPolicyEvaluation | null;
+  researchIntervention?: PositionGuardBacktestResearchIntervention | null;
+  modeledExecution?: PositionGuardBacktestModeledExecutionEvidence;
+  modeledTradeOrigin?: PositionGuardBacktestModeledTradeOriginEvidence;
 }
+
+export type PositionGuardBacktestModeledExecutionEvidence = Readonly<{
+  timingModel: PositionGuardBacktestExecutionTimingModel;
+  decisionGeneratedAt: string;
+  status: "PENDING_NEXT_FRAME" | "EXECUTED_NEXT_FRAME" | "SKIPPED_NEXT_FRAME" | "SKIPPED_NO_NEXT_FRAME";
+  executedAt: string | null;
+  executionPrice: number | null;
+  reason: PositionGuardBacktestSkipReason | "NO_NEXT_FRAME" | null;
+}>;
+
+export type PositionGuardBacktestModeledTradeOriginEvidence = Readonly<{
+  timingModel: "NEXT_FRAME_MODELED";
+  decisionGeneratedAt: string;
+  decisionFrameIndex: number;
+  executedAt: string;
+  executionFrameIndex: number;
+  originalAction: StrategyDecisionAction;
+  effectiveAction: Extract<StrategyDecisionAction, "ENTER" | "ADD" | "REDUCE" | "EXIT">;
+  scenario: PositionGuardBacktestFrozenResearchPolicyId | null;
+  intervention: Readonly<Pick<PositionGuardBacktestResearchIntervention, "outcome" | "reason">> | null;
+}>;
 
 export interface PositionGuardBacktestMetrics {
   actionCounts: Record<StrategyDecisionAction, number>;
@@ -161,6 +270,7 @@ export interface PositionGuardBacktestResult {
   frames: PositionGuardBacktestFrameResult[];
   metrics: PositionGuardBacktestMetrics;
   finalState: PositionGuardBacktestState;
+  finalResearchState?: PositionGuardBacktestResearchState;
 }
 
 const DEFAULT_BACKTEST_EXECUTION: PositionGuardBacktestExecutionModel = {
@@ -169,15 +279,36 @@ const DEFAULT_BACKTEST_EXECUTION: PositionGuardBacktestExecutionModel = {
   minimumTradeValueKrw: DEFAULT_POSITION_GUARD_STRATEGY_SETTINGS.minimumTradeValueKrw,
 };
 
+type PositionGuardBacktestDecisionExecutionResult = {
+  state: PositionGuardBacktestState;
+  trade: PositionGuardBacktestTrade | null;
+  skipReason: PositionGuardBacktestSkipReason | null;
+};
+
+type PendingModeledDecision = {
+  decision: PositionGuardEngineDecision;
+  originalGeneratedAt: string;
+  sourceResultIndex: number;
+  entryPath: StrategyEntryPath;
+  originalAction: StrategyDecisionAction;
+  effectiveAction: Extract<StrategyDecisionAction, "ENTER" | "ADD" | "REDUCE" | "EXIT">;
+  scenario: PositionGuardBacktestFrozenResearchPolicyId | null;
+  intervention: Readonly<Pick<PositionGuardBacktestResearchIntervention, "outcome" | "reason">> | null;
+};
+
 export function runPositionGuardBacktest(input: PositionGuardBacktestInput): PositionGuardBacktestResult {
   const settings = input.settings ?? DEFAULT_POSITION_GUARD_STRATEGY_SETTINGS;
   const execution = input.execution ?? DEFAULT_BACKTEST_EXECUTION;
   const researchExecutionPolicy = validateResearchExecutionPolicy(input.researchExecutionPolicy);
+  const executionTimingModel = input.executionTimingModel ?? "SAME_CLOSE_MODELED";
+  validateExecutionTimingModel(executionTimingModel);
   let state: PositionGuardBacktestState = {
     cashKrw: input.initialCashKrw,
     quantity: input.initialQuantity,
     averageEntryPrice: input.initialAverageEntryPrice,
   };
+  let researchState = initializeResearchState(input, researchExecutionPolicy);
+  let pendingDecision: PendingModeledDecision | null = null;
   let latestDecision: PreviousPositionGuardDecision | null = null;
   const initialEquity = getInitialEquity(input, state);
   let peakEquity = initialEquity;
@@ -196,8 +327,55 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
   };
   const results: PositionGuardBacktestFrameResult[] = [];
 
-  for (const frame of input.frames) {
+  for (const [frameIndex, frame] of input.frames.entries()) {
     validateConditionalAddAnalysis(researchExecutionPolicy, frame.analysis);
+    let carriedExecution: PositionGuardBacktestDecisionExecutionResult | null = null;
+    let modeledTradeOrigin: PositionGuardBacktestModeledTradeOriginEvidence | undefined;
+    if (executionTimingModel === "NEXT_FRAME_MODELED" && pendingDecision) {
+      const executionDecision = {
+        ...pendingDecision.decision,
+        referencePrice: frame.analysis.currentPrice,
+      };
+      carriedExecution = applyDecision({
+        decision: executionDecision,
+        state,
+        execution,
+        minimumTradeValueKrw: Math.max(execution.minimumTradeValueKrw, settings.minimumTradeValueKrw),
+      });
+      state = carriedExecution.state;
+      researchState = advanceResearchState({
+        researchState,
+        executionResult: carriedExecution,
+        decision: executionDecision,
+        entryPath: pendingDecision.entryPath,
+        executedAt: frame.generatedAt,
+      });
+      const sourceResult = results[pendingDecision.sourceResultIndex];
+      if (sourceResult) {
+        sourceResult.modeledExecution = Object.freeze({
+          timingModel: executionTimingModel,
+          decisionGeneratedAt: pendingDecision.originalGeneratedAt,
+          status: carriedExecution.trade ? "EXECUTED_NEXT_FRAME" : "SKIPPED_NEXT_FRAME",
+          executedAt: frame.generatedAt,
+          executionPrice: frame.analysis.currentPrice,
+          reason: carriedExecution.skipReason,
+        });
+      }
+      if (carriedExecution.trade) {
+        modeledTradeOrigin = Object.freeze({
+          timingModel: "NEXT_FRAME_MODELED",
+          decisionGeneratedAt: pendingDecision.originalGeneratedAt,
+          decisionFrameIndex: pendingDecision.sourceResultIndex,
+          executedAt: frame.generatedAt,
+          executionFrameIndex: frameIndex,
+          originalAction: pendingDecision.originalAction,
+          effectiveAction: pendingDecision.effectiveAction,
+          scenario: pendingDecision.scenario,
+          intervention: pendingDecision.intervention,
+        });
+      }
+      pendingDecision = null;
+    }
     const startingState = cloneState(state);
     const context = buildContext({
       input,
@@ -207,6 +385,16 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
       latestDecision,
     });
     const decision = decidePositionGuardCore(context);
+    const researchIntervention = isFrozenResearchPolicy(researchExecutionPolicy)
+      ? evaluatePositionGuardResearchIntervention({
+          policyId: researchExecutionPolicy.id,
+          generatedAt: frame.generatedAt,
+          decision,
+          state,
+          researchState,
+          analysis: context.analysis,
+        })
+      : null;
     const researchPolicyEvaluation = getConditionalAddPolicyEvaluation(
       researchExecutionPolicy,
       decision.action,
@@ -218,15 +406,55 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
       frame,
       researchPolicyEvaluation,
     );
-    const executionResult = researchSuppression
-      ? { state: cloneState(state), trade: null, skipReason: null }
-      : applyDecision({
-          decision,
-          state,
-          execution,
-          minimumTradeValueKrw: Math.max(execution.minimumTradeValueKrw, settings.minimumTradeValueKrw),
+    const effectiveDecision = toEffectiveDecision(decision, researchIntervention);
+    const interventionSuppressed = researchIntervention?.outcome === "SUPPRESS";
+    let executionResult: PositionGuardBacktestDecisionExecutionResult;
+    let modeledExecution: PositionGuardBacktestModeledExecutionEvidence | undefined;
+    if (executionTimingModel === "NEXT_FRAME_MODELED") {
+      executionResult = carriedExecution ?? { state: cloneState(state), trade: null, skipReason: null };
+      if (!researchSuppression && !interventionSuppressed && isExecutableDecision(effectiveDecision)) {
+        pendingDecision = {
+          decision: effectiveDecision,
+          originalGeneratedAt: frame.generatedAt,
+          sourceResultIndex: results.length,
+          entryPath: context.analysis.entryPath,
+          originalAction: decision.action,
+          effectiveAction: effectiveDecision.action,
+          scenario: researchIntervention?.scenario ?? null,
+          intervention: researchIntervention
+            ? Object.freeze({
+                outcome: researchIntervention.outcome,
+                reason: researchIntervention.reason,
+              })
+            : null,
+        };
+        modeledExecution = Object.freeze({
+          timingModel: executionTimingModel,
+          decisionGeneratedAt: frame.generatedAt,
+          status: "PENDING_NEXT_FRAME",
+          executedAt: null,
+          executionPrice: null,
+          reason: null,
         });
-    state = executionResult.state;
+      }
+    } else {
+      executionResult = researchSuppression || interventionSuppressed
+        ? { state: cloneState(state), trade: null, skipReason: null }
+        : applyDecision({
+            decision: effectiveDecision,
+            state,
+            execution,
+            minimumTradeValueKrw: Math.max(execution.minimumTradeValueKrw, settings.minimumTradeValueKrw),
+          });
+      state = executionResult.state;
+      researchState = advanceResearchState({
+        researchState,
+        executionResult,
+        decision: effectiveDecision,
+        entryPath: context.analysis.entryPath,
+        executedAt: frame.generatedAt,
+      });
+    }
     const equity = getEquity(state, frame.analysis.currentPrice);
     peakEquity = Math.max(peakEquity, equity);
     const drawdownPct = peakEquity > 0 ? (peakEquity - equity) / peakEquity : 0;
@@ -263,6 +491,9 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
       ...(researchExecutionPolicy && researchExecutionPolicy.id !== "NO_ADD"
         ? { researchPolicyEvaluation }
         : {}),
+      ...(isFrozenResearchPolicy(researchExecutionPolicy) ? { researchIntervention } : {}),
+      ...(modeledExecution ? { modeledExecution } : {}),
+      ...(modeledTradeOrigin ? { modeledTradeOrigin } : {}),
     });
 
     latestDecision = {
@@ -272,6 +503,20 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
       qualityBucket: decision.signalQuality.bucket,
       createdAt: frame.generatedAt,
     };
+  }
+
+  if (pendingDecision) {
+    const sourceResult = results[pendingDecision.sourceResultIndex];
+    if (sourceResult) {
+      sourceResult.modeledExecution = Object.freeze({
+        timingModel: "NEXT_FRAME_MODELED",
+        decisionGeneratedAt: pendingDecision.originalGeneratedAt,
+        status: "SKIPPED_NO_NEXT_FRAME",
+        executedAt: null,
+        executionPrice: null,
+        reason: "NO_NEXT_FRAME",
+      });
+    }
   }
 
   metrics.finalEquityKrw = roundMoney(metrics.finalEquityKrw);
@@ -284,6 +529,9 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
     frames: results,
     metrics,
     finalState: cloneState(state),
+    ...(isFrozenResearchPolicy(researchExecutionPolicy)
+      ? { finalResearchState: cloneResearchState(researchState) }
+      : {}),
   };
 }
 
@@ -301,6 +549,12 @@ function validateResearchExecutionPolicy(
     case "ADD_RISK_CLEAR":
     case "ADD_HIGH_ALIGNMENT":
     case "ADD_CORE_TREND":
+    case "HTF_TREND_GATE":
+    case "STRICT_PULLBACK":
+    case "EARLY_THESIS_FAILURE":
+    case "ADD_LIMITED":
+    case "COOLDOWN_CONTROL":
+    case "COMBINED_CONSERVATIVE":
       if ("suppressedActions" in policy) {
         throw new Error(`${policy.id} research execution policy must not define suppressedActions.`);
       }
@@ -308,6 +562,257 @@ function validateResearchExecutionPolicy(
     default:
       throw new Error(`Invalid research execution policy ${String((policy as { id?: unknown }).id)}.`);
   }
+}
+
+export function evaluatePositionGuardResearchIntervention(input: {
+  policyId: PositionGuardBacktestFrozenResearchPolicyId;
+  generatedAt: string;
+  decision: PositionGuardEngineDecision;
+  state: PositionGuardBacktestState;
+  researchState: PositionGuardBacktestResearchState;
+  analysis: PositionGuardStructureAnalysis;
+}): PositionGuardBacktestResearchIntervention | null {
+  const { decision } = input;
+  if (
+    (input.policyId === "EARLY_THESIS_FAILURE" || input.policyId === "COMBINED_CONSERVATIVE") &&
+    (decision.action === "EXIT" || decision.action === "REDUCE")
+  ) {
+    return createResearchIntervention(input, "ALLOW", decision.action, "RISK_REDUCING_DECISION_PRESERVED");
+  }
+
+  if (input.policyId === "EARLY_THESIS_FAILURE" || input.policyId === "COMBINED_CONSERVATIVE") {
+    const earlyFailureReason = getEarlyThesisFailureReason(input);
+    if (earlyFailureReason) {
+      return createResearchIntervention(input, "OVERRIDE_EXIT", "EXIT", earlyFailureReason);
+    }
+    if (input.policyId === "EARLY_THESIS_FAILURE") {
+      return decision.action === "HOLD" || decision.action === "ADD"
+        ? createResearchIntervention(input, "ALLOW", decision.action, "CONDITIONS_MET")
+        : null;
+    }
+  }
+
+  if (input.policyId === "COOLDOWN_CONTROL" || input.policyId === "COMBINED_CONSERVATIVE") {
+    const cooldownReason = getCooldownReason(input);
+    if (cooldownReason) {
+      return createResearchIntervention(input, "SUPPRESS", "HOLD", cooldownReason);
+    }
+    if (input.policyId === "COOLDOWN_CONTROL") {
+      return decision.action === "ENTER"
+        ? createResearchIntervention(input, "ALLOW", "ENTER", "CONDITIONS_MET")
+        : null;
+    }
+  }
+
+  if (input.policyId === "HTF_TREND_GATE" || input.policyId === "COMBINED_CONSERVATIVE") {
+    const htfReason = getHtfTrendGateReason(input);
+    if (htfReason) {
+      return createResearchIntervention(input, "SUPPRESS", "HOLD", htfReason);
+    }
+    if (input.policyId === "HTF_TREND_GATE") {
+      return decision.action === "ENTER"
+        ? createResearchIntervention(input, "ALLOW", "ENTER", "CONDITIONS_MET")
+        : null;
+    }
+  }
+
+  if (input.policyId === "STRICT_PULLBACK") {
+    if (decision.action !== "ENTER") return null;
+    const reason = getStrictPullbackReason(input.analysis);
+    return reason
+      ? createResearchIntervention(input, "SUPPRESS", "HOLD", reason)
+      : createResearchIntervention(input, "ALLOW", "ENTER", "CONDITIONS_MET");
+  }
+
+  if (input.policyId === "ADD_LIMITED" || input.policyId === "COMBINED_CONSERVATIVE") {
+    const addReason = getAddLimitedReason(input);
+    if (addReason) {
+      return createResearchIntervention(input, "SUPPRESS", "HOLD", addReason);
+    }
+    if (decision.action === "ADD") {
+      return createResearchIntervention(input, "ALLOW", "ADD", "CONDITIONS_MET");
+    }
+  }
+
+  return null;
+}
+
+function getHtfTrendGateReason(
+  input: Parameters<typeof evaluatePositionGuardResearchIntervention>[0],
+): PositionGuardBacktestResearchInterventionReason | null {
+  if (input.decision.action !== "ENTER") return null;
+  const { analysis } = input;
+  const policy = POSITION_GUARD_RESEARCH_POLICY_MANIFEST.scenarios.HTF_TREND_GATE;
+  if (analysis.breakdown1d || analysis.breakdown4h) return "HTF_BREAKDOWN";
+  if (analysis.trendAlignmentScore < policy.minimumTrendAlignmentScore) {
+    return "TREND_ALIGNMENT_BELOW_3";
+  }
+  if (analysis.weakeningStage !== "NONE") return "WEAKENING_PRESENT";
+  if (!policy.allowedRegimes.includes(analysis.regime as typeof policy.allowedRegimes[number])) {
+    return "REGIME_NOT_ENTRY_TREND";
+  }
+  return null;
+}
+
+function getStrictPullbackReason(
+  analysis: PositionGuardStructureAnalysis,
+): PositionGuardBacktestResearchInterventionReason | null {
+  const policy = POSITION_GUARD_RESEARCH_POLICY_MANIFEST.scenarios.STRICT_PULLBACK;
+  if (analysis.entryPath !== policy.requiredEntryPath) return "ENTRY_PATH_NOT_PULLBACK";
+  if (!analysis.pullbackZone) return "PULLBACK_ZONE_MISSING";
+  if (analysis.regime !== policy.requiredRegime) return "REGIME_NOT_PULLBACK_IN_UPTREND";
+  if (analysis.breakdown1d || analysis.breakdown4h) return "HTF_BREAKDOWN";
+  if (analysis.trendAlignmentScore < policy.minimumTrendAlignmentScore) return "TREND_ALIGNMENT_BELOW_4";
+  if (analysis.recoveryQualityScore < policy.minimumRecoveryQualityScore) return "RECOVERY_QUALITY_BELOW_3";
+  if (!policy.allowedOneHourLocations.includes(
+    analysis.oneHourLocation as typeof policy.allowedOneHourLocations[number],
+  )) {
+    return "ONE_HOUR_LOCATION_NOT_LOWER_OR_MIDDLE";
+  }
+  if (!analysis.volumeRecovery) return "VOLUME_RECOVERY_MISSING";
+  if (!analysis.macdImproving && !analysis.rsiRecovery) return "MOMENTUM_RECOVERY_MISSING";
+  return null;
+}
+
+function getEarlyThesisFailureReason(
+  input: Parameters<typeof evaluatePositionGuardResearchIntervention>[0],
+): PositionGuardBacktestResearchInterventionReason | null {
+  if (input.state.quantity <= POSITION_GUARD_RESEARCH_POLICY_MANIFEST.quantityTolerance) return null;
+  if (input.decision.action !== "HOLD" && input.decision.action !== "ADD") return null;
+  const { analysis } = input;
+  const policy = POSITION_GUARD_RESEARCH_POLICY_MANIFEST.scenarios.EARLY_THESIS_FAILURE;
+  if (
+    analysis.failedReclaim &&
+    (analysis.weakeningStage === "CLEAR" || analysis.weakeningStage === "FAILURE") &&
+    analysis.recoveryQualityScore <= policy.maximumFailedReclaimRecoveryQualityScore
+  ) {
+    return "FAILED_RECLAIM_THESIS";
+  }
+  if (
+    analysis.breakdownPressureScore >= policy.minimumBearishBreakdownPressureScore &&
+    analysis.bearishMomentumExpansion &&
+    analysis.pnlPct < 0
+  ) {
+    return "BEARISH_LOSS_THESIS";
+  }
+  return null;
+}
+
+function getAddLimitedReason(
+  input: Parameters<typeof evaluatePositionGuardResearchIntervention>[0],
+): PositionGuardBacktestResearchInterventionReason | null {
+  if (input.decision.action !== "ADD") return null;
+  const { analysis, researchState, state } = input;
+  const policy = POSITION_GUARD_RESEARCH_POLICY_MANIFEST.scenarios.ADD_LIMITED;
+  if (analysis.currentPrice < state.averageEntryPrice) return "POSITION_AT_LOSS";
+  if (
+    researchState.currentEpisodeAddCount >=
+      policy.maxAddsPerEpisode
+  ) {
+    return "EPISODE_ADD_LIMIT_REACHED";
+  }
+  if (analysis.atrShock) return "ATR_SHOCK";
+  if (analysis.weakeningStage !== "NONE") return "WEAKENING_PRESENT";
+  if (analysis.trendAlignmentScore < policy.minimumTrendAlignmentScore) return "TREND_ALIGNMENT_BELOW_4";
+  if (analysis.recoveryQualityScore < policy.minimumRecoveryQualityScore) return "RECOVERY_QUALITY_BELOW_3";
+  if (!policy.allowedRegimes.includes(analysis.regime as typeof policy.allowedRegimes[number])) {
+    return "REGIME_NOT_CORE_TREND";
+  }
+  return null;
+}
+
+function getCooldownReason(
+  input: Parameters<typeof evaluatePositionGuardResearchIntervention>[0],
+): PositionGuardBacktestResearchInterventionReason | null {
+  if (input.decision.action !== "ENTER") return null;
+  const { lastFullExitAt, lastFullExitRealizedPnlKrw, lastEntryPath } = input.researchState;
+  if (lastFullExitAt === null) return null;
+  const elapsedNanoseconds = parseExactTimestamp(input.generatedAt) - parseExactTimestamp(lastFullExitAt);
+  if (elapsedNanoseconds < 0n) {
+    throw new Error("Research cooldown generatedAt must not precede lastFullExitAt.");
+  }
+  if (
+    lastFullExitRealizedPnlKrw !== null &&
+    lastFullExitRealizedPnlKrw <= 0 &&
+    elapsedNanoseconds < hoursToNanoseconds(
+      POSITION_GUARD_RESEARCH_POLICY_MANIFEST.scenarios.COOLDOWN_CONTROL.nonPositiveExitHours,
+    )
+  ) {
+    return "NON_POSITIVE_EXIT_12H_COOLDOWN";
+  }
+  if (
+    lastEntryPath === input.analysis.entryPath &&
+    elapsedNanoseconds < hoursToNanoseconds(
+      POSITION_GUARD_RESEARCH_POLICY_MANIFEST.scenarios.COOLDOWN_CONTROL.sameEntryPathHours,
+    )
+  ) {
+    return "SAME_ENTRY_PATH_24H_COOLDOWN";
+  }
+  return null;
+}
+
+function createResearchIntervention(
+  input: Parameters<typeof evaluatePositionGuardResearchIntervention>[0],
+  outcome: PositionGuardBacktestResearchIntervention["outcome"],
+  effectiveAction: StrategyDecisionAction,
+  reason: PositionGuardBacktestResearchInterventionReason,
+): PositionGuardBacktestResearchIntervention {
+  const analysis = Object.freeze({
+    regime: input.analysis.regime,
+    entryPath: input.analysis.entryPath,
+    pullbackZone: input.analysis.pullbackZone,
+    breakdown1d: input.analysis.breakdown1d,
+    breakdown4h: input.analysis.breakdown4h,
+    trendAlignmentScore: input.analysis.trendAlignmentScore,
+    recoveryQualityScore: input.analysis.recoveryQualityScore,
+    breakdownPressureScore: input.analysis.breakdownPressureScore,
+    weakeningStage: input.analysis.weakeningStage,
+    failedReclaim: input.analysis.failedReclaim,
+    bearishMomentumExpansion: input.analysis.bearishMomentumExpansion,
+    volumeRecovery: input.analysis.volumeRecovery,
+    macdImproving: input.analysis.macdImproving,
+    rsiRecovery: input.analysis.rsiRecovery,
+    atrShock: input.analysis.atrShock,
+    oneHourLocation: input.analysis.oneHourLocation,
+    currentPrice: input.analysis.currentPrice,
+    averageEntryPrice: input.analysis.averageEntryPrice,
+    pnlPct: input.analysis.pnlPct,
+  });
+  return Object.freeze({
+    scenario: input.policyId,
+    generatedAt: input.generatedAt,
+    originalAction: input.decision.action,
+    effectiveAction,
+    outcome,
+    reason,
+    evidence: Object.freeze({
+      analysis,
+      researchState: Object.freeze(cloneResearchState(input.researchState)),
+    }),
+  });
+}
+
+function toEffectiveDecision(
+  decision: PositionGuardEngineDecision,
+  intervention: PositionGuardBacktestResearchIntervention | null,
+): PositionGuardEngineDecision {
+  if (!intervention || intervention.outcome === "ALLOW") return decision;
+  if (intervention.outcome === "OVERRIDE_EXIT") {
+    return {
+      ...decision,
+      action: "EXIT",
+      targetNotionalKrw: 0,
+      targetQuantityFraction: 1,
+      executionDisposition: "IMMEDIATE",
+    };
+  }
+  return {
+    ...decision,
+    action: "HOLD",
+    targetNotionalKrw: 0,
+    targetQuantityFraction: null,
+    executionDisposition: "SKIPPED",
+  };
 }
 
 function getResearchSuppression(
@@ -325,6 +830,8 @@ function getResearchSuppression(
     };
   }
 
+  if (!isConditionalAddPolicy(policy)) return null;
+
   if (conditionalEvaluation?.outcome !== "SUPPRESS") return null;
 
   return {
@@ -341,7 +848,7 @@ function getConditionalAddPolicyEvaluation(
   action: StrategyDecisionAction,
   frame: PositionGuardBacktestFrame,
 ): PositionGuardBacktestConditionalAddPolicyEvaluation | null {
-  if (!policy || policy.id === "NO_ADD" || action !== "ADD") return null;
+  if (!isConditionalAddPolicy(policy) || action !== "ADD") return null;
 
   const reason = getConditionalAddSuppressionReason(policy.id, frame.analysis);
   const evidence = {
@@ -369,7 +876,7 @@ function validateConditionalAddAnalysis(
   policy: PositionGuardBacktestResearchExecutionPolicy | undefined,
   analysis: PositionGuardStructureAnalysis,
 ): void {
-  if (!policy || policy.id === "NO_ADD") return;
+  if (!isConditionalAddPolicy(policy)) return;
   if (!Number.isFinite(analysis.trendAlignmentScore)) {
     throw new Error("Invalid conditional ADD analysis trendAlignmentScore: expected a finite number.");
   }
@@ -397,6 +904,25 @@ function validateConditionalAddAnalysis(
   }
 }
 
+function isConditionalAddPolicy(
+  policy: PositionGuardBacktestResearchExecutionPolicy | undefined,
+): policy is PositionGuardBacktestResearchExecutionPolicy<PositionGuardBacktestConditionalAddPolicyId> {
+  return policy?.id === "ADD_RISK_CLEAR" ||
+    policy?.id === "ADD_HIGH_ALIGNMENT" ||
+    policy?.id === "ADD_CORE_TREND";
+}
+
+function isFrozenResearchPolicy(
+  policy: PositionGuardBacktestResearchExecutionPolicy | undefined,
+): policy is PositionGuardBacktestResearchExecutionPolicy<PositionGuardBacktestFrozenResearchPolicyId> {
+  return policy?.id === "HTF_TREND_GATE" ||
+    policy?.id === "STRICT_PULLBACK" ||
+    policy?.id === "EARLY_THESIS_FAILURE" ||
+    policy?.id === "ADD_LIMITED" ||
+    policy?.id === "COOLDOWN_CONTROL" ||
+    policy?.id === "COMBINED_CONSERVATIVE";
+}
+
 function getConditionalAddSuppressionReason(
   policyId: PositionGuardBacktestConditionalAddPolicyId,
   analysis: PositionGuardStructureAnalysis,
@@ -410,6 +936,128 @@ function getConditionalAddSuppressionReason(
     return "REGIME_NOT_CORE_TREND";
   }
   return null;
+}
+
+function initializeResearchState(
+  input: PositionGuardBacktestInput,
+  policy: PositionGuardBacktestResearchExecutionPolicy | undefined,
+): PositionGuardBacktestResearchState {
+  const stateful = policy?.id === "ADD_LIMITED" ||
+    policy?.id === "COOLDOWN_CONTROL" ||
+    policy?.id === "COMBINED_CONSERVATIVE";
+  if (
+    stateful &&
+    input.initialQuantity > POSITION_GUARD_RESEARCH_POLICY_MANIFEST.quantityTolerance &&
+    !input.researchCarryInState
+  ) {
+    throw new Error(`${policy.id} requires explicit carry-in research state when initial quantity is non-zero.`);
+  }
+  const state = input.researchCarryInState ?? {
+    currentEpisodeAddCount: 0,
+    currentEpisodeRealizedPnlKrw: 0,
+    lastFullExitAt: null,
+    lastFullExitRealizedPnlKrw: null,
+    lastEntryPath: null,
+  };
+  validateResearchState(state);
+  return cloneResearchState(state);
+}
+
+function validateResearchState(state: PositionGuardBacktestResearchState): void {
+  if (!Number.isInteger(state.currentEpisodeAddCount) || state.currentEpisodeAddCount < 0) {
+    throw new Error("Research state currentEpisodeAddCount must be a non-negative integer.");
+  }
+  if (!Number.isFinite(state.currentEpisodeRealizedPnlKrw)) {
+    throw new Error("Research state currentEpisodeRealizedPnlKrw must be finite.");
+  }
+  if (state.lastFullExitAt !== null) parseExactTimestamp(state.lastFullExitAt);
+  if (
+    state.lastFullExitRealizedPnlKrw !== null &&
+    !Number.isFinite(state.lastFullExitRealizedPnlKrw)
+  ) {
+    throw new Error("Research state lastFullExitRealizedPnlKrw must be finite or null.");
+  }
+  if (
+    state.lastEntryPath !== null &&
+    state.lastEntryPath !== "PULLBACK" &&
+    state.lastEntryPath !== "RECLAIM" &&
+    state.lastEntryPath !== "BREAKOUT_HOLD" &&
+    state.lastEntryPath !== "NONE"
+  ) {
+    throw new Error("Research state lastEntryPath is invalid.");
+  }
+}
+
+function advanceResearchState(input: {
+  researchState: PositionGuardBacktestResearchState;
+  executionResult: PositionGuardBacktestDecisionExecutionResult;
+  decision: PositionGuardEngineDecision;
+  entryPath: StrategyEntryPath;
+  executedAt: string;
+}): PositionGuardBacktestResearchState {
+  const next = cloneResearchState(input.researchState);
+  const trade = input.executionResult.trade;
+  if (!trade) return next;
+  if (trade.action === "ENTER") {
+    next.lastEntryPath = input.entryPath;
+  } else if (trade.action === "ADD") {
+    next.currentEpisodeAddCount += 1;
+  }
+  if (trade.action === "REDUCE" || trade.action === "EXIT") {
+    next.currentEpisodeRealizedPnlKrw = roundMoney(
+      next.currentEpisodeRealizedPnlKrw + trade.realizedPnlKrw,
+    );
+  }
+  if (
+    trade.action === "EXIT" &&
+    input.executionResult.state.quantity <= POSITION_GUARD_RESEARCH_POLICY_MANIFEST.quantityTolerance
+  ) {
+    next.currentEpisodeAddCount = 0;
+    next.lastFullExitAt = input.executedAt;
+    next.lastFullExitRealizedPnlKrw = next.currentEpisodeRealizedPnlKrw;
+    next.currentEpisodeRealizedPnlKrw = 0;
+  }
+  return next;
+}
+
+function cloneResearchState(state: PositionGuardBacktestResearchState): PositionGuardBacktestResearchState {
+  return {
+    currentEpisodeAddCount: state.currentEpisodeAddCount,
+    currentEpisodeRealizedPnlKrw: state.currentEpisodeRealizedPnlKrw,
+    lastFullExitAt: state.lastFullExitAt,
+    lastFullExitRealizedPnlKrw: state.lastFullExitRealizedPnlKrw,
+    lastEntryPath: state.lastEntryPath,
+  };
+}
+
+function validateExecutionTimingModel(model: PositionGuardBacktestExecutionTimingModel): void {
+  if (model !== "SAME_CLOSE_MODELED" && model !== "NEXT_FRAME_MODELED") {
+    throw new Error(`Invalid backtest execution timing model ${String(model)}.`);
+  }
+}
+
+function isExecutableDecision(
+  decision: PositionGuardEngineDecision,
+): decision is PositionGuardEngineDecision & {
+  action: Extract<StrategyDecisionAction, "ENTER" | "ADD" | "REDUCE" | "EXIT">;
+} {
+  return decision.executionDisposition !== "DEFERRED_CONFIRMATION" &&
+    (decision.action === "ENTER" ||
+      decision.action === "ADD" ||
+      decision.action === "REDUCE" ||
+      decision.action === "EXIT");
+}
+
+function parseExactTimestamp(value: string): bigint {
+  try {
+    return performanceTimestampEpochNanoseconds(value);
+  } catch {
+    throw new Error(`Invalid research timestamp ${value}.`);
+  }
+}
+
+function hoursToNanoseconds(hours: number): bigint {
+  return BigInt(hours) * 3_600_000_000_000n;
 }
 
 function buildContext(input: {
@@ -633,4 +1281,14 @@ function roundMoney(value: number): number {
 
 function roundQuantity(value: number): number {
   return Number(value.toFixed(12));
+}
+
+function deepFreeze<T>(value: T): Readonly<T> {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const nested of Object.values(value as Record<string, unknown>)) {
+      deepFreeze(nested);
+    }
+    Object.freeze(value);
+  }
+  return value;
 }

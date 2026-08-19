@@ -6,6 +6,7 @@ import {
   type PositionGuardBacktestFrame,
 } from "../src/modules/strategy/position-guard-backtest.js";
 import {
+  BROAD_LOSS_CAUSE_RESEARCH_MANIFEST,
   runCounterfactualScenarios,
   type CounterfactualInput,
   type CounterfactualScenario,
@@ -74,6 +75,200 @@ test("counterfactual maps all five scenarios to Task 1 policies in caller order"
       ["ADD_HIGH_ALIGNMENT", { id: "ADD_HIGH_ALIGNMENT" }],
     ],
   );
+});
+
+test("counterfactual maps all six frozen broad-loss scenarios without reordering", () => {
+  const scenarios = [
+    "HTF_TREND_GATE",
+    "STRICT_PULLBACK",
+    "EARLY_THESIS_FAILURE",
+    "ADD_LIMITED",
+    "COOLDOWN_CONTROL",
+    "COMBINED_CONSERVATIVE",
+  ] as const satisfies readonly CounterfactualScenario[];
+  const result = runCounterfactualScenarios({
+    ...createCounterfactualInput(scenarios),
+    initialQuantity: 0,
+    initialAverageEntryPrice: 0,
+  });
+
+  assert.deepEqual(result.map(({ scenario }) => scenario), scenarios);
+  assert.deepEqual(result.map(({ executionPolicy }) => executionPolicy), scenarios.map((id) => ({ id })));
+});
+
+test("counterfactual exports the frozen development, cost-role, threshold, and timing manifest", () => {
+  assert.deepEqual(BROAD_LOSS_CAUSE_RESEARCH_MANIFEST.developmentRange, {
+    from: "2025-01-01T00:00:00Z",
+    to: "2026-04-12T19:00:00Z",
+  });
+  assert.deepEqual(BROAD_LOSS_CAUSE_RESEARCH_MANIFEST.costCells, {
+    BASE: { role: "BASE", feeRate: 0.0005, slippageRate: 0.0003 },
+    STRESS: { role: "STRESS", feeRate: 0.001, slippageRate: 0.002 },
+  });
+  assert.deepEqual(BROAD_LOSS_CAUSE_RESEARCH_MANIFEST.executionTimingModels, [
+    "SAME_CLOSE_MODELED",
+    "NEXT_FRAME_MODELED",
+  ]);
+  assert.equal(BROAD_LOSS_CAUSE_RESEARCH_MANIFEST.scenarios.ADD_LIMITED.maxAddsPerEpisode, 1);
+  assert.equal(BROAD_LOSS_CAUSE_RESEARCH_MANIFEST.scenarios.COOLDOWN_CONTROL.nonPositiveExitHours, 12);
+  assert.equal(Object.isFrozen(BROAD_LOSS_CAUSE_RESEARCH_MANIFEST), true);
+  assert.equal(Object.isFrozen(BROAD_LOSS_CAUSE_RESEARCH_MANIFEST.scenarios), true);
+});
+
+test("counterfactual defaults to same-close provenance and explicitly records next-frame provenance", () => {
+  const sameClose = runCounterfactualScenarios(createCounterfactualInput(["BASELINE"]))[0]!;
+  const nextFrame = runCounterfactualScenarios({
+    ...createCounterfactualInput(["BASELINE"]),
+    executionTimingModel: "NEXT_FRAME_MODELED",
+  })[0]!;
+
+  assert.deepEqual(sameClose.executionTimingProvenance, {
+    model: "SAME_CLOSE_MODELED",
+    observedExecution: false,
+    caveat: "Core decisions are modeled at each frame close and filled at that same close.",
+  });
+  assert.deepEqual(nextFrame.executionTimingProvenance, {
+    model: "NEXT_FRAME_MODELED",
+    observedExecution: false,
+    caveat: "Core decisions are modeled at one frame close and filled at the next completed frame close.",
+  });
+});
+
+test("NEXT_FRAME synthetic fill keeps the originating ENTER when the execution frame decides EXIT", () => {
+  const decisionGeneratedAt = "2026-04-20T01:00:00.000000100Z";
+  const executedAt = "2026-04-20T02:00:00.000000200Z";
+  const [result] = runCounterfactualScenarios({
+    ...createCounterfactualInput(["HTF_TREND_GATE"], [
+      createFrame(decisionGeneratedAt, {
+        regime: "EARLY_RECOVERY",
+        currentPrice: 100_000,
+        entryPath: "RECLAIM",
+        reclaimStructure: true,
+        trendAlignmentScore: 4,
+        recoveryQualityScore: 4,
+        volumeRecovery: true,
+        macdImproving: true,
+        rsiRecovery: true,
+      }),
+      createFrame(executedAt, {
+        currentPrice: 110_000,
+        invalidationState: "BROKEN",
+        breakdown1d: true,
+        breakdown4h: true,
+        bearishMomentumExpansion: true,
+      }),
+    ], {
+      initialCashKrw: 100_000,
+      initialQuantity: 0,
+      initialAverageEntryPrice: 0,
+    }),
+    executionTimingModel: "NEXT_FRAME_MODELED",
+  });
+  const fill = result?.fills[0];
+
+  assert.equal(result?.legacyBacktest.result.frames[0]?.decision.action, "ENTER");
+  assert.equal(result?.legacyBacktest.result.frames[1]?.decision.action, "EXIT");
+  assert.equal(result?.legacyBacktest.result.frames[1]?.trade?.action, "ENTER");
+  assert.equal(fill?.decisionAction, "ENTER");
+  assert.equal(fill?.filledAt, executedAt);
+  assert.equal(
+    fill?.strategyDecisionId,
+    `counterfactual:HTF_TREND_GATE:BTC:${decisionGeneratedAt}:0:ENTER:decision`,
+  );
+  assert.match(fill?.id ?? "", /HTF_TREND_GATE.*ENTER.*ALLOW.*CONDITIONS_MET/);
+  assert.deepEqual(result?.modeledFillAttributions, [{
+    fillId: fill?.id,
+    scenario: "HTF_TREND_GATE",
+    decisionGeneratedAt,
+    decisionFrameIndex: 0,
+    executedAt,
+    executionFrameIndex: 1,
+    originalAction: "ENTER",
+    effectiveAction: "ENTER",
+    intervention: {
+      outcome: "ALLOW",
+      reason: "CONDITIONS_MET",
+    },
+  }]);
+});
+
+test("SAME_CLOSE synthetic fill preserves the policy intervention attribution", () => {
+  const generatedAt = "2026-04-20T01:00:00.000000100Z";
+  const [result] = runCounterfactualScenarios({
+    ...createCounterfactualInput(["HTF_TREND_GATE"], [
+      createFrame(generatedAt, {
+        regime: "EARLY_RECOVERY",
+        currentPrice: 100_000,
+        entryPath: "RECLAIM",
+        reclaimStructure: true,
+        trendAlignmentScore: 4,
+        recoveryQualityScore: 4,
+        volumeRecovery: true,
+        macdImproving: true,
+        rsiRecovery: true,
+      }),
+    ], {
+      initialCashKrw: 100_000,
+      initialQuantity: 0,
+      initialAverageEntryPrice: 0,
+    }),
+    executionTimingModel: "SAME_CLOSE_MODELED",
+  });
+  const fill = result?.fills[0];
+
+  assert.equal(fill?.decisionAction, "ENTER");
+  assert.equal(fill?.filledAt, generatedAt);
+  assert.deepEqual(result?.modeledFillAttributions, [{
+    fillId: fill?.id,
+    scenario: "HTF_TREND_GATE",
+    decisionGeneratedAt: generatedAt,
+    decisionFrameIndex: 0,
+    executedAt: generatedAt,
+    executionFrameIndex: 0,
+    originalAction: "ENTER",
+    effectiveAction: "ENTER",
+    intervention: {
+      outcome: "ALLOW",
+      reason: "CONDITIONS_MET",
+    },
+  }]);
+});
+
+test("synthetic fills record an overridden effective action without losing the original action", () => {
+  const decisionGeneratedAt = "2026-04-20T01:00:00.000000100Z";
+  const executedAt = "2026-04-20T02:00:00.000000200Z";
+  const [result] = runCounterfactualScenarios({
+    ...createCounterfactualInput(["EARLY_THESIS_FAILURE"], [
+      createFrame(decisionGeneratedAt, {
+        regime: "BULL_TREND",
+        currentPrice: 90_000,
+        entryPath: "RECLAIM",
+        reclaimStructure: true,
+        trendAlignmentScore: 4,
+        failedReclaim: true,
+        weakeningStage: "CLEAR",
+        recoveryQualityScore: 1,
+      }),
+      createFrame(executedAt, { currentPrice: 89_000 }),
+    ]),
+    executionTimingModel: "NEXT_FRAME_MODELED",
+  });
+  const fill = result?.fills[0];
+  const attribution = result?.modeledFillAttributions?.[0];
+
+  assert.equal(attribution?.originalAction, "HOLD");
+  assert.equal(attribution?.effectiveAction, "EXIT");
+  assert.equal(fill?.side, "ask");
+  assert.equal(fill?.decisionAction, "EXIT");
+});
+
+test("counterfactual rejects carry-in stateful scenarios without explicit policy state", () => {
+  for (const scenario of ["ADD_LIMITED", "COOLDOWN_CONTROL", "COMBINED_CONSERVATIVE"] as const) {
+    assert.throws(
+      () => runCounterfactualScenarios(createCounterfactualInput([scenario])),
+      new RegExp(`${scenario}.*carry-in research state`),
+    );
+  }
 });
 
 test("counterfactual conditional scenarios produce stable scenario-qualified fill ids", () => {

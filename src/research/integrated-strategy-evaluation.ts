@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -66,6 +67,16 @@ import {
   type PerformanceRegimeAnalysisResult,
 } from "../modules/performance/performance-regimes.js";
 import {
+  evaluateStrategyHypotheses,
+  FROZEN_STRATEGY_HYPOTHESIS_MANIFEST,
+  FROZEN_STRATEGY_HYPOTHESIS_SCENARIO_ORDER,
+  type StrategyHypothesisCoverageObservation,
+  type StrategyHypothesisEvaluationResult,
+  type StrategyHypothesisMetricObservation,
+  type StrategyHypothesisSupportObservation,
+  type StrategyHypothesisTimingModel,
+} from "../modules/performance/performance-strategy-hypothesis-evaluation.js";
+import {
   runCostSensitivity,
   type CostScenario,
   type CostSensitivityCell,
@@ -81,7 +92,11 @@ import {
   type ResearchCandleDataset,
   type ResearchDatasetProvenance,
 } from "../modules/performance/research-candle-dataset.js";
-import type { CounterfactualScenario } from "../modules/performance/strategy-counterfactual.js";
+import {
+  runCounterfactualScenarios,
+  type CounterfactualScenario,
+  type CounterfactualScenarioResult,
+} from "../modules/performance/strategy-counterfactual.js";
 import {
   normalizeExplicitIsoTimestamp,
   readPerformanceInput,
@@ -94,6 +109,7 @@ import {
   comparePerformanceTimestamps,
   parsePerformanceTimestamp,
 } from "../modules/performance/performance-timestamp.js";
+import { PERFORMANCE_QUANTITY_TOLERANCE } from "../modules/performance/performance-trade-matcher.js";
 import { buildPositionGuardBacktestFrames } from "../modules/strategy/position-guard-backtest-frames.js";
 import type {
   PositionGuardBacktestFrameResult,
@@ -133,6 +149,7 @@ export type IntegratedStrategyEvaluationOptions = {
   format: IntegratedEvaluationFormat;
   simulation: IntegratedSimulationOptions | null;
   stabilityValidation: IntegratedStabilityValidationOptions | null;
+  broadStrategyHypothesisProfile?: "BROAD_LOSS_CAUSE_V1";
 };
 
 export type IntegratedDatasetProvenance = {
@@ -466,8 +483,62 @@ export type IntegratedStrategyEvaluationReport = {
   stabilityValidation?: StabilityValidationSection;
   conditionalAddPolicyEvaluation?: ConditionalAddPolicyEvaluationSection;
   addLossAttribution?: AddLossAttributionSection;
+  broadStrategyHypothesisEvaluation?: BroadStrategyHypothesisEvaluationSection;
   evidenceGaps: readonly IntegratedEvidenceGap[];
   interpretation: readonly InterpretationFinding[];
+};
+
+export type BroadStrategyHypothesisEvaluationSection = StrategyHypothesisEvaluationResult & {
+  profileId: "BROAD_LOSS_CAUSE_V1";
+  readOnly: true;
+  deploymentApproval: false;
+  developmentCutoffExclusive: string;
+  scenarioMatrix: readonly CounterfactualScenario[];
+  independentNoTradeProofAvailable: false;
+  datasets: readonly BroadStrategyHypothesisDatasetProvenance[];
+  pathDiagnostics: readonly BroadStrategyPathDiagnostics[];
+  interpretationBoundary: "READ_ONLY_SELECTED_COUNTERFACTUAL_PATHS_NOT_DEPLOYMENT_APPROVAL";
+};
+
+export type BroadStrategyPathDiagnostics = {
+  asset: SupportedAsset;
+  scenario: CounterfactualScenario;
+  timingModel: StrategyHypothesisTimingModel;
+  costCellId: "BASE" | "STRESS";
+  backtestMetrics: PositionGuardBacktestMetrics;
+  fifoAndEpisodeDiagnostics: PerformanceDiagnosticsResult;
+  regimeAnalysis: PerformanceRegimeAnalysisResult;
+  excursionAnalysis: PerformanceExcursionResult;
+  windows: readonly BroadStrategyWindowDiagnostics[];
+  interventions: {
+    total: number;
+    outcomes: Record<"ALLOW" | "SUPPRESS" | "OVERRIDE_EXIT", number>;
+    reasons: Record<string, number>;
+  };
+};
+
+export type BroadStrategyWindowDiagnostics = {
+  windowId: "W1" | "W2" | "W3";
+  from: string;
+  to: string;
+  frameCount: number;
+  returnAndDrawdown: { status: "AVAILABLE"; netReturnPct: number; maxDrawdownPct: number }
+    | { status: "UNAVAILABLE"; reason: "NO_FRAMES_IN_WINDOW" };
+  completedEpisodes: CounterfactualScenarioResult["matchResult"]["episodes"];
+  realizationSlices: CounterfactualScenarioResult["matchResult"]["realizationSlices"];
+  fills: CounterfactualScenarioResult["fills"];
+  excursionEpisodes: PerformanceExcursionResult["episodes"];
+};
+
+export type BroadStrategyHypothesisDatasetProvenance = {
+  asset: SupportedAsset;
+  datasetSha256: string;
+  initialStateFingerprint: string;
+  frameFingerprint: string;
+  developmentFrameCount: number;
+  firstDevelopmentFrameAt: string | null;
+  lastDevelopmentFrameAt: string | null;
+  excludedPostCutoffCandleCount: number;
 };
 
 export type IntegratedEvaluationDependencies = {
@@ -515,6 +586,16 @@ const ADD_DIAGNOSTIC_GAP_CODES = new Set([
   "BASELINE_ADD_EPISODE_MISSING",
   "COMPLETED_EPISODE_NET_PNL_UNKNOWN",
 ]);
+const BROAD_STRATEGY_PROFILE = "BROAD_LOSS_CAUSE_V1" as const;
+const BROAD_STRATEGY_SCENARIOS = [
+  "BASELINE",
+  "NO_ADD",
+  ...FROZEN_STRATEGY_HYPOTHESIS_SCENARIO_ORDER,
+] as const satisfies readonly CounterfactualScenario[];
+const BROAD_TIMING_MODELS = [
+  "SAME_CLOSE_MODELED",
+  "NEXT_FRAME_MODELED",
+] as const satisfies readonly StrategyHypothesisTimingModel[];
 
 type ConditionalAddPolicyConfiguration = {
   baseCost: CostScenario;
@@ -552,6 +633,7 @@ export function parseIntegratedStrategyEvaluationArgs(
     "validation-frame-interval-ms",
     "validation-comparison-tolerance-pp",
     "validation-minimum-windows",
+    "broad-strategy-hypothesis-profile",
   ]);
   const values = new Map<string, string>();
   for (let index = 0; index < argv.length; index += 1) {
@@ -581,6 +663,7 @@ export function parseIntegratedStrategyEvaluationArgs(
     "scenarios",
     "minimum-order-value-krw",
     "cost-cells",
+    "broad-strategy-hypothesis-profile",
   ];
   if (!hasDataset) {
     if (simulationKeys.some((key) => values.has(key))) {
@@ -622,11 +705,20 @@ export function parseIntegratedStrategyEvaluationArgs(
     costScenarios,
     assets,
   };
+  const stabilityValidation = parseStabilityValidation(values, scenarios);
+  const broadStrategyHypothesisProfile = parseBroadStrategyHypothesisProfile(
+    values,
+    simulation,
+    stabilityValidation,
+  );
   return {
     observed,
     format,
     simulation,
-    stabilityValidation: parseStabilityValidation(values, scenarios),
+    stabilityValidation,
+    ...(broadStrategyHypothesisProfile === undefined
+      ? {}
+      : { broadStrategyHypothesisProfile }),
   };
 }
 
@@ -669,18 +761,39 @@ export async function buildIntegratedStrategyEvaluation(
   );
 
   const assetEvaluations = new Map<SupportedAsset, AssetEvaluation>();
+  const broadDatasets = new Map<SupportedAsset, {
+    raw: ResearchCandleDataset;
+    development: ResearchCandleDataset;
+    options: SimulationAssetOptions;
+  }>();
   if (options.simulation !== null) {
     for (const asset of ASSETS) {
       const assetOptions = options.simulation.assets[asset];
       if (assetOptions === undefined) continue;
-      const dataset = await readDataset(assetOptions.datasetPath);
+      const rawDataset = await readDataset(assetOptions.datasetPath);
+      const dataset = options.broadStrategyHypothesisProfile === BROAD_STRATEGY_PROFILE
+        ? restrictDatasetToDevelopmentCutoff(rawDataset)
+        : rawDataset;
+      if (options.broadStrategyHypothesisProfile === BROAD_STRATEGY_PROFILE) {
+        broadDatasets.set(asset, { raw: rawDataset, development: dataset, options: assetOptions });
+      }
+      const assetSimulation = options.broadStrategyHypothesisProfile === BROAD_STRATEGY_PROFILE
+        && assetOptions.initialState.quantity > 0
+        ? {
+            ...options.simulation,
+            scenarios: options.simulation.scenarios.filter((scenario) =>
+              scenario !== "ADD_LIMITED"
+              && scenario !== "COOLDOWN_CONTROL"
+              && scenario !== "COMBINED_CONSERVATIVE"),
+          }
+        : options.simulation;
       assetEvaluations.set(
         asset,
         evaluateAsset(
           asset,
           assetOptions,
           dataset,
-          options.simulation,
+          assetSimulation,
           options.stabilityValidation,
           conditionalReadiness.configuration,
         ),
@@ -748,6 +861,9 @@ export async function buildIntegratedStrategyEvaluation(
     stabilityValidation: options.stabilityValidation,
     assetEvaluations,
   });
+  const broadStrategyHypothesisEvaluation = options.broadStrategyHypothesisProfile === undefined
+    ? null
+    : buildBroadStrategyHypothesisEvaluation(options, broadDatasets);
   const report: IntegratedStrategyEvaluationReport = {
     provenance: {
       observed: observedRead.provenance,
@@ -789,6 +905,9 @@ export async function buildIntegratedStrategyEvaluation(
       ? {}
       : { conditionalAddPolicyEvaluation }),
     ...(addLossAttribution === null ? {} : { addLossAttribution }),
+    ...(broadStrategyHypothesisEvaluation === null
+      ? {}
+      : { broadStrategyHypothesisEvaluation }),
     evidenceGaps,
     interpretation: buildInterpretation(observedAttribution, simulationAssets),
   };
@@ -836,6 +955,14 @@ export function formatIntegratedStrategyEvaluation(
     "",
     "[ADD Decision Diagnostics]",
     JSON.stringify(report.addDiagnostics, null, 2),
+    ...(report.broadStrategyHypothesisEvaluation === undefined
+      ? []
+      : [
+          "",
+          "[Broad Strategy Hypothesis Evaluation]",
+          "Read-only selected counterfactual paths; this is not deployment approval.",
+          JSON.stringify(report.broadStrategyHypothesisEvaluation, null, 2),
+        ]),
     ...(report.stabilityValidation === undefined
       ? []
       : [
@@ -1274,6 +1401,526 @@ function buildConditionalAddPolicySection(
     };
   });
   return { ...common, status: "AVAILABLE", assets };
+}
+
+function restrictDatasetToDevelopmentCutoff(
+  dataset: ResearchCandleDataset,
+): ResearchCandleDataset {
+  const cutoff = FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentTo;
+  return {
+    provenance: { ...dataset.provenance },
+    candles: {
+      "1h": dataset.candles["1h"].filter((candle) =>
+        comparePerformanceTimestamps(candle.closeTime, cutoff) < 0),
+      "4h": dataset.candles["4h"].filter((candle) =>
+        comparePerformanceTimestamps(candle.closeTime, cutoff) < 0),
+      "1d": dataset.candles["1d"].filter((candle) =>
+        comparePerformanceTimestamps(candle.closeTime, cutoff) < 0),
+    },
+  };
+}
+
+function buildBroadStrategyHypothesisEvaluation(
+  options: IntegratedStrategyEvaluationOptions,
+  datasets: ReadonlyMap<SupportedAsset, {
+    raw: ResearchCandleDataset;
+    development: ResearchCandleDataset;
+    options: SimulationAssetOptions;
+  }>,
+): BroadStrategyHypothesisEvaluationSection {
+  if (
+    options.broadStrategyHypothesisProfile !== BROAD_STRATEGY_PROFILE
+    || options.simulation === null
+  ) {
+    throw new Error("Broad strategy hypothesis evaluation requires the frozen profile.");
+  }
+  const metricObservations: StrategyHypothesisMetricObservation[] = [];
+  const coverageObservations: StrategyHypothesisCoverageObservation[] = [];
+  const supportObservations: StrategyHypothesisSupportObservation[] = [];
+  const datasetProvenance: BroadStrategyHypothesisDatasetProvenance[] = [];
+  const pathDiagnostics: BroadStrategyPathDiagnostics[] = [];
+
+  for (const asset of ASSETS) {
+    const source = datasets.get(asset);
+    if (!source) throw new Error(`Frozen broad profile is missing ${asset} dataset evidence.`);
+    const market = getMarketForAsset(asset);
+    const allFrames = buildPositionGuardBacktestFrames({
+      asset,
+      market,
+      oneHourCandles: source.development.candles["1h"],
+      fourHourCandles: source.development.candles["4h"],
+      oneDayCandles: source.development.candles["1d"],
+    });
+    const frames = allFrames.filter((frame) =>
+      comparePerformanceTimestamps(
+        frame.generatedAt,
+        FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentFrom,
+      ) >= 0
+      && comparePerformanceTimestamps(
+        frame.generatedAt,
+        FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentTo,
+      ) < 0);
+    const initialStateFingerprint = sha256Json(source.options.initialState);
+    const frameFingerprint = sha256Json(frames);
+    datasetProvenance.push({
+      asset,
+      datasetSha256: source.raw.provenance.sha256,
+      initialStateFingerprint,
+      frameFingerprint,
+      developmentFrameCount: frames.length,
+      firstDevelopmentFrameAt: frames[0]?.generatedAt ?? null,
+      lastDevelopmentFrameAt: frames.at(-1)?.generatedAt ?? null,
+      excludedPostCutoffCandleCount: countCandles(source.raw) - countCandles(source.development),
+    });
+
+    const paths = buildBroadContinuousPaths({
+      asset,
+      market,
+      initialState: source.options.initialState,
+      minimumOrderValueKrw: options.simulation.minimumOrderValueKrw,
+      frames,
+      costScenarios: options.simulation.costScenarios,
+    });
+    pathDiagnostics.push(...buildBroadPathDiagnostics({
+      asset,
+      market,
+      dataset: source.development,
+      initialState: source.options.initialState,
+      frames,
+      paths,
+    }));
+    appendBroadObservations({
+      asset,
+      initialState: source.options.initialState,
+      frames,
+      datasetSha256: source.raw.provenance.sha256,
+      initialStateFingerprint,
+      frameFingerprint,
+      paths,
+      metricObservations,
+      coverageObservations,
+      supportObservations,
+    });
+  }
+
+  const evaluation = evaluateStrategyHypotheses({
+    manifest: structuredClone(FROZEN_STRATEGY_HYPOTHESIS_MANIFEST),
+    candidates: [...FROZEN_STRATEGY_HYPOTHESIS_SCENARIO_ORDER],
+    metricObservations,
+    coverageObservations,
+    supportObservations,
+  });
+  return {
+    profileId: BROAD_STRATEGY_PROFILE,
+    readOnly: true,
+    deploymentApproval: false,
+    developmentCutoffExclusive: FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentTo,
+    scenarioMatrix: [...BROAD_STRATEGY_SCENARIOS],
+    independentNoTradeProofAvailable: false,
+    datasets: datasetProvenance,
+    pathDiagnostics,
+    interpretationBoundary: "READ_ONLY_SELECTED_COUNTERFACTUAL_PATHS_NOT_DEPLOYMENT_APPROVAL",
+    ...evaluation,
+  };
+}
+
+type BroadContinuousPathMap = Map<string, CounterfactualScenarioResult>;
+
+function buildBroadPathDiagnostics(input: {
+  asset: SupportedAsset;
+  market: SupportedMarket;
+  dataset: ResearchCandleDataset;
+  initialState: SimulationInitialState;
+  frames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][];
+  paths: BroadContinuousPathMap;
+}): BroadStrategyPathDiagnostics[] {
+  const diagnostics: BroadStrategyPathDiagnostics[] = [];
+  for (const timingModel of BROAD_TIMING_MODELS) {
+    for (const costCell of FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.costCells) {
+      for (const scenario of BROAD_STRATEGY_SCENARIOS) {
+        const result = input.paths.get(broadPathKey(timingModel, costCell.id, scenario));
+        if (!result) continue;
+        const interventions = result.legacyBacktest.result.frames
+          .map((frame) => frame.researchIntervention)
+          .filter((item): item is NonNullable<typeof item> => item !== null && item !== undefined);
+        const outcomes = { ALLOW: 0, SUPPRESS: 0, OVERRIDE_EXIT: 0 };
+        const reasons: Record<string, number> = {};
+        for (const intervention of interventions) {
+          outcomes[intervention.outcome] += 1;
+          reasons[intervention.reason] = (reasons[intervention.reason] ?? 0) + 1;
+        }
+        const excursionAnalysis = analyzePerformanceExcursions({
+          scenario,
+          dataset: input.dataset,
+          fills: result.fills,
+          matchResult: result.matchResult,
+        });
+        diagnostics.push({
+          asset: input.asset,
+          scenario,
+          timingModel,
+          costCellId: costCell.id,
+          backtestMetrics: { ...result.legacyBacktest.result.metrics },
+          fifoAndEpisodeDiagnostics: result.diagnostics,
+          regimeAnalysis: analyzePerformanceRegimes({
+            asset: input.asset,
+            market: input.market,
+            scenario,
+            frames: toExecutedActionDiagnosticFrames(result),
+            fills: result.fills,
+            matchResult: result.matchResult,
+            breakevenToleranceKrw: 1e-9,
+          }),
+          excursionAnalysis,
+          windows: buildBroadWindowDiagnostics(
+            result,
+            excursionAnalysis,
+            input.frames,
+            input.initialState,
+          ),
+          interventions: {
+            total: interventions.length,
+            outcomes,
+            reasons,
+          },
+        });
+      }
+    }
+  }
+  return diagnostics;
+}
+
+function buildBroadWindowDiagnostics(
+  result: CounterfactualScenarioResult,
+  excursionAnalysis: PerformanceExcursionResult,
+  frames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][],
+  initialState: SimulationInitialState,
+): BroadStrategyWindowDiagnostics[] {
+  return FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.windows.map((window) => {
+    const frameCount = result.legacyBacktest.result.frames.filter((frame) =>
+      comparePerformanceTimestamps(frame.generatedAt, window.from) >= 0
+      && comparePerformanceTimestamps(frame.generatedAt, window.to) < 0).length;
+    const completedEpisodes = completedEpisodesInRange(result, window.from, window.to);
+    const sliceIds = new Set(completedEpisodes.flatMap((episode) => episode.realizationSliceIds));
+    const episodeIds = new Set(completedEpisodes.map((episode) => episode.id));
+    return {
+      windowId: window.id,
+      from: window.from,
+      to: window.to,
+      frameCount,
+      returnAndDrawdown: frameCount === 0
+        ? { status: "UNAVAILABLE", reason: "NO_FRAMES_IN_WINDOW" }
+        : {
+            status: "AVAILABLE",
+            ...summarizeBroadReplayScope(
+              result,
+              frames,
+              initialState,
+              window.from,
+              window.to,
+              false,
+            ),
+          },
+      completedEpisodes,
+      realizationSlices: result.matchResult.realizationSlices.filter((slice) =>
+        sliceIds.has(slice.id)),
+      fills: result.fills.filter((fill) =>
+        comparePerformanceTimestamps(fill.filledAt, window.from) >= 0
+        && comparePerformanceTimestamps(fill.filledAt, window.to) < 0),
+      excursionEpisodes: excursionAnalysis.episodes.filter((episode) =>
+        episodeIds.has(episode.episodeId)),
+    };
+  });
+}
+
+function toExecutedActionDiagnosticFrames(
+  result: CounterfactualScenarioResult,
+): PositionGuardBacktestFrameResult[] {
+  return result.legacyBacktest.result.frames.map((frame) => {
+    if (!frame.trade || frame.decision.action === frame.trade.action) return frame;
+    return {
+      ...frame,
+      decision: {
+        ...frame.decision,
+        action: frame.trade.action,
+      },
+    };
+  });
+}
+
+function buildBroadContinuousPaths(input: {
+  asset: SupportedAsset;
+  market: SupportedMarket;
+  initialState: SimulationInitialState;
+  minimumOrderValueKrw: number;
+  frames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][];
+  costScenarios: readonly CostScenario[];
+}): BroadContinuousPathMap {
+  const paths: BroadContinuousPathMap = new Map();
+  const carryInIncomplete = input.initialState.quantity > PERFORMANCE_QUANTITY_TOLERANCE;
+  for (const timingModel of BROAD_TIMING_MODELS) {
+    for (const costScenario of input.costScenarios) {
+      for (const scenario of BROAD_STRATEGY_SCENARIOS) {
+        if (
+          carryInIncomplete
+          && (scenario === "ADD_LIMITED"
+            || scenario === "COOLDOWN_CONTROL"
+            || scenario === "COMBINED_CONSERVATIVE")
+        ) {
+          continue;
+        }
+        const [result] = runCounterfactualScenarios({
+          asset: input.asset,
+          market: input.market,
+          initialCashKrw: input.initialState.cashKrw,
+          initialQuantity: input.initialState.quantity,
+          initialAverageEntryPrice: input.initialState.averageEntryPriceKrw,
+          frames: input.frames,
+          scenarios: [scenario],
+          diagnosticPolicy: { breakevenToleranceKrw: 1e-9 },
+          execution: {
+            feeRate: costScenario.feeRate,
+            slippageRate: costScenario.slippageRate,
+            minimumTradeValueKrw: input.minimumOrderValueKrw,
+          },
+          executionTimingModel: timingModel,
+        });
+        if (!result) throw new Error(`Missing broad replay result for ${scenario}.`);
+        paths.set(broadPathKey(timingModel, costScenario.id, scenario), result);
+      }
+    }
+  }
+  return paths;
+}
+
+function appendBroadObservations(input: {
+  asset: SupportedAsset;
+  initialState: SimulationInitialState;
+  frames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][];
+  datasetSha256: string;
+  initialStateFingerprint: string;
+  frameFingerprint: string;
+  paths: BroadContinuousPathMap;
+  metricObservations: StrategyHypothesisMetricObservation[];
+  coverageObservations: StrategyHypothesisCoverageObservation[];
+  supportObservations: StrategyHypothesisSupportObservation[];
+}): void {
+  const flatAtDevelopmentStart =
+    input.initialState.quantity <= PERFORMANCE_QUANTITY_TOLERANCE;
+  const scopes = [
+    { windowId: null, from: FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentFrom,
+      to: FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentTo },
+    ...FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.windows.map((window) => ({
+      windowId: window.id,
+      from: window.from,
+      to: window.to,
+    })),
+  ] as const;
+  for (const candidate of FROZEN_STRATEGY_HYPOTHESIS_SCENARIO_ORDER) {
+    const carryInStateComplete = flatAtDevelopmentStart
+      || (candidate !== "ADD_LIMITED"
+        && candidate !== "COOLDOWN_CONTROL"
+        && candidate !== "COMBINED_CONSERVATIVE");
+    for (const timingModel of BROAD_TIMING_MODELS) {
+      const baseCandidate = input.paths.get(broadPathKey(timingModel, "BASE", candidate));
+      for (const scope of scopes) {
+        const scopeFrames = input.frames.filter((frame) =>
+          comparePerformanceTimestamps(frame.generatedAt, scope.from) >= 0
+          && comparePerformanceTimestamps(frame.generatedAt, scope.to) < 0);
+        const candidateLifecycleComplete = baseCandidate !== undefined
+          && baseCandidate.matchResult.unmatchedSells.length === 0
+          && baseCandidate.matchResult.attributionFailures.length === 0;
+        const candidateFeeComplete = baseCandidate?.diagnostics.combined.feeCompleteness === "COMPLETE";
+        coverageObservationsPush(input.coverageObservations, {
+          asset: input.asset,
+          candidate,
+          timingModel,
+          scope: scope.windowId === null ? "FULL_PATH" : "WINDOW",
+          windowId: scope.windowId,
+          cadenceComplete: hasCompleteHourlyCadence(scopeFrames),
+          independentlyVerifiedNoTrade: false,
+          lifecycleComplete: candidateLifecycleComplete,
+          feeComplete: candidateFeeComplete,
+          finiteMetricsComplete: baseCandidate !== undefined
+            && hasFiniteReplayMetrics(baseCandidate),
+          carryInStateComplete,
+        });
+        const episodes = baseCandidate === undefined
+          ? []
+          : completedEpisodesInRange(baseCandidate, scope.from, scope.to);
+        supportObservationsPush(input.supportObservations, {
+          asset: input.asset,
+          candidate,
+          timingModel,
+          scope: scope.windowId === null ? "FULL_PATH" : "WINDOW",
+          windowId: scope.windowId,
+          completedEpisodeCount: episodes.length,
+          policyExposedCompletedEpisodeCount: countPolicyExposedEpisodes(baseCandidate, episodes),
+        });
+        if (scopeFrames.length === 0) continue;
+        for (const cost of FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.costCells) {
+          for (const scenario of ["BASELINE", "NO_ADD", candidate] as const) {
+            const result = input.paths.get(broadPathKey(timingModel, cost.id, scenario));
+            if (!result) continue;
+            const metrics = summarizeBroadReplayScope(
+              result,
+              input.frames,
+              input.initialState,
+              scope.from,
+              scope.to,
+              scope.windowId === null,
+            );
+            input.metricObservations.push({
+              asset: input.asset,
+              candidate,
+              scenario,
+              timingModel,
+              datasetSha256: input.datasetSha256,
+              initialStateFingerprint: input.initialStateFingerprint,
+              frameFingerprint: input.frameFingerprint,
+              costCellId: cost.id,
+              costRole: cost.role,
+              scope: scope.windowId === null ? "FULL_PATH" : "WINDOW",
+              windowId: scope.windowId,
+              netReturnPct: metrics.netReturnPct,
+              maxDrawdownPct: metrics.maxDrawdownPct,
+            });
+          }
+        }
+      }
+    }
+  }
+}
+
+function coverageObservationsPush(
+  target: StrategyHypothesisCoverageObservation[],
+  value: StrategyHypothesisCoverageObservation,
+): void {
+  target.push(value);
+}
+
+function supportObservationsPush(
+  target: StrategyHypothesisSupportObservation[],
+  value: StrategyHypothesisSupportObservation,
+): void {
+  target.push(value);
+}
+
+function summarizeBroadReplayScope(
+  result: CounterfactualScenarioResult,
+  frames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][],
+  initialState: SimulationInitialState,
+  from: string,
+  to: string,
+  fullPath: boolean,
+): { netReturnPct: number; maxDrawdownPct: number } {
+  if (fullPath) {
+    return {
+      netReturnPct: result.legacyBacktest.result.metrics.totalReturnPct,
+      maxDrawdownPct: result.legacyBacktest.result.metrics.maxDrawdownPct,
+    };
+  }
+  const rows = result.legacyBacktest.result.frames;
+  const prior = rows.filter((row) => comparePerformanceTimestamps(row.generatedAt, from) < 0).at(-1);
+  const scoped = rows.filter((row) =>
+    comparePerformanceTimestamps(row.generatedAt, from) >= 0
+    && comparePerformanceTimestamps(row.generatedAt, to) < 0);
+  const firstPrice = frames[0]?.analysis.currentPrice ?? 0;
+  const initialEquity = initialState.cashKrw + initialState.quantity * firstPrice;
+  const openingEquity = prior?.equityKrw ?? initialEquity;
+  let peak = openingEquity;
+  let maxDrawdownPct = 0;
+  for (const row of scoped) {
+    peak = Math.max(peak, row.equityKrw);
+    const drawdown = peak > 0 ? (peak - row.equityKrw) / peak : 0;
+    maxDrawdownPct = Math.max(maxDrawdownPct, drawdown);
+  }
+  const closingEquity = scoped.at(-1)?.equityKrw ?? openingEquity;
+  return {
+    netReturnPct: openingEquity > 0 ? (closingEquity - openingEquity) / openingEquity : 0,
+    maxDrawdownPct,
+  };
+}
+
+function completedEpisodesInRange(
+  result: CounterfactualScenarioResult,
+  from: string,
+  to: string,
+): Array<CounterfactualScenarioResult["matchResult"]["episodes"][number] & { closedAt: string }> {
+  return result.matchResult.episodes.filter((episode): episode is typeof episode & { closedAt: string } =>
+    episode.status === "COMPLETED"
+    && episode.closedAt !== null
+    && comparePerformanceTimestamps(episode.closedAt, from) >= 0
+    && comparePerformanceTimestamps(episode.closedAt, to) < 0);
+}
+
+function countPolicyExposedEpisodes(
+  result: CounterfactualScenarioResult | undefined,
+  episodes: readonly (CounterfactualScenarioResult["matchResult"]["episodes"][number] & {
+    closedAt: string;
+  })[],
+): number {
+  if (!result) return 0;
+  const exposedFillIds = new Set(
+    (result.modeledFillAttributions ?? [])
+      .filter((attribution) => attribution.intervention !== null)
+      .map((attribution) => attribution.fillId),
+  );
+  const interventionInstants = result.legacyBacktest.result.frames
+    .filter((frame) => frame.researchIntervention !== null
+      && frame.researchIntervention !== undefined)
+    .map((frame) => frame.generatedAt);
+  return episodes.filter((episode) => {
+    if ([...episode.entryFillIds, ...episode.exitFillIds]
+      .some((fillId) => exposedFillIds.has(fillId))) return true;
+    return interventionInstants.some((instant) =>
+      comparePerformanceTimestamps(instant, episode.openedAt) >= 0
+      && comparePerformanceTimestamps(instant, episode.closedAt) < 0);
+  }).length;
+}
+
+function hasCompleteHourlyCadence(
+  frames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][],
+): boolean {
+  if (frames.length === 0) return false;
+  for (let index = 1; index < frames.length; index += 1) {
+    const previous = parsePerformanceTimestamp(frames[index - 1]!.generatedAt);
+    const current = parsePerformanceTimestamp(frames[index]!.generatedAt);
+    if (!previous || !current || current.epochNanoseconds - previous.epochNanoseconds !== 3_600_000_000_000n) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function hasFiniteReplayMetrics(result: CounterfactualScenarioResult): boolean {
+  const metrics = result.legacyBacktest.result.metrics;
+  return [
+    metrics.totalReturnPct,
+    metrics.maxDrawdownPct,
+    metrics.finalEquityKrw,
+    metrics.realizedPnlKrw,
+    metrics.turnoverKrw,
+    metrics.feesKrw,
+  ].every(Number.isFinite);
+}
+
+function broadPathKey(
+  timingModel: StrategyHypothesisTimingModel,
+  costCellId: string,
+  scenario: CounterfactualScenario,
+): string {
+  return `${timingModel}:${costCellId}:${scenario}`;
+}
+
+function countCandles(dataset: ResearchCandleDataset): number {
+  return dataset.candles["1h"].length
+    + dataset.candles["4h"].length
+    + dataset.candles["1d"].length;
+}
+
+function sha256Json(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
 function evaluateAsset(
@@ -2649,6 +3296,12 @@ function parseScenarios(value: string): CounterfactualScenario[] {
       && scenario !== "ADD_RISK_CLEAR"
       && scenario !== "ADD_HIGH_ALIGNMENT"
       && scenario !== "ADD_CORE_TREND"
+      && scenario !== "HTF_TREND_GATE"
+      && scenario !== "STRICT_PULLBACK"
+      && scenario !== "EARLY_THESIS_FAILURE"
+      && scenario !== "ADD_LIMITED"
+      && scenario !== "COOLDOWN_CONTROL"
+      && scenario !== "COMBINED_CONSERVATIVE"
     ) {
       throw new Error(`Unsupported scenario ${String(scenario)}.`);
     }
@@ -2657,6 +3310,56 @@ function parseScenarios(value: string): CounterfactualScenario[] {
     result.push(scenario);
   }
   return result;
+}
+
+function parseBroadStrategyHypothesisProfile(
+  values: ReadonlyMap<string, string>,
+  simulation: IntegratedSimulationOptions,
+  stabilityValidation: IntegratedStabilityValidationOptions | null,
+): "BROAD_LOSS_CAUSE_V1" | undefined {
+  const value = values.get("broad-strategy-hypothesis-profile");
+  if (value === undefined) return undefined;
+  if (value !== "BROAD_LOSS_CAUSE_V1") {
+    throw new Error(
+      `Invalid --broad-strategy-hypothesis-profile: ${value}. Use BROAD_LOSS_CAUSE_V1.`,
+    );
+  }
+  if (!simulation.assets.BTC || !simulation.assets.ETH) {
+    throw new Error("BROAD_LOSS_CAUSE_V1 requires both BTC and ETH datasets and initial states.");
+  }
+  const exactScenarios: readonly CounterfactualScenario[] = [
+    "BASELINE",
+    "NO_ADD",
+    ...FROZEN_STRATEGY_HYPOTHESIS_SCENARIO_ORDER,
+  ];
+  if (!sameJson(simulation.scenarios, exactScenarios)) {
+    throw new Error("BROAD_LOSS_CAUSE_V1 requires the exact frozen 8-scenario matrix in canonical order.");
+  }
+  const exactCosts = FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.costCells.map((cell) => ({
+    id: cell.id,
+    feeRate: cell.feeRate,
+    slippageRate: cell.slippageRate,
+  }));
+  if (!sameJson(simulation.costScenarios, exactCosts)) {
+    throw new Error("BROAD_LOSS_CAUSE_V1 requires the exact frozen BASE/STRESS cost cells.");
+  }
+  const exactWindows = FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.windows.map((window) => ({
+    id: window.id,
+    from: normalizeExplicitIsoTimestamp(window.from, "frozen window from"),
+    to: normalizeExplicitIsoTimestamp(window.to, "frozen window to"),
+  }));
+  if (
+    stabilityValidation === null
+    || !sameJson(stabilityValidation.windows, exactWindows)
+    || stabilityValidation.expectedFrameIntervalMs !== 3_600_000
+  ) {
+    throw new Error("BROAD_LOSS_CAUSE_V1 requires the exact frozen W1/W2/W3 validation windows.");
+  }
+  return value;
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function parseCostScenarios(value: string): CostScenario[] {

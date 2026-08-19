@@ -6,7 +6,10 @@ import {
   partitionHourlyCoverage,
   type VerifiedNoTradeCoverage,
 } from "./performance-hourly-coverage.js";
-import type { CounterfactualScenario } from "./strategy-counterfactual.js";
+import {
+  isSupportedCounterfactualScenario,
+  type CounterfactualScenario,
+} from "./strategy-counterfactual.js";
 import type {
   ResearchCandle,
   ResearchCandleDataset,
@@ -109,7 +112,7 @@ const INTRABAR_WARNING = {
 export function analyzePerformanceExcursions(
   input: PerformanceExcursionInput,
 ): PerformanceExcursionResult {
-  if (input.scenario !== "BASELINE" && input.scenario !== "NO_ADD") {
+  if (!isSupportedCounterfactualScenario(input.scenario)) {
     throw new Error(`Invalid counterfactual scenario ${String(input.scenario)}.`);
   }
   validateDataset(input.dataset);

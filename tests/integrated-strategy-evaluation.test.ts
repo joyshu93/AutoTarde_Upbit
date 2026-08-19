@@ -251,6 +251,217 @@ test("integrated evaluation CLI accepts the complete conditional ADD research ma
   ]);
 });
 
+test("integrated evaluation CLI enables broad strategy hypotheses only for the exact frozen profile", () => {
+  const parsed = parseIntegratedStrategyEvaluationArgs(broadStrategyHypothesisArgs("./btc.json", "./eth.json"));
+
+  assert.equal(
+    (parsed as { broadStrategyHypothesisProfile?: unknown }).broadStrategyHypothesisProfile,
+    "BROAD_LOSS_CAUSE_V1",
+  );
+  assert.deepEqual(parsed.simulation?.scenarios, [
+    "BASELINE",
+    "NO_ADD",
+    "HTF_TREND_GATE",
+    "STRICT_PULLBACK",
+    "EARLY_THESIS_FAILURE",
+    "ADD_LIMITED",
+    "COOLDOWN_CONTROL",
+    "COMBINED_CONSERVATIVE",
+  ]);
+  assert.deepEqual(parsed.simulation?.costScenarios, [
+    { id: "BASE", feeRate: 0.0005, slippageRate: 0.0003 },
+    { id: "STRESS", feeRate: 0.001, slippageRate: 0.002 },
+  ]);
+  assert.deepEqual(parsed.stabilityValidation?.windows.map((window) => window.id), ["W1", "W2", "W3"]);
+
+  const legacy = parseIntegratedStrategyEvaluationArgs(simulationArgs("BTC", "./btc.json"));
+  assert.equal("broadStrategyHypothesisProfile" in legacy, false);
+
+  assert.throws(
+    () => parseIntegratedStrategyEvaluationArgs(replaceArg(
+      broadStrategyHypothesisArgs("./btc.json", "./eth.json"),
+      "--scenarios",
+      '["BASELINE","NO_ADD","STRICT_PULLBACK","HTF_TREND_GATE","EARLY_THESIS_FAILURE","ADD_LIMITED","COOLDOWN_CONTROL","COMBINED_CONSERVATIVE"]',
+    )),
+    /exact frozen 8-scenario matrix/,
+  );
+  assert.throws(
+    () => parseIntegratedStrategyEvaluationArgs(replaceArg(
+      broadStrategyHypothesisArgs("./btc.json", "./eth.json"),
+      "--cost-cells",
+      '[{"id":"BASE","feeRate":0.0005,"slippageRate":0},{"id":"STRESS","feeRate":0.001,"slippageRate":0.002}]',
+    )),
+    /exact frozen BASE\/STRESS cost cells/,
+  );
+  assert.throws(
+    () => parseIntegratedStrategyEvaluationArgs(removeArg(
+      removeArg(broadStrategyHypothesisArgs("./btc.json", "./eth.json"), "--eth-dataset"),
+      "--eth-initial-state",
+    )),
+    /requires both BTC and ETH datasets/,
+  );
+});
+
+test("broad strategy hypothesis report uses frozen continuous paths and excludes post-cutoff evidence", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase("broad-strategy-hypothesis"),
+    cleanupFixture,
+    async (databasePath) => withFixtureResource(
+      () => writeDatasetFixture("BTC", "broad-strategy-hypothesis", {
+        candleCounts: { "1h": 400, "4h": 400, "1d": 400 },
+        endAt: "2026-04-20T00:00:00.000Z",
+        spacingMs: 36 * 60 * 60 * 1_000,
+      }),
+      (btcPath) => rm(path.dirname(btcPath), { recursive: true, force: true }),
+      async (btcPath) => {
+        const ethPath = await writeDatasetFixture("ETH", "broad-strategy-hypothesis", {
+          candleCounts: { "1h": 400, "4h": 400, "1d": 400 },
+          endAt: "2026-04-20T00:00:00.000Z",
+          spacingMs: 36 * 60 * 60 * 1_000,
+        });
+        const args = broadStrategyHypothesisArgs(btcPath, ethPath);
+        const options = parseIntegratedStrategyEvaluationArgs(
+          replaceArg(args, "--database", databasePath),
+        );
+
+        const first = await buildIntegratedStrategyEvaluation(options);
+        const second = await buildIntegratedStrategyEvaluation(options);
+        const section = (first as unknown as {
+          broadStrategyHypothesisEvaluation?: {
+            profileId: string;
+            readOnly: boolean;
+            deploymentApproval: boolean;
+            developmentCutoffExclusive: string;
+            independentNoTradeProofAvailable: boolean;
+            datasets: Array<{
+              asset: string;
+              datasetSha256: string;
+              developmentFrameCount: number;
+              lastDevelopmentFrameAt: string | null;
+              excludedPostCutoffCandleCount: number;
+              initialStateFingerprint: string;
+              frameFingerprint: string;
+            }>;
+            executionTimingProvenance: Array<{ timingModel: string; caveat: string }>;
+            evaluations: Array<{
+              asset: string;
+              candidate: string;
+              status: string;
+              pathProvenance: Array<{
+                timingModel: string;
+                datasetSha256: string;
+                initialStateFingerprint: string;
+                frameFingerprint: string;
+              }>;
+              dataSufficiency: { status: string; reasons: string[] };
+              directionalGateOutcome: { status: string; reasons: string[] };
+            }>;
+            crossAssetSummary: Array<{ candidate: string; adjudicative: boolean }>;
+            pathDiagnostics: Array<{
+              asset: string;
+              scenario: string;
+              timingModel: string;
+              costCellId: string;
+              backtestMetrics: { turnoverKrw: number; feesKrw: number; timeInMarketFrames: number };
+              fifoAndEpisodeDiagnostics: {
+                combined: { maxConsecutiveLosses: { status: string } };
+              };
+              regimeAnalysis: { regimes: Record<string, unknown> };
+              excursionAnalysis: { episodes: unknown[] };
+              windows: Array<{
+                windowId: string;
+                frameCount: number;
+                returnAndDrawdown: { status: string };
+                completedEpisodes: unknown[];
+                realizationSlices: unknown[];
+                fills: unknown[];
+                excursionEpisodes: unknown[];
+              }>;
+              interventions: { total: number; outcomes: Record<string, number> };
+            }>;
+          };
+        }).broadStrategyHypothesisEvaluation;
+
+        assert.ok(section);
+        assert.equal(section.profileId, "BROAD_LOSS_CAUSE_V1");
+        assert.equal(section.readOnly, true);
+        assert.equal(section.deploymentApproval, false);
+        assert.equal(section.developmentCutoffExclusive, "2026-04-12T19:00:00Z");
+        assert.equal(section.independentNoTradeProofAvailable, false);
+        assert.deepEqual(section.executionTimingProvenance.map((item) => item.timingModel), [
+          "SAME_CLOSE_MODELED",
+          "NEXT_FRAME_MODELED",
+        ]);
+        assert.deepEqual(section.datasets.map((item) => item.asset), ["BTC", "ETH"]);
+        assert.ok(section.datasets.every((item) => item.developmentFrameCount > 0));
+        assert.ok(section.datasets.every((item) => item.excludedPostCutoffCandleCount > 0));
+        assert.ok(section.datasets.every((item) =>
+          item.lastDevelopmentFrameAt !== null
+          && Date.parse(item.lastDevelopmentFrameAt) < Date.parse(section.developmentCutoffExclusive)));
+        assert.deepEqual(section.evaluations.map((item) => `${item.asset}:${item.candidate}`), [
+          "BTC:HTF_TREND_GATE",
+          "BTC:STRICT_PULLBACK",
+          "BTC:EARLY_THESIS_FAILURE",
+          "BTC:ADD_LIMITED",
+          "BTC:COOLDOWN_CONTROL",
+          "BTC:COMBINED_CONSERVATIVE",
+          "ETH:HTF_TREND_GATE",
+          "ETH:STRICT_PULLBACK",
+          "ETH:EARLY_THESIS_FAILURE",
+          "ETH:ADD_LIMITED",
+          "ETH:COOLDOWN_CONTROL",
+          "ETH:COMBINED_CONSERVATIVE",
+        ]);
+        assert.ok(section.evaluations.every((item) => item.pathProvenance.length === 2));
+        for (const evaluation of section.evaluations) {
+          assert.equal(evaluation.dataSufficiency.status, "INSUFFICIENT");
+          assert.ok(evaluation.dataSufficiency.reasons.some((reason) =>
+            reason.endsWith("INDEPENDENTLY_VERIFIED_NO_TRADE_FALSE")));
+          const dataset = section.datasets.find((item) => item.asset === evaluation.asset);
+          assert.ok(dataset);
+          assert.ok(evaluation.pathProvenance.every((pathIdentity) =>
+            pathIdentity.datasetSha256 === dataset.datasetSha256
+            && pathIdentity.initialStateFingerprint === dataset.initialStateFingerprint
+            && pathIdentity.frameFingerprint === dataset.frameFingerprint));
+        }
+        assert.ok(section.crossAssetSummary.every((item) => item.adjudicative === false));
+        assert.equal(section.pathDiagnostics.length, 64);
+        assert.deepEqual(
+          [...new Set(section.pathDiagnostics.map((item) => item.timingModel))],
+          ["SAME_CLOSE_MODELED", "NEXT_FRAME_MODELED"],
+        );
+        assert.ok(section.pathDiagnostics.every((item) =>
+          Number.isFinite(item.backtestMetrics.turnoverKrw)
+          && Number.isFinite(item.backtestMetrics.feesKrw)
+          && Number.isFinite(item.backtestMetrics.timeInMarketFrames)
+          && item.fifoAndEpisodeDiagnostics.combined.maxConsecutiveLosses.status !== undefined
+          && typeof item.regimeAnalysis.regimes === "object"
+          && Array.isArray(item.excursionAnalysis.episodes)
+          && item.windows.length === 3
+          && item.windows.every((window) =>
+            ["AVAILABLE", "UNAVAILABLE"].includes(window.returnAndDrawdown.status)
+            && Array.isArray(window.completedEpisodes)
+            && Array.isArray(window.realizationSlices)
+            && Array.isArray(window.fills)
+            && Array.isArray(window.excursionEpisodes))
+          && item.interventions.total === Object.values(item.interventions.outcomes)
+            .reduce((sum, count) => sum + count, 0)));
+        assert.equal(
+          formatIntegratedStrategyEvaluation(first, "json"),
+          formatIntegratedStrategyEvaluation(second, "json"),
+        );
+        const text = formatIntegratedStrategyEvaluation(first, "text");
+        assert.match(text, /Broad Strategy Hypothesis Evaluation/);
+        assert.match(text, /SAME_CLOSE_MODELED/);
+        assert.match(text, /NEXT_FRAME_MODELED/);
+        assert.match(text, /INDEPENDENTLY_VERIFIED_NO_TRADE_FALSE/);
+        assert.match(text, /not deployment approval/i);
+        assert.deepEqual(JSON.parse(formatIntegratedStrategyEvaluation(first, "json")), first);
+      },
+    ),
+  );
+});
+
 test("conditional ADD suppression evidence comes only from candidate replay researchSuppression", () => {
   const evidence = extractAddPolicySuppressionEvidence("BTC", [
     {
@@ -1742,6 +1953,27 @@ function conditionalResearchArgs(): string[] {
   ];
 }
 
+function broadStrategyHypothesisArgs(btcDatasetPath: string, ethDatasetPath: string): string[] {
+  return [
+    ...requiredArgs(),
+    "--btc-dataset", btcDatasetPath,
+    "--btc-initial-state", '{"cashKrw":1000000,"quantity":0,"averageEntryPriceKrw":0}',
+    "--eth-dataset", ethDatasetPath,
+    "--eth-initial-state", '{"cashKrw":1000000,"quantity":0,"averageEntryPriceKrw":0}',
+    "--broad-strategy-hypothesis-profile", "BROAD_LOSS_CAUSE_V1",
+    "--scenarios",
+    '["BASELINE","NO_ADD","HTF_TREND_GATE","STRICT_PULLBACK","EARLY_THESIS_FAILURE","ADD_LIMITED","COOLDOWN_CONTROL","COMBINED_CONSERVATIVE"]',
+    "--minimum-order-value-krw", "5000",
+    "--cost-cells",
+    '[{"id":"BASE","feeRate":0.0005,"slippageRate":0.0003},{"id":"STRESS","feeRate":0.001,"slippageRate":0.002}]',
+    "--validation-windows",
+    '[{"id":"W1","from":"2025-07-20T00:00:00Z","to":"2025-10-25T19:00:00Z"},{"id":"W2","from":"2025-10-26T00:00:00Z","to":"2025-12-31T19:00:00Z"},{"id":"W3","from":"2026-01-01T00:00:00Z","to":"2026-04-12T19:00:00Z"}]',
+    "--validation-frame-interval-ms", "3600000",
+    "--validation-comparison-tolerance-pp", "0.000001",
+    "--validation-minimum-windows", "3",
+  ];
+}
+
 type ConditionalAddPolicyEvaluationFixture = {
   status: "AVAILABLE" | "UNAVAILABLE";
   reasonCodes: string[];
@@ -2058,10 +2290,12 @@ function createDataset(
     endOffsetsMs?: Partial<Record<ResearchCandleTimeframe, number>>;
     commonCoverageDays?: number;
     missingCloseTimes?: Partial<Record<ResearchCandleTimeframe, readonly string[]>>;
+    endAt?: string;
+    spacingMs?: number;
   } = {},
 ): ResearchCandleDataset {
   const market: ResearchCandle["market"] = asset === "BTC" ? "KRW-BTC" : "KRW-ETH";
-  const endMs = Date.parse("2026-08-01T00:00:00.000Z");
+  const endMs = Date.parse(options.endAt ?? "2026-08-01T00:00:00.000Z");
   const durationMs: Record<ResearchCandleTimeframe, number> = {
     "1h": 60 * 60 * 1_000,
     "4h": 4 * 60 * 60 * 1_000,
@@ -2072,13 +2306,16 @@ function createDataset(
       ? options.candleCounts?.[timeframe] ?? 200
       : options.commonCoverageDays * (timeframe === "1h" ? 24 : timeframe === "4h" ? 6 : 1);
     const timeframeEndMs = endMs + (options.endOffsetsMs?.[timeframe] ?? 0);
+    const spacingMs = options.spacingMs ?? durationMs[timeframe];
     const generated = [
       timeframe,
       Array.from({ length: count }, (_, index) => fixtureCandle(
         market,
         timeframe,
-        new Date(timeframeEndMs - (count - index) * durationMs[timeframe]).toISOString(),
-        new Date(timeframeEndMs - (count - 1 - index) * durationMs[timeframe]).toISOString(),
+        new Date(timeframeEndMs - (count - index) * spacingMs).toISOString(),
+        new Date(
+          timeframeEndMs - (count - index) * spacingMs + durationMs[timeframe],
+        ).toISOString(),
         100_000 + index * 100,
       )),
     ] as const;

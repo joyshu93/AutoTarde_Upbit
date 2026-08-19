@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile, readdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import ts from "typescript";
 
 import type { UpbitCandleSnapshot } from "../src/modules/exchange/upbit/contracts.js";
 import {
@@ -246,6 +247,62 @@ test("conditional ADD research stays outside runtime and operational import grap
   assert.ok(integratedImports.includes(holdoutHypothesis));
 });
 
+test("independent no-trade evidence stays outside runtime and network acquisition graphs", async () => {
+  const srcRoot = join(process.cwd(), "src");
+  const sidecar = join(srcRoot, "modules", "performance", "research-no-trade-evidence.ts");
+  const networkAcquisition = join(srcRoot, "modules", "performance", "upbit-research-candle-acquisition.ts");
+  assert.deepEqual(
+    collectModuleSpecifiers(`
+      import value from "static-import";
+      import "side-effect-import";
+      export * from "export-from";
+      void import("dynamic-import");
+      require("require-import");
+      void import(variableSpecifier);
+      require(variableSpecifier);
+    `),
+    [
+      "<non-literal dynamic import()>",
+      "<non-literal require()>",
+      "dynamic-import",
+      "export-from",
+      "require-import",
+      "side-effect-import",
+      "static-import",
+    ],
+  );
+  assert.deepEqual(
+    collectModuleSpecifiers(await readFile(sidecar, "utf8")),
+    [
+      "./performance-timestamp.js",
+      "./research-candle-dataset.js",
+      "node:crypto",
+    ],
+    "sidecar direct module specifiers must stay on the pure allowlist",
+  );
+  const reachable = await collectRelativeImportGraph([sidecar]);
+  const forbiddenPath = /(?:^|\/)(?:app|execution|exchange|reconciliation|telegram|runtime|db|research)(?:\/|$)/;
+
+  assert.ok(reachable.has(sidecar));
+  assert.equal(reachable.has(networkAcquisition), false, "sidecar must not reach network acquisition");
+  for (const filePath of reachable) {
+    const relative = filePath.slice(srcRoot.length + 1).replaceAll("\\", "/");
+    assert.equal(
+      forbiddenPath.test(relative),
+      false,
+      `independent no-trade evidence reached forbidden source ${relative}`,
+    );
+  }
+
+  const importers: string[] = [];
+  for (const sourceFile of await listTypeScriptFiles(srcRoot)) {
+    if ((await readRelativeImports(sourceFile)).includes(sidecar)) {
+      importers.push(sourceFile.slice(srcRoot.length + 1).replaceAll("\\", "/"));
+    }
+  }
+  assert.deepEqual(importers.sort(), [], "runtime source graph must not import the sidecar");
+});
+
 async function collectRelativeImportGraph(roots: readonly string[]): Promise<Set<string>> {
   const visited = new Set<string>();
   const pending = [...roots];
@@ -262,10 +319,45 @@ async function collectRelativeImportGraph(roots: readonly string[]): Promise<Set
 
 async function readRelativeImports(filePath: string): Promise<string[]> {
   const source = await readFile(filePath, "utf8");
-  return [...source.matchAll(/from\s+["'](\.{1,2}\/[^"']+)["']/g)]
-    .map((match) => match[1]!)
+  return collectModuleSpecifiers(source)
+    .filter((specifier) => /^\.{1,2}\//.test(specifier))
     .map((specifier) => resolve(dirname(filePath), specifier.replace(/\.js$/, ".ts")))
     .sort();
+}
+
+function collectModuleSpecifiers(source: string): string[] {
+  const sourceFile = ts.createSourceFile(
+    "module-specifier-fixture.ts",
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  );
+  const specifiers: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      if (node.moduleSpecifier !== undefined && ts.isStringLiteral(node.moduleSpecifier)) {
+        specifiers.push(node.moduleSpecifier.text);
+      }
+    } else if (ts.isCallExpression(node)) {
+      if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        specifiers.push(moduleSpecifierArgument(node, "<non-literal dynamic import()>"));
+      } else if (ts.isIdentifier(node.expression) && node.expression.text === "require") {
+        specifiers.push(moduleSpecifierArgument(node, "<non-literal require()>"));
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+
+  visit(sourceFile);
+  return specifiers.sort();
+}
+
+function moduleSpecifierArgument(call: ts.CallExpression, fallback: string): string {
+  const argument = call.arguments[0];
+  return argument !== undefined && (ts.isStringLiteral(argument) || ts.isNoSubstitutionTemplateLiteral(argument))
+    ? argument.text
+    : fallback;
 }
 
 async function listTypeScriptFiles(directory: string): Promise<string[]> {

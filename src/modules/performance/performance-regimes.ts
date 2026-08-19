@@ -14,7 +14,10 @@ import {
   type SampleSupport,
 } from "./performance-attribution.js";
 import type { Metric } from "./performance-diagnostics.js";
-import type { CounterfactualScenario } from "./strategy-counterfactual.js";
+import {
+  isSupportedCounterfactualScenario,
+  type CounterfactualScenario,
+} from "./strategy-counterfactual.js";
 import {
   PERFORMANCE_QUANTITY_TOLERANCE,
   type FifoRealizationSlice,
@@ -213,7 +216,7 @@ function validateInput(
   if (getMarketForAsset(input.asset) !== input.market) {
     throw new Error(`Regime analysis market ${input.market} does not match asset ${input.asset}.`);
   }
-  if (input.scenario !== "BASELINE" && input.scenario !== "NO_ADD") {
+  if (!isSupportedCounterfactualScenario(input.scenario)) {
     throw new Error(`Invalid counterfactual scenario ${String(input.scenario)}.`);
   }
   if (!Number.isFinite(input.breakevenToleranceKrw) || input.breakevenToleranceKrw < 0) {

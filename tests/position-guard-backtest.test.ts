@@ -5,8 +5,10 @@ import {
   type PositionGuardStructureAnalysis,
 } from "../src/modules/strategy/position-guard-core.js";
 import {
+  evaluatePositionGuardResearchIntervention,
   runPositionGuardBacktest,
   type PositionGuardBacktestFrame,
+  type PositionGuardBacktestResearchState,
   type PositionGuardBacktestResearchExecutionPolicy,
 } from "../src/modules/strategy/position-guard-backtest.js";
 import { test } from "./harness.js";
@@ -16,6 +18,12 @@ const publicResearchPolicyContract: readonly PositionGuardBacktestResearchExecut
   { id: "ADD_RISK_CLEAR" },
   { id: "ADD_HIGH_ALIGNMENT" },
   { id: "ADD_CORE_TREND" },
+  { id: "HTF_TREND_GATE" },
+  { id: "STRICT_PULLBACK" },
+  { id: "EARLY_THESIS_FAILURE" },
+  { id: "ADD_LIMITED" },
+  { id: "COOLDOWN_CONTROL" },
+  { id: "COMBINED_CONSERVATIVE" },
 ];
 void publicResearchPolicyContract;
 
@@ -605,6 +613,438 @@ test("conditional ADD suppression reasons follow strict first-failure precedence
   }
 });
 
+test("frozen entry overlays allow only their exact contemporaneous entry evidence", () => {
+  const enterDecision = runPositionGuardBacktest({
+    asset: "BTC",
+    market: "KRW-BTC",
+    initialCashKrw: 100_000,
+    initialQuantity: 0,
+    initialAverageEntryPrice: 0,
+    frames: [createFrame("2026-04-20T01:00:00.000Z", {
+      regime: "EARLY_RECOVERY",
+      entryPath: "RECLAIM",
+      reclaimStructure: true,
+      trendAlignmentScore: 4,
+      recoveryQualityScore: 4,
+      volumeRecovery: true,
+      macdImproving: true,
+      rsiRecovery: true,
+    })],
+  }).frames[0]!.decision;
+  assert.equal(enterDecision.action, "ENTER");
+  const state = { cashKrw: 100_000, quantity: 0, averageEntryPrice: 0 };
+  const researchState = emptyResearchState();
+  const generatedAt = "2026-04-20T01:00:00.000Z";
+
+  const htfAllowed = evaluatePositionGuardResearchIntervention({
+    policyId: "HTF_TREND_GATE",
+    generatedAt,
+    decision: enterDecision,
+    state,
+    researchState,
+    analysis: createFrame(generatedAt, {
+      regime: "EARLY_RECOVERY",
+      trendAlignmentScore: 3,
+      weakeningStage: "NONE",
+      breakdown1d: false,
+      breakdown4h: false,
+    }).analysis,
+  });
+  assert.deepEqual(
+    [htfAllowed?.outcome, htfAllowed?.effectiveAction, htfAllowed?.reason],
+    ["ALLOW", "ENTER", "CONDITIONS_MET"],
+  );
+
+  const htfSuppressed = evaluatePositionGuardResearchIntervention({
+    policyId: "HTF_TREND_GATE",
+    generatedAt,
+    decision: enterDecision,
+    state,
+    researchState,
+    analysis: createFrame(generatedAt, {
+      regime: "EARLY_RECOVERY",
+      trendAlignmentScore: 2,
+    }).analysis,
+  });
+  assert.deepEqual(
+    [htfSuppressed?.outcome, htfSuppressed?.effectiveAction, htfSuppressed?.reason],
+    ["SUPPRESS", "HOLD", "TREND_ALIGNMENT_BELOW_3"],
+  );
+
+  const strictAllowed = evaluatePositionGuardResearchIntervention({
+    policyId: "STRICT_PULLBACK",
+    generatedAt,
+    decision: enterDecision,
+    state,
+    researchState,
+    analysis: createFrame(generatedAt, {
+      regime: "PULLBACK_IN_UPTREND",
+      entryPath: "PULLBACK",
+      pullbackZone: true,
+      trendAlignmentScore: 4,
+      recoveryQualityScore: 3,
+      oneHourLocation: "MIDDLE",
+      volumeRecovery: true,
+      macdImproving: true,
+    }).analysis,
+  });
+  assert.deepEqual(
+    [strictAllowed?.outcome, strictAllowed?.effectiveAction, strictAllowed?.reason],
+    ["ALLOW", "ENTER", "CONDITIONS_MET"],
+  );
+
+  const strictSuppressed = evaluatePositionGuardResearchIntervention({
+    policyId: "STRICT_PULLBACK",
+    generatedAt,
+    decision: enterDecision,
+    state,
+    researchState,
+    analysis: createFrame(generatedAt, {
+      regime: "PULLBACK_IN_UPTREND",
+      entryPath: "RECLAIM",
+      pullbackZone: true,
+      trendAlignmentScore: 4,
+      recoveryQualityScore: 3,
+      oneHourLocation: "LOWER",
+      volumeRecovery: true,
+      rsiRecovery: true,
+    }).analysis,
+  });
+  assert.deepEqual(
+    [strictSuppressed?.outcome, strictSuppressed?.effectiveAction, strictSuppressed?.reason],
+    ["SUPPRESS", "HOLD", "ENTRY_PATH_NOT_PULLBACK"],
+  );
+});
+
+test("early thesis failure overrides HOLD or ADD but preserves risk-reducing decisions", () => {
+  const baseline = runPositionGuardBacktest(createAddReplayInput());
+  const addDecision = baseline.frames[0]!.decision;
+  const exitDecision = runPositionGuardBacktest({
+    ...createAddReplayInput([createFrame("2026-04-20T01:00:00.000Z", {
+      invalidationState: "BROKEN",
+      breakdown1d: true,
+    })]),
+  }).frames[0]!.decision;
+  assert.equal(addDecision.action, "ADD");
+  assert.equal(exitDecision.action, "EXIT");
+  const generatedAt = "2026-04-20T01:00:00.000Z";
+  const analysis = createFrame(generatedAt, {
+    currentPrice: 90_000,
+    failedReclaim: true,
+    weakeningStage: "CLEAR",
+    recoveryQualityScore: 1,
+  }).analysis;
+  const shared = {
+    policyId: "EARLY_THESIS_FAILURE" as const,
+    generatedAt,
+    state: { cashKrw: 600_000, quantity: 4, averageEntryPrice: 100_000 },
+    researchState: emptyResearchState(),
+    analysis,
+  };
+
+  const overridden = evaluatePositionGuardResearchIntervention({ ...shared, decision: addDecision });
+  assert.deepEqual(
+    [overridden?.outcome, overridden?.originalAction, overridden?.effectiveAction, overridden?.reason],
+    ["OVERRIDE_EXIT", "ADD", "EXIT", "FAILED_RECLAIM_THESIS"],
+  );
+  const preserved = evaluatePositionGuardResearchIntervention({ ...shared, decision: exitDecision });
+  assert.deepEqual(
+    [preserved?.outcome, preserved?.originalAction, preserved?.effectiveAction, preserved?.reason],
+    ["ALLOW", "EXIT", "EXIT", "RISK_REDUCING_DECISION_PRESERVED"],
+  );
+});
+
+test("ADD_LIMITED enforces frozen first-failure precedence and executed ADD count", () => {
+  const decision = runPositionGuardBacktest(createAddReplayInput()).frames[0]!.decision;
+  const generatedAt = "2026-04-20T01:00:00.000Z";
+  const base = {
+    policyId: "ADD_LIMITED" as const,
+    generatedAt,
+    decision,
+    state: { cashKrw: 600_000, quantity: 4, averageEntryPrice: 100_000 },
+  };
+  const allowed = evaluatePositionGuardResearchIntervention({
+    ...base,
+    researchState: emptyResearchState(),
+    analysis: createFrame(generatedAt, strongAddAnalysis).analysis,
+  });
+  assert.deepEqual([allowed?.outcome, allowed?.reason], ["ALLOW", "CONDITIONS_MET"]);
+
+  const atLoss = evaluatePositionGuardResearchIntervention({
+    ...base,
+    researchState: { ...emptyResearchState(), currentEpisodeAddCount: 1 },
+    analysis: createFrame(generatedAt, {
+      ...strongAddAnalysis,
+      currentPrice: 99_000,
+      atrShock: true,
+    }).analysis,
+  });
+  assert.deepEqual([atLoss?.outcome, atLoss?.reason], ["SUPPRESS", "POSITION_AT_LOSS"]);
+
+  const limited = evaluatePositionGuardResearchIntervention({
+    ...base,
+    researchState: { ...emptyResearchState(), currentEpisodeAddCount: 1 },
+    analysis: createFrame(generatedAt, strongAddAnalysis).analysis,
+  });
+  assert.deepEqual([limited?.outcome, limited?.reason], ["SUPPRESS", "EPISODE_ADD_LIMIT_REACHED"]);
+});
+
+test("stateful scenarios reject carry-in inventory without explicit research state", () => {
+  for (const id of ["ADD_LIMITED", "COOLDOWN_CONTROL", "COMBINED_CONSERVATIVE"] as const) {
+    assert.throws(
+      () => runPositionGuardBacktest({
+        ...createAddReplayInput(),
+        researchExecutionPolicy: { id },
+      }),
+      new RegExp(`${id}.*carry-in research state`),
+    );
+  }
+
+  assert.throws(
+    () => runPositionGuardBacktest({
+      ...createAddReplayInput(),
+      researchExecutionPolicy: { id: "COOLDOWN_CONTROL" },
+      researchCarryInState: {
+        ...emptyResearchState(),
+        currentEpisodeRealizedPnlKrw: Number.NaN,
+      },
+    }),
+    /currentEpisodeRealizedPnlKrw.*finite/,
+  );
+});
+
+test("cooldown uses elapsed timestamps and prior full-exit evidence", () => {
+  const enterDecision = runPositionGuardBacktest({
+    asset: "BTC",
+    market: "KRW-BTC",
+    initialCashKrw: 100_000,
+    initialQuantity: 0,
+    initialAverageEntryPrice: 0,
+    frames: [createFrame("2026-04-20T13:00:00.000Z", {
+      regime: "EARLY_RECOVERY",
+      entryPath: "RECLAIM",
+      reclaimStructure: true,
+      trendAlignmentScore: 4,
+      recoveryQualityScore: 4,
+      volumeRecovery: true,
+      macdImproving: true,
+      rsiRecovery: true,
+    })],
+  }).frames[0]!.decision;
+  const analysis = createFrame("2026-04-20T13:00:00.000Z", {
+    entryPath: "RECLAIM",
+  }).analysis;
+  const base = {
+    policyId: "COOLDOWN_CONTROL" as const,
+    decision: enterDecision,
+    state: { cashKrw: 100_000, quantity: 0, averageEntryPrice: 0 },
+    analysis,
+  };
+  const lossCooldown = evaluatePositionGuardResearchIntervention({
+    ...base,
+    generatedAt: "2026-04-20T11:59:59.999Z",
+    researchState: {
+      ...emptyResearchState(),
+      lastFullExitAt: "2026-04-20T00:00:00.000Z",
+      lastFullExitRealizedPnlKrw: 0,
+      lastEntryPath: "PULLBACK",
+    },
+  });
+  assert.deepEqual([lossCooldown?.outcome, lossCooldown?.reason], ["SUPPRESS", "NON_POSITIVE_EXIT_12H_COOLDOWN"]);
+
+  const samePathCooldown = evaluatePositionGuardResearchIntervention({
+    ...base,
+    generatedAt: "2026-04-20T13:00:00.000Z",
+    researchState: {
+      ...emptyResearchState(),
+      lastFullExitAt: "2026-04-20T00:00:00.000Z",
+      lastFullExitRealizedPnlKrw: 1,
+      lastEntryPath: "RECLAIM",
+    },
+  });
+  assert.deepEqual([samePathCooldown?.outcome, samePathCooldown?.reason], ["SUPPRESS", "SAME_ENTRY_PATH_24H_COOLDOWN"]);
+
+  const elapsed = evaluatePositionGuardResearchIntervention({
+    ...base,
+    generatedAt: "2026-04-21T00:00:00.000Z",
+    researchState: {
+      ...emptyResearchState(),
+      lastFullExitAt: "2026-04-20T00:00:00.000Z",
+      lastFullExitRealizedPnlKrw: 0,
+      lastEntryPath: "RECLAIM",
+    },
+  });
+  assert.deepEqual([elapsed?.outcome, elapsed?.reason], ["ALLOW", "CONDITIONS_MET"]);
+});
+
+test("cooldown compares mixed-offset nanosecond timestamps exactly at 12h and 24h", () => {
+  const enterDecision = runPositionGuardBacktest({
+    asset: "BTC",
+    market: "KRW-BTC",
+    initialCashKrw: 100_000,
+    initialQuantity: 0,
+    initialAverageEntryPrice: 0,
+    frames: [createFrame("2026-04-20T13:00:00.000Z", {
+      regime: "EARLY_RECOVERY",
+      entryPath: "RECLAIM",
+      reclaimStructure: true,
+      trendAlignmentScore: 4,
+      recoveryQualityScore: 4,
+      volumeRecovery: true,
+      macdImproving: true,
+      rsiRecovery: true,
+    })],
+  }).frames[0]!.decision;
+  const base = {
+    policyId: "COOLDOWN_CONTROL" as const,
+    decision: enterDecision,
+    state: { cashKrw: 100_000, quantity: 0, averageEntryPrice: 0 },
+    analysis: createFrame("2026-04-20T13:00:00.000Z", { entryPath: "RECLAIM" }).analysis,
+  };
+  const exitAt = "2026-04-20T00:00:00.000000500Z";
+  const evaluate = (
+    generatedAt: string,
+    lastFullExitRealizedPnlKrw: number,
+    lastEntryPath: PositionGuardBacktestResearchState["lastEntryPath"],
+  ) => evaluatePositionGuardResearchIntervention({
+    ...base,
+    generatedAt,
+    researchState: {
+      ...emptyResearchState(),
+      lastFullExitAt: exitAt,
+      lastFullExitRealizedPnlKrw,
+      lastEntryPath,
+    },
+  });
+
+  assert.equal(
+    evaluate("2026-04-20T21:00:00.000000499+09:00", 0, "PULLBACK")?.reason,
+    "NON_POSITIVE_EXIT_12H_COOLDOWN",
+  );
+  assert.equal(
+    evaluate("2026-04-20T21:00:00.000000500+09:00", 0, "PULLBACK")?.reason,
+    "CONDITIONS_MET",
+  );
+  assert.equal(
+    evaluate("2026-04-20T21:00:00.000000501+09:00", 0, "PULLBACK")?.reason,
+    "CONDITIONS_MET",
+  );
+  assert.equal(
+    evaluate("2026-04-21T09:00:00.000000499+09:00", 1, "RECLAIM")?.reason,
+    "SAME_ENTRY_PATH_24H_COOLDOWN",
+  );
+  assert.equal(
+    evaluate("2026-04-21T09:00:00.000000500+09:00", 1, "RECLAIM")?.reason,
+    "CONDITIONS_MET",
+  );
+  assert.equal(
+    evaluate("2026-04-21T09:00:00.000000501+09:00", 1, "RECLAIM")?.reason,
+    "CONDITIONS_MET",
+  );
+});
+
+test("cooldown uses the whole episode loss when REDUCE loses and final EXIT profits", () => {
+  const result = runCooldownEpisodeReplay(50_000, 110_000);
+
+  assert.deepEqual(result.frames.slice(0, 3).map((frame) => frame.decision.action), [
+    "REDUCE",
+    "EXIT",
+    "ENTER",
+  ]);
+  assert.ok((result.frames[0]?.trade?.realizedPnlKrw ?? 0) < 0);
+  assert.ok((result.frames[1]?.trade?.realizedPnlKrw ?? 0) > 0);
+  assert.ok((result.finalResearchState?.lastFullExitRealizedPnlKrw ?? 0) < 0);
+  assert.equal(result.frames[2]?.researchIntervention?.reason, "NON_POSITIVE_EXIT_12H_COOLDOWN");
+  assert.equal(result.frames[2]?.trade, null);
+  assert.equal(result.finalResearchState?.currentEpisodeRealizedPnlKrw, 0);
+});
+
+test("cooldown uses the whole episode profit when REDUCE profits and final EXIT loses", () => {
+  const result = runCooldownEpisodeReplay(150_000, 90_000);
+
+  assert.deepEqual(result.frames.slice(0, 3).map((frame) => frame.decision.action), [
+    "REDUCE",
+    "EXIT",
+    "ENTER",
+  ]);
+  assert.ok((result.frames[0]?.trade?.realizedPnlKrw ?? 0) > 0);
+  assert.ok((result.frames[1]?.trade?.realizedPnlKrw ?? 0) < 0);
+  assert.ok((result.finalResearchState?.lastFullExitRealizedPnlKrw ?? 0) > 0);
+  assert.equal(result.frames[2]?.researchIntervention?.reason, "CONDITIONS_MET");
+  assert.equal(result.frames[2]?.trade?.action, "ENTER");
+  assert.equal(result.finalResearchState?.currentEpisodeRealizedPnlKrw, 0);
+});
+
+test("combined conservative applies early-exit before entry and ADD suppressions", () => {
+  const decision = runPositionGuardBacktest(createAddReplayInput()).frames[0]!.decision;
+  const generatedAt = "2026-04-20T01:00:00.000Z";
+  const result = evaluatePositionGuardResearchIntervention({
+    policyId: "COMBINED_CONSERVATIVE",
+    generatedAt,
+    decision,
+    state: { cashKrw: 600_000, quantity: 4, averageEntryPrice: 100_000 },
+    researchState: { ...emptyResearchState(), currentEpisodeAddCount: 1 },
+    analysis: createFrame(generatedAt, {
+      ...strongAddAnalysis,
+      currentPrice: 90_000,
+      failedReclaim: true,
+      weakeningStage: "CLEAR",
+      recoveryQualityScore: 1,
+    }).analysis,
+  });
+
+  assert.deepEqual(
+    [result?.outcome, result?.effectiveAction, result?.reason],
+    ["OVERRIDE_EXIT", "EXIT", "FAILED_RECLAIM_THESIS"],
+  );
+});
+
+test("NEXT_FRAME_MODELED executes against the next price and records the final pending skip", () => {
+  const input = {
+    asset: "BTC" as const,
+    market: "KRW-BTC" as const,
+    initialCashKrw: 100_000,
+    initialQuantity: 0,
+    initialAverageEntryPrice: 0,
+    executionTimingModel: "NEXT_FRAME_MODELED" as const,
+    frames: [
+      createFrame("2026-04-20T01:00:00.000Z", {
+        regime: "EARLY_RECOVERY",
+        currentPrice: 100_000,
+        entryPath: "RECLAIM",
+        reclaimStructure: true,
+        trendAlignmentScore: 4,
+        recoveryQualityScore: 4,
+        volumeRecovery: true,
+        macdImproving: true,
+        rsiRecovery: true,
+      }),
+      createFrame("2026-04-20T02:00:00.000Z", {
+        regime: "EARLY_RECOVERY",
+        currentPrice: 110_000,
+        entryPath: "RECLAIM",
+        reclaimStructure: true,
+        trendAlignmentScore: 4,
+        recoveryQualityScore: 4,
+        volumeRecovery: true,
+        macdImproving: true,
+        rsiRecovery: true,
+      }),
+    ],
+  };
+  const result = runPositionGuardBacktest(input);
+
+  assert.equal(result.frames[0]?.decision.action, "ENTER");
+  assert.equal(result.frames[0]?.trade, null);
+  assert.equal(result.frames[0]?.modeledExecution?.status, "EXECUTED_NEXT_FRAME");
+  assert.equal(result.frames[0]?.modeledExecution?.executedAt, "2026-04-20T02:00:00.000Z");
+  assert.equal(result.frames[0]?.modeledExecution?.executionPrice, 110_000);
+  assert.equal((result.frames[1]?.startingState.quantity ?? 0) > 0, true);
+  assert.equal(result.frames[1]?.modeledExecution?.status, "SKIPPED_NO_NEXT_FRAME");
+  assert.equal(result.frames[1]?.modeledExecution?.reason, "NO_NEXT_FRAME");
+  assert.equal(result.metrics.tradeCount, 1);
+});
+
 const strongAddAnalysis: Partial<PositionGuardStructureAnalysis> = {
   regime: "BULL_TREND",
   currentPrice: 100_000,
@@ -616,6 +1056,58 @@ const strongAddAnalysis: Partial<PositionGuardStructureAnalysis> = {
   macdImproving: true,
   rsiRecovery: true,
 };
+
+function emptyResearchState(): PositionGuardBacktestResearchState {
+  return {
+    currentEpisodeAddCount: 0,
+    currentEpisodeRealizedPnlKrw: 0,
+    lastFullExitAt: null,
+    lastFullExitRealizedPnlKrw: null,
+    lastEntryPath: null,
+  };
+}
+
+function runCooldownEpisodeReplay(reducePrice: number, exitPrice: number) {
+  return runPositionGuardBacktest({
+    asset: "BTC",
+    market: "KRW-BTC",
+    initialCashKrw: 100_000,
+    initialQuantity: 1,
+    initialAverageEntryPrice: 100_000,
+    researchExecutionPolicy: { id: "COOLDOWN_CONTROL" },
+    researchCarryInState: {
+      ...emptyResearchState(),
+      lastEntryPath: "PULLBACK",
+    },
+    frames: [
+      createFrame("2026-04-20T01:00:00.000Z", {
+        regime: "WEAK_DOWNTREND",
+        currentPrice: reducePrice,
+        weakeningStage: "CLEAR",
+        failedReclaim: true,
+        bearishMomentumExpansion: true,
+      }),
+      createFrame("2026-04-20T02:00:00.000Z", {
+        currentPrice: exitPrice,
+        invalidationState: "BROKEN",
+        breakdown1d: true,
+        breakdown4h: true,
+        bearishMomentumExpansion: true,
+      }),
+      createFrame("2026-04-20T03:00:00.000Z", {
+        regime: "EARLY_RECOVERY",
+        currentPrice: 100_000,
+        entryPath: "RECLAIM",
+        reclaimStructure: true,
+        trendAlignmentScore: 4,
+        recoveryQualityScore: 4,
+        volumeRecovery: true,
+        macdImproving: true,
+        rsiRecovery: true,
+      }),
+    ],
+  });
+}
 
 function createAddReplayInput(frames?: readonly PositionGuardBacktestFrame[]) {
   return {
