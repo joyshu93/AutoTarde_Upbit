@@ -47,6 +47,22 @@ would require a separate versioned design and is not introduced by this unit.
   `pageLimit`.
 - Validate market, unit, finite raw values, explicit UTC candle timestamps, strict
   cursor progress, and deterministic duplicate handling.
+- Normalize Upbit `candle_date_time_utc` by accepting only its UTC wall-clock form
+  and appending `Z` before exact parsing. The numeric `timestamp` is the exchange's
+  last-trade observation time, not the candle open time; require it to be a finite,
+  non-negative safe integer and retain it in the fingerprint, but do not require it
+  to equal the candle open instant.
+- Sort each successful page by exact candle-open instant descending. Equal open
+  instants with different validated payloads are corrupt and rejected. Identical
+  duplicate rows are retained in canonical fingerprint membership but collapsed for
+  cursor traversal and in-range conflict detection.
+- Use the oldest unique candle open as the next exclusive Upbit `to` cursor without
+  subtracting time. It must be strictly earlier than the request cursor. A page whose
+  oldest unique open does not advance the cursor, including a repeated duplicate-only
+  page, fails explicitly.
+- Reject any returned candle whose open is at or after the page request cursor. Raw
+  page row count and every sorted canonical row, including identical duplicates, are
+  bound into the fingerprint.
 - Filter using exact `[from,to)` epoch comparisons. A candle exactly at `from` is in
   range; a candle exactly at `to` is outside the range.
 - Treat the segment as completely traversed only after the returned sequence crosses
@@ -148,7 +164,9 @@ Tests must first fail for the missing behavior and cover:
 
 Final verification is `npm.cmd run typecheck`, the focused suites, full
 `npm.cmd run check`, and `git diff --check`. Automated tests use injected readers and
-must not call Upbit.
+must not call Upbit. Focused acquisition and CLI tests install a temporary throwing
+`globalThis.fetch` trap while injected dependencies run, then restore it, so an
+accidental network fallback fails the test.
 
 ## Deferred Work
 
