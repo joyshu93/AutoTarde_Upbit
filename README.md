@@ -458,9 +458,18 @@ This diagnostic was designed after an observed holdout outcome, so it is retrosp
 
 ## Prospective Component Shadow Protocol
 
-The prospective protocol is not active yet: this repository contains the implementation and workflow, but no actual `PCS-2026-001` registration artifact or registry entry has been created. Do not treat the CLI, workflow, or tests as an active experiment.
+`PCS-2026-001` is publicly registered. Its immutable no-peek observation window is `[2026-08-23T08:00:00.000Z,2026-12-21T08:00:00.000Z)`, equivalent to 2026-08-23 17:00 KST through 2026-12-21 17:00 KST. Before `window.from` it is registered and awaiting observation; from `window.from` until `window.to`, reports remain `COLLECTING` and expose no outcome metrics. The registration does not require the trading runtime or LIVE scheduler to run.
 
-Before registration, the proposed authority, fixed window, matrix, payload hash, canonical bytes, and destination paths can be inspected without creating a registration:
+The public authority chain is:
+
+- implementation publication (`Publication A`): `ed4de872d07f416c77d5f05b9dc657eae676155e`
+- registration publication (`Publication B`): `358113dba5cd0425161a4aed0827f496d268d1f5`
+- successful GitHub Actions commitment run: `32348730422`
+- registration payload SHA-256: `978e31695707453507fa604bae71f3f1657a061f891e621f2026f1e293c53b40`
+
+The registration artifact and registry entry are `docs/research/prospective-shadow/PCS-2026-001.registration.json` and `docs/research/prospective-shadow/registry.jsonl`. The successful Actions metadata has also been preserved in the Git-ignored local research authority archive because the hosted artifact expires before the observation window ends. Do not change the registration, registered scenarios, thresholds, costs, timing models, observation window, or commitment workflow in response to evidence observed during the window.
+
+The non-binding preview command used before this registration remains documented for provenance. Re-running it now performs only a local hypothetical calculation; it does not replace, update, or create another active registration:
 
 ```powershell
 npm.cmd run research:prospective-shadow -- preview `
@@ -469,20 +478,20 @@ npm.cmd run research:prospective-shadow -- preview `
   --retrospective-report-sha256 <64-character-sha256>
 ```
 
-`preview` is a local, non-binding pure calculation. It performs no file, Git, network, database, Upbit, Telegram, scheduler, strategy, sync, or order operation, and it does not activate the experiment. It reports the canonical bytes and paths that a later `register` command would write. The later registration samples its clock again, so its `registeredAt`, `[from,to)` window, canonical bytes, and payload SHA-256 can differ from the preview.
+`preview` is a local, non-binding pure calculation. It performs no file, Git, network, database, Upbit, Telegram, scheduler, strategy, sync, or order operation, and it does not activate the experiment. It reports the canonical bytes and paths that the subsequent `register` command would write. The completed registration sampled its clock again, so its `registeredAt`, `[from,to)` window, canonical bytes, and payload SHA-256 were not inferred from an earlier preview.
 
 Text is the default output. Add `--output json` for the complete stable machine-readable preview; both formats include the canonical registration and registry bytes.
 
-Activation is deliberately split into two public stages:
+Activation was deliberately split into two public stages:
 
-1. **Publication A:** land and publicly push the complete implementation plus `.github/workflows/prospective-shadow-registration.yml` on canonical `origin/main`.
-2. Freeze the registration authority against Publication A without observing future-window evidence.
-3. **Publication B:** in a separate one-parent commit, add only `docs/research/prospective-shadow/PCS-2026-001.registration.json` and `docs/research/prospective-shadow/registry.jsonl`. Registration creation reserves 72 hours before the first whole-hour `window.from`; the successful Publication B workflow's GitHub server `created_at` must be at least 48 hours before `window.from`.
-4. Preserve the successful Publication B Actions metadata and manually confirm the canonical public run with `I_VERIFIED_PUBLIC_GITHUB_COMMITMENT`.
+1. **Publication A completed:** the complete implementation and `.github/workflows/prospective-shadow-registration.yml` were publicly pushed on canonical `origin/main` at `ed4de872d07f416c77d5f05b9dc657eae676155e`.
+2. The registration authority was frozen against Publication A without observing future-window evidence.
+3. **Publication B completed:** the separate one-parent commit `358113dba5cd0425161a4aed0827f496d268d1f5` added only `docs/research/prospective-shadow/PCS-2026-001.registration.json` and `docs/research/prospective-shadow/registry.jsonl`. GitHub server time for successful run `32348730422` was `2026-08-20T08:25:23Z`, more than 48 hours before `window.from`.
+4. The successful Publication B Actions metadata and validated commitment were preserved locally. Commands that inspect or evaluate the authority must still use the explicit `I_VERIFIED_PUBLIC_GITHUB_COMMITMENT` confirmation rather than inferring trust from local files.
 
 The manually triggered/read-only GitHub Actions workflow is an auditable, non-cryptographic lookup. It has only `contents: read` and `actions: read`, queries the Actions REST endpoint only for its own exact run ID, verifies repository/branch/head identity, and uses the returned GitHub server `created_at`; runner clocks and Git author/committer timestamps are not commitment time. Pinned Actions and credential-free checkout are required. The checked-in `.github/scripts/prospective-shadow-commitment.mjs` validator is regenerated locally with `npm run build:prospective-commitment-bundle`; the workflow performs no package installation, so its only direct network request is the exact own-run Actions lookup. The workflow never receives trading secrets and never runs the app, operational DB, market acquisition, Telegram, scheduler, strategy, sync, or order paths. Because Actions artifacts expire before the 120-day window, the operator must preserve the successful metadata outside ephemeral artifact retention.
 
-The registered no-peek interval is exactly 120 fixed days and uses `[from,to)`. Before `to`, reports remain `COLLECTING` and expose no outcome metrics. At or after `to`, final evaluation requires a separate manual closure workflow run, its own server `created_at`, complete canonical path history, and `I_VERIFIED_PUBLIC_GITHUB_REGISTRY_CLOSURE`. Missing, abandoned, stale, superseded, or manually unconfirmed authority is `REGISTRATION_INVALID`; complete evidence may otherwise resolve to `REJECTED`, `INSUFFICIENT`, or `SUPPORTS_CONTINUED_SHADOW`. These statuses are research classifications only and never approve deployment, strategy changes, API/DB wiring, Upbit access, Telegram behavior, scheduler/runtime startup, orders, DRY_RUN, or LIVE operation.
+The registered no-peek interval is exactly 120 fixed days and uses `[from,to)`. Do not acquire or evaluate the final evidence before `window.to`, interpolate missing candles, tune candidates, or select a winner during the window. At or after `window.to`, acquire immutable BTC and ETH evidence for the exact registered range, then perform the separate manual closure workflow run and confirm its server `created_at` and complete canonical path history with `I_VERIFIED_PUBLIC_GITHUB_REGISTRY_CLOSURE` before final evaluation. Missing, abandoned, stale, superseded, or manually unconfirmed authority is `REGISTRATION_INVALID`; complete evidence may otherwise resolve to `REJECTED`, `INSUFFICIENT`, or `SUPPORTS_CONTINUED_SHADOW`. These statuses are research classifications only and never approve deployment, strategy changes, API/DB wiring, Upbit access, Telegram behavior, scheduler/runtime startup, orders, DRY_RUN, or LIVE operation.
 
 ## Local DRY_RUN Script
 
