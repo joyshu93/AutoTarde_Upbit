@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
 import {
   DEFAULT_POSITION_GUARD_STRATEGY_SETTINGS,
@@ -24,6 +25,10 @@ const publicResearchPolicyContract: readonly PositionGuardBacktestResearchExecut
   { id: "ADD_LIMITED" },
   { id: "COOLDOWN_CONTROL" },
   { id: "COMBINED_CONSERVATIVE" },
+  { id: "COMBINED_MINUS_HTF_TREND_GATE" },
+  { id: "COMBINED_MINUS_EARLY_THESIS_FAILURE" },
+  { id: "COMBINED_MINUS_ADD_LIMITED" },
+  { id: "COMBINED_MINUS_COOLDOWN_CONTROL" },
 ];
 void publicResearchPolicyContract;
 
@@ -996,6 +1001,286 @@ test("combined conservative applies early-exit before entry and ADD suppressions
   assert.deepEqual(
     [result?.outcome, result?.effectiveAction, result?.reason],
     ["OVERRIDE_EXIT", "EXIT", "FAILED_RECLAIM_THESIS"],
+  );
+});
+
+test("combined ablations omit exactly one component while retaining original precedence", () => {
+  const generatedAt = "2026-04-20T13:00:00.000Z";
+  const addDecision = runPositionGuardBacktest(createAddReplayInput()).frames[0]!.decision;
+  const enterDecision = runPositionGuardBacktest({
+    ...createAddReplayInput([createFrame(generatedAt, {
+      regime: "EARLY_RECOVERY",
+      currentPrice: 100_000,
+      entryPath: "RECLAIM",
+      reclaimStructure: true,
+      trendAlignmentScore: 4,
+      recoveryQualityScore: 4,
+      volumeRecovery: true,
+      macdImproving: true,
+      rsiRecovery: true,
+    })]),
+    initialQuantity: 0,
+    initialAverageEntryPrice: 0,
+  }).frames[0]!.decision;
+
+  const withoutEarlyFailure = evaluatePositionGuardResearchIntervention({
+    policyId: "COMBINED_MINUS_EARLY_THESIS_FAILURE",
+    generatedAt,
+    decision: addDecision,
+    state: { cashKrw: 600_000, quantity: 4, averageEntryPrice: 100_000 },
+    researchState: { ...emptyResearchState(), currentEpisodeAddCount: 1 },
+    analysis: createFrame(generatedAt, {
+      ...strongAddAnalysis,
+      currentPrice: 90_000,
+      failedReclaim: true,
+      weakeningStage: "CLEAR",
+      recoveryQualityScore: 1,
+    }).analysis,
+  });
+  assert.deepEqual(
+    [withoutEarlyFailure?.outcome, withoutEarlyFailure?.reason],
+    ["SUPPRESS", "POSITION_AT_LOSS"],
+  );
+
+  const withoutAddLimited = evaluatePositionGuardResearchIntervention({
+    policyId: "COMBINED_MINUS_ADD_LIMITED",
+    generatedAt,
+    decision: addDecision,
+    state: { cashKrw: 600_000, quantity: 4, averageEntryPrice: 100_000 },
+    researchState: { ...emptyResearchState(), currentEpisodeAddCount: 1 },
+    analysis: createFrame(generatedAt, strongAddAnalysis).analysis,
+  });
+  assert.equal(withoutAddLimited, null);
+
+  const withoutHtfGate = evaluatePositionGuardResearchIntervention({
+    policyId: "COMBINED_MINUS_HTF_TREND_GATE",
+    generatedAt,
+    decision: enterDecision,
+    state: { cashKrw: 1_000_000, quantity: 0, averageEntryPrice: 0 },
+    researchState: emptyResearchState(),
+    analysis: createFrame(generatedAt, {
+      regime: "EARLY_RECOVERY",
+      entryPath: "RECLAIM",
+      trendAlignmentScore: 2,
+    }).analysis,
+  });
+  assert.equal(withoutHtfGate, null);
+
+  const withoutCooldown = evaluatePositionGuardResearchIntervention({
+    policyId: "COMBINED_MINUS_COOLDOWN_CONTROL",
+    generatedAt,
+    decision: enterDecision,
+    state: { cashKrw: 1_000_000, quantity: 0, averageEntryPrice: 0 },
+    researchState: {
+      ...emptyResearchState(),
+      lastFullExitAt: "2026-04-20T12:00:00.000Z",
+      lastFullExitRealizedPnlKrw: -1,
+    },
+    analysis: createFrame(generatedAt, {
+      regime: "EARLY_RECOVERY",
+      entryPath: "RECLAIM",
+      trendAlignmentScore: 4,
+    }).analysis,
+  });
+  assert.equal(withoutCooldown, null);
+});
+
+test("every combined ablation retains the exact complementary component behavior and precedence", () => {
+  const generatedAt = "2026-04-20T13:00:00.000Z";
+  const addDecision = runPositionGuardBacktest(createAddReplayInput()).frames[0]!.decision;
+  const holdDecision = runPositionGuardBacktest({
+    ...createAddReplayInput([createFrame(generatedAt, {})]),
+  }).frames[0]!.decision;
+  const enterDecision = runPositionGuardBacktest({
+    ...createAddReplayInput([createFrame(generatedAt, {
+      regime: "EARLY_RECOVERY",
+      currentPrice: 100_000,
+      entryPath: "RECLAIM",
+      reclaimStructure: true,
+      trendAlignmentScore: 4,
+      recoveryQualityScore: 4,
+      volumeRecovery: true,
+      macdImproving: true,
+      rsiRecovery: true,
+    })]),
+    initialQuantity: 0,
+    initialAverageEntryPrice: 0,
+  }).frames[0]!.decision;
+  const policyIds = [
+    "COMBINED_MINUS_HTF_TREND_GATE",
+    "COMBINED_MINUS_EARLY_THESIS_FAILURE",
+    "COMBINED_MINUS_ADD_LIMITED",
+    "COMBINED_MINUS_COOLDOWN_CONTROL",
+  ] as const;
+  const expected = {
+    COMBINED_MINUS_HTF_TREND_GATE: {
+      components: ["FAILED_RECLAIM_THESIS", "NON_POSITIVE_EXIT_12H_COOLDOWN", null, "EPISODE_ADD_LIMIT_REACHED"],
+      precedence: ["FAILED_RECLAIM_THESIS", "NON_POSITIVE_EXIT_12H_COOLDOWN"],
+    },
+    COMBINED_MINUS_EARLY_THESIS_FAILURE: {
+      components: [null, "NON_POSITIVE_EXIT_12H_COOLDOWN", "TREND_ALIGNMENT_BELOW_3", "EPISODE_ADD_LIMIT_REACHED"],
+      precedence: ["POSITION_AT_LOSS", "NON_POSITIVE_EXIT_12H_COOLDOWN"],
+    },
+    COMBINED_MINUS_ADD_LIMITED: {
+      components: ["FAILED_RECLAIM_THESIS", "NON_POSITIVE_EXIT_12H_COOLDOWN", "TREND_ALIGNMENT_BELOW_3", null],
+      precedence: ["FAILED_RECLAIM_THESIS", "NON_POSITIVE_EXIT_12H_COOLDOWN"],
+    },
+    COMBINED_MINUS_COOLDOWN_CONTROL: {
+      components: ["FAILED_RECLAIM_THESIS", null, "TREND_ALIGNMENT_BELOW_3", "EPISODE_ADD_LIMIT_REACHED"],
+      precedence: ["FAILED_RECLAIM_THESIS", "TREND_ALIGNMENT_BELOW_3"],
+    },
+  } as const;
+
+  for (const policyId of policyIds) {
+    const base = {
+      policyId,
+      generatedAt,
+      state: { cashKrw: 600_000, quantity: 4, averageEntryPrice: 100_000 },
+    };
+    const early = evaluatePositionGuardResearchIntervention({
+      ...base,
+      decision: holdDecision,
+      researchState: emptyResearchState(),
+      analysis: createFrame(generatedAt, {
+        failedReclaim: true,
+        weakeningStage: "CLEAR",
+        recoveryQualityScore: 1,
+      }).analysis,
+    })?.reason ?? null;
+    const cooldown = evaluatePositionGuardResearchIntervention({
+      ...base,
+      decision: enterDecision,
+      state: { cashKrw: 1_000_000, quantity: 0, averageEntryPrice: 0 },
+      researchState: {
+        ...emptyResearchState(),
+        lastFullExitAt: "2026-04-20T12:00:00.000Z",
+        lastFullExitRealizedPnlKrw: -1,
+      },
+      analysis: createFrame(generatedAt, {
+        regime: "EARLY_RECOVERY",
+        entryPath: "RECLAIM",
+        trendAlignmentScore: 4,
+      }).analysis,
+    })?.reason ?? null;
+    const htf = evaluatePositionGuardResearchIntervention({
+      ...base,
+      decision: enterDecision,
+      state: { cashKrw: 1_000_000, quantity: 0, averageEntryPrice: 0 },
+      researchState: emptyResearchState(),
+      analysis: createFrame(generatedAt, {
+        regime: "EARLY_RECOVERY",
+        entryPath: "RECLAIM",
+        trendAlignmentScore: 2,
+      }).analysis,
+    })?.reason ?? null;
+    const add = evaluatePositionGuardResearchIntervention({
+      ...base,
+      decision: addDecision,
+      researchState: { ...emptyResearchState(), currentEpisodeAddCount: 1 },
+      analysis: createFrame(generatedAt, strongAddAnalysis).analysis,
+    })?.reason ?? null;
+    const earlyBeforeAdd = evaluatePositionGuardResearchIntervention({
+      ...base,
+      decision: addDecision,
+      researchState: { ...emptyResearchState(), currentEpisodeAddCount: 1 },
+      analysis: createFrame(generatedAt, {
+        ...strongAddAnalysis,
+        currentPrice: 90_000,
+        failedReclaim: true,
+        weakeningStage: "CLEAR",
+        recoveryQualityScore: 1,
+      }).analysis,
+    })?.reason ?? null;
+    const cooldownBeforeHtf = evaluatePositionGuardResearchIntervention({
+      ...base,
+      decision: enterDecision,
+      state: { cashKrw: 1_000_000, quantity: 0, averageEntryPrice: 0 },
+      researchState: {
+        ...emptyResearchState(),
+        lastFullExitAt: "2026-04-20T12:00:00.000Z",
+        lastFullExitRealizedPnlKrw: -1,
+      },
+      analysis: createFrame(generatedAt, {
+        regime: "EARLY_RECOVERY",
+        entryPath: "RECLAIM",
+        trendAlignmentScore: 2,
+      }).analysis,
+    })?.reason ?? null;
+
+    assert.deepEqual([early, cooldown, htf, add], expected[policyId].components);
+    assert.deepEqual([earlyBeforeAdd, cooldownBeforeHtf], expected[policyId].precedence);
+  }
+});
+
+test("combined ablations preserve core risk reduction before component evaluation", () => {
+  const generatedAt = "2026-04-20T01:00:00.000Z";
+  const exitDecision = runPositionGuardBacktest({
+    ...createAddReplayInput([createFrame(generatedAt, {
+      invalidationState: "BROKEN",
+      breakdown1d: true,
+      breakdown4h: true,
+      bearishMomentumExpansion: true,
+    })]),
+  }).frames[0]!.decision;
+  const policyIds = [
+    "COMBINED_MINUS_HTF_TREND_GATE",
+    "COMBINED_MINUS_EARLY_THESIS_FAILURE",
+    "COMBINED_MINUS_ADD_LIMITED",
+    "COMBINED_MINUS_COOLDOWN_CONTROL",
+  ] as const;
+
+  for (const policyId of policyIds) {
+    const result = evaluatePositionGuardResearchIntervention({
+      policyId,
+      generatedAt,
+      decision: exitDecision,
+      state: { cashKrw: 600_000, quantity: 4, averageEntryPrice: 100_000 },
+      researchState: emptyResearchState(),
+      analysis: createFrame(generatedAt, { breakdown1d: true, breakdown4h: true }).analysis,
+    });
+    assert.deepEqual(
+      [result?.outcome, result?.effectiveAction, result?.reason],
+      ["ALLOW", "EXIT", "RISK_REDUCING_DECISION_PRESERVED"],
+    );
+  }
+});
+
+test("combined conservative retains a byte-for-byte full-result golden", () => {
+  const result = runPositionGuardBacktest({
+    asset: "BTC",
+    market: "KRW-BTC",
+    initialCashKrw: 1_000_000,
+    initialQuantity: 0,
+    initialAverageEntryPrice: 0,
+    executionTimingModel: "NEXT_FRAME_MODELED",
+    researchExecutionPolicy: { id: "COMBINED_CONSERVATIVE" },
+    frames: [
+      createFrame("2026-04-20T01:00:00.000000100Z", {
+        ...strongAddAnalysis,
+        regime: "EARLY_RECOVERY",
+        entryPath: "RECLAIM",
+      }),
+      createFrame("2026-04-20T02:00:00.000000200Z", strongAddAnalysis),
+      createFrame("2026-04-20T03:00:00.000000300Z", {
+        currentPrice: 110_000,
+        invalidationState: "BROKEN",
+        breakdown1d: true,
+        breakdown4h: true,
+        bearishMomentumExpansion: true,
+      }),
+      createFrame("2026-04-20T04:00:00.000000400Z", { currentPrice: 105_000 }),
+    ],
+  });
+  const serialized = JSON.stringify(result);
+
+  assert.equal(result.frames.length, 4);
+  assert.ok(result.frames.some((frame) => frame.researchIntervention?.evidence));
+  assert.ok(result.frames.some((frame) => frame.modeledExecution));
+  assert.ok(result.frames.some((frame) => frame.modeledTradeOrigin));
+  assert.ok(result.finalResearchState);
+  assert.equal(
+    createHash("sha256").update(serialized).digest("hex"),
+    "ca974febcf3d20d6ae87b35aa41c9b5932b90c55a0107ab5496b27ea139ff02b",
   );
 });
 

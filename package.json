@@ -24,10 +24,15 @@
     "report:performance": "npm run build && node dist/src/research/performance-report.js",
     "report:strategy-evaluation": "npm run build && node dist/src/research/integrated-strategy-evaluation.js",
     "research:candles": "npm run build && node dist/src/research/upbit-candle-dataset.js",
-    "check": "npm run typecheck && npm run test"
+    "research:no-trade-evidence": "npm run build && node dist/src/research/upbit-no-trade-evidence.js",
+    "research:prospective-shadow": "npm run build && node dist/src/research/prospective-component-shadow.js",
+    "build:prospective-commitment-bundle": "esbuild ./src/research/prospective-shadow-commitment.ts --bundle --platform=node --format=esm --target=node20 --outfile=./.github/scripts/prospective-shadow-commitment.mjs --banner:js=\"// Generated validator bundle. Source: src/research/prospective-shadow-commitment.ts\"",
+    "check:prospective-commitment-bundle": "node scripts/check-prospective-commitment-bundle.mjs",
+    "check": "npm run typecheck && npm run check:prospective-commitment-bundle && npm run test"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "esbuild": "~0.27.0",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3"
   }

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import {
   createVerifiedNoTradeCoverage,
+  createVerifiedNoTradeCoverageFromRanges,
   partitionHourlyCoverage,
 } from "../src/modules/performance/performance-hourly-coverage.js";
 import type { CandleCoverageGap } from "../src/modules/performance/performance-candle-coverage.js";
@@ -150,6 +151,19 @@ test("verified no-trade authority is derived from anomaly-free source observatio
       observedIntervals: [duplicate, duplicate],
     }),
     /duplicate observed/i,
+  );
+});
+
+test("explicit verified no-trade authority rejects an omitted missing range", () => {
+  const first = gap("2026-04-20T03:00:00Z", "2026-04-20T03:00:00Z", 1);
+  const second = gap("2026-04-20T06:00:00Z", "2026-04-20T06:00:00Z", 1);
+  assert.throws(
+    () => createVerifiedNoTradeCoverageFromRanges({
+      sourceBoundary: SOURCE_BOUNDARY,
+      observedIntervals: observedIntervalsExcludingGaps(SOURCE_BOUNDARY, [first, second]),
+      verifiedNoTradeRanges: [first],
+    }),
+    /unexplained missing hourly interval/i,
   );
 });
 

@@ -172,6 +172,28 @@ test("upbit public client requests minute and day candles", async () => {
   assert.equal(dayCandles[0]?.market, "KRW-BTC");
 });
 
+test("upbit public client supports an injected-fetch research-only 1m candle request", async () => {
+  const requests: string[] = [];
+  const client = new UpbitPublicTickerClient({
+    fetchImpl: async (input) => {
+      requests.push(String(input));
+      return new Response(JSON.stringify([]), { status: 200 });
+    },
+  });
+
+  const candles = await client.getMinuteCandles({
+    market: "KRW-BTC",
+    unit: 1,
+    count: 200,
+    to: "2026-08-01T01:00:00.000Z",
+  });
+
+  assert.deepEqual(candles, []);
+  assert.deepEqual(requests, [
+    "https://api.upbit.com/v1/candles/minutes/1?market=KRW-BTC&count=200&to=2026-08-01T01%3A00%3A00.000Z",
+  ]);
+});
+
 test("upbit public client validates candle count before requesting", async () => {
   const client = new UpbitPublicTickerClient({
     fetchImpl: async () => {

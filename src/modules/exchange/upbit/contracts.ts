@@ -82,7 +82,9 @@ export interface UpbitTickerSnapshot {
   readonly trade_timestamp: number;
 }
 
-export type UpbitMinuteCandleUnit = 60 | 240;
+export type UpbitMinuteCandleUnit = 1 | 60 | 240;
+/** PositionGuard readers deliberately default to strategy-supported aggregation units. */
+export type UpbitStrategyMinuteCandleUnit = Exclude<UpbitMinuteCandleUnit, 1>;
 
 export interface UpbitCandleSnapshot {
   readonly market: UpbitSpotMarket;
@@ -98,11 +100,17 @@ export interface UpbitCandleSnapshot {
   readonly unit?: UpbitMinuteCandleUnit;
 }
 
-export interface UpbitGetMinuteCandlesRequest {
+export interface UpbitGetMinuteCandlesRequest<
+  TUnit extends UpbitMinuteCandleUnit = UpbitStrategyMinuteCandleUnit,
+> {
   readonly market: UpbitSpotMarket;
-  readonly unit: UpbitMinuteCandleUnit;
+  readonly unit: TUnit;
   readonly count: number;
   readonly to?: string;
+}
+
+export interface UpbitGetOneMinuteCandlesRequest extends UpbitGetMinuteCandlesRequest<1> {
+  readonly unit: 1;
 }
 
 export interface UpbitGetDayCandlesRequest {
@@ -308,6 +316,8 @@ export interface UpbitPrivateExchangeClient {
 
 export interface UpbitPublicQuotationClient {
   getTickers(markets: readonly UpbitSpotMarket[]): Promise<readonly UpbitTickerSnapshot[]>;
-  getMinuteCandles(request: UpbitGetMinuteCandlesRequest): Promise<readonly UpbitCandleSnapshot[]>;
+  getMinuteCandles<TUnit extends UpbitMinuteCandleUnit>(
+    request: UpbitGetMinuteCandlesRequest<TUnit>,
+  ): Promise<readonly UpbitCandleSnapshot[]>;
   getDayCandles(request: UpbitGetDayCandlesRequest): Promise<readonly UpbitCandleSnapshot[]>;
 }

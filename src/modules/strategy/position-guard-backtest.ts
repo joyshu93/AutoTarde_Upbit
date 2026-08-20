@@ -14,7 +14,11 @@ import type { SupportedStrategyTimeframe } from "./market-structure.js";
 import { performanceTimestampEpochNanoseconds } from "../performance/performance-timestamp.js";
 import {
   BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY,
+  COMBINED_CONSERVATIVE_ABLATION_RESEARCH_AUTHORITY,
+  COMBINED_CONSERVATIVE_COMPONENTS,
+  type CombinedConservativeComponent,
   type FrozenBroadLossCauseScenario,
+  type FrozenCombinedConservativeAblationScenario,
 } from "./position-guard-research-manifest.js";
 
 export interface PositionGuardBacktestFrame {
@@ -52,12 +56,19 @@ export type PositionGuardBacktestExecutionTimingModel =
 
 export type PositionGuardBacktestFrozenResearchPolicyId = FrozenBroadLossCauseScenario;
 
+export type PositionGuardBacktestAblationResearchPolicyId =
+  FrozenCombinedConservativeAblationScenario;
+
+export type PositionGuardBacktestInterventionPolicyId =
+  | PositionGuardBacktestFrozenResearchPolicyId
+  | PositionGuardBacktestAblationResearchPolicyId;
+
 export type PositionGuardBacktestResearchExecutionPolicyId =
   | "NO_ADD"
   | "ADD_RISK_CLEAR"
   | "ADD_HIGH_ALIGNMENT"
   | "ADD_CORE_TREND"
-  | PositionGuardBacktestFrozenResearchPolicyId;
+  | PositionGuardBacktestInterventionPolicyId;
 
 type PositionGuardBacktestConditionalAddPolicyId =
   | "ADD_RISK_CLEAR"
@@ -157,7 +168,7 @@ export type PositionGuardBacktestResearchInterventionReason =
   | "SAME_ENTRY_PATH_24H_COOLDOWN";
 
 export interface PositionGuardBacktestResearchIntervention {
-  readonly scenario: PositionGuardBacktestFrozenResearchPolicyId;
+  readonly scenario: PositionGuardBacktestInterventionPolicyId;
   readonly generatedAt: string;
   readonly originalAction: StrategyDecisionAction;
   readonly effectiveAction: StrategyDecisionAction;
@@ -248,7 +259,7 @@ export type PositionGuardBacktestModeledTradeOriginEvidence = Readonly<{
   executionFrameIndex: number;
   originalAction: StrategyDecisionAction;
   effectiveAction: Extract<StrategyDecisionAction, "ENTER" | "ADD" | "REDUCE" | "EXIT">;
-  scenario: PositionGuardBacktestFrozenResearchPolicyId | null;
+  scenario: PositionGuardBacktestInterventionPolicyId | null;
   intervention: Readonly<Pick<PositionGuardBacktestResearchIntervention, "outcome" | "reason">> | null;
 }>;
 
@@ -292,7 +303,7 @@ type PendingModeledDecision = {
   entryPath: StrategyEntryPath;
   originalAction: StrategyDecisionAction;
   effectiveAction: Extract<StrategyDecisionAction, "ENTER" | "ADD" | "REDUCE" | "EXIT">;
-  scenario: PositionGuardBacktestFrozenResearchPolicyId | null;
+  scenario: PositionGuardBacktestInterventionPolicyId | null;
   intervention: Readonly<Pick<PositionGuardBacktestResearchIntervention, "outcome" | "reason">> | null;
 };
 
@@ -385,7 +396,7 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
       latestDecision,
     });
     const decision = decidePositionGuardCore(context);
-    const researchIntervention = isFrozenResearchPolicy(researchExecutionPolicy)
+    const researchIntervention = isInterventionResearchPolicy(researchExecutionPolicy)
       ? evaluatePositionGuardResearchIntervention({
           policyId: researchExecutionPolicy.id,
           generatedAt: frame.generatedAt,
@@ -491,7 +502,7 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
       ...(researchExecutionPolicy && researchExecutionPolicy.id !== "NO_ADD"
         ? { researchPolicyEvaluation }
         : {}),
-      ...(isFrozenResearchPolicy(researchExecutionPolicy) ? { researchIntervention } : {}),
+      ...(isInterventionResearchPolicy(researchExecutionPolicy) ? { researchIntervention } : {}),
       ...(modeledExecution ? { modeledExecution } : {}),
       ...(modeledTradeOrigin ? { modeledTradeOrigin } : {}),
     });
@@ -529,7 +540,7 @@ export function runPositionGuardBacktest(input: PositionGuardBacktestInput): Pos
     frames: results,
     metrics,
     finalState: cloneState(state),
-    ...(isFrozenResearchPolicy(researchExecutionPolicy)
+    ...(isInterventionResearchPolicy(researchExecutionPolicy)
       ? { finalResearchState: cloneResearchState(researchState) }
       : {}),
   };
@@ -555,6 +566,10 @@ function validateResearchExecutionPolicy(
     case "ADD_LIMITED":
     case "COOLDOWN_CONTROL":
     case "COMBINED_CONSERVATIVE":
+    case "COMBINED_MINUS_HTF_TREND_GATE":
+    case "COMBINED_MINUS_EARLY_THESIS_FAILURE":
+    case "COMBINED_MINUS_ADD_LIMITED":
+    case "COMBINED_MINUS_COOLDOWN_CONTROL":
       if ("suppressedActions" in policy) {
         throw new Error(`${policy.id} research execution policy must not define suppressedActions.`);
       }
@@ -565,7 +580,7 @@ function validateResearchExecutionPolicy(
 }
 
 export function evaluatePositionGuardResearchIntervention(input: {
-  policyId: PositionGuardBacktestFrozenResearchPolicyId;
+  policyId: PositionGuardBacktestInterventionPolicyId;
   generatedAt: string;
   decision: PositionGuardEngineDecision;
   state: PositionGuardBacktestState;
@@ -574,13 +589,13 @@ export function evaluatePositionGuardResearchIntervention(input: {
 }): PositionGuardBacktestResearchIntervention | null {
   const { decision } = input;
   if (
-    (input.policyId === "EARLY_THESIS_FAILURE" || input.policyId === "COMBINED_CONSERVATIVE") &&
+    (input.policyId === "EARLY_THESIS_FAILURE" || isCombinedPolicy(input.policyId)) &&
     (decision.action === "EXIT" || decision.action === "REDUCE")
   ) {
     return createResearchIntervention(input, "ALLOW", decision.action, "RISK_REDUCING_DECISION_PRESERVED");
   }
 
-  if (input.policyId === "EARLY_THESIS_FAILURE" || input.policyId === "COMBINED_CONSERVATIVE") {
+  if (isComponentActive(input.policyId, "EARLY_THESIS_FAILURE")) {
     const earlyFailureReason = getEarlyThesisFailureReason(input);
     if (earlyFailureReason) {
       return createResearchIntervention(input, "OVERRIDE_EXIT", "EXIT", earlyFailureReason);
@@ -592,7 +607,7 @@ export function evaluatePositionGuardResearchIntervention(input: {
     }
   }
 
-  if (input.policyId === "COOLDOWN_CONTROL" || input.policyId === "COMBINED_CONSERVATIVE") {
+  if (isComponentActive(input.policyId, "COOLDOWN_CONTROL")) {
     const cooldownReason = getCooldownReason(input);
     if (cooldownReason) {
       return createResearchIntervention(input, "SUPPRESS", "HOLD", cooldownReason);
@@ -604,7 +619,7 @@ export function evaluatePositionGuardResearchIntervention(input: {
     }
   }
 
-  if (input.policyId === "HTF_TREND_GATE" || input.policyId === "COMBINED_CONSERVATIVE") {
+  if (isComponentActive(input.policyId, "HTF_TREND_GATE")) {
     const htfReason = getHtfTrendGateReason(input);
     if (htfReason) {
       return createResearchIntervention(input, "SUPPRESS", "HOLD", htfReason);
@@ -624,7 +639,7 @@ export function evaluatePositionGuardResearchIntervention(input: {
       : createResearchIntervention(input, "ALLOW", "ENTER", "CONDITIONS_MET");
   }
 
-  if (input.policyId === "ADD_LIMITED" || input.policyId === "COMBINED_CONSERVATIVE") {
+  if (isComponentActive(input.policyId, "ADD_LIMITED")) {
     const addReason = getAddLimitedReason(input);
     if (addReason) {
       return createResearchIntervention(input, "SUPPRESS", "HOLD", addReason);
@@ -635,6 +650,33 @@ export function evaluatePositionGuardResearchIntervention(input: {
   }
 
   return null;
+}
+
+function isComponentActive(
+  policyId: PositionGuardBacktestInterventionPolicyId,
+  component: CombinedConservativeComponent,
+): boolean {
+  if (policyId === component) return true;
+  if (policyId === "COMBINED_CONSERVATIVE") {
+    return COMBINED_CONSERVATIVE_COMPONENTS.includes(component);
+  }
+  if (!isAblationPolicy(policyId)) return false;
+  const activeComponents: readonly CombinedConservativeComponent[] =
+    COMBINED_CONSERVATIVE_ABLATION_RESEARCH_AUTHORITY.scenarios[policyId].activeComponents;
+  return activeComponents.includes(component);
+}
+
+function isCombinedPolicy(
+  policyId: PositionGuardBacktestInterventionPolicyId,
+): policyId is "COMBINED_CONSERVATIVE" | PositionGuardBacktestAblationResearchPolicyId {
+  return policyId === "COMBINED_CONSERVATIVE" || isAblationPolicy(policyId);
+}
+
+function isAblationPolicy(
+  policyId: PositionGuardBacktestInterventionPolicyId,
+): policyId is PositionGuardBacktestAblationResearchPolicyId {
+  return (COMBINED_CONSERVATIVE_ABLATION_RESEARCH_AUTHORITY.scenarioOrder as readonly string[])
+    .includes(policyId);
 }
 
 function getHtfTrendGateReason(
@@ -912,15 +954,19 @@ function isConditionalAddPolicy(
     policy?.id === "ADD_CORE_TREND";
 }
 
-function isFrozenResearchPolicy(
+function isInterventionResearchPolicy(
   policy: PositionGuardBacktestResearchExecutionPolicy | undefined,
-): policy is PositionGuardBacktestResearchExecutionPolicy<PositionGuardBacktestFrozenResearchPolicyId> {
+): policy is PositionGuardBacktestResearchExecutionPolicy<PositionGuardBacktestInterventionPolicyId> {
   return policy?.id === "HTF_TREND_GATE" ||
     policy?.id === "STRICT_PULLBACK" ||
     policy?.id === "EARLY_THESIS_FAILURE" ||
     policy?.id === "ADD_LIMITED" ||
     policy?.id === "COOLDOWN_CONTROL" ||
-    policy?.id === "COMBINED_CONSERVATIVE";
+    policy?.id === "COMBINED_CONSERVATIVE" ||
+    policy?.id === "COMBINED_MINUS_HTF_TREND_GATE" ||
+    policy?.id === "COMBINED_MINUS_EARLY_THESIS_FAILURE" ||
+    policy?.id === "COMBINED_MINUS_ADD_LIMITED" ||
+    policy?.id === "COMBINED_MINUS_COOLDOWN_CONTROL";
 }
 
 function getConditionalAddSuppressionReason(
@@ -942,9 +988,10 @@ function initializeResearchState(
   input: PositionGuardBacktestInput,
   policy: PositionGuardBacktestResearchExecutionPolicy | undefined,
 ): PositionGuardBacktestResearchState {
-  const stateful = policy?.id === "ADD_LIMITED" ||
-    policy?.id === "COOLDOWN_CONTROL" ||
-    policy?.id === "COMBINED_CONSERVATIVE";
+  const stateful = isInterventionResearchPolicy(policy) && (
+    isComponentActive(policy.id, "ADD_LIMITED") ||
+    isComponentActive(policy.id, "COOLDOWN_CONTROL")
+  );
   if (
     stateful &&
     input.initialQuantity > POSITION_GUARD_RESEARCH_POLICY_MANIFEST.quantityTolerance &&

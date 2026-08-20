@@ -76,6 +76,42 @@ export function createVerifiedNoTradeCoverage(input: {
   });
 }
 
+export function createVerifiedNoTradeCoverageFromRanges(input: {
+  sourceBoundary: {
+    historyStartAt: string;
+    endAt: string;
+  };
+  observedIntervals: readonly HourlyObservedInterval[];
+  verifiedNoTradeRanges: readonly CandleCoverageGap[];
+}): VerifiedNoTradeCoverage {
+  if (input.observedIntervals.length === 0) {
+    throw new Error("Verified no-trade coverage requires at least one observed source interval.");
+  }
+  const sourceBoundary = Object.freeze({ ...input.sourceBoundary });
+  const partition = partitionHourlyCoverage({
+    from: sourceBoundary.historyStartAt,
+    to: sourceBoundary.endAt,
+    sourceBoundary,
+    observedIntervals: input.observedIntervals,
+    verifiedNoTradeRanges: input.verifiedNoTradeRanges,
+  });
+  if (partition.unexplainedMissingIntervalCount > 0) {
+    throw new Error(
+      `Verified no-trade coverage leaves ${partition.unexplainedMissingIntervalCount} unexplained missing hourly interval(s).`,
+    );
+  }
+  const ranges = Object.freeze(
+    partition.verifiedNoTradeRanges.map((range) => Object.freeze({ ...range })),
+  );
+  return Object.freeze({
+    sourceBoundary,
+    ranges,
+    sourceSequenceStatus: "COMPLETE",
+    sourceBlockingAnomalyCount: 0,
+    [VERIFIED_NO_TRADE_COVERAGE]: true as const,
+  });
+}
+
 function groupMissingIntervals(
   intervalKeys: readonly string[],
   sourceBoundary: Readonly<{ historyStartAt: string; endAt: string }>,

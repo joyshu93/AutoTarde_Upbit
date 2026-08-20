@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -55,7 +56,7 @@ import {
   type PerformanceDiagnosticsResult,
 } from "../modules/performance/performance-diagnostics.js";
 import {
-  createVerifiedNoTradeCoverage,
+  createVerifiedNoTradeCoverageFromRanges,
   type VerifiedNoTradeCoverage,
 } from "../modules/performance/performance-hourly-coverage.js";
 import {
@@ -77,6 +78,25 @@ import {
   type StrategyHypothesisTimingModel,
 } from "../modules/performance/performance-strategy-hypothesis-evaluation.js";
 import {
+  evaluateCombinedConservativeHoldout,
+  type CombinedConservativeHoldoutMatrixCell,
+  type CombinedConservativeHoldoutResult,
+} from "../modules/performance/performance-combined-conservative-holdout.js";
+import {
+  evaluatePerformanceComponentAblation,
+  type PerformanceComponentAblationCell,
+  type PerformanceComponentAblationMetrics,
+  type PerformanceComponentAblationResult,
+} from "../modules/performance/performance-component-ablation.js";
+import {
+  analyzeHoldoutEpisodeAttribution,
+  type HoldoutEpisodePathProvenance,
+} from "../modules/performance/performance-holdout-episode-attribution.js";
+import {
+  diagnoseCombinedConservativeHoldoutFailures,
+  type HoldoutFailureDiagnosticsResult,
+} from "../modules/performance/performance-holdout-failure-diagnostics.js";
+import {
   runCostSensitivity,
   type CostScenario,
   type CostSensitivityCell,
@@ -92,6 +112,13 @@ import {
   type ResearchCandleDataset,
   type ResearchDatasetProvenance,
 } from "../modules/performance/research-candle-dataset.js";
+import {
+  classifyIndependentNoTradeCoverage,
+  parseResearchNoTradeEvidence,
+  type IndependentNoTradeCoverage,
+  type ResearchNoTradeEvidence,
+  type ResearchNoTradeRange,
+} from "../modules/performance/research-no-trade-evidence.js";
 import {
   runCounterfactualScenarios,
   type CounterfactualScenario,
@@ -116,6 +143,8 @@ import type {
   PositionGuardBacktestMetrics,
   PositionGuardBacktestState,
 } from "../modules/strategy/position-guard-backtest.js";
+import { FROZEN_COMBINED_CONSERVATIVE_ABLATION_SCENARIO_ORDER } from
+  "../modules/strategy/position-guard-research-manifest.js";
 
 export type IntegratedEvaluationFormat = "text" | "json";
 
@@ -127,7 +156,20 @@ export type SimulationInitialState = {
 
 export type SimulationAssetOptions = {
   datasetPath: string;
+  noTradeEvidencePath?: string;
   initialState: SimulationInitialState;
+};
+
+export type IntegratedNoTradeEvidenceProvenance = {
+  path: string;
+  sha256: string;
+  parentDatasetSha256: string;
+  source: string;
+  collectedAt: string;
+  coverageStatus: IndependentNoTradeCoverage["status"];
+  verifiedRangeCount: number;
+  missingRangeCount: number;
+  uncoveredRangeCount: number;
 };
 
 export type IntegratedSimulationOptions = {
@@ -150,6 +192,10 @@ export type IntegratedStrategyEvaluationOptions = {
   simulation: IntegratedSimulationOptions | null;
   stabilityValidation: IntegratedStabilityValidationOptions | null;
   broadStrategyHypothesisProfile?: "BROAD_LOSS_CAUSE_V1";
+  broadStrategyShadowHoldout?: {
+    from: string;
+    to: string;
+  };
 };
 
 export type IntegratedDatasetProvenance = {
@@ -161,6 +207,7 @@ export type IntegratedDatasetProvenance = {
   initialState: SimulationInitialState;
   frameCount: number;
   featureCoverage?: PositionGuardFeatureCoverage;
+  noTradeEvidence?: IntegratedNoTradeEvidenceProvenance;
 };
 
 export type IntegratedProvenance = {
@@ -484,6 +531,9 @@ export type IntegratedStrategyEvaluationReport = {
   conditionalAddPolicyEvaluation?: ConditionalAddPolicyEvaluationSection;
   addLossAttribution?: AddLossAttributionSection;
   broadStrategyHypothesisEvaluation?: BroadStrategyHypothesisEvaluationSection;
+  broadStrategyShadowHoldoutEvaluation?: CombinedConservativeHoldoutResult;
+  broadStrategyShadowHoldoutDiagnostics?: HoldoutFailureDiagnosticsResult;
+  broadStrategyShadowHoldoutComponentDiagnostics?: PerformanceComponentAblationResult;
   evidenceGaps: readonly IntegratedEvidenceGap[];
   interpretation: readonly InterpretationFinding[];
 };
@@ -494,7 +544,7 @@ export type BroadStrategyHypothesisEvaluationSection = StrategyHypothesisEvaluat
   deploymentApproval: false;
   developmentCutoffExclusive: string;
   scenarioMatrix: readonly CounterfactualScenario[];
-  independentNoTradeProofAvailable: false;
+  independentNoTradeProofAvailable: boolean;
   datasets: readonly BroadStrategyHypothesisDatasetProvenance[];
   pathDiagnostics: readonly BroadStrategyPathDiagnostics[];
   interpretationBoundary: "READ_ONLY_SELECTED_COUNTERFACTUAL_PATHS_NOT_DEPLOYMENT_APPROVAL";
@@ -539,11 +589,41 @@ export type BroadStrategyHypothesisDatasetProvenance = {
   firstDevelopmentFrameAt: string | null;
   lastDevelopmentFrameAt: string | null;
   excludedPostCutoffCandleCount: number;
+  noTradeEvidence: IntegratedNoTradeEvidenceProvenance | null;
+  developmentVerifiedRangeCount: number;
 };
 
 export type IntegratedEvaluationDependencies = {
   readObserved?: (filters: PerformanceReadFilters) => PerformanceReadResult;
   readDataset?: (datasetPath: string) => Promise<ResearchCandleDataset>;
+  readNoTradeEvidence?: (evidencePath: string) => Promise<ResearchNoTradeEvidence>;
+  verifyBroadShadowDevelopmentAuthority?: (
+    observations: readonly BroadShadowDevelopmentAuthorityObservation[],
+  ) => void;
+};
+
+const UNVERIFIED_TEST_AUTHORITY_VERSION = "UNVERIFIED_TEST_OVERRIDE" as const;
+
+export type BroadShadowDevelopmentAuthorityObservation = {
+  asset: SupportedAsset;
+  market: SupportedMarket;
+  developmentFrom: string;
+  developmentTo: string;
+  initialStateFingerprint: string;
+  developmentFrameFingerprint: string;
+  developmentFrameCount: number;
+  firstDevelopmentFrameAt: string | null;
+  lastDevelopmentFrameAt: string | null;
+  developmentCadenceComplete: boolean;
+  featureCoverageStatus: PositionGuardFeatureCoverage["status"];
+};
+
+type IndependentNoTradeInput = {
+  evidence: ResearchNoTradeEvidence;
+  coverage: IndependentNoTradeCoverage;
+  provenance: IntegratedNoTradeEvidenceProvenance;
+  ranges: readonly CandleCoverageGap[];
+  verifiedCoverage: VerifiedNoTradeCoverage;
 };
 
 type AssetEvaluation = {
@@ -596,6 +676,165 @@ const BROAD_TIMING_MODELS = [
   "SAME_CLOSE_MODELED",
   "NEXT_FRAME_MODELED",
 ] as const satisfies readonly StrategyHypothesisTimingModel[];
+type ValidatedFrozenBroadCostCell = {
+  id: "BASE" | "STRESS";
+  role: "BASE" | "STRESS";
+  feeRate: number;
+  slippageRate: number;
+};
+type ValidatedFrozenBroadAuthority = {
+  scenarios: readonly CounterfactualScenario[];
+  costScenarios: readonly CostScenario[];
+  costCells: readonly ValidatedFrozenBroadCostCell[];
+};
+const BROAD_COMBINED_SHADOW_AUTHORITY = Object.freeze({
+  version:
+    "BROAD_LOSS_CAUSE_V1_HOLDOUT_AUTHORITY_V2@1c3a223b819e11d08eaac52744d1a29b2de18e2f3381a028b010a42600598e8f",
+  frozenAt: "2026-08-19T05:54:10.188Z",
+  developmentEvidenceSha256: "1c3a223b819e11d08eaac52744d1a29b2de18e2f3381a028b010a42600598e8f",
+  minimumCompletedEpisodes: 10,
+  comparisonTolerancePercentagePoints: 0.000001,
+  comparisonToleranceKrw: 0.000000001,
+} as const);
+
+export function assertFrozenBroadShadowDevelopmentAuthority(
+  observations: readonly BroadShadowDevelopmentAuthorityObservation[],
+): void {
+  const observedSha256 = sha256Json(observations);
+  if (observedSha256 !== BROAD_COMBINED_SHADOW_AUTHORITY.developmentEvidenceSha256) {
+    throw new Error(
+      `Broad shadow development evidence ${observedSha256} does not match the frozen development authority ${BROAD_COMBINED_SHADOW_AUTHORITY.developmentEvidenceSha256}.`,
+    );
+  }
+}
+
+function validateProgrammaticFrozenBroadAuthority(
+  options: IntegratedStrategyEvaluationOptions,
+): ValidatedFrozenBroadAuthority | null {
+  const requested = options.broadStrategyHypothesisProfile !== undefined
+    || options.broadStrategyShadowHoldout !== undefined;
+  if (!requested) return null;
+  if (options.broadStrategyHypothesisProfile !== BROAD_STRATEGY_PROFILE) {
+    throw new Error("Frozen broad evaluation requires BROAD_LOSS_CAUSE_V1.");
+  }
+  const simulation = options.simulation;
+  if (simulation === null) {
+    throw new Error("BROAD_LOSS_CAUSE_V1 requires explicit simulation options.");
+  }
+  if (simulation.assets.BTC === undefined || simulation.assets.ETH === undefined) {
+    throw new Error("BROAD_LOSS_CAUSE_V1 requires both BTC and ETH datasets and initial states.");
+  }
+  if (!sameJson(simulation.scenarios, BROAD_STRATEGY_SCENARIOS)) {
+    throw new Error("BROAD_LOSS_CAUSE_V1 requires the exact frozen 8-scenario matrix in canonical order.");
+  }
+  const authorityCosts = FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.costCells;
+  if (simulation.costScenarios.length !== authorityCosts.length) {
+    throw new Error("BROAD_LOSS_CAUSE_V1 requires the exact frozen BASE/STRESS cost cells in canonical order.");
+  }
+  const costCells = simulation.costScenarios.map((actual, index): ValidatedFrozenBroadCostCell => {
+    const expected = authorityCosts[index];
+    if (!expected) {
+      throw new Error("BROAD_LOSS_CAUSE_V1 requires the exact frozen BASE/STRESS cost cells in canonical order.");
+    }
+    const keys = Object.keys(actual).sort();
+    if (!sameJson(keys, ["feeRate", "id", "slippageRate"])) {
+      throw new Error("BROAD_LOSS_CAUSE_V1 requires the exact frozen BASE/STRESS cost cells in canonical order.");
+    }
+    if (
+      actual.id !== expected.id
+      || actual.feeRate !== expected.feeRate
+      || actual.slippageRate !== expected.slippageRate
+    ) {
+      throw new Error("BROAD_LOSS_CAUSE_V1 requires the exact frozen BASE/STRESS cost cells in canonical order.");
+    }
+    return Object.freeze({
+      id: actual.id,
+      role: actual.id,
+      feeRate: actual.feeRate,
+      slippageRate: actual.slippageRate,
+    });
+  });
+  const exactWindows = FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.windows.map((window) => ({
+    id: window.id,
+    from: normalizeExplicitIsoTimestamp(window.from, "frozen window from"),
+    to: normalizeExplicitIsoTimestamp(window.to, "frozen window to"),
+  }));
+  if (
+    options.stabilityValidation === null
+    || !sameJson(options.stabilityValidation.windows, exactWindows)
+    || options.stabilityValidation.expectedFrameIntervalMs !== 3_600_000
+  ) {
+    throw new Error("BROAD_LOSS_CAUSE_V1 requires the exact frozen W1/W2/W3 validation windows.");
+  }
+  if (options.broadStrategyShadowHoldout !== undefined) {
+    if (
+      simulation.assets.BTC.noTradeEvidencePath === undefined
+      || simulation.assets.ETH.noTradeEvidencePath === undefined
+    ) {
+      throw new Error("Broad shadow holdout requires authenticated BTC and ETH no-trade evidence.");
+    }
+    const from = normalizeExplicitIsoTimestamp(
+      options.broadStrategyShadowHoldout.from,
+      "broad shadow holdout from",
+    );
+    const to = normalizeExplicitIsoTimestamp(
+      options.broadStrategyShadowHoldout.to,
+      "broad shadow holdout to",
+    );
+    if (comparePerformanceTimestamps(from, FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentTo) < 0) {
+      throw new Error("Broad shadow holdout must not overlap the frozen development range.");
+    }
+    if (comparePerformanceTimestamps(from, to) >= 0) {
+      throw new Error("Broad shadow holdout [from,to) requires from before to.");
+    }
+  }
+  const scenarios = Object.freeze([...simulation.scenarios]);
+  const costScenarios = Object.freeze(costCells.map((cost) => Object.freeze({
+    id: cost.id,
+    feeRate: cost.feeRate,
+    slippageRate: cost.slippageRate,
+  })));
+  return Object.freeze({
+    scenarios,
+    costScenarios,
+    costCells: Object.freeze(costCells),
+  });
+}
+
+function requireFrozenBroadAuthority(
+  value: ValidatedFrozenBroadAuthority | null,
+): ValidatedFrozenBroadAuthority {
+  if (value === null) throw new Error("Frozen broad authority was not validated before evaluation.");
+  return value;
+}
+
+export function scopeResearchDatasetForFeatureCoverage(
+  dataset: ResearchCandleDataset,
+  frames: readonly Pick<PositionGuardBacktestFrameResult, "generatedAt">[],
+): ResearchCandleDataset {
+  const lastFrame = frames.at(-1);
+  if (lastFrame === undefined) {
+    throw new Error("Feature coverage scope requires at least one analyzed frame.");
+  }
+  const endAt = normalizeExplicitIsoTimestamp(
+    lastFrame.generatedAt,
+    "feature coverage last frame generatedAt",
+  );
+  return {
+    provenance: {
+      ...dataset.provenance,
+      endAt,
+    },
+    candles: {
+      "1h": dataset.candles["1h"].filter((candle) =>
+        comparePerformanceTimestamps(candle.closeTime, endAt) <= 0),
+      "4h": dataset.candles["4h"].filter((candle) =>
+        comparePerformanceTimestamps(candle.closeTime, endAt) <= 0),
+      "1d": dataset.candles["1d"].filter((candle) =>
+        comparePerformanceTimestamps(candle.closeTime, endAt) <= 0),
+    },
+  };
+}
 
 type ConditionalAddPolicyConfiguration = {
   baseCost: CostScenario;
@@ -624,6 +863,8 @@ export function parseIntegratedStrategyEvaluationArgs(
     "format",
     "btc-dataset",
     "eth-dataset",
+    "btc-no-trade-evidence",
+    "eth-no-trade-evidence",
     "btc-initial-state",
     "eth-initial-state",
     "scenarios",
@@ -634,6 +875,8 @@ export function parseIntegratedStrategyEvaluationArgs(
     "validation-comparison-tolerance-pp",
     "validation-minimum-windows",
     "broad-strategy-hypothesis-profile",
+    "broad-shadow-holdout-from",
+    "broad-shadow-holdout-to",
   ]);
   const values = new Map<string, string>();
   for (let index = 0; index < argv.length; index += 1) {
@@ -654,16 +897,26 @@ export function parseIntegratedStrategyEvaluationArgs(
 
   const observed = parseObservedFilters(values);
   const format = parseFormat(values.get("format"));
+  for (const asset of ASSETS) {
+    const prefix = asset.toLowerCase();
+    if (values.has(`${prefix}-no-trade-evidence`) && !values.has(`${prefix}-dataset`)) {
+      throw new Error(`--${prefix}-no-trade-evidence requires --${prefix}-dataset.`);
+    }
+  }
   const hasDataset = values.has("btc-dataset") || values.has("eth-dataset");
   const simulationKeys = [
     "btc-dataset",
     "eth-dataset",
+    "btc-no-trade-evidence",
+    "eth-no-trade-evidence",
     "btc-initial-state",
     "eth-initial-state",
     "scenarios",
     "minimum-order-value-krw",
     "cost-cells",
     "broad-strategy-hypothesis-profile",
+    "broad-shadow-holdout-from",
+    "broad-shadow-holdout-to",
   ];
   if (!hasDataset) {
     if (simulationKeys.some((key) => values.has(key))) {
@@ -679,6 +932,7 @@ export function parseIntegratedStrategyEvaluationArgs(
   for (const asset of ASSETS) {
     const prefix = asset.toLowerCase();
     const datasetPath = values.get(`${prefix}-dataset`);
+    const noTradeEvidencePath = values.get(`${prefix}-no-trade-evidence`);
     const initialStateValue = values.get(`${prefix}-initial-state`);
     if (datasetPath === undefined && initialStateValue !== undefined) {
       throw new Error(`--${prefix}-initial-state requires --${prefix}-dataset.`);
@@ -689,6 +943,14 @@ export function parseIntegratedStrategyEvaluationArgs(
     }
     assets[asset] = {
       datasetPath: requireNonEmpty(datasetPath, `--${prefix}-dataset`),
+      ...(noTradeEvidencePath === undefined
+        ? {}
+        : {
+            noTradeEvidencePath: requireNonEmpty(
+              noTradeEvidencePath,
+              `--${prefix}-no-trade-evidence`,
+            ),
+          }),
       initialState: parseInitialState(initialStateValue, `--${prefix}-initial-state`),
     };
   }
@@ -711,6 +973,20 @@ export function parseIntegratedStrategyEvaluationArgs(
     simulation,
     stabilityValidation,
   );
+  const broadStrategyShadowHoldout = parseBroadStrategyShadowHoldout(
+    values,
+    broadStrategyHypothesisProfile,
+    simulation,
+  );
+  if (
+    broadStrategyHypothesisProfile === BROAD_STRATEGY_PROFILE
+    && ((assets.BTC?.noTradeEvidencePath === undefined)
+      !== (assets.ETH?.noTradeEvidencePath === undefined))
+  ) {
+    throw new Error(
+      "BROAD_LOSS_CAUSE_V1 requires both BTC and ETH no-trade evidence paths when either is supplied.",
+    );
+  }
   return {
     observed,
     format,
@@ -719,6 +995,9 @@ export function parseIntegratedStrategyEvaluationArgs(
     ...(broadStrategyHypothesisProfile === undefined
       ? {}
       : { broadStrategyHypothesisProfile }),
+    ...(broadStrategyShadowHoldout === undefined
+      ? {}
+      : { broadStrategyShadowHoldout }),
   };
 }
 
@@ -729,8 +1008,17 @@ export async function buildIntegratedStrategyEvaluation(
   if (options.observed.executionMode !== "LIVE") {
     throw new Error("OBSERVED_LIVE_ATTRIBUTION requires executionMode LIVE.");
   }
+  const frozenBroadAuthority = validateProgrammaticFrozenBroadAuthority(options);
+  const evaluationSimulation = frozenBroadAuthority === null
+    ? options.simulation
+    : {
+        ...options.simulation!,
+        scenarios: frozenBroadAuthority.scenarios,
+        costScenarios: frozenBroadAuthority.costScenarios,
+      };
   const readObserved = dependencies.readObserved ?? readPerformanceInput;
   const readDataset = dependencies.readDataset ?? readResearchCandleDataset;
+  const readNoTradeEvidence = dependencies.readNoTradeEvidence ?? readResearchNoTradeEvidence;
   const observedRead = readObserved(options.observed);
   const observedDiagnostics = diagnosePerformance({
     fills: observedRead.tradeFills,
@@ -756,7 +1044,7 @@ export async function buildIntegratedStrategyEvaluation(
     disclaimer: OBSERVED_DISCLAIMER,
   };
   const conditionalReadiness = assessConditionalAddPolicyReadiness(
-    options.simulation,
+    evaluationSimulation,
     options.stabilityValidation,
   );
 
@@ -765,28 +1053,41 @@ export async function buildIntegratedStrategyEvaluation(
     raw: ResearchCandleDataset;
     development: ResearchCandleDataset;
     options: SimulationAssetOptions;
+    noTrade: IndependentNoTradeInput | undefined;
   }>();
-  if (options.simulation !== null) {
+  if (evaluationSimulation !== null) {
     for (const asset of ASSETS) {
-      const assetOptions = options.simulation.assets[asset];
+      const assetOptions = evaluationSimulation.assets[asset];
       if (assetOptions === undefined) continue;
       const rawDataset = await readDataset(assetOptions.datasetPath);
+      const noTrade = assetOptions.noTradeEvidencePath === undefined
+        ? undefined
+        : buildIndependentNoTradeInput(
+            assetOptions.noTradeEvidencePath,
+            rawDataset,
+            await readNoTradeEvidence(assetOptions.noTradeEvidencePath),
+          );
       const dataset = options.broadStrategyHypothesisProfile === BROAD_STRATEGY_PROFILE
         ? restrictDatasetToDevelopmentCutoff(rawDataset)
         : rawDataset;
       if (options.broadStrategyHypothesisProfile === BROAD_STRATEGY_PROFILE) {
-        broadDatasets.set(asset, { raw: rawDataset, development: dataset, options: assetOptions });
+        broadDatasets.set(asset, {
+          raw: rawDataset,
+          development: dataset,
+          options: assetOptions,
+          noTrade,
+        });
       }
       const assetSimulation = options.broadStrategyHypothesisProfile === BROAD_STRATEGY_PROFILE
         && assetOptions.initialState.quantity > 0
-        ? {
-            ...options.simulation,
-            scenarios: options.simulation.scenarios.filter((scenario) =>
+          ? {
+            ...evaluationSimulation,
+            scenarios: evaluationSimulation.scenarios.filter((scenario) =>
               scenario !== "ADD_LIMITED"
               && scenario !== "COOLDOWN_CONTROL"
               && scenario !== "COMBINED_CONSERVATIVE"),
           }
-        : options.simulation;
+        : evaluationSimulation;
       assetEvaluations.set(
         asset,
         evaluateAsset(
@@ -796,6 +1097,7 @@ export async function buildIntegratedStrategyEvaluation(
           assetSimulation,
           options.stabilityValidation,
           conditionalReadiness.configuration,
+          noTrade,
         ),
       );
     }
@@ -848,7 +1150,7 @@ export async function buildIntegratedStrategyEvaluation(
     const provenance = assetEvaluations.get(asset)?.datasetProvenance;
     return provenance === undefined ? [] : [provenance];
   });
-  const baseCostScenario = options.simulation?.costScenarios[0] ?? null;
+  const baseCostScenario = evaluationSimulation?.costScenarios[0] ?? null;
   const conditionalAddPolicyEvaluation = buildConditionalAddPolicySection(
     conditionalReadiness,
     options.stabilityValidation,
@@ -857,23 +1159,51 @@ export async function buildIntegratedStrategyEvaluation(
   const addLossAttribution = buildAddLossAttributionSection({
     conditionalAddPolicyEvaluation,
     observedProvenance: observedRead.provenance,
-    simulation: options.simulation,
+    simulation: evaluationSimulation,
     stabilityValidation: options.stabilityValidation,
     assetEvaluations,
   });
   const broadStrategyHypothesisEvaluation = options.broadStrategyHypothesisProfile === undefined
     ? null
-    : buildBroadStrategyHypothesisEvaluation(options, broadDatasets);
+    : buildBroadStrategyHypothesisEvaluation(
+        options,
+        broadDatasets,
+        requireFrozenBroadAuthority(frozenBroadAuthority),
+      );
+  const broadStrategyShadowHoldoutBundle = options.broadStrategyShadowHoldout === undefined
+    ? null
+    : buildBroadCombinedConservativeHoldoutEvaluation(
+        options,
+        broadDatasets,
+        dependencies.verifyBroadShadowDevelopmentAuthority
+          ?? assertFrozenBroadShadowDevelopmentAuthority,
+        dependencies.verifyBroadShadowDevelopmentAuthority === undefined,
+        requireFrozenBroadAuthority(frozenBroadAuthority),
+      );
+  const broadStrategyShadowHoldoutEvaluation =
+    broadStrategyShadowHoldoutBundle?.evaluation ?? null;
+  const broadStrategyShadowHoldoutComponentDiagnostics =
+    broadStrategyShadowHoldoutBundle?.componentDiagnostics ?? null;
+  const broadStrategyShadowHoldoutDiagnostics = broadStrategyShadowHoldoutEvaluation === null
+    ? null
+    : diagnoseCombinedConservativeHoldoutFailures(
+        broadStrategyShadowHoldoutEvaluation.assets.map((asset) => ({
+          asset: asset.asset,
+          market: asset.market,
+          status: asset.status,
+          comparisons: asset.comparisons,
+        })),
+      );
   const report: IntegratedStrategyEvaluationReport = {
     provenance: {
       observed: observedRead.provenance,
       datasets,
       scenarioAssumptions: {
-        scenarios: options.simulation?.scenarios ?? [],
+        scenarios: evaluationSimulation?.scenarios ?? [],
         baseCostScenario,
-        minimumOrderValueKrw: options.simulation?.minimumOrderValueKrw ?? null,
+        minimumOrderValueKrw: evaluationSimulation?.minimumOrderValueKrw ?? null,
       },
-      costCells: options.simulation?.costScenarios ?? [],
+      costCells: evaluationSimulation?.costScenarios ?? [],
       sampleSupportPolicy: SAMPLE_POLICY,
       capitalSemantics: CAPITAL_SEMANTICS,
     },
@@ -908,6 +1238,15 @@ export async function buildIntegratedStrategyEvaluation(
     ...(broadStrategyHypothesisEvaluation === null
       ? {}
       : { broadStrategyHypothesisEvaluation }),
+    ...(broadStrategyShadowHoldoutEvaluation === null
+      ? {}
+      : { broadStrategyShadowHoldoutEvaluation }),
+    ...(broadStrategyShadowHoldoutDiagnostics === null
+      ? {}
+      : { broadStrategyShadowHoldoutDiagnostics }),
+    ...(broadStrategyShadowHoldoutComponentDiagnostics === null
+      ? {}
+      : { broadStrategyShadowHoldoutComponentDiagnostics }),
     evidenceGaps,
     interpretation: buildInterpretation(observedAttribution, simulationAssets),
   };
@@ -962,6 +1301,30 @@ export function formatIntegratedStrategyEvaluation(
           "[Broad Strategy Hypothesis Evaluation]",
           "Read-only selected counterfactual paths; this is not deployment approval.",
           JSON.stringify(report.broadStrategyHypothesisEvaluation, null, 2),
+        ]),
+    ...(report.broadStrategyShadowHoldoutEvaluation === undefined
+      ? []
+      : [
+          "",
+          "[Combined Conservative Shadow Holdout]",
+          "Separate read-only holdout evidence; this is not deployment approval.",
+          JSON.stringify(report.broadStrategyShadowHoldoutEvaluation, null, 2),
+        ]),
+    ...(report.broadStrategyShadowHoldoutDiagnostics === undefined
+      ? []
+      : [
+          "",
+          "[Combined Conservative Aggregate Failure Diagnostics]",
+          "Descriptive aggregate path associations only; no causal or deployment claim.",
+          JSON.stringify(report.broadStrategyShadowHoldoutDiagnostics, null, 2),
+        ]),
+    ...(report.broadStrategyShadowHoldoutComponentDiagnostics === undefined
+      ? []
+      : [
+          "",
+          "[Combined Conservative Component Ablation Diagnostics]",
+          "Retrospective association only; non-causal; cannot authorize shadow/LIVE and can only nominate a fresh prospective test.",
+          JSON.stringify(report.broadStrategyShadowHoldoutComponentDiagnostics, null, 2),
         ]),
     ...(report.stabilityValidation === undefined
       ? []
@@ -1068,6 +1431,18 @@ function formatHumanSummary(report: IntegratedStrategyEvaluationReport): string[
 
   if (report.addLossAttribution !== undefined) {
     lines.push(...formatAddLossAttributionSummary(report.addLossAttribution));
+  }
+
+  const componentDiagnostics = report.broadStrategyShadowHoldoutComponentDiagnostics;
+  if (componentDiagnostics !== undefined) {
+    for (const asset of ["ETH", "BTC"] as const) {
+      const assetDiagnostics = componentDiagnostics.assets.find((item) => item.asset === asset);
+      if (!assetDiagnostics) continue;
+      lines.push(
+        `${asset} component ablation: ${assetDiagnostics.components.map((component) =>
+          `${component.ablationScenario}=${component.classification}`).join(",")}; retrospective association; non-causal; cannot authorize shadow/LIVE; can only nominate a fresh prospective test.`,
+      );
+    }
   }
 
   const gapCodes = [...new Set(report.evidenceGaps.map((gap) => gap.code))];
@@ -1426,7 +1801,9 @@ function buildBroadStrategyHypothesisEvaluation(
     raw: ResearchCandleDataset;
     development: ResearchCandleDataset;
     options: SimulationAssetOptions;
+    noTrade: IndependentNoTradeInput | undefined;
   }>,
+  authority: ValidatedFrozenBroadAuthority,
 ): BroadStrategyHypothesisEvaluationSection {
   if (
     options.broadStrategyHypothesisProfile !== BROAD_STRATEGY_PROFILE
@@ -1471,6 +1848,16 @@ function buildBroadStrategyHypothesisEvaluation(
       firstDevelopmentFrameAt: frames[0]?.generatedAt ?? null,
       lastDevelopmentFrameAt: frames.at(-1)?.generatedAt ?? null,
       excludedPostCutoffCandleCount: countCandles(source.raw) - countCandles(source.development),
+      noTradeEvidence: source.noTrade === undefined
+        ? null
+        : { ...source.noTrade.provenance },
+      developmentVerifiedRangeCount: source.noTrade === undefined
+        ? 0
+        : countNoTradeRangesIntersectingWindow(
+            source.noTrade.evidence.verifiedNoTradeRanges,
+            FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentFrom,
+            FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentTo,
+          ),
     });
 
     const paths = buildBroadContinuousPaths({
@@ -1479,7 +1866,7 @@ function buildBroadStrategyHypothesisEvaluation(
       initialState: source.options.initialState,
       minimumOrderValueKrw: options.simulation.minimumOrderValueKrw,
       frames,
-      costScenarios: options.simulation.costScenarios,
+      costScenarios: authority.costScenarios,
     });
     pathDiagnostics.push(...buildBroadPathDiagnostics({
       asset,
@@ -1488,6 +1875,10 @@ function buildBroadStrategyHypothesisEvaluation(
       initialState: source.options.initialState,
       frames,
       paths,
+      costCells: authority.costCells,
+      ...(source.noTrade === undefined
+        ? {}
+        : { verifiedNoTradeCoverage: source.noTrade.verifiedCoverage }),
     }));
     appendBroadObservations({
       asset,
@@ -1497,6 +1888,9 @@ function buildBroadStrategyHypothesisEvaluation(
       initialStateFingerprint,
       frameFingerprint,
       paths,
+      costCells: authority.costCells,
+      independentNoTradeRanges: source.noTrade?.ranges ?? [],
+      independentlyVerifiedNoTrade: source.noTrade !== undefined,
       metricObservations,
       coverageObservations,
       supportObservations,
@@ -1516,7 +1910,7 @@ function buildBroadStrategyHypothesisEvaluation(
     deploymentApproval: false,
     developmentCutoffExclusive: FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentTo,
     scenarioMatrix: [...BROAD_STRATEGY_SCENARIOS],
-    independentNoTradeProofAvailable: false,
+    independentNoTradeProofAvailable: ASSETS.every((asset) => datasets.get(asset)?.noTrade !== undefined),
     datasets: datasetProvenance,
     pathDiagnostics,
     interpretationBoundary: "READ_ONLY_SELECTED_COUNTERFACTUAL_PATHS_NOT_DEPLOYMENT_APPROVAL",
@@ -1524,19 +1918,403 @@ function buildBroadStrategyHypothesisEvaluation(
   };
 }
 
+type BroadCombinedConservativeHoldoutBundle = {
+  evaluation: CombinedConservativeHoldoutResult;
+  componentDiagnostics: PerformanceComponentAblationResult;
+};
+
+function buildBroadCombinedConservativeHoldoutEvaluation(
+  options: IntegratedStrategyEvaluationOptions,
+  datasets: ReadonlyMap<SupportedAsset, {
+    raw: ResearchCandleDataset;
+    development: ResearchCandleDataset;
+    options: SimulationAssetOptions;
+    noTrade: IndependentNoTradeInput | undefined;
+  }>,
+  verifyDevelopmentAuthority: (
+    observations: readonly BroadShadowDevelopmentAuthorityObservation[],
+  ) => void,
+  developmentAuthorityVerified: boolean,
+  authority: ValidatedFrozenBroadAuthority,
+): BroadCombinedConservativeHoldoutBundle {
+  const holdout = options.broadStrategyShadowHoldout;
+  if (
+    holdout === undefined
+    || options.broadStrategyHypothesisProfile !== BROAD_STRATEGY_PROFILE
+    || options.simulation === null
+  ) {
+    throw new Error("Combined conservative holdout requires the frozen broad profile and explicit range.");
+  }
+  const authorityObservations: BroadShadowDevelopmentAuthorityObservation[] = [];
+  const builtAssets = ASSETS.map((asset) => {
+    const source = datasets.get(asset);
+    if (!source || !source.noTrade) {
+      throw new Error(`Combined conservative holdout is missing authenticated ${asset} evidence.`);
+    }
+    if (source.options.initialState.quantity > PERFORMANCE_QUANTITY_TOLERANCE) {
+      throw new Error(
+        `Combined conservative holdout requires a flat ${asset} development-start state.`,
+      );
+    }
+    if (comparePerformanceTimestamps(holdout.to, source.raw.provenance.endAt) > 0) {
+      throw new Error(`${asset} holdout end is beyond the immutable dataset end.`);
+    }
+    const market = getMarketForAsset(asset);
+    const allFrames = buildPositionGuardBacktestFrames({
+      asset,
+      market,
+      oneHourCandles: source.raw.candles["1h"],
+      fourHourCandles: source.raw.candles["4h"],
+      oneDayCandles: source.raw.candles["1d"],
+    });
+    const frames = allFrames.filter((frame) =>
+      comparePerformanceTimestamps(
+        frame.generatedAt,
+        FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentFrom,
+      ) >= 0
+      && comparePerformanceTimestamps(frame.generatedAt, holdout.to) < 0);
+    const developmentFrames = frames.filter((frame) =>
+      comparePerformanceTimestamps(
+        frame.generatedAt,
+        FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentTo,
+      ) < 0);
+    const initialStateFingerprint = sha256Json(source.options.initialState);
+    const developmentFrameFingerprint = sha256Json(developmentFrames);
+    const replayFrameFingerprint = sha256Json(frames);
+    const developmentCadenceFrom = resolveBroadCadenceFrom(
+      null,
+      FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentFrom,
+      developmentFrames[0]?.generatedAt,
+    );
+    const developmentCadenceComplete = hasCompleteHourlyCadenceForScope({
+      frames: developmentFrames,
+      verifiedNoTradeRanges: source.noTrade.ranges,
+      from: developmentCadenceFrom,
+      to: FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentTo,
+    });
+    const developmentFeatureCoverage = analyzePositionGuardFeatureCoverage({
+      dataset: scopeResearchDatasetForFeatureCoverage(source.raw, developmentFrames),
+      frames: developmentFrames.map((frame) => ({
+        generatedAt: frame.generatedAt,
+        latestCloseTime: { ...frame.source.latestCloseTime },
+      })),
+      requiredLookbackCandles: REQUIRED_COMPLETED_CANDLES,
+    });
+    authorityObservations.push({
+      asset,
+      market,
+      developmentFrom: FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentFrom,
+      developmentTo: FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentTo,
+      initialStateFingerprint,
+      developmentFrameFingerprint,
+      developmentFrameCount: developmentFrames.length,
+      firstDevelopmentFrameAt: developmentFrames[0]?.generatedAt ?? null,
+      lastDevelopmentFrameAt: developmentFrames.at(-1)?.generatedAt ?? null,
+      developmentCadenceComplete,
+      featureCoverageStatus: developmentFeatureCoverage.status,
+    });
+    const datasetFingerprint = sha256Json({
+      datasetSha256: source.raw.provenance.sha256,
+      noTradeEvidenceSha256: source.noTrade.provenance.sha256,
+      holdout,
+      initialStateFingerprint,
+      developmentFrameFingerprint,
+      replayFrameFingerprint,
+    });
+    const paths = buildBroadContinuousPaths({
+      asset,
+      market,
+      initialState: source.options.initialState,
+      minimumOrderValueKrw: options.simulation!.minimumOrderValueKrw,
+      frames,
+      costScenarios: authority.costScenarios,
+    });
+    const ablationPaths = buildCombinedConservativeAblationPaths({
+      asset,
+      market,
+      initialState: source.options.initialState,
+      minimumOrderValueKrw: options.simulation!.minimumOrderValueKrw,
+      frames,
+      costScenarios: authority.costScenarios,
+    });
+    const holdoutFrames = frames.filter((frame) =>
+      comparePerformanceTimestamps(frame.generatedAt, holdout.from) >= 0
+      && comparePerformanceTimestamps(frame.generatedAt, holdout.to) < 0);
+    const holdoutCadenceComplete = hasCompleteHourlyCadenceForScope({
+      frames: holdoutFrames,
+      verifiedNoTradeRanges: source.noTrade.ranges,
+      from: holdout.from,
+      to: holdout.to,
+    });
+    const replayFeatureCoverage = analyzePositionGuardFeatureCoverage({
+      dataset: scopeResearchDatasetForFeatureCoverage(source.raw, frames),
+      frames: frames.map((frame) => ({
+        generatedAt: frame.generatedAt,
+        latestCloseTime: { ...frame.source.latestCloseTime },
+      })),
+      requiredLookbackCandles: REQUIRED_COMPLETED_CANDLES,
+    });
+    const cadenceComplete = holdoutCadenceComplete
+      && replayFeatureCoverage.status === "COMPLETE";
+    const carryInStateComplete = developmentAuthorityVerified
+      && developmentCadenceComplete
+      && developmentFeatureCoverage.status === "COMPLETE";
+    const matrix: CombinedConservativeHoldoutMatrixCell[] = [];
+    const componentCells: PerformanceComponentAblationCell[] = [];
+    for (const timing of BROAD_TIMING_MODELS) {
+      for (const cost of authority.costCells) {
+        for (const scenario of ["BASELINE", "NO_ADD", "COMBINED_CONSERVATIVE"] as const) {
+          const result = paths.get(broadPathKey(timing, cost.id, scenario));
+          if (!result) {
+            throw new Error(`Missing holdout replay ${asset}:${timing}:${cost.id}:${scenario}.`);
+          }
+          const metrics = summarizeBroadHoldoutPath(
+            result,
+            frames,
+            source.options.initialState,
+            holdout.from,
+            holdout.to,
+          );
+          matrix.push({
+            asset,
+            market,
+            timing,
+            cost: cost.id,
+            scenario,
+            holdoutFrom: holdout.from,
+            holdoutTo: holdout.to,
+            datasetChecksum: source.raw.provenance.sha256,
+            noTradeEvidenceChecksum: source.noTrade.provenance.sha256,
+            datasetFingerprint,
+            initialStateFingerprint,
+            developmentFrameFingerprint,
+            replayFrameFingerprint,
+            netReturnPct: metrics.netReturnPct,
+            maxDrawdownPct: metrics.maxDrawdownPct,
+            turnoverKrw: metrics.turnoverKrw,
+            feesKrw: metrics.feesKrw,
+            completedEpisodeCount: metrics.completedEpisodeCount,
+            coverage: {
+              cadenceComplete,
+              independentlyVerifiedNoTrade: true,
+              lifecycleComplete: result.matchResult.unmatchedSells.length === 0
+                && result.matchResult.attributionFailures.length === 0,
+              feeComplete: result.diagnostics.combined.feeCompleteness === "COMPLETE",
+              finiteMetricsComplete: hasFiniteReplayMetrics(result),
+              carryInStateComplete,
+            },
+          });
+        }
+        const reference = paths.get(broadPathKey(
+          timing,
+          cost.id,
+          "COMBINED_CONSERVATIVE",
+        ));
+        if (!reference) {
+          throw new Error(
+            `Missing holdout replay ${asset}:${timing}:${cost.id}:COMBINED_CONSERVATIVE.`,
+          );
+        }
+        const referenceMetrics = summarizeBroadHoldoutPath(
+          reference,
+          frames,
+          source.options.initialState,
+          holdout.from,
+          holdout.to,
+        );
+        const provenance: HoldoutEpisodePathProvenance = {
+          authorityId: "COMBINED_CONSERVATIVE_ABLATION_V1",
+          asset,
+          market,
+          timingModel: timing,
+          costCellId: cost.id,
+          costRole: cost.role,
+          feeRate: cost.feeRate,
+          slippageRate: cost.slippageRate,
+          holdoutFrom: holdout.from,
+          holdoutTo: holdout.to,
+          datasetSha256: source.raw.provenance.sha256,
+          datasetFingerprint,
+          initialStateFingerprint,
+          developmentFrameFingerprint,
+          replayFrameFingerprint,
+        };
+        for (const scenario of FROZEN_COMBINED_CONSERVATIVE_ABLATION_SCENARIO_ORDER) {
+          const ablation = ablationPaths.get(broadPathKey(timing, cost.id, scenario));
+          if (!ablation) {
+            throw new Error(`Missing ablation replay ${asset}:${timing}:${cost.id}:${scenario}.`);
+          }
+          const ablationMetrics = summarizeBroadHoldoutPath(
+            ablation,
+            frames,
+            source.options.initialState,
+            holdout.from,
+            holdout.to,
+          );
+          componentCells.push({
+            asset,
+            market,
+            timing,
+            cost: cost.id,
+            holdoutFrom: holdout.from,
+            holdoutTo: holdout.to,
+            reference: toPerformanceComponentAblationMetrics(
+              "COMBINED_CONSERVATIVE",
+              referenceMetrics,
+            ),
+            ablation: toPerformanceComponentAblationMetrics(scenario, ablationMetrics),
+            coverage: {
+              cadenceComplete: holdoutCadenceComplete,
+              featureCoverageComplete: replayFeatureCoverage.status === "COMPLETE",
+              carryInStateComplete,
+              referenceLifecycleComplete: hasCompleteReplayLifecycle(reference),
+              ablationLifecycleComplete: hasCompleteReplayLifecycle(ablation),
+              referenceFeeComplete:
+                reference.diagnostics.combined.feeCompleteness === "COMPLETE",
+              ablationFeeComplete:
+                ablation.diagnostics.combined.feeCompleteness === "COMPLETE",
+              referenceFiniteMetricsComplete: hasFiniteReplayMetrics(reference),
+              ablationFiniteMetricsComplete: hasFiniteReplayMetrics(ablation),
+            },
+            attribution: analyzeHoldoutEpisodeAttribution({
+              reference,
+              ablation,
+              asset,
+              market,
+              timingModel: timing,
+              cost: {
+                id: cost.id,
+                role: cost.role,
+                feeRate: cost.feeRate,
+                slippageRate: cost.slippageRate,
+              },
+              referenceProvenance: provenance,
+              ablationProvenance: provenance,
+              from: holdout.from,
+              to: holdout.to,
+            }),
+          });
+        }
+      }
+    }
+    return {
+      holdoutAsset: {
+        asset,
+        market,
+        authorityVersion: developmentAuthorityVerified
+          ? BROAD_COMBINED_SHADOW_AUTHORITY.version
+          : UNVERIFIED_TEST_AUTHORITY_VERSION,
+        authorityFrozenAt: BROAD_COMBINED_SHADOW_AUTHORITY.frozenAt,
+        holdout: { ...holdout },
+        dataset: {
+          asset,
+          market,
+          collectedAt: source.raw.provenance.collectedAt,
+          endAt: source.raw.provenance.endAt,
+          checksum: source.raw.provenance.sha256,
+          fingerprint: datasetFingerprint,
+          holdoutFrom: holdout.from,
+          holdoutTo: holdout.to,
+          noTradeEvidenceChecksum: source.noTrade.provenance.sha256,
+          initialStateFingerprint,
+          developmentFrameFingerprint,
+          replayFrameFingerprint,
+        },
+        matrix,
+      },
+      componentAsset: {
+        asset,
+        market,
+        holdoutFrom: holdout.from,
+        holdoutTo: holdout.to,
+        cells: componentCells,
+      },
+    };
+  });
+  verifyDevelopmentAuthority(authorityObservations);
+  const evaluation = evaluateCombinedConservativeHoldout({
+    authority: {
+      version: developmentAuthorityVerified
+        ? BROAD_COMBINED_SHADOW_AUTHORITY.version
+        : UNVERIFIED_TEST_AUTHORITY_VERSION,
+      frozenAt: BROAD_COMBINED_SHADOW_AUTHORITY.frozenAt,
+      developmentCutoff: FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentTo,
+    },
+    policy: {
+      candidate: "COMBINED_CONSERVATIVE",
+      minimumCompletedEpisodes: BROAD_COMBINED_SHADOW_AUTHORITY.minimumCompletedEpisodes,
+      comparisonTolerancePercentagePoints:
+        BROAD_COMBINED_SHADOW_AUTHORITY.comparisonTolerancePercentagePoints,
+      comparisonToleranceKrw: BROAD_COMBINED_SHADOW_AUTHORITY.comparisonToleranceKrw,
+    },
+    assets: builtAssets.map((asset) => asset.holdoutAsset),
+  });
+  const componentDiagnostics = evaluatePerformanceComponentAblation({
+    authorityId: "COMBINED_CONSERVATIVE_ABLATION_V1",
+    assets: builtAssets.map((asset) => asset.componentAsset),
+  });
+  return { evaluation, componentDiagnostics };
+}
+
 type BroadContinuousPathMap = Map<string, CounterfactualScenarioResult>;
+
+type BroadHoldoutPathMetrics = {
+  netReturnPct: number;
+  maxDrawdownPct: number;
+  turnoverKrw: number;
+  feesKrw: number;
+  completedEpisodeCount: number;
+};
+
+function summarizeBroadHoldoutPath(
+  result: CounterfactualScenarioResult,
+  frames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][],
+  initialState: SimulationInitialState,
+  from: string,
+  to: string,
+): BroadHoldoutPathMetrics {
+  const returnAndDrawdown = summarizeBroadReplayScope(
+    result,
+    frames,
+    initialState,
+    from,
+    to,
+    false,
+  );
+  const scopedRows = result.legacyBacktest.result.frames.filter((row) =>
+    comparePerformanceTimestamps(row.generatedAt, from) >= 0
+    && comparePerformanceTimestamps(row.generatedAt, to) < 0);
+  return {
+    ...returnAndDrawdown,
+    turnoverKrw: scopedRows.reduce(
+      (sum, row) => sum + (row.trade?.grossNotionalKrw ?? 0),
+      0,
+    ),
+    feesKrw: scopedRows.reduce((sum, row) => sum + (row.trade?.feeKrw ?? 0), 0),
+    completedEpisodeCount: completedEpisodesInRange(result, from, to).length,
+  };
+}
+
+function toPerformanceComponentAblationMetrics(
+  scenario: PerformanceComponentAblationMetrics["scenario"],
+  metrics: BroadHoldoutPathMetrics,
+): PerformanceComponentAblationMetrics {
+  return { scenario, ...metrics };
+}
 
 function buildBroadPathDiagnostics(input: {
   asset: SupportedAsset;
   market: SupportedMarket;
   dataset: ResearchCandleDataset;
+  verifiedNoTradeCoverage?: VerifiedNoTradeCoverage;
   initialState: SimulationInitialState;
   frames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][];
   paths: BroadContinuousPathMap;
+  costCells: readonly ValidatedFrozenBroadCostCell[];
 }): BroadStrategyPathDiagnostics[] {
   const diagnostics: BroadStrategyPathDiagnostics[] = [];
   for (const timingModel of BROAD_TIMING_MODELS) {
-    for (const costCell of FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.costCells) {
+    for (const costCell of input.costCells) {
       for (const scenario of BROAD_STRATEGY_SCENARIOS) {
         const result = input.paths.get(broadPathKey(timingModel, costCell.id, scenario));
         if (!result) continue;
@@ -1554,6 +2332,9 @@ function buildBroadPathDiagnostics(input: {
           dataset: input.dataset,
           fills: result.fills,
           matchResult: result.matchResult,
+          ...(input.verifiedNoTradeCoverage === undefined
+            ? {}
+            : { verifiedNoTradeCoverage: input.verifiedNoTradeCoverage }),
         });
         diagnostics.push({
           asset: input.asset,
@@ -1693,14 +2474,53 @@ function buildBroadContinuousPaths(input: {
   return paths;
 }
 
+function buildCombinedConservativeAblationPaths(input: {
+  asset: SupportedAsset;
+  market: SupportedMarket;
+  initialState: SimulationInitialState;
+  minimumOrderValueKrw: number;
+  frames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][];
+  costScenarios: readonly CostScenario[];
+}): BroadContinuousPathMap {
+  const paths: BroadContinuousPathMap = new Map();
+  for (const timingModel of BROAD_TIMING_MODELS) {
+    for (const costScenario of input.costScenarios) {
+      for (const scenario of FROZEN_COMBINED_CONSERVATIVE_ABLATION_SCENARIO_ORDER) {
+        const [result] = runCounterfactualScenarios({
+          asset: input.asset,
+          market: input.market,
+          initialCashKrw: input.initialState.cashKrw,
+          initialQuantity: input.initialState.quantity,
+          initialAverageEntryPrice: input.initialState.averageEntryPriceKrw,
+          frames: input.frames,
+          scenarios: [scenario],
+          diagnosticPolicy: { breakevenToleranceKrw: 1e-9 },
+          execution: {
+            feeRate: costScenario.feeRate,
+            slippageRate: costScenario.slippageRate,
+            minimumTradeValueKrw: input.minimumOrderValueKrw,
+          },
+          executionTimingModel: timingModel,
+        });
+        if (!result) throw new Error(`Missing ablation replay result for ${scenario}.`);
+        paths.set(broadPathKey(timingModel, costScenario.id, scenario), result);
+      }
+    }
+  }
+  return paths;
+}
+
 function appendBroadObservations(input: {
   asset: SupportedAsset;
   initialState: SimulationInitialState;
   frames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][];
+  independentNoTradeRanges: readonly CandleCoverageGap[];
+  independentlyVerifiedNoTrade: boolean;
   datasetSha256: string;
   initialStateFingerprint: string;
   frameFingerprint: string;
   paths: BroadContinuousPathMap;
+  costCells: readonly ValidatedFrozenBroadCostCell[];
   metricObservations: StrategyHypothesisMetricObservation[];
   coverageObservations: StrategyHypothesisCoverageObservation[];
   supportObservations: StrategyHypothesisSupportObservation[];
@@ -1731,14 +2551,25 @@ function appendBroadObservations(input: {
           && baseCandidate.matchResult.unmatchedSells.length === 0
           && baseCandidate.matchResult.attributionFailures.length === 0;
         const candidateFeeComplete = baseCandidate?.diagnostics.combined.feeCompleteness === "COMPLETE";
+        const firstReplayFrameAt = input.frames[0]?.generatedAt;
+        const cadenceFrom = resolveBroadCadenceFrom(
+          scope.windowId,
+          scope.from,
+          firstReplayFrameAt,
+        );
         coverageObservationsPush(input.coverageObservations, {
           asset: input.asset,
           candidate,
           timingModel,
           scope: scope.windowId === null ? "FULL_PATH" : "WINDOW",
           windowId: scope.windowId,
-          cadenceComplete: hasCompleteHourlyCadence(scopeFrames),
-          independentlyVerifiedNoTrade: false,
+          cadenceComplete: hasCompleteHourlyCadenceForScope({
+            frames: scopeFrames,
+            verifiedNoTradeRanges: input.independentNoTradeRanges,
+            from: cadenceFrom,
+            to: scope.to,
+          }),
+          independentlyVerifiedNoTrade: input.independentlyVerifiedNoTrade,
           lifecycleComplete: candidateLifecycleComplete,
           feeComplete: candidateFeeComplete,
           finiteMetricsComplete: baseCandidate !== undefined
@@ -1758,7 +2589,7 @@ function appendBroadObservations(input: {
           policyExposedCompletedEpisodeCount: countPolicyExposedEpisodes(baseCandidate, episodes),
         });
         if (scopeFrames.length === 0) continue;
-        for (const cost of FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.costCells) {
+        for (const cost of input.costCells) {
           for (const scenario of ["BASELINE", "NO_ADD", candidate] as const) {
             const result = input.paths.get(broadPathKey(timingModel, cost.id, scenario));
             if (!result) continue;
@@ -1879,18 +2710,87 @@ function countPolicyExposedEpisodes(
   }).length;
 }
 
-function hasCompleteHourlyCadence(
-  frames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][],
-): boolean {
-  if (frames.length === 0) return false;
-  for (let index = 1; index < frames.length; index += 1) {
-    const previous = parsePerformanceTimestamp(frames[index - 1]!.generatedAt);
-    const current = parsePerformanceTimestamp(frames[index]!.generatedAt);
-    if (!previous || !current || current.epochNanoseconds - previous.epochNanoseconds !== 3_600_000_000_000n) {
+export function hasCompleteHourlyCadenceForScope(input: {
+  frames: readonly { generatedAt: string }[];
+  verifiedNoTradeRanges: readonly CandleCoverageGap[];
+  from: string;
+  to: string;
+}): boolean {
+  const hour = 3_600_000_000_000n;
+  const from = parsePerformanceTimestamp(input.from);
+  const to = parsePerformanceTimestamp(input.to);
+  if (!from || !to || to.epochNanoseconds <= from.epochNanoseconds) return false;
+  const duration = to.epochNanoseconds - from.epochNanoseconds;
+  if (duration % hour !== 0n) return false;
+  const observed = new Set<string>();
+  for (const frame of input.frames) {
+    const instant = parsePerformanceTimestamp(frame.generatedAt);
+    if (!instant) return false;
+    const offset = instant.epochNanoseconds - from.epochNanoseconds;
+    if (offset < 0n || instant.epochNanoseconds >= to.epochNanoseconds || offset % hour !== 0n) {
       return false;
     }
+    const key = instant.epochNanoseconds.toString();
+    if (observed.has(key)) return false;
+    observed.add(key);
+  }
+  const parsedRanges = input.verifiedNoTradeRanges.map((range) => {
+    const first = parsePerformanceTimestamp(range.firstMissingCloseTime);
+    const last = parsePerformanceTimestamp(range.lastMissingCloseTime);
+    if (!first || !last) return null;
+    return {
+      first: first.epochNanoseconds,
+      last: last.epochNanoseconds,
+    };
+  });
+  if (parsedRanges.some((range) => range === null)) return false;
+  for (
+    let expectedClose = from.epochNanoseconds;
+    expectedClose < to.epochNanoseconds;
+    expectedClose += hour
+  ) {
+    if (observed.has(expectedClose.toString())) continue;
+    const verified = parsedRanges.some((range) =>
+      range !== null && expectedClose >= range.first && expectedClose <= range.last);
+    if (!verified) return false;
   }
   return true;
+}
+
+export function resolveBroadCadenceFrom(
+  windowId: string | null,
+  scopeFrom: string,
+  firstReplayFrameAt: string | undefined,
+): string {
+  if (
+    windowId === null
+    && firstReplayFrameAt !== undefined
+    && comparePerformanceTimestamps(firstReplayFrameAt, scopeFrom) > 0
+  ) {
+    return firstReplayFrameAt;
+  }
+  return scopeFrom;
+}
+
+function countNoTradeRangesIntersectingWindow(
+  ranges: readonly ResearchNoTradeRange[],
+  from: string,
+  to: string,
+): number {
+  const parsedFrom = parsePerformanceTimestamp(from);
+  const parsedTo = parsePerformanceTimestamp(to);
+  if (!parsedFrom || !parsedTo) {
+    throw new Error("No-trade provenance window requires valid timestamps.");
+  }
+  return ranges.filter((range) => {
+    const parsedRangeFrom = parsePerformanceTimestamp(range.from);
+    const parsedRangeTo = parsePerformanceTimestamp(range.to);
+    if (!parsedRangeFrom || !parsedRangeTo) {
+      throw new Error("No-trade provenance range requires valid timestamps.");
+    }
+    return parsedRangeFrom.epochNanoseconds < parsedTo.epochNanoseconds
+      && parsedRangeTo.epochNanoseconds > parsedFrom.epochNanoseconds;
+  }).length;
 }
 
 function hasFiniteReplayMetrics(result: CounterfactualScenarioResult): boolean {
@@ -1903,6 +2803,11 @@ function hasFiniteReplayMetrics(result: CounterfactualScenarioResult): boolean {
     metrics.turnoverKrw,
     metrics.feesKrw,
   ].every(Number.isFinite);
+}
+
+function hasCompleteReplayLifecycle(result: CounterfactualScenarioResult): boolean {
+  return result.matchResult.unmatchedSells.length === 0
+    && result.matchResult.attributionFailures.length === 0;
 }
 
 function broadPathKey(
@@ -1923,6 +2828,110 @@ function sha256Json(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+async function readResearchNoTradeEvidence(evidencePath: string): Promise<ResearchNoTradeEvidence> {
+  const bytes = await readFile(evidencePath);
+  let json: string;
+  try {
+    json = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error("Research no-trade evidence file must contain valid UTF-8 JSON.");
+  }
+  return parseResearchNoTradeEvidence(json);
+}
+
+function buildIndependentNoTradeInput(
+  evidencePath: string,
+  dataset: ResearchCandleDataset,
+  evidence: ResearchNoTradeEvidence,
+): IndependentNoTradeInput {
+  const coverage = classifyIndependentNoTradeCoverage(dataset, evidence);
+  if (coverage.status === "UNVERIFIED_SPARSE") {
+    throw new Error(
+      `Research no-trade evidence leaves ${coverage.uncoveredRanges.length} parent range(s) unverified.`,
+    );
+  }
+  const ranges = toCandleCoverageGaps(
+    evidence.verifiedNoTradeRanges,
+    dataset.provenance.historyStartAt,
+    dataset.provenance.endAt,
+  );
+  const verifiedCoverage = createVerifiedNoTradeCoverageFromRanges({
+    sourceBoundary: {
+      historyStartAt: dataset.provenance.historyStartAt,
+      endAt: dataset.provenance.endAt,
+    },
+    observedIntervals: dataset.candles["1h"].map((candle) => ({
+      openTime: candle.openTime,
+      closeTime: candle.closeTime,
+    })),
+    verifiedNoTradeRanges: ranges,
+  });
+  return {
+    evidence,
+    coverage,
+    ranges,
+    verifiedCoverage,
+    provenance: {
+      path: evidencePath,
+      sha256: evidence.provenance.sha256,
+      parentDatasetSha256: evidence.provenance.parentDatasetSha256,
+      source: evidence.provenance.source,
+      collectedAt: evidence.provenance.collectedAt,
+      coverageStatus: coverage.status,
+      verifiedRangeCount: evidence.verifiedNoTradeRanges.length,
+      missingRangeCount: coverage.missingRanges.length,
+      uncoveredRangeCount: coverage.uncoveredRanges.length,
+    },
+  };
+}
+
+function toCandleCoverageGaps(
+  sourceRanges: readonly ResearchNoTradeRange[],
+  historyStartAt: string,
+  endAt: string,
+): CandleCoverageGap[] {
+  const hour = 3_600_000_000_000n;
+  const historyStart = requirePerformanceTimestamp(
+    historyStartAt,
+    "no-trade historyStartAt",
+  ).epochNanoseconds;
+  const end = requirePerformanceTimestamp(endAt, "no-trade endAt").epochNanoseconds;
+  const grouped: Array<{ from: bigint; to: bigint }> = [];
+  for (const [index, range] of sourceRanges.entries()) {
+    const from = requirePerformanceTimestamp(
+      range.from,
+      `no-trade range ${index} from`,
+    ).epochNanoseconds;
+    const to = requirePerformanceTimestamp(
+      range.to,
+      `no-trade range ${index} to`,
+    ).epochNanoseconds;
+    const previous = grouped.at(-1);
+    if (previous !== undefined && previous.to === from) {
+      previous.to = to;
+    } else {
+      grouped.push({ from, to });
+    }
+  }
+  return grouped.map((range) => {
+    const count = Number((range.to - range.from) / hour);
+    if (!Number.isSafeInteger(count) || count <= 0) {
+      throw new Error("Research no-trade evidence range must span positive whole hours.");
+    }
+    return {
+      firstMissingCloseTime: formatCadenceInstant(range.from + hour),
+      lastMissingCloseTime: formatCadenceInstant(range.to),
+      missingCandleCount: count,
+      previousObservedCloseTime: range.from > historyStart
+        ? formatCadenceInstant(range.from)
+        : null,
+      nextObservedCloseTime: range.to + hour <= end
+        ? formatCadenceInstant(range.to + hour)
+        : null,
+    };
+  });
+}
+
 function evaluateAsset(
   asset: SupportedAsset,
   assetOptions: SimulationAssetOptions,
@@ -1930,6 +2939,7 @@ function evaluateAsset(
   simulationOptions: IntegratedSimulationOptions,
   stabilityOptions: IntegratedStabilityValidationOptions | null,
   conditionalConfiguration: ConditionalAddPolicyConfiguration | null,
+  independentNoTrade: IndependentNoTradeInput | undefined,
 ): AssetEvaluation {
   const market = getMarketForAsset(asset);
   if (dataset.provenance.asset !== asset) {
@@ -1964,6 +2974,9 @@ function evaluateAsset(
     initialState: { ...assetOptions.initialState },
     frameCount: frames.length,
     ...(featureCoverage === null ? {} : { featureCoverage }),
+    ...(independentNoTrade === undefined
+      ? {}
+      : { noTradeEvidence: { ...independentNoTrade.provenance } }),
   };
   if (frames.length === 0) {
     return buildUnusableAssetEvaluation(assetOptions, dataset, datasetProvenance);
@@ -2037,7 +3050,7 @@ function evaluateAsset(
   const excursionEntries: ExcursionAnalysisEntry[] = [];
   const addDiagnosticEntries: AddDecisionDiagnosticsEntry[] = [];
   const gaps: IntegratedEvidenceGap[] = [];
-  const verifiedNoTradeCoverage = buildVerifiedNoTradeCoverage(dataset, featureCoverage);
+  const verifiedNoTradeCoverage = independentNoTrade?.verifiedCoverage;
   for (const cell of sensitivity.cells) {
     if (!isLegacyStabilityCell(cell)) continue;
     const regime = analyzePerformanceRegimes({
@@ -2179,6 +3192,8 @@ function evaluateAsset(
       frames,
       featureCoverage,
       conditionalConfiguration,
+      independentNoTrade?.ranges
+        ?? featureCoverage.timeframes["1h"].sourceNoTradeRanges,
     );
     policySuppressionEvidence = extractAddPolicySuppressionEvidence(
       asset,
@@ -2290,27 +3305,6 @@ function isLegacyStabilityCell(
   return cell.scenario === "BASELINE" || cell.scenario === "NO_ADD";
 }
 
-function buildVerifiedNoTradeCoverage(
-  dataset: ResearchCandleDataset,
-  featureCoverage: PositionGuardFeatureCoverage | null,
-): VerifiedNoTradeCoverage | undefined {
-  if (featureCoverage === null) return undefined;
-  const oneHour = featureCoverage.timeframes["1h"];
-  if (oneHour.sourceSequenceStatus !== "COMPLETE" || oneHour.sourceBlockingAnomalyCount !== 0) {
-    return undefined;
-  }
-  return createVerifiedNoTradeCoverage({
-    sourceBoundary: {
-      historyStartAt: dataset.provenance.historyStartAt,
-      endAt: dataset.provenance.endAt,
-    },
-    observedIntervals: dataset.candles["1h"].map((candle) => ({
-      openTime: candle.openTime,
-      closeTime: candle.closeTime,
-    })),
-  });
-}
-
 function buildConditionalCandidateEvaluations(
   asset: SupportedAsset,
   cells: readonly CostSensitivityCell[],
@@ -2318,6 +3312,7 @@ function buildConditionalCandidateEvaluations(
   sourceFrames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][],
   featureCoverage: PositionGuardFeatureCoverage,
   configuration: ConditionalAddPolicyConfiguration,
+  independentNoTradeRanges: readonly CandleCoverageGap[],
 ): AddPolicyCandidateEvaluationResult[] {
   return CONDITIONAL_ADD_CANDIDATES.map((candidate) => {
     const baseCandidateCell = requireCostCell(cells, candidate, configuration.baseCost.id);
@@ -2329,6 +3324,7 @@ function buildConditionalCandidateEvaluations(
       sourceFrames,
       featureCoverage,
       configuration,
+      independentNoTradeRanges,
       window,
       baseCandidateCell,
     ));
@@ -2342,7 +3338,7 @@ function buildConditionalCandidateEvaluations(
           sourceFrames,
           configuration.expectedFrameIntervalMs,
           featureCoverage.affectedFrameRanges,
-          featureCoverage.timeframes["1h"].sourceNoTradeRanges,
+          independentNoTradeRanges,
         ),
         policyExposedCompletedEpisodeCount: countPolicyExposedCompletedEpisodes(
           baseCandidateCell,
@@ -2386,6 +3382,7 @@ function buildCandidateWindow(
   sourceFrames: readonly ReturnType<typeof buildPositionGuardBacktestFrames>[number][],
   featureCoverage: PositionGuardFeatureCoverage,
   configuration: ConditionalAddPolicyConfiguration,
+  independentNoTradeRanges: readonly CandleCoverageGap[],
   window: StabilityValidationWindow,
   baseCandidateCell: CostSensitivityCell,
 ): AddPolicyEvaluationWindow {
@@ -2398,7 +3395,7 @@ function buildCandidateWindow(
     expectedFrameIntervalMs: configuration.expectedFrameIntervalMs,
     frames: sourceFrames,
     featureLookbackAffectedRanges: featureCoverage.affectedFrameRanges,
-    noTradeFrameRanges: featureCoverage.timeframes["1h"].sourceNoTradeRanges,
+    noTradeFrameRanges: independentNoTradeRanges,
   });
   const observations = ([
     ["BASE", configuration.baseCost],
@@ -3356,6 +4353,37 @@ function parseBroadStrategyHypothesisProfile(
     throw new Error("BROAD_LOSS_CAUSE_V1 requires the exact frozen W1/W2/W3 validation windows.");
   }
   return value;
+}
+
+function parseBroadStrategyShadowHoldout(
+  values: ReadonlyMap<string, string>,
+  profile: "BROAD_LOSS_CAUSE_V1" | undefined,
+  simulation: IntegratedSimulationOptions,
+): IntegratedStrategyEvaluationOptions["broadStrategyShadowHoldout"] {
+  const fromValue = values.get("broad-shadow-holdout-from");
+  const toValue = values.get("broad-shadow-holdout-to");
+  if (fromValue === undefined && toValue === undefined) return undefined;
+  if (fromValue === undefined || toValue === undefined) {
+    throw new Error("--broad-shadow-holdout-from and --broad-shadow-holdout-to must be provided together.");
+  }
+  if (profile !== BROAD_STRATEGY_PROFILE) {
+    throw new Error("Broad shadow holdout requires --broad-strategy-hypothesis-profile BROAD_LOSS_CAUSE_V1.");
+  }
+  if (
+    simulation.assets.BTC?.noTradeEvidencePath === undefined
+    || simulation.assets.ETH?.noTradeEvidencePath === undefined
+  ) {
+    throw new Error("Broad shadow holdout requires authenticated BTC and ETH no-trade evidence.");
+  }
+  const from = normalizeExplicitIsoTimestamp(fromValue, "--broad-shadow-holdout-from");
+  const to = normalizeExplicitIsoTimestamp(toValue, "--broad-shadow-holdout-to");
+  if (comparePerformanceTimestamps(from, FROZEN_STRATEGY_HYPOTHESIS_MANIFEST.developmentTo) < 0) {
+    throw new Error("Broad shadow holdout must not overlap the frozen development range.");
+  }
+  if (comparePerformanceTimestamps(from, to) >= 0) {
+    throw new Error("Broad shadow holdout [from,to) requires from before to.");
+  }
+  return { from, to };
 }
 
 function sameJson(left: unknown, right: unknown): boolean {

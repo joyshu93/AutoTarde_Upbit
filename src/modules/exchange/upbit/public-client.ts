@@ -2,6 +2,7 @@ import type {
   UpbitCandleSnapshot,
   UpbitGetDayCandlesRequest,
   UpbitGetMinuteCandlesRequest,
+  UpbitMinuteCandleUnit,
   UpbitPublicQuotationClient,
   UpbitTickerSnapshot,
 } from "./contracts.js";
@@ -59,7 +60,9 @@ export class UpbitPublicTickerClient implements UpbitPublicQuotationClient {
     }));
   }
 
-  async getMinuteCandles(request: UpbitGetMinuteCandlesRequest): Promise<readonly UpbitCandleSnapshot[]> {
+  async getMinuteCandles<TUnit extends UpbitMinuteCandleUnit>(
+    request: UpbitGetMinuteCandlesRequest<TUnit>,
+  ): Promise<readonly UpbitCandleSnapshot[]> {
     assertCandleCount(request.count);
     const query = buildQuery({
       market: request.market,

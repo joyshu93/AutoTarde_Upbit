@@ -10,6 +10,16 @@ export const FROZEN_BROAD_LOSS_CAUSE_SCENARIO_ORDER = [
 export type FrozenBroadLossCauseScenario =
   typeof FROZEN_BROAD_LOSS_CAUSE_SCENARIO_ORDER[number];
 
+export const FROZEN_COMBINED_CONSERVATIVE_ABLATION_SCENARIO_ORDER = [
+  "COMBINED_MINUS_HTF_TREND_GATE",
+  "COMBINED_MINUS_EARLY_THESIS_FAILURE",
+  "COMBINED_MINUS_ADD_LIMITED",
+  "COMBINED_MINUS_COOLDOWN_CONTROL",
+] as const;
+
+export type FrozenCombinedConservativeAblationScenario =
+  typeof FROZEN_COMBINED_CONSERVATIVE_ABLATION_SCENARIO_ORDER[number];
+
 export const BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY = deepFreeze({
   id: "BROAD_LOSS_CAUSE_V1",
   developmentRange: {
@@ -71,6 +81,37 @@ export const BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY = deepFreeze({
           "ADD_LIMITED",
         ],
       },
+    },
+  },
+} as const);
+
+export const COMBINED_CONSERVATIVE_COMPONENTS =
+  BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY.policy.scenarios.COMBINED_CONSERVATIVE.components;
+
+export type CombinedConservativeComponent =
+  typeof COMBINED_CONSERVATIVE_COMPONENTS[number];
+
+export const COMBINED_CONSERVATIVE_ABLATION_RESEARCH_AUTHORITY = deepFreeze({
+  id: "COMBINED_CONSERVATIVE_ABLATION_V1",
+  components: COMBINED_CONSERVATIVE_COMPONENTS,
+  precedence: BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY.policy.scenarios.COMBINED_CONSERVATIVE.precedence,
+  scenarioOrder: FROZEN_COMBINED_CONSERVATIVE_ABLATION_SCENARIO_ORDER,
+  scenarios: {
+    COMBINED_MINUS_HTF_TREND_GATE: {
+      inactiveComponent: "HTF_TREND_GATE",
+      activeComponents: ["EARLY_THESIS_FAILURE", "ADD_LIMITED", "COOLDOWN_CONTROL"],
+    },
+    COMBINED_MINUS_EARLY_THESIS_FAILURE: {
+      inactiveComponent: "EARLY_THESIS_FAILURE",
+      activeComponents: ["HTF_TREND_GATE", "ADD_LIMITED", "COOLDOWN_CONTROL"],
+    },
+    COMBINED_MINUS_ADD_LIMITED: {
+      inactiveComponent: "ADD_LIMITED",
+      activeComponents: ["HTF_TREND_GATE", "EARLY_THESIS_FAILURE", "COOLDOWN_CONTROL"],
+    },
+    COMBINED_MINUS_COOLDOWN_CONTROL: {
+      inactiveComponent: "COOLDOWN_CONTROL",
+      activeComponents: ["HTF_TREND_GATE", "EARLY_THESIS_FAILURE", "ADD_LIMITED"],
     },
   },
 } as const);

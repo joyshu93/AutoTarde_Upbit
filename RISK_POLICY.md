@@ -167,6 +167,12 @@ A live startup script must run the live readiness smoke before runtime startup a
 A live scheduler startup script must require a separate explicit automatic-scheduler confirmation, keep `STRATEGY_SCHEDULER_RUN_ON_START=false` by default, and run the scheduler preflight smoke before starting the runtime.
 Windows Task Scheduler registration helpers must remain manual-only. They may point to ignored local launcher scripts, but must not include API keys, Telegram secrets, startup/logon triggers, catch-up triggers, or automatic task starts after registration.
 
+## Prospective Research Guardrails
+
+The prospective component-shadow protocol must remain disconnected from API clients, operational SQLite/DB, Upbit acquisition, Telegram, orders, reconciliation, scheduler/runtime, migrations, secrets, and LIVE process control. Its only subprocess capability is the explicit read-only Git allowlist required to inspect commitment history and verify the exact clean implementation checkout; it cannot checkout, fetch, push, mutate refs, or execute a non-Git process.
+
+The experiment uses a fixed 120-day `[from,to)` no-peek window. Publication A must already contain the implementation and workflow on public `origin/main`; the registration is frozen against that commit and reserves 72 hours before `from`; Publication B then adds only the canonical registration and registry entry. The Publication B Actions evidence uses the exact run's REST `created_at`, must prove at least 48 hours of public lead time, remains non-cryptographic, and requires manual public-run confirmation plus external preservation beyond ephemeral artifact retention. Final evaluation also requires a public closure run at or after `to` plus separate manual closure and public-path-history confirmation. No registration has been published yet, and no prospective status grants deployment, strategy-change, DRY_RUN, LIVE, scheduler, or order approval.
+
 ## Audit Expectations
 
 Every important transition should leave a durable trail:

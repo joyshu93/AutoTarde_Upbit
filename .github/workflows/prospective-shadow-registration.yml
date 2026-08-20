@@ -1,0 +1,116 @@
+name: Prospective shadow registration commitment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - docs/research/prospective-shadow/PCS-2026-001.registration.json
+      - docs/research/prospective-shadow/registry.jsonl
+  workflow_dispatch:
+    inputs:
+      abandonment_metadata_json:
+        description: Prior public ABANDONED workflow output JSON; required only when closing an abandoned registry
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  validate-public-commitment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out complete public history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select exclusive validation mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          registration='docs/research/prospective-shadow/PCS-2026-001.registration.json'
+          registry='docs/research/prospective-shadow/registry.jsonl'
+          if [[ '${{ github.event_name }}' == 'workflow_dispatch' ]]; then
+            mode='CLOSURE'
+            publication="$(git log --diff-filter=A --format=%H -- "$registration" | tail -n 1)"
+          else
+            mapfile -t changed < <(git diff-tree --no-commit-id --name-only -r '${{ github.sha }}' | sort)
+            if [[ "${changed[*]}" == "$registration $registry" ]]; then
+              mode='REGISTERED_PUBLICATION'
+              publication='${{ github.sha }}'
+            elif [[ "${changed[*]}" == "$registry" ]]; then
+              mode='ABANDONED'
+              publication="$(tail -n 1 "$registry" | jq -r '.publicationCommitSha')"
+            else
+              echo 'Changed paths do not match REGISTERED_PUBLICATION or ABANDONED mode.' >&2
+              exit 1
+            fi
+          fi
+          implementation="$(jq -r '.implementationCommitSha' "$registration")"
+          [[ "$implementation" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$publication" =~ ^[a-f0-9]{40}$ ]]
+          echo "VALIDATION_MODE=$mode" >> "$GITHUB_ENV"
+          echo "IMPLEMENTATION_COMMIT_SHA=$implementation" >> "$GITHUB_ENV"
+          echo "PUBLICATION_COMMIT_SHA=$publication" >> "$GITHUB_ENV"
+
+      - name: Read exact own workflow-run server metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            'https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}' \
+            --output prospective-shadow-own-run.json
+
+      - name: Validate committed bytes and emit metadata
+        shell: bash
+        env:
+          ABANDONMENT_METADATA_JSON: ${{ inputs.abandonment_metadata_json }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_BRANCH" == 'main' ]] || {
+            echo 'Prospective shadow commitments must run from the main branch.' >&2
+            exit 1
+          }
+          abandonment_args=()
+          if [[ "$VALIDATION_MODE" == 'CLOSURE' ]] && tail -n 1 'docs/research/prospective-shadow/registry.jsonl' | jq -e '.event == "ABANDONED"' >/dev/null; then
+            if [[ -z "$ABANDONMENT_METADATA_JSON" ]]; then
+              echo 'Abandoned closure requires the prior public ABANDONED workflow output JSON.' >&2
+              exit 1
+            fi
+            printf '%s\n' "$ABANDONMENT_METADATA_JSON" > prospective-shadow-abandonment-metadata.json
+            abandonment_args=(--abandonment-metadata prospective-shadow-abandonment-metadata.json)
+          elif [[ -n "$ABANDONMENT_METADATA_JSON" ]]; then
+            printf '%s\n' "$ABANDONMENT_METADATA_JSON" > prospective-shadow-abandonment-metadata.json
+            abandonment_args=(--abandonment-metadata prospective-shadow-abandonment-metadata.json)
+          fi
+          node .github/scripts/prospective-shadow-commitment.mjs \
+            --mode "$VALIDATION_MODE" \
+            --github-run-json prospective-shadow-own-run.json \
+            --output prospective-shadow-commitment.json \
+            --repository '${{ github.repository }}' \
+            --branch "$TARGET_BRANCH" \
+            --run-id '${{ github.run_id }}' \
+            --run-url '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}' \
+            --head-sha '${{ github.sha }}' \
+            --implementation-commit-sha "$IMPLEMENTATION_COMMIT_SHA" \
+            --publication-commit-sha "$PUBLICATION_COMMIT_SHA" \
+            "${abandonment_args[@]}"
+          cat prospective-shadow-commitment.json
+
+      - name: Upload public commitment metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: prospective-shadow-${{ env.VALIDATION_MODE }}-${{ github.run_id }}
+          path: prospective-shadow-commitment.json
+          if-no-files-found: error
+          retention-days: 90

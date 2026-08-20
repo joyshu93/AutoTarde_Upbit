@@ -54,7 +54,7 @@ export type IndependentNoTradeCoverage = {
   uncoveredRanges: ResearchNoTradeRange[];
 };
 
-type ResearchNoTradeEvidenceWithoutChecksum = Omit<ResearchNoTradeEvidence, "provenance"> & {
+export type ResearchNoTradeEvidenceWithoutChecksum = Omit<ResearchNoTradeEvidence, "provenance"> & {
   provenance: Omit<ResearchNoTradeEvidenceProvenance, "sha256">;
 };
 

@@ -247,10 +247,12 @@ test("conditional ADD research stays outside runtime and operational import grap
   assert.ok(integratedImports.includes(holdoutHypothesis));
 });
 
-test("independent no-trade evidence stays outside runtime and network acquisition graphs", async () => {
+test("independent no-trade evidence stays outside operational graphs and admits only approved research consumers", async () => {
   const srcRoot = join(process.cwd(), "src");
   const sidecar = join(srcRoot, "modules", "performance", "research-no-trade-evidence.ts");
-  const networkAcquisition = join(srcRoot, "modules", "performance", "upbit-research-candle-acquisition.ts");
+  const collector = join(srcRoot, "modules", "performance", "upbit-no-trade-evidence-acquisition.ts");
+  const writer = join(srcRoot, "modules", "performance", "research-no-trade-evidence-writer.ts");
+  const cli = join(srcRoot, "research", "upbit-no-trade-evidence.ts");
   assert.deepEqual(
     collectModuleSpecifiers(`
       import value from "static-import";
@@ -270,21 +272,29 @@ test("independent no-trade evidence stays outside runtime and network acquisitio
       "side-effect-import",
       "static-import",
     ],
+    "the AST collector must retain every supported module-loading syntax and non-literal sentinels",
   );
-  assert.deepEqual(
-    collectModuleSpecifiers(await readFile(sidecar, "utf8")),
-    [
-      "./performance-timestamp.js",
-      "./research-candle-dataset.js",
-      "node:crypto",
-    ],
-    "sidecar direct module specifiers must stay on the pure allowlist",
+  assert.throws(
+    () => assertAllowedModuleSpecifiers(
+      "void import(variableSpecifier); require(variableSpecifier);",
+      new Set(),
+      "non-literal loading fixture",
+    ),
+    /forbidden or non-literal module specifier/i,
+    "non-literal dynamic import and require must fail every allowlist",
   );
+  assertAllowedModuleSpecifiers(await readFile(sidecar, "utf8"), new Set([
+    "./performance-timestamp.js",
+    "./research-candle-dataset.js",
+    "node:crypto",
+  ]), "sidecar");
   const reachable = await collectRelativeImportGraph([sidecar]);
   const forbiddenPath = /(?:^|\/)(?:app|execution|exchange|reconciliation|telegram|runtime|db|research)(?:\/|$)/;
 
   assert.ok(reachable.has(sidecar));
-  assert.equal(reachable.has(networkAcquisition), false, "sidecar must not reach network acquisition");
+  assert.equal(reachable.has(collector), false, "sidecar must not reach minute-candle acquisition");
+  assert.equal(reachable.has(writer), false, "sidecar must not reach filesystem publication");
+  assert.equal(reachable.has(cli), false, "sidecar must not reach the CLI composition root");
   for (const filePath of reachable) {
     const relative = filePath.slice(srcRoot.length + 1).replaceAll("\\", "/");
     assert.equal(
@@ -300,7 +310,123 @@ test("independent no-trade evidence stays outside runtime and network acquisitio
       importers.push(sourceFile.slice(srcRoot.length + 1).replaceAll("\\", "/"));
     }
   }
-  assert.deepEqual(importers.sort(), [], "runtime source graph must not import the sidecar");
+  assert.deepEqual(
+    importers.sort(),
+    [
+      "modules/performance/performance-prospective-shadow-replay.ts",
+      "modules/performance/research-no-trade-evidence-writer.ts",
+      "modules/performance/upbit-no-trade-evidence-acquisition.ts",
+      "research/integrated-strategy-evaluation.ts",
+      "research/prospective-component-shadow.ts",
+    ],
+    "only the collector, verified writer, and explicitly approved read-only evaluators may import the pure sidecar",
+  );
+});
+
+test("independent no-trade collector, writer, and CLI stay outside operational graphs", async () => {
+  const srcRoot = join(process.cwd(), "src");
+  const collector = join(srcRoot, "modules", "performance", "upbit-no-trade-evidence-acquisition.ts");
+  const writer = join(srcRoot, "modules", "performance", "research-no-trade-evidence-writer.ts");
+  const cli = join(srcRoot, "research", "upbit-no-trade-evidence.ts");
+  const publicClient = join(srcRoot, "modules", "exchange", "upbit", "public-client.ts");
+  const publicContracts = join(srcRoot, "modules", "exchange", "upbit", "contracts.ts");
+  const protectedModules = new Set([collector, writer, cli]);
+  const approvedImporters = new Map([
+    [collector, new Set([cli])],
+    [writer, new Set([cli])],
+    [cli, new Set<string>()],
+  ]);
+
+  assertAllowedModuleSpecifiers(await readFile(collector, "utf8"), new Set([
+    "../exchange/upbit/contracts.js",
+    "./performance-timestamp.js",
+    "./research-candle-dataset.js",
+    "./research-no-trade-evidence.js",
+    "node:crypto",
+  ]), "collector");
+  assertAllowedModuleSpecifiers(await readFile(writer, "utf8"), new Set([
+    "./research-candle-dataset.js",
+    "./research-no-trade-evidence.js",
+    "node:crypto",
+    "node:fs",
+    "node:fs/promises",
+    "node:path",
+  ]), "writer");
+  assertAllowedModuleSpecifiers(await readFile(cli, "utf8"), new Set([
+    "../modules/exchange/upbit/public-client.js",
+    "../modules/performance/performance-timestamp.js",
+    "../modules/performance/research-candle-dataset.js",
+    "../modules/performance/research-no-trade-evidence-writer.js",
+    "../modules/performance/upbit-no-trade-evidence-acquisition.js",
+    "node:path",
+    "node:url",
+  ]), "standalone CLI");
+
+  const collectorReachable = await collectRelativeImportGraph([collector]);
+  assertReachableExchangeNodes(
+    collectorReachable,
+    new Set([publicContracts]),
+    "collector",
+  );
+  assert.throws(
+    () => assertReachableExchangeNodes(
+      new Set([collector, join(srcRoot, "modules", "exchange", "upbit", "private-client.ts")]),
+      new Set([publicContracts]),
+      "private-edge regression fixture",
+    ),
+    /private-client\.ts/i,
+    "a future collector edge to private exchange code must fail the firewall",
+  );
+  const collectorForbidden = /(?:^|\/)(?:app|db|execution|reconciliation|telegram|runtime|research)(?:\/|$)/;
+  for (const filePath of collectorReachable) {
+    const relative = filePath.slice(srcRoot.length + 1).replaceAll("\\", "/");
+    assert.equal(
+      collectorForbidden.test(relative),
+      false,
+      `collector reached operational source ${relative}`,
+    );
+  }
+
+  const cliReachable = await collectRelativeImportGraph([cli]);
+  assertReachableExchangeNodes(
+    cliReachable,
+    new Set([publicClient, publicContracts]),
+    "standalone CLI",
+  );
+  for (const filePath of cliReachable) {
+    const relative = filePath.slice(srcRoot.length + 1).replaceAll("\\", "/");
+    assert.equal(
+      /(?:^|\/)(?:app|db|execution|reconciliation|telegram|runtime)(?:\/|$)/.test(relative),
+      false,
+      `standalone CLI reached operational source ${relative}`,
+    );
+  }
+
+  const violations: string[] = [];
+  for (const importer of await listTypeScriptFiles(srcRoot)) {
+    for (const imported of await readRelativeImports(importer)) {
+      if (!protectedModules.has(imported)) continue;
+      if (!(approvedImporters.get(imported)?.has(importer) ?? false)) {
+        violations.push(
+          `${importer.slice(srcRoot.length + 1).replaceAll("\\", "/")} -> ${imported.slice(srcRoot.length + 1).replaceAll("\\", "/")}`,
+        );
+      }
+    }
+  }
+  assert.deepEqual(violations.sort(), []);
+
+  const applicationRoots = [
+    join(srcRoot, "index.ts"),
+    ...(await listTypeScriptFiles(join(srcRoot, "app"))),
+  ];
+  const runtimeReachable = await collectRelativeImportGraph(applicationRoots);
+  for (const protectedModule of protectedModules) {
+    assert.equal(
+      runtimeReachable.has(protectedModule),
+      false,
+      `application runtime must not reach ${protectedModule.slice(srcRoot.length + 1).replaceAll("\\", "/")}`,
+    );
+  }
 });
 
 async function collectRelativeImportGraph(roots: readonly string[]): Promise<Set<string>> {
@@ -351,6 +477,31 @@ function collectModuleSpecifiers(source: string): string[] {
 
   visit(sourceFile);
   return specifiers.sort();
+}
+
+function assertAllowedModuleSpecifiers(
+  source: string,
+  allowed: ReadonlySet<string>,
+  label: string,
+): void {
+  const specifiers = collectModuleSpecifiers(source);
+  const forbidden = specifiers.filter((specifier) => !allowed.has(specifier));
+  assert.deepEqual(forbidden, [], `${label} has a forbidden or non-literal module specifier.`);
+}
+
+function assertReachableExchangeNodes(
+  reachable: ReadonlySet<string>,
+  allowed: ReadonlySet<string>,
+  label: string,
+): void {
+  const exchangeNodes = [...reachable]
+    .filter((filePath) => filePath.includes(`${join("modules", "exchange")}${"\\"}`))
+    .sort();
+  assert.deepEqual(
+    exchangeNodes,
+    [...allowed].sort(),
+    `${label} may reach only its explicit public exchange nodes.`,
+  );
 }
 
 function moduleSpecifierArgument(call: ts.CallExpression, fallback: string): string {

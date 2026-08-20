@@ -6,21 +6,170 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   calculateResearchCandleDatasetChecksum,
+  parseResearchCandleDataset,
   type ResearchCandle,
   type ResearchCandleDataset,
   type ResearchCandleTimeframe,
 } from "../src/modules/performance/research-candle-dataset.js";
 import {
+  classifyIndependentNoTradeCoverage,
+  computeResearchNoTradeEvidenceSha256,
+  type ResearchNoTradeEvidence,
+  type ResearchNoTradeEvidenceWithoutChecksum,
+} from "../src/modules/performance/research-no-trade-evidence.js";
+import type {
+  CombinedConservativeHoldoutAssetResult,
+  CombinedConservativeHoldoutMatrixCell,
+} from "../src/modules/performance/performance-combined-conservative-holdout.js";
+import { parsePerformanceTimestamp } from
+  "../src/modules/performance/performance-timestamp.js";
+import { buildPositionGuardBacktestFrames } from
+  "../src/modules/strategy/position-guard-backtest-frames.js";
+import {
+  assertFrozenBroadShadowDevelopmentAuthority,
   buildInterpretation,
   buildIntegratedStrategyEvaluation,
   calculateConditionalAddCadenceCoverage,
   extractAddPolicySuppressionEvidence,
   formatIntegratedStrategyEvaluation,
+  hasCompleteHourlyCadenceForScope,
   parseIntegratedStrategyEvaluationArgs,
+  resolveBroadCadenceFrom,
+  scopeResearchDatasetForFeatureCoverage,
   type IntegratedStrategyEvaluationReport,
 } from "../src/research/integrated-strategy-evaluation.js";
+
 import * as integratedStrategyEvaluation from "../src/research/integrated-strategy-evaluation.js";
 import { test } from "./harness.js";
+
+test("broad shadow authority rejects any mutation of the frozen development evidence", () => {
+  const frozen = [
+    {
+      asset: "BTC" as const,
+      market: "KRW-BTC" as const,
+      developmentFrom: "2025-01-01T00:00:00Z",
+      developmentTo: "2026-04-12T19:00:00Z",
+      initialStateFingerprint: "c3b0808c2e13030640f814f4460149ac10310b083b1c94a26fe235262e098727",
+      developmentFrameFingerprint: "a25338aefe0495c484ad5c1b687518ff53705c0533f41f534e2fd3e9b3eb9494",
+      developmentFrameCount: 6395,
+      firstDevelopmentFrameAt: "2025-07-20T00:00:00.000Z",
+      lastDevelopmentFrameAt: "2026-04-12T18:00:00.000Z",
+      developmentCadenceComplete: true,
+      featureCoverageStatus: "COMPLETE" as const,
+    },
+    {
+      asset: "ETH" as const,
+      market: "KRW-ETH" as const,
+      developmentFrom: "2025-01-01T00:00:00Z",
+      developmentTo: "2026-04-12T19:00:00Z",
+      initialStateFingerprint: "c3b0808c2e13030640f814f4460149ac10310b083b1c94a26fe235262e098727",
+      developmentFrameFingerprint: "ad79770791df803903490b5060782f487490bff00646a98773efa015a70a7776",
+      developmentFrameCount: 6395,
+      firstDevelopmentFrameAt: "2025-07-20T00:00:00.000Z",
+      lastDevelopmentFrameAt: "2026-04-12T18:00:00.000Z",
+      developmentCadenceComplete: true,
+      featureCoverageStatus: "COMPLETE" as const,
+    },
+  ];
+
+  assert.doesNotThrow(() => assertFrozenBroadShadowDevelopmentAuthority(frozen));
+  assert.throws(
+    () => assertFrozenBroadShadowDevelopmentAuthority([
+      { ...frozen[0]!, developmentFrameCount: frozen[0]!.developmentFrameCount - 1 },
+      frozen[1]!,
+    ]),
+    /does not match the frozen development authority/i,
+  );
+});
+
+test("broad cadence verifies the leading and trailing [from,to) boundaries", () => {
+  const frames = [
+    { generatedAt: "2026-01-01T01:00:00Z" },
+    { generatedAt: "2026-01-01T02:00:00Z" },
+  ];
+  const leading = {
+    firstMissingCloseTime: "2026-01-01T00:00:00Z",
+    lastMissingCloseTime: "2026-01-01T00:00:00Z",
+    missingCandleCount: 1,
+    previousObservedCloseTime: null,
+    nextObservedCloseTime: "2026-01-01T01:00:00Z",
+  };
+
+  assert.equal(hasCompleteHourlyCadenceForScope({
+    frames,
+    verifiedNoTradeRanges: [],
+    from: "2026-01-01T00:00:00Z",
+    to: "2026-01-01T03:00:00Z",
+  }), false);
+  assert.equal(hasCompleteHourlyCadenceForScope({
+    frames,
+    verifiedNoTradeRanges: [leading],
+    from: "2026-01-01T00:00:00Z",
+    to: "2026-01-01T03:00:00Z",
+  }), true);
+  assert.equal(hasCompleteHourlyCadenceForScope({
+    frames,
+    verifiedNoTradeRanges: [leading],
+    from: "2026-01-01T00:00:00Z",
+    to: "2026-01-01T04:00:00Z",
+  }), false);
+});
+
+test("broad cadence excludes warmup only for the full path", () => {
+  const scopeFrom = "2025-01-01T00:00:00Z";
+  const firstReplayFrameAt = "2025-07-20T00:00:00Z";
+
+  assert.equal(resolveBroadCadenceFrom(null, scopeFrom, firstReplayFrameAt), firstReplayFrameAt);
+  assert.equal(resolveBroadCadenceFrom("W1", scopeFrom, firstReplayFrameAt), scopeFrom);
+});
+
+test("feature coverage scope excludes candles after the last analyzed frame", () => {
+  const dataset = createDataset("BTC", {
+    candleCounts: { "1h": 48, "4h": 12, "1d": 2 },
+    endAt: "2026-08-03T00:00:00.000Z",
+  });
+  const lastAnalyzedFrameAt = "2026-08-02T12:00:00.000Z";
+
+  const scoped = scopeResearchDatasetForFeatureCoverage(dataset, [
+    { generatedAt: "2026-08-02T11:00:00.000Z" },
+    { generatedAt: lastAnalyzedFrameAt },
+  ]);
+
+  assert.equal(scoped.provenance.endAt, lastAnalyzedFrameAt);
+  for (const candles of Object.values(scoped.candles) as ResearchCandle[][]) {
+    assert.ok(candles.every((candle) => Date.parse(candle.closeTime) <= Date.parse(lastAnalyzedFrameAt)));
+  }
+  assert.ok(dataset.candles["1h"].some((candle) =>
+    Date.parse(candle.closeTime) > Date.parse(lastAnalyzedFrameAt)));
+});
+
+test("broad combined conservative holdout requires an explicit post-development [from,to) range", () => {
+  const args = broadStrategyHypothesisArgs(
+    "btc.json",
+    "eth.json",
+    "btc.no-trade.json",
+    "eth.no-trade.json",
+  );
+  const parsed = parseIntegratedStrategyEvaluationArgs([
+    ...args,
+    "--broad-shadow-holdout-from", "2026-04-12T19:00:00Z",
+    "--broad-shadow-holdout-to", "2026-08-11T00:00:00Z",
+  ]);
+
+  assert.deepEqual(parsed.broadStrategyShadowHoldout, {
+    from: "2026-04-12T19:00:00.000Z",
+    to: "2026-08-11T00:00:00.000Z",
+  });
+  assert.throws(() => parseIntegratedStrategyEvaluationArgs([
+    ...args,
+    "--broad-shadow-holdout-from", "2026-04-12T19:00:00Z",
+  ]), /holdout-from.*holdout-to.*together/i);
+  assert.throws(() => parseIntegratedStrategyEvaluationArgs([
+    ...args,
+    "--broad-shadow-holdout-from", "2026-04-12T18:00:00Z",
+    "--broad-shadow-holdout-to", "2026-08-11T00:00:00Z",
+  ]), /must not overlap the frozen development range/i);
+});
 
 const TMP_ROOT = path.resolve(".tmp-db-tests", "integrated-strategy-evaluation");
 const OBSERVED_MARK_CASES = [
@@ -252,7 +401,12 @@ test("integrated evaluation CLI accepts the complete conditional ADD research ma
 });
 
 test("integrated evaluation CLI enables broad strategy hypotheses only for the exact frozen profile", () => {
-  const parsed = parseIntegratedStrategyEvaluationArgs(broadStrategyHypothesisArgs("./btc.json", "./eth.json"));
+  const parsed = parseIntegratedStrategyEvaluationArgs(broadStrategyHypothesisArgs(
+    "./btc.json",
+    "./eth.json",
+    "./btc.no-trade.json",
+    "./eth.no-trade.json",
+  ));
 
   assert.equal(
     (parsed as { broadStrategyHypothesisProfile?: unknown }).broadStrategyHypothesisProfile,
@@ -273,6 +427,8 @@ test("integrated evaluation CLI enables broad strategy hypotheses only for the e
     { id: "STRESS", feeRate: 0.001, slippageRate: 0.002 },
   ]);
   assert.deepEqual(parsed.stabilityValidation?.windows.map((window) => window.id), ["W1", "W2", "W3"]);
+  assert.equal(parsed.simulation?.assets.BTC?.noTradeEvidencePath, "./btc.no-trade.json");
+  assert.equal(parsed.simulation?.assets.ETH?.noTradeEvidencePath, "./eth.no-trade.json");
 
   const legacy = parseIntegratedStrategyEvaluationArgs(simulationArgs("BTC", "./btc.json"));
   assert.equal("broadStrategyHypothesisProfile" in legacy, false);
@@ -299,6 +455,288 @@ test("integrated evaluation CLI enables broad strategy hypotheses only for the e
       "--eth-initial-state",
     )),
     /requires both BTC and ETH datasets/,
+  );
+  assert.throws(
+    () => parseIntegratedStrategyEvaluationArgs([
+      ...broadStrategyHypothesisArgs("./btc.json", "./eth.json"),
+      "--btc-no-trade-evidence",
+      "./btc.no-trade.json",
+    ]),
+    /requires both BTC and ETH no-trade evidence paths/,
+  );
+  assert.throws(
+    () => parseIntegratedStrategyEvaluationArgs([
+      ...requiredArgs(),
+      "--btc-no-trade-evidence",
+      "./btc.no-trade.json",
+    ]),
+    /--btc-no-trade-evidence requires --btc-dataset/,
+  );
+});
+
+test("programmatic broad-profile builder validates exact frozen scenarios and costs before persistence", async () => {
+  const exact = parseIntegratedStrategyEvaluationArgs(broadStrategyHypothesisArgs(
+    "./btc.json",
+    "./eth.json",
+    "./btc.no-trade.json",
+    "./eth.no-trade.json",
+  ));
+  const mutations: Array<[string, (options: typeof exact) => void, RegExp]> = [
+    ["altered rate", (options) => replaceProgrammaticCosts(options, (costs) => [
+      { ...costs[0]!, feeRate: 0.123 },
+      ...costs.slice(1),
+    ]), /exact frozen BASE\/STRESS cost cells/i],
+    ["missing cost", (options) => replaceProgrammaticCosts(options, (costs) => costs.slice(0, -1)), /exact frozen BASE\/STRESS cost cells/i],
+    ["extra cost", (options) => replaceProgrammaticCosts(options, (costs) => [
+      ...costs,
+      { id: "EXTRA", feeRate: 0, slippageRate: 0 },
+    ]), /exact frozen BASE\/STRESS cost cells/i],
+    ["reordered cost", (options) => replaceProgrammaticCosts(options, (costs) => [...costs].reverse()), /exact frozen BASE\/STRESS cost cells/i],
+    ["mislabeled cost", (options) => replaceProgrammaticCosts(options, (costs) => [
+      { ...costs[0]!, id: "base" },
+      ...costs.slice(1),
+    ]), /exact frozen BASE\/STRESS cost cells/i],
+    ["missing scenario", (options) => replaceProgrammaticScenarios(options, (scenarios) => scenarios.slice(0, -1)), /exact frozen 8-scenario matrix/i],
+    ["extra scenario", (options) => replaceProgrammaticScenarios(options, (scenarios) => [
+      ...scenarios,
+      "ADD_RISK_CLEAR",
+    ]), /exact frozen 8-scenario matrix/i],
+    ["reordered scenario", (options) => replaceProgrammaticScenarios(options, (scenarios) => [...scenarios].reverse()), /exact frozen 8-scenario matrix/i],
+    ["mislabeled scenario", (options) => replaceProgrammaticScenarios(options, (scenarios) => [
+      ...scenarios.slice(0, 2),
+      "ADD_RISK_CLEAR",
+      ...scenarios.slice(3),
+    ]), /exact frozen 8-scenario matrix/i],
+  ];
+
+  for (const [name, mutate, expected] of mutations) {
+    const options = structuredClone(exact);
+    mutate(options);
+    let persistenceRead = false;
+    await assert.rejects(
+      buildIntegratedStrategyEvaluation(options, {
+        readObserved: () => {
+          persistenceRead = true;
+          throw new Error("PERSISTENCE_MUST_NOT_BE_READ");
+        },
+      }),
+      expected,
+      name,
+    );
+    assert.equal(persistenceRead, false, name);
+  }
+
+  let exactAuthorityReachedPersistence = false;
+  await assert.rejects(
+    buildIntegratedStrategyEvaluation(structuredClone(exact), {
+      readObserved: () => {
+        exactAuthorityReachedPersistence = true;
+        throw new Error("EXACT_FROZEN_AUTHORITY_ACCEPTED");
+      },
+    }),
+    /EXACT_FROZEN_AUTHORITY_ACCEPTED/,
+  );
+  assert.equal(exactAuthorityReachedPersistence, true);
+});
+
+test("broad replay keeps the detached frozen cost snapshot across an async caller mutation", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase("broad-async-cost-snapshot"),
+    cleanupFixture,
+    async (databasePath) => withFixtureResource(
+      () => writeDatasetFixture("BTC", "broad-async-cost-snapshot", {
+        candleCounts: { "1h": 400, "4h": 400, "1d": 400 },
+        endAt: "2026-04-20T00:00:00.000Z",
+        spacingMs: 36 * 60 * 60 * 1_000,
+      }),
+      (btcPath) => rm(path.dirname(btcPath), { recursive: true, force: true }),
+      async (btcPath) => {
+        const ethPath = await writeDatasetFixture("ETH", "broad-async-cost-snapshot", {
+          candleCounts: { "1h": 400, "4h": 400, "1d": 400 },
+          endAt: "2026-04-20T00:00:00.000Z",
+          spacingMs: 36 * 60 * 60 * 1_000,
+        });
+        const btcEvidence = await writeNoTradeEvidenceFixture(btcPath, "btc-async-cost");
+        const ethEvidence = await writeNoTradeEvidenceFixture(ethPath, "eth-async-cost");
+        const exact = parseIntegratedStrategyEvaluationArgs(replaceArg([
+          ...broadStrategyHypothesisArgs(btcPath, ethPath, btcEvidence, ethEvidence),
+          "--broad-shadow-holdout-from", "2026-04-12T19:00:00Z",
+          "--broad-shadow-holdout-to", "2026-04-19T00:00:00Z",
+        ], "--database", databasePath));
+        const clean = await buildIntegratedStrategyEvaluation(structuredClone(exact), {
+          verifyBroadShadowDevelopmentAuthority: () => undefined,
+        });
+        const racedOptions = structuredClone(exact);
+        const simulation = racedOptions.simulation;
+        assert.ok(simulation);
+        const callerCosts: ProgrammaticCost[] = simulation.costScenarios.map((cost) => ({ ...cost }));
+        const callerScenarios: ProgrammaticScenario[] = [...simulation.scenarios];
+        racedOptions.simulation = {
+          ...simulation,
+          scenarios: callerScenarios,
+          costScenarios: callerCosts,
+        };
+
+        let releaseReader!: () => void;
+        const readerGate = new Promise<void>((resolve) => { releaseReader = resolve; });
+        let markReaderEntered!: () => void;
+        const readerEntered = new Promise<void>((resolve) => { markReaderEntered = resolve; });
+        let firstRead = true;
+        const racedPromise = buildIntegratedStrategyEvaluation(racedOptions, {
+          readDataset: async (datasetPath) => {
+            if (firstRead) {
+              firstRead = false;
+              markReaderEntered();
+              await readerGate;
+            }
+            return parseResearchCandleDataset(await readFile(datasetPath, "utf8"));
+          },
+          verifyBroadShadowDevelopmentAuthority: () => undefined,
+        });
+
+        await readerEntered;
+        callerCosts[0]!.feeRate = 0.25;
+        callerCosts[0]!.slippageRate = 0.5;
+        callerCosts[0]!.id = callerCosts[1]!.id;
+        callerCosts.reverse();
+        callerScenarios.reverse();
+        callerScenarios[0] = "NO_ADD";
+        releaseReader();
+        const raced = await racedPromise;
+
+        assert.deepEqual(raced.provenance.scenarioAssumptions, clean.provenance.scenarioAssumptions);
+        assert.deepEqual(raced.provenance.costCells, clean.provenance.costCells);
+        assert.deepEqual(
+          raced.broadStrategyHypothesisEvaluation,
+          clean.broadStrategyHypothesisEvaluation,
+        );
+        assert.deepEqual(
+          raced.broadStrategyShadowHoldoutEvaluation,
+          clean.broadStrategyShadowHoldoutEvaluation,
+        );
+        assert.deepEqual(
+          raced.broadStrategyShadowHoldoutComponentDiagnostics,
+          clean.broadStrategyShadowHoldoutComponentDiagnostics,
+        );
+        const diagnostics = raced.broadStrategyShadowHoldoutComponentDiagnostics;
+        assert.ok(diagnostics);
+        for (const asset of diagnostics.assets) {
+          for (const component of asset.components) {
+            for (const delta of component.deltas) {
+              const expected = delta.cost === "BASE"
+                ? { feeRate: 0.0005, slippageRate: 0.0003 }
+                : { feeRate: 0.001, slippageRate: 0.002 };
+              assert.equal(delta.provenance.feeRate, expected.feeRate);
+              assert.equal(delta.provenance.slippageRate, expected.slippageRate);
+            }
+          }
+        }
+      },
+    ),
+  );
+});
+
+type ParsedIntegratedOptions = ReturnType<typeof parseIntegratedStrategyEvaluationArgs>;
+type ProgrammaticCost = NonNullable<ParsedIntegratedOptions["simulation"]>["costScenarios"][number];
+type ProgrammaticScenario = NonNullable<ParsedIntegratedOptions["simulation"]>["scenarios"][number];
+
+function replaceProgrammaticCosts(
+  options: ParsedIntegratedOptions,
+  transform: (costs: ProgrammaticCost[]) => readonly ProgrammaticCost[],
+): void {
+  const simulation = options.simulation;
+  if (simulation === null) throw new Error("Test fixture requires simulation options.");
+  options.simulation = {
+    ...simulation,
+    costScenarios: transform(simulation.costScenarios.map((cost) => ({ ...cost }))),
+  };
+}
+
+function replaceProgrammaticScenarios(
+  options: ParsedIntegratedOptions,
+  transform: (scenarios: ProgrammaticScenario[]) => readonly ProgrammaticScenario[],
+): void {
+  const simulation = options.simulation;
+  if (simulation === null) throw new Error("Test fixture requires simulation options.");
+  options.simulation = {
+    ...simulation,
+    scenarios: transform([...simulation.scenarios]),
+  };
+}
+
+test("broad strategy hypothesis report authenticates independent no-trade evidence", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase("broad-independent-no-trade"),
+    cleanupFixture,
+    async (databasePath) => withFixtureResource(
+      () => writeDatasetFixture("BTC", "broad-independent-no-trade", {
+        candleCounts: { "1h": 400, "4h": 400, "1d": 400 },
+        endAt: "2026-04-20T00:00:00.000Z",
+        spacingMs: 36 * 60 * 60 * 1_000,
+      }),
+      (btcPath) => rm(path.dirname(btcPath), { recursive: true, force: true }),
+      async (btcPath) => {
+        const ethPath = await writeDatasetFixture("ETH", "broad-independent-no-trade", {
+          candleCounts: { "1h": 400, "4h": 400, "1d": 400 },
+          endAt: "2026-04-20T00:00:00.000Z",
+          spacingMs: 36 * 60 * 60 * 1_000,
+        });
+        const btcEvidencePath = await writeNoTradeEvidenceFixture(btcPath, "btc");
+        const ethEvidencePath = await writeNoTradeEvidenceFixture(ethPath, "eth");
+        const args = broadStrategyHypothesisArgs(
+          btcPath,
+          ethPath,
+          btcEvidencePath,
+          ethEvidencePath,
+        );
+        const report = await buildIntegratedStrategyEvaluation(
+          parseIntegratedStrategyEvaluationArgs(replaceArg(args, "--database", databasePath)),
+        );
+        const section = report.broadStrategyHypothesisEvaluation;
+
+        assert.ok(section);
+        assert.equal(section.independentNoTradeProofAvailable, true);
+        assert.ok(section.datasets.every((dataset) =>
+          dataset.noTradeEvidence !== null
+          && dataset.noTradeEvidence.coverageStatus === "VERIFIED_SPARSE"
+          && dataset.noTradeEvidence.uncoveredRangeCount === 0));
+        assert.ok(section.evaluations.every((evaluation) =>
+          evaluation.dataSufficiency.reasons.every((reason) =>
+            !reason.endsWith("INDEPENDENTLY_VERIFIED_NO_TRADE_FALSE")
+            && !reason.endsWith("CADENCE_INCOMPLETE"))));
+      },
+    ),
+  );
+});
+
+test("integrated evaluation rejects no-trade evidence for a different parent dataset", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase("mismatched-independent-no-trade"),
+    cleanupFixture,
+    async (databasePath) => withFixtureResource(
+      () => writeDatasetFixture("BTC", "mismatched-independent-no-trade", {
+        candleCounts: { "1h": 240, "4h": 240, "1d": 240 },
+      }),
+      (btcPath) => rm(path.dirname(btcPath), { recursive: true, force: true }),
+      async (btcPath) => {
+        const otherBtcPath = await writeDatasetFixture("BTC", "mismatched-independent-no-trade-other", {
+          candleCounts: { "1h": 241, "4h": 241, "1d": 241 },
+        });
+        const evidencePath = await writeNoTradeEvidenceFixture(otherBtcPath, "mismatch");
+        const args = [
+          ...simulationArgs("BTC", btcPath),
+          "--btc-no-trade-evidence",
+          evidencePath,
+        ];
+
+        await assert.rejects(
+          buildIntegratedStrategyEvaluation(
+            parseIntegratedStrategyEvaluationArgs(replaceArg(args, "--database", databasePath)),
+          ),
+          /parent sha256 does not match the dataset/,
+        );
+      },
+    ),
   );
 });
 
@@ -457,6 +895,268 @@ test("broad strategy hypothesis report uses frozen continuous paths and excludes
         assert.match(text, /INDEPENDENTLY_VERIFIED_NO_TRADE_FALSE/);
         assert.match(text, /not deployment approval/i);
         assert.deepEqual(JSON.parse(formatIntegratedStrategyEvaluation(first, "json")), first);
+      },
+    ),
+  );
+});
+
+test("broad combined conservative holdout is a separate continuous read-only evaluation", async () => {
+  await withFixtureResource(
+    () => createDisposableDatabase("broad-combined-holdout"),
+    cleanupFixture,
+    async (databasePath) => withFixtureResource(
+      () => writeDatasetFixture("BTC", "broad-combined-holdout", {
+        candleCounts: { "1h": 400, "4h": 400, "1d": 400 },
+        endAt: "2026-04-20T00:00:00.000Z",
+        spacingMs: 36 * 60 * 60 * 1_000,
+      }),
+      (btcPath) => rm(path.dirname(btcPath), { recursive: true, force: true }),
+      async (btcPath) => {
+        const ethPath = await writeDatasetFixture("ETH", "broad-combined-holdout", {
+          candleCounts: { "1h": 400, "4h": 400, "1d": 400 },
+          endAt: "2026-04-20T00:00:00.000Z",
+          spacingMs: 36 * 60 * 60 * 1_000,
+        });
+        const btcEvidence = await writeNoTradeEvidenceFixture(btcPath, "btc-holdout");
+        const ethEvidence = await writeNoTradeEvidenceFixture(ethPath, "eth-holdout");
+        const options = parseIntegratedStrategyEvaluationArgs(replaceArg([
+          ...broadStrategyHypothesisArgs(btcPath, ethPath, btcEvidence, ethEvidence),
+          "--broad-shadow-holdout-from", "2026-04-12T19:00:00Z",
+          "--broad-shadow-holdout-to", "2026-04-19T00:00:00Z",
+        ], "--database", databasePath));
+
+        const report = await buildIntegratedStrategyEvaluation(options, {
+          verifyBroadShadowDevelopmentAuthority: () => undefined,
+        });
+        const holdout = report.broadStrategyShadowHoldoutEvaluation;
+        assert.ok(holdout);
+        assert.equal(holdout.analysisKind, "COMBINED_CONSERVATIVE_HOLDOUT");
+        assert.equal(holdout.phase, "RETROSPECTIVE_HOLDOUT");
+        assert.equal(holdout.readOnly, true);
+        assert.equal(holdout.deploymentApproval, false);
+        assert.equal(holdout.authority.version, "UNVERIFIED_TEST_OVERRIDE");
+        assert.ok(holdout.assets.every((asset) => asset.status === "INSUFFICIENT"));
+        const failureDiagnostics = report.broadStrategyShadowHoldoutDiagnostics;
+        assert.ok(failureDiagnostics);
+        assert.equal(failureDiagnostics.readOnly, true);
+        assert.equal(failureDiagnostics.causalClaim, false);
+        assert.deepEqual(failureDiagnostics.assets.map((asset) => asset.asset), ["BTC", "ETH"]);
+        const componentDiagnostics = report.broadStrategyShadowHoldoutComponentDiagnostics;
+        assert.ok(componentDiagnostics);
+        assert.equal(componentDiagnostics.analysisKind, "PERFORMANCE_COMPONENT_ABLATION");
+        assert.equal(componentDiagnostics.authorityId, "COMBINED_CONSERVATIVE_ABLATION_V1");
+        assert.equal(componentDiagnostics.readOnly, true);
+        assert.equal(componentDiagnostics.causalClaim, false);
+        assert.equal(componentDiagnostics.deploymentApproval, false);
+        assert.equal(componentDiagnostics.prospectiveApproval, false);
+        assert.match(componentDiagnostics.interpretationBoundary, /retrospective association/i);
+        assert.match(componentDiagnostics.interpretationBoundary, /cannot authorize shadow or LIVE/i);
+        assert.match(componentDiagnostics.interpretationBoundary, /fresh prospective test/i);
+        assert.deepEqual(componentDiagnostics.assets.map((asset) => asset.asset), ["BTC", "ETH"]);
+        const expectedAblations = [
+          "COMBINED_MINUS_HTF_TREND_GATE",
+          "COMBINED_MINUS_EARLY_THESIS_FAILURE",
+          "COMBINED_MINUS_ADD_LIMITED",
+          "COMBINED_MINUS_COOLDOWN_CONTROL",
+        ];
+        const validClassifications = new Set([
+          "PROTECTIVE_ASSOCIATION",
+          "HARM_ASSOCIATION",
+          "MIXED_ASSOCIATION",
+          "NO_MEASURABLE_DIFFERENCE",
+          "INSUFFICIENT_EVIDENCE",
+        ]);
+        const expectedCoverageKeys = [
+          "ablationFeeComplete",
+          "ablationFiniteMetricsComplete",
+          "ablationLifecycleComplete",
+          "cadenceComplete",
+          "carryInStateComplete",
+          "featureCoverageComplete",
+          "referenceFeeComplete",
+          "referenceFiniteMetricsComplete",
+          "referenceLifecycleComplete",
+        ];
+        const ablationCells = componentDiagnostics.assets.flatMap((asset) => {
+          assert.deepEqual(asset.components.map((component) => component.ablationScenario), expectedAblations);
+          assert.ok(asset.components.every((component) =>
+            validClassifications.has(component.classification)));
+          return asset.components.flatMap((component) => component.deltas.map((delta) => ({
+            asset: asset.asset,
+            scenario: component.ablationScenario,
+            delta,
+          })));
+        });
+        assert.equal(ablationCells.length, 32);
+        assert.equal(new Set(ablationCells.map(({ asset, scenario, delta }) =>
+          `${asset}:${scenario}:${delta.timing}:${delta.cost}`)).size, 32);
+        const expectedReplayFrameFingerprints = new Map(await Promise.all(
+          (["BTC", "ETH"] as const).map(async (asset) => {
+            const datasetPath = options.simulation?.assets[asset]?.datasetPath;
+            assert.ok(datasetPath);
+            const dataset = parseResearchCandleDataset(await readFile(datasetPath, "utf8"));
+            const holdoutTo = parsePerformanceTimestamp(options.broadStrategyShadowHoldout!.to);
+            assert.ok(holdoutTo);
+            const replayFrames = buildPositionGuardBacktestFrames({
+              asset,
+              market: dataset.provenance.market,
+              oneHourCandles: dataset.candles["1h"],
+              fourHourCandles: dataset.candles["4h"],
+              oneDayCandles: dataset.candles["1d"],
+            }).filter((frame) => {
+              const generatedAt = parsePerformanceTimestamp(frame.generatedAt);
+              assert.ok(generatedAt);
+              return generatedAt.epochNanoseconds
+                >= parsePerformanceTimestamp("2025-01-01T00:00:00Z")!.epochNanoseconds
+                && generatedAt.epochNanoseconds < holdoutTo.epochNanoseconds;
+            });
+            return [
+              asset,
+              createHash("sha256").update(JSON.stringify(replayFrames)).digest("hex"),
+            ] as const;
+          }),
+        ));
+        for (const ablationCell of ablationCells) {
+          const assetId = ablationCell.asset;
+          const scenarioId = ablationCell.scenario;
+          const delta = ablationCell.delta;
+          const holdoutAsset: CombinedConservativeHoldoutAssetResult | undefined =
+            holdout.assets.find((candidate) => candidate.asset === assetId);
+          assert.ok(holdoutAsset);
+          const referenceCell: CombinedConservativeHoldoutMatrixCell | undefined =
+            holdoutAsset.matrix.find((cell) =>
+              cell.scenario === "COMBINED_CONSERVATIVE"
+              && cell.timing === delta.timing
+              && cell.cost === delta.cost);
+          assert.ok(referenceCell);
+          assert.deepEqual(delta.reference, {
+            scenario: "COMBINED_CONSERVATIVE",
+            netReturnPct: referenceCell.netReturnPct,
+            maxDrawdownPct: referenceCell.maxDrawdownPct,
+            turnoverKrw: referenceCell.turnoverKrw,
+            feesKrw: referenceCell.feesKrw,
+            completedEpisodeCount: referenceCell.completedEpisodeCount,
+          });
+          assert.equal(delta.ablation.scenario, scenarioId);
+          assert.deepEqual(Object.keys(delta.coverage).sort(), expectedCoverageKeys);
+          assert.ok(Object.values(delta.coverage).every((value) => typeof value === "boolean"));
+          assert.equal(delta.coverage.carryInStateComplete, false);
+          assert.equal(
+            delta.episodeAttribution.ablationScenario,
+            scenarioId,
+          );
+          assert.equal(
+            delta.episodeAttribution.referenceScenario,
+            "COMBINED_CONSERVATIVE",
+          );
+          assert.deepEqual(delta.episodeAttribution.provenance, delta.provenance);
+          assert.equal(
+            delta.episodeAttribution.counts.totalRelationships,
+            delta.episodeAttribution.relationships.length,
+          );
+          assert.deepEqual(delta.provenance, {
+            authorityId: "COMBINED_CONSERVATIVE_ABLATION_V1",
+            asset: assetId,
+            market: holdoutAsset.market,
+            timingModel: delta.timing,
+            costCellId: delta.cost,
+            costRole: delta.cost,
+            feeRate: delta.cost === "BASE" ? 0.0005 : 0.001,
+            slippageRate: delta.cost === "BASE" ? 0.0003 : 0.002,
+            holdoutFrom: holdoutAsset.holdout.from,
+            holdoutTo: holdoutAsset.holdout.to,
+            datasetSha256: holdoutAsset.dataset.checksum,
+            datasetFingerprint: holdoutAsset.dataset.fingerprint,
+            initialStateFingerprint: holdoutAsset.dataset.initialStateFingerprint,
+            developmentFrameFingerprint: holdoutAsset.dataset.developmentFrameFingerprint,
+            replayFrameFingerprint: holdoutAsset.dataset.replayFrameFingerprint,
+          });
+          assert.equal(
+            delta.provenance.replayFrameFingerprint,
+            expectedReplayFrameFingerprints.get(assetId),
+          );
+          const holdoutTo = parsePerformanceTimestamp(delta.provenance.holdoutTo);
+          assert.ok(holdoutTo);
+          assert.ok(
+            parsePerformanceTimestamp(holdoutAsset.dataset.endAt)!.epochNanoseconds
+              > holdoutTo.epochNanoseconds,
+            "The fixture must contain future source evidence beyond the exclusive holdout end.",
+          );
+        }
+        assert.deepEqual(holdout.assets.map((asset) => asset.asset), ["BTC", "ETH"]);
+        assert.ok(holdout.assets.every((asset) =>
+          asset.holdout.from === "2026-04-12T19:00:00.000Z"
+          && asset.holdout.to === "2026-04-19T00:00:00.000Z"
+          && asset.matrix.length === 12));
+        assert.equal(
+          report.broadStrategyHypothesisEvaluation?.developmentCutoffExclusive,
+          "2026-04-12T19:00:00Z",
+        );
+        const text = formatIntegratedStrategyEvaluation(report, "text");
+        assert.match(text, /Combined Conservative Shadow Holdout/);
+        assert.match(text, /Aggregate Failure Diagnostics/);
+        assert.match(text, /no causal or deployment claim/i);
+        assert.match(text, /retrospective association/i);
+        assert.match(text, /non-causal/i);
+        assert.match(text, /cannot authorize shadow\/LIVE/i);
+        assert.match(text, /fresh prospective test/i);
+        assert.ok(text.indexOf("ETH component ablation:") < text.indexOf("BTC component ablation:"));
+        assert.match(text, /\[Combined Conservative Component Ablation Diagnostics\]/);
+        assert.deepEqual(JSON.parse(formatIntegratedStrategyEvaluation(report, "json")), report);
+        const repeated = await buildIntegratedStrategyEvaluation(options, {
+          verifyBroadShadowDevelopmentAuthority: () => undefined,
+        });
+        assert.equal(
+          formatIntegratedStrategyEvaluation(report, "json"),
+          formatIntegratedStrategyEvaluation(repeated, "json"),
+        );
+        const originalBtcDataset = parseResearchCandleDataset(await readFile(btcPath, "utf8"));
+        const originalEthDataset = parseResearchCandleDataset(await readFile(ethPath, "utf8"));
+        const selectedHoldout = options.broadStrategyShadowHoldout;
+        assert.ok(selectedHoldout);
+        const mutatedBtcDataset = mutateDatasetAtOrAfter(
+          originalBtcDataset,
+          selectedHoldout.to,
+        );
+        const mutatedEthDataset = mutateDatasetAtOrAfter(
+          originalEthDataset,
+          selectedHoldout.to,
+        );
+        await writeFile(btcPath, JSON.stringify(mutatedBtcDataset), "utf8");
+        await writeFile(ethPath, JSON.stringify(mutatedEthDataset), "utf8");
+        await writeFile(
+          btcEvidence,
+          `${JSON.stringify(createNoTradeEvidenceFixture(mutatedBtcDataset), null, 2)}\n`,
+          "utf8",
+        );
+        await writeFile(
+          ethEvidence,
+          `${JSON.stringify(createNoTradeEvidenceFixture(mutatedEthDataset), null, 2)}\n`,
+          "utf8",
+        );
+        const futureMutated = await buildIntegratedStrategyEvaluation(options, {
+          verifyBroadShadowDevelopmentAuthority: () => undefined,
+        });
+        const futureDiagnostics = futureMutated.broadStrategyShadowHoldoutComponentDiagnostics;
+        assert.ok(futureDiagnostics);
+        assert.notDeepEqual(
+          futureMutated.broadStrategyShadowHoldoutEvaluation?.assets.map((asset) =>
+            asset.dataset.checksum),
+          holdout.assets.map((asset) => asset.dataset.checksum),
+        );
+        const originalIdentity = componentDiagnostics.assets[0]!.components[0]!.deltas[0]!.provenance;
+        const futureIdentity = futureDiagnostics.assets[0]!.components[0]!.deltas[0]!.provenance;
+        assert.notEqual(futureIdentity.datasetSha256, originalIdentity.datasetSha256);
+        assert.notEqual(futureIdentity.datasetFingerprint, originalIdentity.datasetFingerprint);
+        assert.equal(
+          futureIdentity.replayFrameFingerprint,
+          originalIdentity.replayFrameFingerprint,
+        );
+        assert.equal(
+          JSON.stringify(withoutWholeDatasetIdentity(futureDiagnostics)),
+          JSON.stringify(withoutWholeDatasetIdentity(componentDiagnostics)),
+          "future-only candles must not alter pre-to metrics, attribution, classifications, counts, or replay provenance",
+        );
       },
     ),
   );
@@ -1789,7 +2489,7 @@ test("conditional ADD evaluation requires the first caller-ordered cost cell as 
 
 test("legacy report JSON shape is unchanged when conditional scenarios are absent", async () => {
   await withFixtureResource(
-    () => createDisposableDatabase("legacy-shape"),
+    () => createDisposableDatabase("legacy-shape", undefined, true),
     cleanupFixture,
     async (databasePath) => {
       const report = await buildIntegratedStrategyEvaluation(
@@ -1807,11 +2507,38 @@ test("legacy report JSON shape is unchanged when conditional scenarios are absen
       );
       assert.equal(Object.hasOwn(report, "conditionalAddPolicyEvaluation"), false);
       assert.equal(Object.hasOwn(report, "addLossAttribution"), false);
+      assert.equal(Object.hasOwn(report, "broadStrategyShadowHoldoutComponentDiagnostics"), false);
+      assert.deepEqual(Object.keys(report), [
+        "provenance",
+        "observedLive",
+        "simulatedCounterfactuals",
+        "costSensitivity",
+        "regimeAnalysis",
+        "excursionAnalysis",
+        "addDiagnostics",
+        "evidenceGaps",
+        "interpretation",
+      ]);
+      assert.doesNotMatch(
+        formatIntegratedStrategyEvaluation(report, "text"),
+        /Component Ablation Diagnostics/,
+      );
       assert.equal(
         report.provenance.datasets.some((dataset) => Object.hasOwn(dataset, "featureCoverage")),
         false,
       );
       const text = formatIntegratedStrategyEvaluation(report, "text");
+      const json = formatIntegratedStrategyEvaluation(report, "json");
+      assert.equal(
+        sha256Text(json),
+        "17197df314ba4ed614b175498983152759dca6b39be1f228d582026316e070dd",
+        "legacy full JSON serialization changed",
+      );
+      assert.equal(
+        sha256Text(text),
+        "5f2ca657f7a778eaf4da76ccd4a69878ace5a76f2ca62b8537df509374cc1d37",
+        "legacy full text report changed",
+      );
       const legacyProjection = text.split("\n").filter((line) =>
         !line.startsWith("Observed mark exclusions:")
         && !line.startsWith("Observed mark exclusion:"),
@@ -1825,11 +2552,14 @@ test("legacy report JSON shape is unchanged when conditional scenarios are absen
   );
 });
 
-test("ADD attribution integration imports stay outside execution and writable runtime graphs", async () => {
+test("performance research integration imports stay outside execution and writable runtime graphs", async () => {
   const files = [
     "src/research/integrated-strategy-evaluation.ts",
     "src/modules/performance/performance-add-loss-attribution.ts",
     "src/modules/performance/performance-add-holdout-hypothesis.ts",
+    "src/modules/performance/performance-holdout-failure-diagnostics.ts",
+    "src/modules/performance/performance-component-ablation.ts",
+    "src/modules/performance/performance-holdout-episode-attribution.ts",
   ];
   const forbidden = /(?:^|\/)(?:app|execution|exchange|reconciliation|telegram|runtime|db)(?:\/|$)/;
   for (const file of files) {
@@ -1855,6 +2585,18 @@ test("ADD attribution integration imports stay outside execution and writable ru
   assert.match(
     integratedSource,
     /from "\.\.\/modules\/performance\/performance-add-holdout-hypothesis\.js"/,
+  );
+  assert.match(
+    integratedSource,
+    /from "\.\.\/modules\/performance\/performance-holdout-failure-diagnostics\.js"/,
+  );
+  assert.match(
+    integratedSource,
+    /from "\.\.\/modules\/performance\/performance-component-ablation\.js"/,
+  );
+  assert.match(
+    integratedSource,
+    /from "\.\.\/modules\/performance\/performance-holdout-episode-attribution\.js"/,
   );
 });
 
@@ -1953,8 +2695,13 @@ function conditionalResearchArgs(): string[] {
   ];
 }
 
-function broadStrategyHypothesisArgs(btcDatasetPath: string, ethDatasetPath: string): string[] {
-  return [
+function broadStrategyHypothesisArgs(
+  btcDatasetPath: string,
+  ethDatasetPath: string,
+  btcNoTradeEvidencePath?: string,
+  ethNoTradeEvidencePath?: string,
+): string[] {
+  const args = [
     ...requiredArgs(),
     "--btc-dataset", btcDatasetPath,
     "--btc-initial-state", '{"cashKrw":1000000,"quantity":0,"averageEntryPriceKrw":0}',
@@ -1972,6 +2719,105 @@ function broadStrategyHypothesisArgs(btcDatasetPath: string, ethDatasetPath: str
     "--validation-comparison-tolerance-pp", "0.000001",
     "--validation-minimum-windows", "3",
   ];
+  if (btcNoTradeEvidencePath !== undefined) {
+    args.push("--btc-no-trade-evidence", btcNoTradeEvidencePath);
+  }
+  if (ethNoTradeEvidencePath !== undefined) {
+    args.push("--eth-no-trade-evidence", ethNoTradeEvidencePath);
+  }
+  return args;
+}
+
+async function writeNoTradeEvidenceFixture(datasetPath: string, label: string): Promise<string> {
+  const dataset = parseResearchCandleDataset(await readFile(datasetPath, "utf8"));
+  const evidence = createNoTradeEvidenceFixture(dataset);
+  const outputPath = path.join(path.dirname(datasetPath), `${label}.no-trade.json`);
+  await writeFile(outputPath, `${JSON.stringify(evidence, null, 2)}\n`, "utf8");
+  return outputPath;
+}
+
+function createNoTradeEvidenceFixture(
+  dataset: ResearchCandleDataset,
+): ResearchNoTradeEvidence {
+  const coverage = classifyIndependentNoTradeCoverage(dataset);
+  const unsigned: ResearchNoTradeEvidenceWithoutChecksum = {
+    provenance: {
+      schemaVersion: 1,
+      evidenceKind: "INDEPENDENT_NO_TRADE_EVIDENCE_V1",
+      asset: dataset.provenance.asset,
+      market: dataset.provenance.market,
+      parentDatasetSha256: dataset.provenance.sha256,
+      from: dataset.provenance.historyStartAt,
+      to: dataset.provenance.endAt,
+      source: "fixture-independent-no-trade",
+      lowerTimeframe: "1m",
+      collectorVersion: "fixture-v1",
+      collectedAt: dataset.provenance.collectedAt,
+    },
+    querySegments: coverage.missingRanges.map((range, index) => ({
+      ...range,
+      paginationComplete: true,
+      responseFingerprint: (index % 16).toString(16).repeat(64),
+    })),
+    verifiedNoTradeRanges: coverage.missingRanges.map((range) => ({ ...range })),
+  };
+  const evidence = {
+    ...unsigned,
+    provenance: {
+      ...unsigned.provenance,
+      sha256: computeResearchNoTradeEvidenceSha256(unsigned),
+    },
+  };
+  return evidence;
+}
+
+function mutateDatasetAtOrAfter(
+  dataset: ResearchCandleDataset,
+  from: string,
+): ResearchCandleDataset {
+  const boundary = parsePerformanceTimestamp(from);
+  assert.ok(boundary);
+  let mutationCount = 0;
+  const candles = Object.fromEntries(
+    (Object.entries(dataset.candles) as Array<[
+      ResearchCandleTimeframe,
+      readonly ResearchCandle[],
+    ]>).map(([timeframe, rows]) => [
+      timeframe,
+      rows.map((candle) => {
+        const close = parsePerformanceTimestamp(candle.closeTime);
+        assert.ok(close);
+        if (close.epochNanoseconds < boundary.epochNanoseconds) return { ...candle };
+        mutationCount += 1;
+        return {
+          ...candle,
+          openPrice: candle.openPrice + 10_000,
+          highPrice: candle.highPrice + 10_000,
+          lowPrice: candle.lowPrice + 10_000,
+          closePrice: candle.closePrice + 10_000,
+          quoteVolume: candle.quoteVolume + 10_000,
+        };
+      }),
+    ]),
+  ) as Record<ResearchCandleTimeframe, ResearchCandle[]>;
+  assert.ok(mutationCount > 0, "Future-evidence fixture must mutate at least one candle.");
+  const { sha256: _datasetSha256, ...provenance } = dataset.provenance;
+  const unsigned = { provenance, candles };
+  return {
+    provenance: {
+      ...provenance,
+      sha256: calculateResearchCandleDatasetChecksum(unsigned),
+    },
+    candles,
+  };
+}
+
+function withoutWholeDatasetIdentity(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutWholeDatasetIdentity);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .filter(([key]) => key !== "datasetSha256" && key !== "datasetFingerprint")
+    .map(([key, nested]) => [key, withoutWholeDatasetIdentity(nested)]));
 }
 
 type ConditionalAddPolicyEvaluationFixture = {
@@ -2075,9 +2921,13 @@ function removeArg(args: readonly string[], key: string): string[] {
 async function createDisposableDatabase(
   label: string,
   seed?: (db: DatabaseSync) => void,
+  stablePath = false,
 ): Promise<string> {
   await mkdir(TMP_ROOT, { recursive: true });
-  const databasePath = path.join(TMP_ROOT, `${label}-${process.pid}-${Date.now()}.sqlite`);
+  const databasePath = stablePath
+    ? `.tmp-db-tests/integrated-strategy-evaluation/${label}.sqlite`
+    : path.join(TMP_ROOT, `${label}-${process.pid}-${Date.now()}.sqlite`);
+  if (stablePath) await rm(databasePath, { force: true });
   const db = new DatabaseSync(databasePath);
   try {
     db.exec(`
@@ -2256,6 +3106,10 @@ async function cleanupFixture(databasePath: string): Promise<void> {
 
 async function sha256File(filePath: string): Promise<string> {
   return createHash("sha256").update(await readFile(filePath)).digest("hex");
+}
+
+function sha256Text(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 async function withFixtureResource<T, R>(

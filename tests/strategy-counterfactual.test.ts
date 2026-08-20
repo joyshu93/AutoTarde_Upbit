@@ -6,11 +6,19 @@ import {
   type PositionGuardBacktestFrame,
 } from "../src/modules/strategy/position-guard-backtest.js";
 import {
+  COMBINED_CONSERVATIVE_ABLATION_RESEARCH_MANIFEST,
   BROAD_LOSS_CAUSE_RESEARCH_MANIFEST,
+  SUPPORTED_COUNTERFACTUAL_SCENARIOS,
   runCounterfactualScenarios,
   type CounterfactualInput,
   type CounterfactualScenario,
 } from "../src/modules/performance/strategy-counterfactual.js";
+import {
+  BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY,
+  COMBINED_CONSERVATIVE_COMPONENTS,
+  FROZEN_BROAD_LOSS_CAUSE_SCENARIO_ORDER,
+} from
+  "../src/modules/strategy/position-guard-research-manifest.js";
 import { test } from "./harness.js";
 
 test("counterfactual BASELINE has parity with the existing no-policy engine", () => {
@@ -90,6 +98,87 @@ test("counterfactual maps all six frozen broad-loss scenarios without reordering
     ...createCounterfactualInput(scenarios),
     initialQuantity: 0,
     initialAverageEntryPrice: 0,
+  });
+
+  assert.deepEqual(result.map(({ scenario }) => scenario), scenarios);
+  assert.deepEqual(result.map(({ executionPolicy }) => executionPolicy), scenarios.map((id) => ({ id })));
+});
+
+test("counterfactual exposes exactly four immutable combined ablations outside broad scenario order", () => {
+  const expected = [
+    "COMBINED_MINUS_HTF_TREND_GATE",
+    "COMBINED_MINUS_EARLY_THESIS_FAILURE",
+    "COMBINED_MINUS_ADD_LIMITED",
+    "COMBINED_MINUS_COOLDOWN_CONTROL",
+  ];
+
+  assert.deepEqual(COMBINED_CONSERVATIVE_ABLATION_RESEARCH_MANIFEST.scenarioOrder, expected);
+  assert.equal(
+    COMBINED_CONSERVATIVE_COMPONENTS,
+    BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY.policy.scenarios.COMBINED_CONSERVATIVE.components,
+  );
+  assert.deepEqual(COMBINED_CONSERVATIVE_ABLATION_RESEARCH_MANIFEST.scenarios, {
+    COMBINED_MINUS_HTF_TREND_GATE: {
+      inactiveComponent: "HTF_TREND_GATE",
+      activeComponents: ["EARLY_THESIS_FAILURE", "ADD_LIMITED", "COOLDOWN_CONTROL"],
+    },
+    COMBINED_MINUS_EARLY_THESIS_FAILURE: {
+      inactiveComponent: "EARLY_THESIS_FAILURE",
+      activeComponents: ["HTF_TREND_GATE", "ADD_LIMITED", "COOLDOWN_CONTROL"],
+    },
+    COMBINED_MINUS_ADD_LIMITED: {
+      inactiveComponent: "ADD_LIMITED",
+      activeComponents: ["HTF_TREND_GATE", "EARLY_THESIS_FAILURE", "COOLDOWN_CONTROL"],
+    },
+    COMBINED_MINUS_COOLDOWN_CONTROL: {
+      inactiveComponent: "COOLDOWN_CONTROL",
+      activeComponents: ["HTF_TREND_GATE", "EARLY_THESIS_FAILURE", "ADD_LIMITED"],
+    },
+  });
+  assert.deepEqual(COMBINED_CONSERVATIVE_ABLATION_RESEARCH_MANIFEST.precedence, [
+    "PRESERVE_RISK_REDUCTION",
+    "EARLY_THESIS_FAILURE",
+    "COOLDOWN_CONTROL",
+    "HTF_TREND_GATE",
+    "ADD_LIMITED",
+  ]);
+  assert.deepEqual(FROZEN_BROAD_LOSS_CAUSE_SCENARIO_ORDER, [
+    "HTF_TREND_GATE",
+    "STRICT_PULLBACK",
+    "EARLY_THESIS_FAILURE",
+    "ADD_LIMITED",
+    "COOLDOWN_CONTROL",
+    "COMBINED_CONSERVATIVE",
+  ]);
+  assert.equal(
+    (COMBINED_CONSERVATIVE_ABLATION_RESEARCH_MANIFEST.components as readonly string[])
+      .includes("STRICT_PULLBACK"),
+    false,
+  );
+  assert.equal(Object.isFrozen(COMBINED_CONSERVATIVE_ABLATION_RESEARCH_MANIFEST), true);
+  assert.equal(Object.isFrozen(COMBINED_CONSERVATIVE_ABLATION_RESEARCH_MANIFEST.scenarios), true);
+  assert.deepEqual(
+    SUPPORTED_COUNTERFACTUAL_SCENARIOS.slice(-4),
+    expected,
+  );
+});
+
+test("counterfactual replays all four combined ablation policies in caller order", () => {
+  const scenarios = [
+    "COMBINED_MINUS_COOLDOWN_CONTROL",
+    "COMBINED_MINUS_ADD_LIMITED",
+    "COMBINED_MINUS_EARLY_THESIS_FAILURE",
+    "COMBINED_MINUS_HTF_TREND_GATE",
+  ] as const satisfies readonly CounterfactualScenario[];
+  const result = runCounterfactualScenarios({
+    ...createCounterfactualInput(scenarios),
+    researchCarryInState: {
+      currentEpisodeAddCount: 0,
+      currentEpisodeRealizedPnlKrw: 0,
+      lastFullExitAt: null,
+      lastFullExitRealizedPnlKrw: null,
+      lastEntryPath: null,
+    },
   });
 
   assert.deepEqual(result.map(({ scenario }) => scenario), scenarios);

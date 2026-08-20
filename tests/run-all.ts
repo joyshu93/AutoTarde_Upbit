@@ -1,3 +1,9 @@
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
 await import("./env.test.js");
 await import("./create-app.test.js");
 await import("./db-sqlite-wiring.test.js");
@@ -44,6 +50,10 @@ await import("./performance-add-excursions.test.js");
 await import("./performance-add-loss-attribution.test.js");
 await import("./performance-add-holdout-hypothesis.test.js");
 await import("./performance-strategy-hypothesis-evaluation.test.js");
+await import("./performance-combined-conservative-holdout.test.js");
+await import("./performance-holdout-failure-diagnostics.test.js");
+await import("./performance-holdout-episode-attribution.test.js");
+await import("./performance-component-ablation.test.js");
 await import("./position-guard-backtest-frames.test.js");
 await import("./position-guard-backtest-report.test.js");
 await import("./position-guard-public-backtest.test.js");
@@ -55,6 +65,8 @@ await import("./research-candle-dataset.test.js");
 await import("./research-no-trade-evidence.test.js");
 await import("./research-candle-dataset-builder.test.js");
 await import("./upbit-research-candle-acquisition.test.js");
+await import("./upbit-no-trade-evidence-acquisition.test.js");
+await import("./upbit-no-trade-evidence-cli.test.js");
 await import("./upbit-candle-dataset-cli.test.js");
 await import("./performance-regimes.test.js");
 await import("./performance-excursions.test.js");
@@ -62,3 +74,22 @@ await import("./performance-report.test.js");
 await import("./integrated-strategy-evaluation.test.js");
 const { runRegisteredTests } = await import("./harness.js");
 await runRegisteredTests();
+
+// Node test suites are isolated from the repository's shared custom harness.
+const prospectiveTestPaths = [
+  "./performance-prospective-shadow-registration.test.js",
+  "./performance-prospective-shadow-registration-writer.test.js",
+  "./performance-prospective-shadow-commitment.test.js",
+  "./prospective-shadow-git-commitment-reader.test.js",
+  "./prospective-shadow-commitment-cli.test.js",
+  "./performance-prospective-shadow-evaluation.test.js",
+  "./performance-prospective-shadow-replay.test.js",
+  "./prospective-component-shadow-cli.test.js",
+  "./prospective-shadow-dependency-boundary.test.js",
+].map((relativePath) => fileURLToPath(new URL(relativePath, import.meta.url)));
+const prospectiveResult = await execFileAsync(process.execPath, ["--test", ...prospectiveTestPaths], {
+  encoding: "utf8",
+  maxBuffer: 4 * 1024 * 1024,
+});
+process.stdout.write(prospectiveResult.stdout);
+process.stderr.write(prospectiveResult.stderr);

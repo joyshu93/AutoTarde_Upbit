@@ -8,7 +8,10 @@ import {
   type PositionGuardBacktestResearchExecutionPolicyId,
   type PositionGuardBacktestResult,
 } from "../strategy/position-guard-backtest.js";
-import { BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY } from
+import {
+  BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY,
+  COMBINED_CONSERVATIVE_ABLATION_RESEARCH_AUTHORITY,
+} from
   "../strategy/position-guard-research-manifest.js";
 import type { PerformanceOpeningPosition } from "./performance-calculator.js";
 import {
@@ -35,6 +38,7 @@ export const SUPPORTED_COUNTERFACTUAL_SCENARIOS = Object.freeze([
   "ADD_HIGH_ALIGNMENT",
   "ADD_CORE_TREND",
   ...BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY.scenarioOrder,
+  ...COMBINED_CONSERVATIVE_ABLATION_RESEARCH_AUTHORITY.scenarioOrder,
 ] as const satisfies readonly CounterfactualScenario[]);
 
 export function isSupportedCounterfactualScenario(
@@ -69,6 +73,9 @@ export const BROAD_LOSS_CAUSE_RESEARCH_MANIFEST = Object.freeze({
   scenarioOrder: BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY.scenarioOrder,
   scenarios: BROAD_LOSS_CAUSE_RESEARCH_AUTHORITY.policy.scenarios,
 });
+
+export const COMBINED_CONSERVATIVE_ABLATION_RESEARCH_MANIFEST =
+  COMBINED_CONSERVATIVE_ABLATION_RESEARCH_AUTHORITY;
 
 type CounterfactualExecutionPolicy = PositionGuardBacktestResearchExecutionPolicy<
   PositionGuardBacktestResearchExecutionPolicyId
@@ -243,6 +250,14 @@ function policyForScenario(
       return { id: "COOLDOWN_CONTROL" };
     case "COMBINED_CONSERVATIVE":
       return { id: "COMBINED_CONSERVATIVE" };
+    case "COMBINED_MINUS_HTF_TREND_GATE":
+      return { id: "COMBINED_MINUS_HTF_TREND_GATE" };
+    case "COMBINED_MINUS_EARLY_THESIS_FAILURE":
+      return { id: "COMBINED_MINUS_EARLY_THESIS_FAILURE" };
+    case "COMBINED_MINUS_ADD_LIMITED":
+      return { id: "COMBINED_MINUS_ADD_LIMITED" };
+    case "COMBINED_MINUS_COOLDOWN_CONTROL":
+      return { id: "COMBINED_MINUS_COOLDOWN_CONTROL" };
     default: {
       const exhaustiveScenario: never = scenario;
       throw new Error(`Invalid counterfactual scenario ${String(exhaustiveScenario)}.`);
