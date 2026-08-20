@@ -190,6 +190,12 @@ export type ProspectiveShadowRegistry = Readonly<{
   abandoned: boolean;
 }>;
 
+export type ProspectiveShadowRegistrationDraft = Readonly<{
+  registration: ProspectiveShadowRegistration;
+  registrationBytes: string;
+  registryBytes: string;
+}>;
+
 const HOUR_NS = 3_600_000_000_000n;
 const REGISTRATION_DELAY_NS = BigInt(PROSPECTIVE_SHADOW_REGISTRATION_PREPARATION_LEAD_MS) * 1_000_000n;
 const NS_PER_MS = 1_000_000n;
@@ -237,6 +243,25 @@ export function createProspectiveShadowRegistration(
     safety: { readOnly: true, deploymentApproval: false, liveApproval: false, boundary: SAFETY_BOUNDARY },
   };
   return deepFreeze({ ...unsigned, payloadSha256: sha256(unsigned) });
+}
+
+export function createProspectiveShadowRegistrationDraft(
+  input: CreateProspectiveShadowRegistrationInput,
+): ProspectiveShadowRegistrationDraft {
+  const registration = createProspectiveShadowRegistration(input);
+  const registeredEvent: ProspectiveShadowRegisteredEvent = {
+    schemaVersion: 1,
+    authority: registration.authority,
+    experimentId: registration.experimentId,
+    event: "REGISTERED",
+    eventAt: registration.registeredAt,
+    registrationPayloadSha256: registration.payloadSha256,
+  };
+  return Object.freeze({
+    registration,
+    registrationBytes: serializeProspectiveShadowRegistration(registration),
+    registryBytes: serializeProspectiveShadowRegistryEvent(registeredEvent),
+  });
 }
 
 export function validateProspectiveShadowRegistration(value: unknown): ProspectiveShadowRegistration {

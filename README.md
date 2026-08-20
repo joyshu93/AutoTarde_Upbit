@@ -460,6 +460,19 @@ This diagnostic was designed after an observed holdout outcome, so it is retrosp
 
 The prospective protocol is not active yet: this repository contains the implementation and workflow, but no actual `PCS-2026-001` registration artifact or registry entry has been created. Do not treat the CLI, workflow, or tests as an active experiment.
 
+Before registration, the proposed authority, fixed window, matrix, payload hash, canonical bytes, and destination paths can be inspected without creating a registration:
+
+```powershell
+npm.cmd run research:prospective-shadow -- preview `
+  --implementation-commit-sha <40-character-commit-sha> `
+  --development-authority-sha256 <64-character-sha256> `
+  --retrospective-report-sha256 <64-character-sha256>
+```
+
+`preview` is a local, non-binding pure calculation. It performs no file, Git, network, database, Upbit, Telegram, scheduler, strategy, sync, or order operation, and it does not activate the experiment. It reports the canonical bytes and paths that a later `register` command would write. The later registration samples its clock again, so its `registeredAt`, `[from,to)` window, canonical bytes, and payload SHA-256 can differ from the preview.
+
+Text is the default output. Add `--output json` for the complete stable machine-readable preview; both formats include the canonical registration and registry bytes.
+
 Activation is deliberately split into two public stages:
 
 1. **Publication A:** land and publicly push the complete implementation plus `.github/workflows/prospective-shadow-registration.yml` on canonical `origin/main`.

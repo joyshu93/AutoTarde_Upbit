@@ -15,6 +15,7 @@ import {
 } from "../modules/performance/performance-prospective-shadow-registration-writer.js";
 import {
   PROSPECTIVE_SHADOW_REGISTRATION_PATH,
+  PROSPECTIVE_SHADOW_REGISTRY_PATH,
   validateProspectiveShadowClosureCommitment,
   validateProspectiveShadowCommitment,
   validateProspectiveShadowPersistedWorkflowMetadata,
@@ -24,6 +25,7 @@ import {
 } from "../modules/performance/performance-prospective-shadow-commitment.js";
 import {
   PROSPECTIVE_SHADOW_POLICY_MANIFEST,
+  createProspectiveShadowRegistrationDraft,
   parseProspectiveShadowRegistry,
   serializeProspectiveShadowRegistration,
   validateProspectiveShadowRegistration,
@@ -63,6 +65,13 @@ type RegisterOptions = Readonly<{
   developmentAuthoritySha256: string;
   retrospectiveReportSha256: string;
 }>;
+type PreviewOptions = Readonly<{
+  command: "preview";
+  implementationCommitSha: string;
+  developmentAuthoritySha256: string;
+  retrospectiveReportSha256: string;
+  output: "json" | "text";
+}>;
 type AbandonOptions = Readonly<{
   command: "abandon";
   abandonedAt: string;
@@ -87,7 +96,29 @@ type FinalEvaluateOptions = Readonly<{
   requiredFeatureLookbackCandles: number;
 }>;
 
-export type ProspectiveComponentShadowCliOptions = RegisterOptions | AbandonOptions | CollectingOptions | FinalEvaluateOptions;
+export type ProspectiveComponentShadowCliOptions = PreviewOptions | RegisterOptions | AbandonOptions | CollectingOptions | FinalEvaluateOptions;
+
+export type ProspectiveShadowRegistrationPreview = Readonly<{
+  schemaVersion: 1;
+  status: "NOT_REGISTERED";
+  registration: ProspectiveShadowRegistration;
+  canonicalRegistrationBytes: string;
+  canonicalRegistryBytes: string;
+  wouldWrite: Readonly<{
+    registrationPath: typeof PROSPECTIVE_SHADOW_REGISTRATION_PATH;
+    registryPath: typeof PROSPECTIVE_SHADOW_REGISTRY_PATH;
+  }>;
+  publicCommitmentVerified: false;
+  experimentActivated: false;
+  safety: Readonly<{
+    binding: false;
+    writesPerformed: false;
+    gitAccessed: false;
+    networkAccessed: false;
+    databaseAccessed: false;
+    actualRegistrationResamplesClock: true;
+  }>;
+}>;
 
 export type ProspectiveComponentShadowReport = Readonly<{
   schemaVersion: 1;
@@ -130,11 +161,14 @@ export type ProspectiveComponentShadowReport = Readonly<{
   }>;
 }>;
 
-export type ProspectiveComponentShadowCliResult = Readonly<{
-  command: ProspectiveComponentShadowCliOptions["command"];
-  report: ProspectiveComponentShadowReport | null;
-  reportDirectoryPath?: string;
-}>;
+export type ProspectiveComponentShadowCliResult =
+  | Readonly<{ command: "preview"; report: null; preview: ProspectiveShadowRegistrationPreview }>
+  | Readonly<{ command: "abandon"; report: null }>
+  | Readonly<{
+    command: "register" | "inspect" | "evaluate";
+    report: ProspectiveComponentShadowReport;
+    reportDirectoryPath?: string;
+  }>;
 
 export interface ProspectiveComponentShadowCliDependencies {
   readonly repositoryRoot: string;
@@ -184,10 +218,20 @@ const nodeProspectiveComponentShadowReportFileSystem: ProspectiveComponentShadow
 
 export function parseProspectiveComponentShadowArgs(argv: readonly string[]): ProspectiveComponentShadowCliOptions {
   const command = argv[0];
-  if (command !== "register" && command !== "abandon" && command !== "inspect" && command !== "evaluate") {
-    throw new Error("First argument must be register, abandon, inspect, or evaluate.");
+  if (command !== "preview" && command !== "register" && command !== "abandon" && command !== "inspect" && command !== "evaluate") {
+    throw new Error("First argument must be preview, register, abandon, inspect, or evaluate.");
   }
   const values = parseValues(argv.slice(1));
+  if (command === "preview") {
+    assertOnly(values, ["implementation-commit-sha", "development-authority-sha256", "retrospective-report-sha256", "output"]);
+    return {
+      command,
+      implementationCommitSha: requireCommit(requireValue(values, "implementation-commit-sha"), "--implementation-commit-sha"),
+      developmentAuthoritySha256: requireSha256(requireValue(values, "development-authority-sha256"), "--development-authority-sha256"),
+      retrospectiveReportSha256: requireSha256(requireValue(values, "retrospective-report-sha256"), "--retrospective-report-sha256"),
+      output: optionalOutput(values.get("output")),
+    };
+  }
   if (command === "register") {
     assertOnly(values, ["implementation-commit-sha", "development-authority-sha256", "retrospective-report-sha256"]);
     return {
@@ -244,6 +288,41 @@ export async function runProspectiveComponentShadowCli(
 ): Promise<ProspectiveComponentShadowCliResult> {
   options = structuredClone(options);
   const repositoryRoot = dependencies.repositoryRoot;
+  if (options.command === "preview") {
+    const registeredAt = normalizedNow(dependencies.now, "Registration preview clock");
+    const draft = createProspectiveShadowRegistrationDraft({
+      implementationCommitSha: options.implementationCommitSha,
+      developmentAuthoritySha256: options.developmentAuthoritySha256,
+      retrospectiveReportSha256: options.retrospectiveReportSha256,
+      policyManifest: PROSPECTIVE_SHADOW_POLICY_MANIFEST,
+      registeredAt,
+    });
+    return {
+      command: "preview",
+      report: null,
+      preview: {
+        schemaVersion: 1,
+        status: "NOT_REGISTERED",
+        registration: draft.registration,
+        canonicalRegistrationBytes: draft.registrationBytes,
+        canonicalRegistryBytes: draft.registryBytes,
+        wouldWrite: {
+          registrationPath: PROSPECTIVE_SHADOW_REGISTRATION_PATH,
+          registryPath: PROSPECTIVE_SHADOW_REGISTRY_PATH,
+        },
+        publicCommitmentVerified: false,
+        experimentActivated: false,
+        safety: {
+          binding: false,
+          writesPerformed: false,
+          gitAccessed: false,
+          networkAccessed: false,
+          databaseAccessed: false,
+          actualRegistrationResamplesClock: true,
+        },
+      },
+    };
+  }
   if (options.command === "register") {
     const registrationOptions = options as RegisterOptions;
     const registeredAt = normalizedNow(dependencies.now, "Registration clock");
@@ -461,6 +540,42 @@ export function formatProspectiveComponentShadowReport(report: ProspectiveCompon
   return lines.join("\n");
 }
 
+export function formatProspectiveShadowRegistrationPreview(
+  preview: ProspectiveShadowRegistrationPreview,
+  output: "json" | "text",
+): string {
+  if (output === "json") return `${stableJson(preview)}\n`;
+  const registration = preview.registration;
+  return [
+    "PROSPECTIVE REGISTRATION PREVIEW - NON-BINDING; NO EXPERIMENT WAS REGISTERED.",
+    `status: ${preview.status}`,
+    `experiment: ${registration.experimentId}`,
+    `authority: ${registration.authority}`,
+    `implementation_commit_sha: ${registration.implementationCommitSha}`,
+    `development_authority_sha256: ${registration.developmentAuthoritySha256}`,
+    `retrospective_report_sha256: ${registration.retrospectiveReportSha256}`,
+    `preview_registered_at: ${registration.registeredAt}`,
+    `preview_window: [${registration.window.from}, ${registration.window.to})`,
+    `duration_ms: ${registration.window.durationMs}`,
+    `assets: ${registration.matrix.assets.map((entry) => `${entry.asset}:${entry.market}`).join(",")}`,
+    `scenarios: ${registration.matrix.scenarios.join(",")}`,
+    `timings: ${registration.matrix.timings.join(",")}`,
+    `costs: ${registration.matrix.costs.map((entry) => `${entry.id}(fee=${entry.feeRate},slippage=${entry.slippageRate})`).join(",")}`,
+    `path_count: ${registration.matrix.pathCount}`,
+    `minimum_order_value_krw: ${registration.minimumOrderValueKrw}`,
+    `payload_sha256: ${registration.payloadSha256}`,
+    `canonical_registration_bytes: ${preview.canonicalRegistrationBytes.trimEnd()}`,
+    `canonical_registry_bytes: ${preview.canonicalRegistryBytes.trimEnd()}`,
+    `would_write_registration: ${preview.wouldWrite.registrationPath}`,
+    `would_write_registry: ${preview.wouldWrite.registryPath}`,
+    `writes_performed: ${preview.safety.writesPerformed}`,
+    `public_commitment_verified: ${preview.publicCommitmentVerified}`,
+    `experiment_activated: ${preview.experimentActivated}`,
+    "Actual registration will resample the clock, so registeredAt, window, canonical bytes, and payload SHA-256 may change.",
+    "This preview is not publication commitment, deployment approval, strategy approval, DRY_RUN approval, or LIVE approval.",
+  ].join("\n");
+}
+
 function appendCommitmentTechnicalDetail(lines: string[], report: ProspectiveComponentShadowReport): void {
   const evidence = report.provenance.evidence;
   if (evidence === null) {
@@ -630,6 +745,11 @@ function assertOnly(values: ReadonlyMap<string, string>, allowed: readonly strin
 function requireValue(values: ReadonlyMap<string, string>, key: string): string {
   const value = values.get(key);
   if (value === undefined) throw new Error(`Missing required argument --${key}.`);
+  return value;
+}
+function optionalOutput(value: string | undefined): "json" | "text" {
+  if (value === undefined) return "text";
+  if (value !== "json" && value !== "text") throw new Error("--output must be text or json.");
   return value;
 }
 function requireTimestamp(value: string, label: string): string {
@@ -917,6 +1037,11 @@ function samePath(left: string, right: string): boolean {
 async function main(): Promise<void> {
   const options = parseProspectiveComponentShadowArgs(process.argv.slice(2));
   const result = await runProspectiveComponentShadowCli(options, createDefaultDependencies(process.cwd()));
+  if (options.command === "preview") {
+    if (result.command !== "preview") throw new Error("Preview command returned an invalid result variant.");
+    process.stdout.write(formatProspectiveShadowRegistrationPreview(result.preview, options.output));
+    return;
+  }
   console.log(result.report === null
     ? "Prospective component shadow abandonment was appended through the locked registry writer. No evaluation or replay was run."
     : formatProspectiveComponentShadowReport(result.report, "text"));

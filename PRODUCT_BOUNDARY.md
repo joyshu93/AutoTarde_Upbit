@@ -144,6 +144,8 @@ Verified source no-trade intervals are absence evidence only: they contribute no
 
 The `PROSPECTIVE_COMPONENT_SHADOW_V1` protocol is offline research only. Its public procedure has two distinct publication stages: Publication A first lands the complete implementation and read-only workflow on public `origin/main`; the experiment authority is then frozen against that commit with a 72-hour preparation lead; Publication B later adds only the canonical registration and registry entry. Its successful Actions run must have a GitHub server `created_at` at least 48 hours before the future window. The Publication B Actions run supplies the external commitment evidence. Neither stage connects the experiment to APIs, operational SQLite/DB, Upbit acquisition, Telegram, orders, scheduler/runtime, process control beyond narrowly allowlisted read-only Git inspection, or LIVE approval. No actual `PCS-2026-001` registration has been created in this repository yet.
 
+The optional prospective registration preview is a non-binding local calculation only. It writes nothing, accesses no Git/network/database/operational service, does not activate or publicly commit an experiment, and grants no strategy, deployment, DRY_RUN, scheduler, order, or LIVE authority.
+
 The registered window is a fixed 120-day `[from,to)` no-peek period. Before `to`, the only valid evaluation state is `COLLECTING`; after the boundary the result may be `REGISTRATION_INVALID`, `REJECTED`, `INSUFFICIENT`, or `SUPPORTS_CONTINUED_SHADOW` according to the frozen evidence policy. None of these statuses authorizes strategy changes, deployment, DRY_RUN/LIVE execution, or order transmission.
 
 ## Design Consequences

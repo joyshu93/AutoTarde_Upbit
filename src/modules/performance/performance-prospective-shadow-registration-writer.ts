@@ -4,7 +4,7 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import {
   PROSPECTIVE_SHADOW_AUTHORITY,
   PROSPECTIVE_SHADOW_EXPERIMENT_ID,
-  createProspectiveShadowRegistration,
+  createProspectiveShadowRegistrationDraft,
   parseProspectiveShadowRegistry,
   serializeProspectiveShadowRegistration,
   serializeProspectiveShadowRegistryEvent,
@@ -12,7 +12,6 @@ import {
   type CreateProspectiveShadowRegistrationInput,
   type ProspectiveShadowAbandonedEvent,
   type ProspectiveShadowRegistration,
-  type ProspectiveShadowRegisteredEvent,
 } from "./performance-prospective-shadow-registration.js";
 import { parsePerformanceTimestamp } from "./performance-timestamp.js";
 
@@ -108,23 +107,14 @@ export async function publishProspectiveShadowRegistration(
   const suffix = requireSafeSuffix(dependencies.randomSuffix());
   const paths = publicationPaths(detachedInput.repositoryRoot);
   const owner = `${PROSPECTIVE_SHADOW_EXPERIMENT_ID}:${suffix}\n`;
-  const registration = createProspectiveShadowRegistration({
+  const draft = createProspectiveShadowRegistrationDraft({
     registeredAt,
     implementationCommitSha: detachedInput.implementationCommitSha,
     developmentAuthoritySha256: detachedInput.developmentAuthoritySha256,
     retrospectiveReportSha256: detachedInput.retrospectiveReportSha256,
     policyManifest: detachedInput.policyManifest,
   });
-  const registrationBytes = serializeProspectiveShadowRegistration(registration);
-  const registeredEvent: ProspectiveShadowRegisteredEvent = {
-    schemaVersion: 1,
-    authority: PROSPECTIVE_SHADOW_AUTHORITY,
-    experimentId: PROSPECTIVE_SHADOW_EXPERIMENT_ID,
-    event: "REGISTERED",
-    eventAt: registration.registeredAt,
-    registrationPayloadSha256: registration.payloadSha256,
-  };
-  const registryBytes = serializeProspectiveShadowRegistryEvent(registeredEvent);
+  const { registration, registrationBytes, registryBytes } = draft;
   let directoryReserved = false;
   let directoryOwned = false;
 

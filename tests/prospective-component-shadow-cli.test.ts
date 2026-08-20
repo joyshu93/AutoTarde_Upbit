@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import {
   formatProspectiveComponentShadowReport,
+  formatProspectiveShadowRegistrationPreview,
   parseProspectiveComponentShadowArgs,
   publishProspectiveComponentShadowReport,
   readProspectiveComponentShadowInspection,
@@ -20,6 +23,7 @@ import {
 } from "../src/research/prospective-component-shadow.js";
 import {
   PROSPECTIVE_SHADOW_POLICY_MANIFEST,
+  createProspectiveShadowRegistrationDraft,
   createProspectiveShadowRegistration,
   serializeProspectiveShadowRegistration,
   serializeProspectiveShadowRegistryEvent,
@@ -42,6 +46,7 @@ import type { PositionGuardBacktestFrame } from "../src/modules/strategy/positio
 
 const IMPLEMENTATION = "1".repeat(40);
 const PUBLICATION = "2".repeat(40);
+const execFileAsync = promisify(execFile);
 
 test("CLI import exposes pure helpers without constructing a runtime, database, network client, or report artifact", () => {
   assert.equal(typeof parseProspectiveComponentShadowArgs, "function");
@@ -73,6 +78,151 @@ test("register rejects caller-controlled time and accepts only authority inputs"
     ]),
     /unknown argument --registered-at/i,
   );
+});
+
+test("preview accepts the exact register authority contract without caller-controlled time", () => {
+  assert.deepEqual(
+    parseProspectiveComponentShadowArgs([
+      "preview",
+      "--implementation-commit-sha", IMPLEMENTATION,
+      "--development-authority-sha256", "a".repeat(64),
+      "--retrospective-report-sha256", "b".repeat(64),
+    ]),
+    {
+      command: "preview",
+      implementationCommitSha: IMPLEMENTATION,
+      developmentAuthoritySha256: "a".repeat(64),
+      retrospectiveReportSha256: "b".repeat(64),
+      output: "text",
+    },
+  );
+  assert.deepEqual(
+    parseProspectiveComponentShadowArgs([
+      "preview",
+      "--implementation-commit-sha", IMPLEMENTATION,
+      "--development-authority-sha256", "a".repeat(64),
+      "--retrospective-report-sha256", "b".repeat(64),
+      "--output", "json",
+    ]),
+    {
+      command: "preview",
+      implementationCommitSha: IMPLEMENTATION,
+      developmentAuthoritySha256: "a".repeat(64),
+      retrospectiveReportSha256: "b".repeat(64),
+      output: "json",
+    },
+  );
+  assert.throws(
+    () => parseProspectiveComponentShadowArgs([
+      "preview",
+      "--implementation-commit-sha", IMPLEMENTATION,
+      "--development-authority-sha256", "a".repeat(64),
+      "--retrospective-report-sha256", "b".repeat(64),
+      "--output", "yaml",
+    ]),
+    /output.*text or json/i,
+  );
+  assert.throws(
+    () => parseProspectiveComponentShadowArgs([
+      "preview", "--registered-at", "2026-08-20T00:00:00Z",
+      "--implementation-commit-sha", IMPLEMENTATION,
+      "--development-authority-sha256", "a".repeat(64),
+      "--retrospective-report-sha256", "b".repeat(64),
+    ]),
+    /unknown argument --registered-at/i,
+  );
+});
+
+test("preview calculates the canonical registration without publishing or reading side effects", async () => {
+  const events: string[] = [];
+  const result = await runProspectiveComponentShadowCli(
+    parseProspectiveComponentShadowArgs([
+      "preview",
+      "--implementation-commit-sha", IMPLEMENTATION,
+      "--development-authority-sha256", "a".repeat(64),
+      "--retrospective-report-sha256", "b".repeat(64),
+    ]),
+    dependencies(events),
+  );
+
+  assert.deepEqual(events, ["now"]);
+  assert.equal(result.command, "preview");
+  if (result.command !== "preview") assert.fail("Expected preview result.");
+  assert.equal(result.report, null);
+  assert.equal(result.preview.registration.registeredAt, "2026-08-20T00:00:00.000Z");
+  assert.equal(result.preview.registration.window.from, "2026-08-23T00:00:00.000Z");
+  assert.equal(result.preview.registration.matrix.pathCount, 24);
+  assert.equal(result.preview.registration.payloadSha256.length, 64);
+  assert.equal(result.preview.canonicalRegistrationBytes, serializeProspectiveShadowRegistration(result.preview.registration));
+  assert.equal(result.preview.canonicalRegistryBytes, registeredRegistryBytes(result.preview.registration));
+  const sharedDraft = createProspectiveShadowRegistrationDraft({
+    registeredAt: result.preview.registration.registeredAt,
+    implementationCommitSha: IMPLEMENTATION,
+    developmentAuthoritySha256: "a".repeat(64),
+    retrospectiveReportSha256: "b".repeat(64),
+    policyManifest: PROSPECTIVE_SHADOW_POLICY_MANIFEST,
+  });
+  assert.equal(result.preview.canonicalRegistrationBytes, sharedDraft.registrationBytes);
+  assert.equal(result.preview.canonicalRegistryBytes, sharedDraft.registryBytes);
+  assert.deepEqual(result.preview.wouldWrite, {
+    registrationPath: "docs/research/prospective-shadow/PCS-2026-001.registration.json",
+    registryPath: "docs/research/prospective-shadow/registry.jsonl",
+  });
+  assert.deepEqual(result.preview.safety, {
+    binding: false,
+    writesPerformed: false,
+    gitAccessed: false,
+    networkAccessed: false,
+    databaseAccessed: false,
+    actualRegistrationResamplesClock: true,
+  });
+});
+
+test("preview formatter emits stable JSON and an explicit non-binding human summary", async () => {
+  const result = await runProspectiveComponentShadowCli(
+    parseProspectiveComponentShadowArgs([
+      "preview",
+      "--implementation-commit-sha", IMPLEMENTATION,
+      "--development-authority-sha256", "a".repeat(64),
+      "--retrospective-report-sha256", "b".repeat(64),
+    ]),
+    dependencies([]),
+  );
+  assert.equal(result.command, "preview");
+  if (result.command !== "preview") assert.fail("Expected preview result.");
+
+  const json = formatProspectiveShadowRegistrationPreview(result.preview, "json");
+  const text = formatProspectiveShadowRegistrationPreview(result.preview, "text");
+  assert.deepEqual(JSON.parse(json), result.preview);
+  assert.equal(json, formatProspectiveShadowRegistrationPreview(result.preview, "json"));
+  assert.match(text, /PREVIEW.*NON-BINDING/i);
+  assert.match(text, /writes_performed: false/i);
+  assert.match(text, /path_count: 24/i);
+  assert.match(text, /canonical_registration_bytes:/i);
+  assert.match(text, /canonical_registry_bytes:/i);
+  assert.match(text, /actual registration.*resample/i);
+});
+
+test("preview CLI JSON entrypoint leaves its working directory empty", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "prospective-preview-"));
+  try {
+    const cliPath = path.resolve("dist/src/research/prospective-component-shadow.js");
+    const { stdout, stderr } = await execFileAsync(process.execPath, [
+      cliPath,
+      "preview",
+      "--implementation-commit-sha", IMPLEMENTATION,
+      "--development-authority-sha256", "a".repeat(64),
+      "--retrospective-report-sha256", "b".repeat(64),
+      "--output", "json",
+    ], { cwd: directory });
+    const parsed = JSON.parse(stdout) as { status?: unknown; safety?: { writesPerformed?: unknown } };
+    assert.equal(parsed.status, "NOT_REGISTERED");
+    assert.equal(parsed.safety?.writesPerformed, false);
+    assert.equal(stderr, "");
+    assert.deepEqual(await readdir(directory), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("parser rejects duplicate, unknown, partial, invalid timestamp, and invalid integer inputs without defaults", () => {

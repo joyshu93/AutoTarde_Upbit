@@ -363,6 +363,8 @@ The workflow has only `contents: read` and `actions: read`. It performs one evid
 
 Static dependency characterization walks the prospective graph recursively. It forbids app, execution, exchange, reconciliation, Telegram, migrations, scheduler/runtime, SQLite/operational DB, Upbit acquisition, secret, and operational process-control dependencies, and it forbids the runtime graph from importing prospective modules. The only process exception is narrowly scoped read-only `git` inspection used to verify public commitment and the exact clean implementation checkout. No result enters strategy, order, scheduler, Telegram, migration, or LIVE dependency graphs, and no actual `PCS-2026-001` registration exists yet.
 
+The prospective CLI `preview` path is stricter than registration inspection: it samples the clock once and uses only pure registration construction and serialization. It has no writer or read adapter, performs no Git, network, database, runtime, or operational call, and returns `NOT_REGISTERED` with explicit zero-side-effect flags. A later `register` invocation independently samples its clock and is the only path that may create the canonical registration and registry files.
+
 ## Failure Posture
 
 The system prefers explicit failure records over silent suppression.
