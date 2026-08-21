@@ -1445,6 +1445,44 @@ async function assertAtomicLifecycleContract(repository: ExecutionRepository): P
   assert.equal((await repository.listFills(submittedOrder.id)).length, 1);
   assert.equal((await repository.listFills(submittedOrder.id))[0]?.price, "500000");
 
+  const filledOrder = createOrderRecord({
+    id: "atomic-filled-order",
+    status: "PERSISTED",
+    updatedAt: "2026-08-21T00:00:03.000Z",
+  });
+  await repository.persistOrderIntent({
+    order: filledOrder,
+    event: createOrderEvent(filledOrder.id, "atomic-filled-intent", "ORDER_PERSISTED"),
+  });
+  const terminalOrder = { ...filledOrder, status: "FILLED" as const, upbitUuid: "atomic-filled-uuid" };
+  const terminalSubmission = createOrderEvent(terminalOrder.id, "atomic-filled-submission", "ORDER_SUBMITTED");
+  terminalSubmission.eventSource = "EXCHANGE";
+  const terminalEvent = createOrderEvent(terminalOrder.id, "atomic-filled-terminal", "ORDER_FILLED");
+  terminalEvent.eventSource = "LOCAL";
+  const terminalFill = createFill(terminalOrder.id, "atomic-filled-fill");
+  await assert.rejects(repository.persistExchangeSubmission({
+    order: terminalOrder,
+    event: terminalSubmission,
+    fills: [terminalFill],
+  }));
+  assert.equal((await repository.findOrderByReference("primary", terminalOrder.id))?.status, "PERSISTED");
+  assert.equal((await repository.listOrderEvents(terminalOrder.id)).length, 1);
+  await repository.persistExchangeSubmission({
+    order: terminalOrder,
+    event: terminalSubmission,
+    terminalEvent,
+    fills: [terminalFill],
+  });
+  await repository.persistExchangeSubmission({
+    order: { ...terminalOrder },
+    event: { ...terminalSubmission },
+    terminalEvent: { ...terminalEvent },
+    fills: [{ ...terminalFill }],
+  });
+  assert.deepEqual((await repository.listOrderEvents(terminalOrder.id)).map((event) => event.eventType).sort(), [
+    "ORDER_FILLED", "ORDER_PERSISTED", "ORDER_SUBMITTED",
+  ]);
+
   const uncertainOrder = createOrderRecord({
     id: "atomic-uncertain-order",
     status: "PERSISTED",

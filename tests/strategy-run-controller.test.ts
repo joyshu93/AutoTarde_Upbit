@@ -104,3 +104,34 @@ test("strategy preview computes order intent without calling the run path", asyn
   assert.equal(result.orderPrice, "150000");
   assert.match(result.detail, /would require \/run to persist and submit/);
 });
+
+test("strategy run propagates reconciliation and lease outcomes without calling them rejections", async () => {
+  const controller = new InlineTelegramStrategyRunController({
+    runner: {
+      async runOnce(): Promise<PositionGuardRunResult> {
+        return {
+          strategyDecisionRecord: { id: "decision-1" } as PositionGuardRunResult["strategyDecisionRecord"],
+          strategyDecision: { action: "ENTER", market: "KRW-BTC" } as PositionGuardRunResult["strategyDecision"],
+          engineDecision: {} as PositionGuardRunResult["engineDecision"],
+          context: {} as PositionGuardRunResult["context"],
+          submission: {
+            accepted: false,
+            outcome: "RECONCILIATION_REQUIRED",
+            order: { id: "order-1", status: "RECONCILIATION_REQUIRED" } as Exclude<NonNullable<PositionGuardRunResult["submission"]>["order"], null>,
+            reason: "transport outcome unknown",
+          },
+        };
+      },
+      async previewOnce(): Promise<PositionGuardPreviewResult> { throw new Error("unused"); },
+    },
+    now: () => "2026-04-20T00:00:00.000Z",
+  });
+
+  const result = await controller.requestRun({
+    exchangeAccountId: "primary", market: "KRW-BTC", requestedBy: "TELEGRAM", requestedCommand: "/run",
+  });
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.submissionOutcome, "RECONCILIATION_REQUIRED");
+  assert.doesNotMatch(result.detail, /rejected/i);
+});

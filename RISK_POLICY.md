@@ -50,7 +50,8 @@ If either condition is missing, the system must behave as non-live, and risk eva
 
 - every executable decision must acquire the account-scoped database lease after idempotency duplicate detection and before execution, risk, exchange-validation, or order-persistence work
 - `ACCOUNT_EXECUTION_LEASE_MS` must be a positive explicit configuration value; its default is `30000`
-- lease conflict or ambiguity must create no order row, make no exchange create-order call, persist `ACCOUNT_EXECUTION_LEASE_BLOCKED` evidence, and attempt an automatic pause
+- lease conflict or ambiguity must create no order row, make no exchange create-order call, persist `ACCOUNT_EXECUTION_LEASE_BLOCKED` evidence, and require a durable automatic pause; pause or release ambiguity is fatal rather than a safe blocked result
+- after durable `SUBMITTING`, ownership must be renewed and verified with a fresh clock instant immediately before the sole send; renewal ambiguity retains recovery evidence and forbids the send
 - safe pre-send exits and definitive terminal outcomes release the lease; active, uncertain, or post-send persistence-failure outcomes retain it for recovery
 
 ### Stale Price Guard

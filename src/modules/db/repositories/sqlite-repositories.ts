@@ -255,6 +255,10 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       assertSameAccount(existingOrder, input.order);
       const existingEvent = this.getOrderEventById(input.event.id);
       assertNoConflictingRecord(existingEvent, input.event, "order event");
+      if (input.terminalEvent) {
+        const existingTerminalEvent = this.getOrderEventById(input.terminalEvent.id);
+        assertNoConflictingRecord(existingTerminalEvent, input.terminalEvent, "terminal order event");
+      }
       const existingFills = input.fills.map((fill) => this.getFillByIdentity(fill));
       input.fills.forEach((fill, index) => assertNoConflictingRecord(existingFills[index] ?? null, fill, "fill"));
 
@@ -271,6 +275,7 @@ export class SqliteExecutionRepository implements ExecutionRepository {
 
       this.upsertOrder(input.order);
       this.insertOrderEvent(input.event);
+      if (input.terminalEvent) this.insertOrderEvent(input.terminalEvent);
       input.fills.forEach((fill) => this.upsertFill(fill));
     });
   }

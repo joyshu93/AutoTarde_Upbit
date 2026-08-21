@@ -134,6 +134,10 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     assertSameAccount(existingOrder, input.order);
     const existingEvent = this.orderEvents.find((candidate) => candidate.id === input.event.id);
     assertNoConflictingRecord(existingEvent, input.event, "order event");
+    if (input.terminalEvent) {
+      const existingTerminalEvent = this.orderEvents.find((candidate) => candidate.id === input.terminalEvent!.id);
+      assertNoConflictingRecord(existingTerminalEvent, input.terminalEvent, "terminal order event");
+    }
     const existingFills = input.fills.map((fill) => findStoredFill(this.fills, fill));
     input.fills.forEach((fill, index) => assertNoConflictingRecord(existingFills[index], fill, "fill"));
 
@@ -151,7 +155,11 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     const nextOrders = this.orders.map((candidate) =>
       candidate.id === input.order.id ? cloneRecord(input.order) : candidate,
     );
-    const nextOrderEvents = [...this.orderEvents, cloneRecord(input.event)];
+    const nextOrderEvents = [
+      ...this.orderEvents,
+      cloneRecord(input.event),
+      ...(input.terminalEvent ? [cloneRecord(input.terminalEvent)] : []),
+    ];
     const nextFills = [...this.fills, ...input.fills.map(cloneRecord)];
     this.orders = nextOrders;
     this.orderEvents = nextOrderEvents;

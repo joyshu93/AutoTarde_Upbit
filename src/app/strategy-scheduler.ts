@@ -152,6 +152,7 @@ export class StrategyScheduler {
         orderId: null,
         orderStatus: null,
         submissionAccepted: null,
+        submissionOutcome: null,
         detail: `A scheduled strategy run is already running for ${market}.`,
       };
       this.statusByMarket.set(market, {
@@ -349,6 +350,7 @@ export class StrategyScheduler {
         orderId: null,
         orderStatus: null,
         submissionAccepted: null,
+        submissionOutcome: null,
         detail: "Strategy scheduler did not run because scheduler history could not be persisted.",
       };
       this.applyRunResult(market, failed, startedAt, failedAt);
@@ -440,6 +442,7 @@ export class StrategyScheduler {
         orderId: null,
         orderStatus: null,
         submissionAccepted: null,
+        submissionOutcome: null,
         detail: `Strategy scheduler failed: ${message}`,
       };
 
@@ -491,6 +494,7 @@ export class StrategyScheduler {
       orderId: null,
       orderStatus: null,
       submissionAccepted: null,
+      submissionOutcome: null,
       detail,
     };
 
@@ -683,6 +687,7 @@ function buildSchedulerNotification(input: {
     orderId: input.result.orderId,
     orderStatus: input.result.orderStatus,
     submissionAccepted: input.result.submissionAccepted,
+    submissionOutcome: input.result.submissionOutcome ?? null,
     requestedAt: input.result.requestedAt,
   };
 
@@ -719,7 +724,9 @@ function buildSchedulerNotification(input: {
     };
   }
 
-  if (input.result.submissionAccepted === false) {
+  if (input.result.submissionOutcome === "REJECTED" || (
+    input.result.submissionOutcome === undefined && input.result.submissionAccepted === false
+  )) {
     return {
       exchangeAccountId: input.exchangeAccountId,
       notificationType: "SCHEDULER_ORDER_REJECTED",
@@ -747,6 +754,7 @@ function createFailedRunResult(input: {
     orderId: null,
     orderStatus: null,
     submissionAccepted: null,
+    submissionOutcome: null,
     detail: input.detail,
   };
 }

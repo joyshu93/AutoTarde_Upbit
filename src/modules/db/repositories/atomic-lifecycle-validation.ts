@@ -35,6 +35,15 @@ export function validateExchangeSubmissionInput(input: PersistExchangeSubmission
     throw new Error(`Exchange submission has unsupported status ${order.status}.`);
   }
   validateOrderEvent(order, event, order.status === "REJECTED" ? "ORDER_REJECTED" : "ORDER_SUBMITTED", "EXCHANGE");
+  if (input.terminalEvent) {
+    if (order.status !== "FILLED") throw new Error("Terminal submission events require a FILLED order.");
+    if (input.terminalEvent.eventSource !== "LOCAL" && input.terminalEvent.eventSource !== "EXCHANGE") {
+      throw new Error("Terminal submission event source is invalid.");
+    }
+    validateOrderEvent(order, input.terminalEvent, "ORDER_FILLED", input.terminalEvent.eventSource);
+  } else if (order.status === "FILLED") {
+    throw new Error("FILLED exchange submissions require terminal order evidence.");
+  }
   validateFills(order, fills);
 }
 
@@ -78,14 +87,17 @@ export function validateExchangeSubmissionCompletion(
   const submissionEvents = existingEvents.filter(
     (event) => event.eventType === "ORDER_SUBMITTED" || event.eventType === "ORDER_REJECTED",
   );
+  const terminalEvents = existingEvents.filter((event) => event.eventType === "ORDER_FILLED");
   if (currentOrder.status === "PERSISTED" || currentOrder.status === "SUBMITTING") {
-    if (submissionEvents.length === 0 && existingFills.length === 0) return "APPLY";
+    if (submissionEvents.length === 0 && terminalEvents.length === 0 && existingFills.length === 0) return "APPLY";
     throw new Error(`Corrupt partial exchange submission children for order ${nextOrder.id}.`);
   }
   if (
     recordsEqual(currentOrder, nextOrder) &&
     submissionEvents.length === 1 &&
     recordsEqual(submissionEvents[0]!, input.event) &&
+    ((input.terminalEvent === undefined && terminalEvents.length === 0) ||
+      (input.terminalEvent !== undefined && terminalEvents.length === 1 && recordsEqual(terminalEvents[0]!, input.terminalEvent))) &&
     recordsEqualSet(existingFills, input.fills, fillIdentity)
   ) return "RETRY";
   throw new Error(`Conflicting exchange submission for order ${nextOrder.id}.`);

@@ -12,6 +12,7 @@ import type {
   SupportedMarket,
   TelegramInboundOffsetRecord,
 } from "../../domain/types.js";
+import type { SubmissionOutcome } from "../execution/interfaces.js";
 import type { ExecutionRepository, OperatorStateStore, TelegramInboundOffsetStore } from "../db/interfaces.js";
 import type { TelegramInboundPollingStatus } from "./inbound.js";
 import type { TelegramLocale } from "./presentation/locale.js";
@@ -125,6 +126,7 @@ export interface TelegramStrategyRunResult {
   readonly orderId: string | null;
   readonly orderStatus: OrderLifecycleStatus | null;
   readonly submissionAccepted: boolean | null;
+  readonly submissionOutcome?: SubmissionOutcome | null;
   readonly detail: string;
 }
 

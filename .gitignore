@@ -12,6 +12,7 @@ coverage/
 var/
 .tmp-db-tests/
 .worktrees/
+.superpowers/sdd/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

@@ -932,6 +932,7 @@ test("strategy scheduler notifies when a scheduled order is rejected", async () 
           orderId: null,
           orderStatus: null,
           submissionAccepted: false,
+          submissionOutcome: "REJECTED",
           detail: "Decision EXIT persisted; order submission rejected: A matching active order already exists.",
         };
       },
@@ -949,6 +950,34 @@ test("strategy scheduler notifies when a scheduled order is rejected", async () 
   assert.equal(notifications[0]?.notificationType, "SCHEDULER_ORDER_REJECTED");
   assert.equal(notifications[0]?.severity, "WARN");
   assert.match(notifications[0]?.message ?? "", /A matching active order already exists/);
+});
+
+test("strategy scheduler reports reconciliation required as a failed run, not exchange rejection", async () => {
+  const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true, runOnStart: false, exchangeAccountId: "primary", liveSendPath: "LIVE_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(request) {
+        return {
+          status: "FAILED", requestedAt: "2026-04-20T00:00:00.000Z", market: request.market,
+          strategyDecisionId: "strategy-decision-1", action: "EXIT", orderId: "order-1",
+          orderStatus: "RECONCILIATION_REQUIRED", submissionAccepted: false,
+          submissionOutcome: "RECONCILIATION_REQUIRED", detail: "Order outcome is uncertain and requires reconciliation.",
+        };
+      },
+    }),
+    reporter: createReporter(notifications),
+    now: createNowSequence(["2026-04-20T00:00:00.000Z", "2026-04-20T00:00:02.000Z"]),
+  });
+
+  const result = await scheduler.runMarketNow("KRW-BTC");
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.submissionOutcome, "RECONCILIATION_REQUIRED");
+  assert.equal(notifications[0]?.notificationType, "SCHEDULER_RUN_FAILED");
 });
 
 test("strategy scheduler notifies when a scheduled run fails", async () => {

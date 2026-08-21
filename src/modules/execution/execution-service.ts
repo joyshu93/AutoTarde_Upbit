@@ -61,35 +61,31 @@ export class ExecutionService {
     }
 
     const leaseOwnerToken = createId("account_execution_lease");
-    const requestedAtEpochMs = Date.parse(requestedAt);
-    if (!Number.isSafeInteger(requestedAtEpochMs) || requestedAtEpochMs < 0) {
-      throw new Error("Execution submission requires a valid current timestamp for account lease acquisition.");
+    let acquisitionWindow: { atEpochMs: number; expiresAtEpochMs: number };
+    let lease;
+    try {
+      acquisitionWindow = this.leaseWindow(requestedAt, "acquisition");
+      lease = await this.dependencies.accountExecutionLeases.acquireLease({
+        exchangeAccountId: input.exchangeAccountId,
+        ownerToken: leaseOwnerToken,
+        purpose: "ORDER_SUBMISSION",
+        acquiredAtEpochMs: acquisitionWindow.atEpochMs,
+        expiresAtEpochMs: acquisitionWindow.expiresAtEpochMs,
+      });
+    } catch {
+      await this.recordLeaseBlockedAndPause({
+        input,
+        idempotencyKey,
+        market,
+        occurredAt: requestedAt,
+        reason: "Account execution lease acquisition is ambiguous; order submission is blocked pending recovery.",
+      });
+      throw new AccountExecutionLeaseSafetyError("Account execution lease acquisition is ambiguous.");
     }
-    const lease = await this.dependencies.accountExecutionLeases.acquireLease({
-      exchangeAccountId: input.exchangeAccountId,
-      ownerToken: leaseOwnerToken,
-      purpose: "ORDER_SUBMISSION",
-      acquiredAtEpochMs: requestedAtEpochMs,
-      expiresAtEpochMs: requestedAtEpochMs + this.dependencies.accountExecutionLeaseMs,
-    });
 
     if (!lease) {
       const message = "Account execution lease is unavailable; order submission is blocked pending recovery.";
-      await this.dependencies.repositories.saveRiskEvent(
-        createRiskEvent(
-          input.exchangeAccountId,
-          input.strategyDecisionId,
-          "ACCOUNT_EXECUTION_LEASE_BLOCKED",
-          message,
-          { idempotencyKey, market, requestedAt },
-        ),
-      );
-      await this.pauseForFault({
-        exchangeAccountId: input.exchangeAccountId,
-        faultId: `account-execution-lease:${idempotencyKey}`,
-        reason: message,
-        occurredAt: requestedAt,
-      });
+      await this.recordLeaseBlockedAndPause({ input, idempotencyKey, market, occurredAt: requestedAt, reason: message });
       return {
         accepted: false,
         outcome: "LEASE_BLOCKED",
@@ -98,12 +94,30 @@ export class ExecutionService {
       };
     }
 
+    if (!this.isOwnedLease(lease, input.exchangeAccountId, leaseOwnerToken, acquisitionWindow.atEpochMs)) {
+      await this.recordLeaseBlockedAndPause({
+        input,
+        idempotencyKey,
+        market,
+        occurredAt: requestedAt,
+        reason: "Account execution lease acquisition returned ambiguous ownership; order submission is blocked pending recovery.",
+      });
+      throw new AccountExecutionLeaseSafetyError("Account execution lease acquisition is ambiguous.");
+    }
+
     let releaseLease = true;
     try {
 
+    const accountActiveOrders = await this.dependencies.repositories.listActiveOrders(input.exchangeAccountId);
+    if (accountActiveOrders.length > 0) {
+      const message = "Account execution lease is blocked by active or uncertain local orders pending recovery.";
+      await this.recordLeaseBlockedAndPause({ input, idempotencyKey, market, occurredAt: requestedAt, reason: message });
+      return { accepted: false, outcome: "LEASE_BLOCKED", order: null, reason: message };
+    }
+
     const state = await this.dependencies.operatorState.getState();
     const policy = composeExecutionPolicy(state, this.dependencies.riskLimits);
-    const openOrders = await this.dependencies.repositories.listActiveOrders(input.exchangeAccountId, market);
+    const openOrders = accountActiveOrders;
     const portfolio = await this.dependencies.repositories.getPortfolioExposure(input.exchangeAccountId);
 
     const requestedNotionalKrw =
@@ -269,6 +283,36 @@ export class ExecutionService {
     };
     await this.dependencies.repositories.updateOrder(submittingOrder);
 
+    const renewalAt = this.currentTimestamp();
+    let renewedLease;
+    try {
+      const renewalWindow = this.leaseWindow(renewalAt, "renewal");
+      const renewedExpiry = Math.max(renewalWindow.expiresAtEpochMs, acquisitionWindow.expiresAtEpochMs + 1);
+      if (!Number.isSafeInteger(renewedExpiry) || renewedExpiry <= renewalWindow.atEpochMs) {
+        throw new Error("lease renewal expiry is unsafe");
+      }
+      renewedLease = await this.dependencies.accountExecutionLeases.renewLease({
+        exchangeAccountId: input.exchangeAccountId,
+        ownerToken: leaseOwnerToken,
+        renewedAtEpochMs: renewalWindow.atEpochMs,
+        expiresAtEpochMs: renewedExpiry,
+      });
+      if (!this.isOwnedLease(renewedLease, input.exchangeAccountId, leaseOwnerToken, renewalWindow.atEpochMs)) {
+        throw new Error("lease ownership was not renewed");
+      }
+    } catch {
+      releaseLease = false;
+      await this.recordLeaseBlockedAndPause({
+        input,
+        idempotencyKey,
+        market,
+        occurredAt: renewalAt,
+        reason: "Account execution lease renewal is ambiguous after SUBMITTING; reconciliation is required before any resend.",
+        orderId: order.id,
+      });
+      throw new AccountExecutionLeaseSafetyError("Account execution lease renewal is ambiguous.");
+    }
+
     try {
       const exchangeOrder = await this.dependencies.exchangeAdapter.createOrder({
         market,
@@ -353,6 +397,20 @@ export class ExecutionService {
             createdAt: updatedOrder.updatedAt,
           },
           fills,
+          ...(updatedOrder.status === "FILLED"
+            ? { terminalEvent: {
+                id: createId("order_event"),
+                orderId: order.id,
+                eventType: "ORDER_FILLED",
+                eventSource: state.executionMode === "DRY_RUN" ? "LOCAL" : "EXCHANGE",
+                payloadJson: JSON.stringify(
+                  state.executionMode === "DRY_RUN"
+                    ? { mode: "DRY_RUN", settlement: "SIMULATED_IMMEDIATE_FILL", fillCount: fills.length }
+                    : exchangeOrder.raw,
+                ),
+                createdAt: updatedOrder.updatedAt,
+              } }
+            : {}),
         });
       } catch {
         await this.throwPostSendPersistenceFailure({
@@ -361,33 +419,6 @@ export class ExecutionService {
           occurredAt: this.currentTimestamp(),
           reason: "Exchange submission response could not be persisted atomically.",
         });
-      }
-
-      if (state.executionMode === "DRY_RUN") {
-        try {
-          await this.dependencies.repositories.appendOrderEvent({
-            id: createId("order_event"),
-            orderId: order.id,
-            eventType: "ORDER_FILLED",
-            eventSource: "LOCAL",
-            payloadJson: JSON.stringify({
-              mode: "DRY_RUN",
-              settlement: "SIMULATED_IMMEDIATE_FILL",
-              fillCount: fills.length,
-            }),
-            createdAt: updatedOrder.updatedAt,
-          });
-        } catch {
-          // The atomic FILLED order, fill, and exchange event already make resend unsafe.
-          await this.safeReport({
-            exchangeAccountId: input.exchangeAccountId,
-            notificationType: "ORDER_SUBMISSION_FAILED",
-            severity: "ERROR",
-            title: "Dry-run fill event persistence failed",
-            message: "The simulated fill is terminal, but its supplemental local event was not persisted.",
-            payload: { orderId: order.id, identifier: order.identifier },
-          });
-        }
       }
 
       releaseLease = isTerminalOrderStatus(updatedOrder.status);
@@ -512,13 +543,87 @@ export class ExecutionService {
     }
     } finally {
       if (releaseLease) {
-        await this.dependencies.accountExecutionLeases.releaseLease(input.exchangeAccountId, leaseOwnerToken);
+        await this.releaseLeaseOrFail({ input, idempotencyKey, market, occurredAt: this.currentTimestamp(), leaseOwnerToken });
       }
     }
   }
 
   private currentTimestamp(): string {
     return this.dependencies.now?.() ?? new Date().toISOString();
+  }
+
+  private leaseWindow(timestamp: string, operation: "acquisition" | "renewal"): { atEpochMs: number; expiresAtEpochMs: number } {
+    const atEpochMs = Date.parse(timestamp);
+    const duration = this.dependencies.accountExecutionLeaseMs;
+    if (!Number.isSafeInteger(atEpochMs) || atEpochMs < 0 || !Number.isSafeInteger(duration) || duration <= 0) {
+      throw new AccountExecutionLeaseSafetyError(`Account execution lease ${operation} requires positive safe integer timestamps and duration.`);
+    }
+    const expiresAtEpochMs = atEpochMs + duration;
+    if (!Number.isSafeInteger(expiresAtEpochMs) || expiresAtEpochMs <= atEpochMs) {
+      throw new AccountExecutionLeaseSafetyError(`Account execution lease ${operation} expiry is unsafe.`);
+    }
+    return { atEpochMs, expiresAtEpochMs };
+  }
+
+  private isOwnedLease(
+    lease: Awaited<ReturnType<AccountExecutionLeaseStore["acquireLease"]>>,
+    exchangeAccountId: string,
+    ownerToken: string,
+    atEpochMs: number,
+  ): boolean {
+    return Boolean(
+      lease && lease.exchangeAccountId === exchangeAccountId && lease.ownerToken === ownerToken &&
+      Number.isSafeInteger(lease.acquiredAtEpochMs) && Number.isSafeInteger(lease.expiresAtEpochMs) &&
+      lease.expiresAtEpochMs > atEpochMs,
+    );
+  }
+
+  private async recordLeaseBlockedAndPause(input: {
+    input: SubmitOrderFromDecisionInput;
+    idempotencyKey: string;
+    market: SubmitOrderFromDecisionInput["decision"]["market"];
+    occurredAt: string;
+    reason: string;
+    orderId?: string;
+  }): Promise<void> {
+    await this.dependencies.repositories.saveRiskEvent(
+      createRiskEvent(
+        input.input.exchangeAccountId,
+        input.input.strategyDecisionId,
+        "ACCOUNT_EXECUTION_LEASE_BLOCKED",
+        input.reason,
+        { idempotencyKey: input.idempotencyKey, market: input.market, occurredAt: input.occurredAt },
+        input.orderId ?? null,
+      ),
+    );
+    await this.pauseForFault({
+      exchangeAccountId: input.input.exchangeAccountId,
+      faultId: `account-execution-lease:${input.idempotencyKey}`,
+      reason: input.reason,
+      occurredAt: input.occurredAt,
+    });
+  }
+
+  private async releaseLeaseOrFail(input: {
+    input: SubmitOrderFromDecisionInput;
+    idempotencyKey: string;
+    market: SubmitOrderFromDecisionInput["decision"]["market"];
+    occurredAt: string;
+    leaseOwnerToken: string;
+  }): Promise<void> {
+    try {
+      if (await this.dependencies.accountExecutionLeases.releaseLease(input.input.exchangeAccountId, input.leaseOwnerToken)) return;
+    } catch {
+      // A false release and a thrown release are both ownership ambiguities.
+    }
+    await this.recordLeaseBlockedAndPause({
+      input: input.input,
+      idempotencyKey: input.idempotencyKey,
+      market: input.market,
+      occurredAt: input.occurredAt,
+      reason: "Account execution lease release is ambiguous; execution remains paused pending recovery.",
+    });
+    throw new AccountExecutionLeaseSafetyError("Account execution lease release is ambiguous.");
   }
 
   private async pauseForFault(input: {
@@ -530,7 +635,7 @@ export class ExecutionService {
     try {
       await this.dependencies.operatorState.pauseForFault(input);
     } catch {
-      // Fault pausing is attempted without obscuring the durable lifecycle evidence.
+      throw new AutomaticFaultPauseSafetyError("Automatic fault pause could not be persisted.");
     }
   }
 
@@ -822,10 +927,24 @@ function describeSubmissionError(error: unknown): {
   };
 }
 
-class PostSendPersistenceSafetyError extends Error {
+export class PostSendPersistenceSafetyError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "PostSendPersistenceSafetyError";
+  }
+}
+
+export class AccountExecutionLeaseSafetyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AccountExecutionLeaseSafetyError";
+  }
+}
+
+export class AutomaticFaultPauseSafetyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AutomaticFaultPauseSafetyError";
   }
 }
 

@@ -102,11 +102,11 @@ The intended live path is:
 4. risk approve and run Upbit order-chance and order-test validation
 5. atomically persist `PERSISTED` plus `ORDER_PERSISTED`
 6. transition the durable order to `SUBMITTING`
-7. call the exchange adapter exactly once
-8. atomically store accepted, definitive rejection, or uncertain-submission evidence
+7. renew and verify lease ownership with a fresh clock instant, then call the exchange adapter exactly once
+8. atomically store accepted, definitive rejection, or uncertain-submission evidence; every immediate `FILLED` result includes submitted, terminal, and fill evidence in the same transaction
 9. reconcile until terminal state is consistent
 
-`ACCOUNT_EXECUTION_LEASE_MS` is a positive explicit setting with a `30000` default. Safe pre-send exits and definitive terminal outcomes release the lease. Uncertain, active, and post-send persistence-failure outcomes retain it. A lease conflict creates no order row or exchange send, persists `ACCOUNT_EXECUTION_LEASE_BLOCKED`, and attempts an automatic pause.
+`ACCOUNT_EXECUTION_LEASE_MS` is a positive explicit setting with a `30000` default. Safe pre-send exits and definitive terminal outcomes release the lease. Uncertain, active, and post-send persistence-failure outcomes retain it. A lease conflict creates no order row or exchange send, persists `ACCOUNT_EXECUTION_LEASE_BLOCKED`, and requires an automatic pause; pause, renewal, acquisition, or release ambiguity fails closed with fatal safety evidence.
 
 The real Upbit order-create adapter distinguishes a clear exchange rejection from an outcome that needs recovery. Only a clear `4xx` creation rejection is definitive; timeouts, disconnects, redirects, `5xx` responses, malformed successful responses (including optional fields), mapping failures, and other dispatched-request failures remain uncertain. Typed submission failures retain only HTTP status, sanitized exchange code/name, and whether a response was received. They never retain request credentials, JWTs, access keys, secret keys, token-shaped/reflected metadata, or raw error responses. Private requests use manual redirect handling so a `3xx` response remains observable. A confirmed authenticated order lookup `404` remains an absent (`null`) lookup result.
 

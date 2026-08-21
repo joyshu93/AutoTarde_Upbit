@@ -8,6 +8,7 @@ import { ExchangeOrderSubmissionError } from "../src/modules/exchange/errors.js"
 import { DryRunExchangeAdapter, type ExchangeAdapter } from "../src/modules/exchange/interfaces.js";
 import { InMemoryAccountExecutionLeaseStore } from "../src/modules/db/repositories/in-memory-account-execution-lease-store.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
+import type { AccountExecutionLeaseStore } from "../src/modules/db/pilot-interfaces.js";
 import { test } from "./harness.js";
 
 test("a lease conflict creates no order row and calls createOrder zero times", async () => {
@@ -32,6 +33,124 @@ test("a lease conflict creates no order row and calls createOrder zero times", a
   assert.equal(exchange.createOrderCalls, 0);
   assert.equal((await repositories.listOrders("primary")).length, 0);
   assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("lease acquisition ambiguity records risk and fails closed when automatic pause succeeds", async () => {
+  const leases: AccountExecutionLeaseStore = {
+    async getLease() { return null; },
+    async acquireLease() { throw new Error("lease storage unavailable"); },
+    async renewLease() { throw new Error("not reached"); },
+    async releaseLease() { return true; },
+  };
+  const { service, repositories, operatorState } = await createService({ accountExecutionLeases: leases });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /Account execution lease acquisition is ambiguous/);
+
+  assert.equal((await repositories.listOrders("primary")).length, 0);
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("an acquired lease blocks an account-wide active order before validation or send", async () => {
+  const exchange = createCountingAdapter();
+  const { service, repositories, operatorState } = await createService({ exchangeAdapter: exchange });
+  await repositories.saveOrder({
+    id: "active-eth-order", strategyDecisionId: "other", exchangeAccountId: "primary", market: "KRW-ETH",
+    side: "bid", ordType: "limit", volume: "0.001", price: "1000000", timeInForce: null, smpType: null,
+    identifier: "active-eth-identifier", idempotencyKey: "other-key", origin: "STRATEGY", requestedAt: "2026-04-20T00:00:00.000Z",
+    upbitUuid: null, status: "RECONCILIATION_REQUIRED", executionMode: "DRY_RUN", exchangeResponseJson: null,
+    failureCode: "RECONCILIATION_REQUIRED", failureMessage: "pending", createdAt: "2026-04-20T00:00:00.000Z", updatedAt: "2026-04-20T00:00:00.000Z",
+  });
+
+  const result = await service.submitOrderFromDecision(validInput());
+
+  assert.equal(result.outcome, "LEASE_BLOCKED");
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await repositories.listOrders("primary")).length, 1);
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("renewal loss after SUBMITTING retains recovery evidence and sends nothing", async () => {
+  const base = new InMemoryAccountExecutionLeaseStore();
+  const leases: AccountExecutionLeaseStore = {
+    getLease: base.getLease.bind(base),
+    acquireLease: base.acquireLease.bind(base),
+    async renewLease() { return null; },
+    releaseLease: base.releaseLease.bind(base),
+  };
+  const exchange = createCountingAdapter();
+  const { service, repositories, operatorState } = await createService({ exchangeAdapter: exchange, accountExecutionLeases: leases });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /Account execution lease renewal is ambiguous/);
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING");
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("slow validation expiry cannot turn into a concurrent send because pre-send renewal verifies ownership", async () => {
+  const base = new InMemoryAccountExecutionLeaseStore();
+  let now = "2026-04-20T00:00:20.000Z";
+  const exchange = createCountingAdapter({
+    async beforeTestOrder() {
+      now = "2026-04-20T00:00:51.000Z";
+      await base.acquireLease({
+        exchangeAccountId: "primary", ownerToken: "second-process", purpose: "ORDER_SUBMISSION",
+        acquiredAtEpochMs: Date.parse(now), expiresAtEpochMs: Date.parse("2026-04-20T00:01:21.000Z"),
+      });
+    },
+  });
+  const { service, repositories } = await createService({ exchangeAdapter: exchange, accountExecutionLeases: base, now: () => now });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /Account execution lease renewal is ambiguous/);
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING");
+});
+
+test("unsafe lease expiry arithmetic records risk and pauses before any order exists", async () => {
+  const { service, repositories, operatorState } = await createService({ accountExecutionLeaseMs: Number.MAX_SAFE_INTEGER });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /Account execution lease acquisition is ambiguous/);
+
+  assert.equal((await repositories.listOrders("primary")).length, 0);
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("automatic pause failure after lease conflict is fatal rather than a safe blocked result", async () => {
+  const blocker = new InMemoryAccountExecutionLeaseStore();
+  const { service } = await createService({
+    accountExecutionLeases: blocker,
+    operatorState: new FailingPauseOperatorStateStore(createRunningState()),
+  });
+  await blocker.acquireLease({ exchangeAccountId: "primary", ownerToken: "other", purpose: "ORDER_SUBMISSION", acquiredAtEpochMs: 1, expiresAtEpochMs: 2 });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /Automatic fault pause could not be persisted/);
+});
+
+test("release ambiguity is fatal after a terminal dry-run outcome", async () => {
+  const base = new InMemoryAccountExecutionLeaseStore();
+  const leases: AccountExecutionLeaseStore = {
+    getLease: base.getLease.bind(base), acquireLease: base.acquireLease.bind(base), renewLease: base.renewLease.bind(base),
+    async releaseLease() { return false; },
+  };
+  const { service, operatorState } = await createService({ accountExecutionLeases: leases });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /Account execution lease release is ambiguous/);
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("a thrown release is also fatal and pauses the account", async () => {
+  const base = new InMemoryAccountExecutionLeaseStore();
+  const leases: AccountExecutionLeaseStore = {
+    getLease: base.getLease.bind(base), acquireLease: base.acquireLease.bind(base), renewLease: base.renewLease.bind(base),
+    async releaseLease() { throw new Error("release transport failure"); },
+  };
+  const { service, operatorState } = await createService({ accountExecutionLeases: leases });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /Account execution lease release is ambiguous/);
   assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
 });
 
@@ -169,11 +288,14 @@ test("only ExecutionService has production createOrder authority", async () => {
 
 async function createService(overrides: {
   exchangeAdapter?: ExchangeAdapter;
-  accountExecutionLeases?: InMemoryAccountExecutionLeaseStore;
+  accountExecutionLeases?: AccountExecutionLeaseStore;
   repositories?: InMemoryExecutionRepository;
+  operatorState?: InMemoryOperatorStateStore;
+  accountExecutionLeaseMs?: number;
+  now?: () => string;
 } = {}) {
   const repositories = overrides.repositories ?? new InMemoryExecutionRepository();
-  const operatorState = new InMemoryOperatorStateStore(createRunningState());
+  const operatorState = overrides.operatorState ?? new InMemoryOperatorStateStore(createRunningState());
   const accountExecutionLeases = overrides.accountExecutionLeases ?? new InMemoryAccountExecutionLeaseStore();
   const service = new ExecutionService({
     riskLimits: {
@@ -185,9 +307,9 @@ async function createService(overrides: {
     exchangeAdapter: overrides.exchangeAdapter ?? new DryRunExchangeAdapter(),
     repositories,
     accountExecutionLeases,
-    accountExecutionLeaseMs: 30_000,
+    accountExecutionLeaseMs: overrides.accountExecutionLeaseMs ?? 30_000,
     operatorState,
-    now: () => "2026-04-20T00:00:20.000Z",
+    now: overrides.now ?? (() => "2026-04-20T00:00:20.000Z"),
   });
   await repositories.saveBalanceSnapshot({
     id: "balance-1",
@@ -210,6 +332,12 @@ async function createService(overrides: {
 class FailingExchangeSubmissionRepository extends InMemoryExecutionRepository {
   override async persistExchangeSubmission(): Promise<void> {
     throw new Error("injected atomic persistence failure");
+  }
+}
+
+class FailingPauseOperatorStateStore extends InMemoryOperatorStateStore {
+  override async pauseForFault(): Promise<ExecutionStateRecord> {
+    throw new Error("injected pause persistence failure");
   }
 }
 
@@ -250,7 +378,7 @@ function validInput() {
   };
 }
 
-function createCountingAdapter(options: { createOrderError?: Error } = {}) {
+function createCountingAdapter(options: { createOrderError?: Error; beforeTestOrder?: () => Promise<void> } = {}) {
   const baseAdapter = new DryRunExchangeAdapter();
   let createOrderCalls = 0;
   const adapter: ExchangeAdapter & { readonly createOrderCalls: number } = {
@@ -259,7 +387,10 @@ function createCountingAdapter(options: { createOrderError?: Error } = {}) {
     },
     getBalances: baseAdapter.getBalances.bind(baseAdapter),
     getOrderChance: baseAdapter.getOrderChance.bind(baseAdapter),
-    testOrder: baseAdapter.testOrder.bind(baseAdapter),
+    async testOrder(request) {
+      await options.beforeTestOrder?.();
+      return baseAdapter.testOrder(request);
+    },
     cancelOrder: baseAdapter.cancelOrder.bind(baseAdapter),
     getOrder: baseAdapter.getOrder.bind(baseAdapter),
     listOpenOrders: baseAdapter.listOpenOrders.bind(baseAdapter),

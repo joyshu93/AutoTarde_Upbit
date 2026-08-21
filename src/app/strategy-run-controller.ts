@@ -31,6 +31,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
         orderId: null,
         orderStatus: null,
         submissionAccepted: null,
+        submissionOutcome: null,
         detail: `A strategy run is already running for ${request.exchangeAccountId}.`,
       };
     }
@@ -50,6 +51,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
             orderId: null,
             orderStatus: null,
             submissionAccepted: null,
+            submissionOutcome: null,
             detail: buildManualRunPreflightBlockDetail(preflight),
           };
         }
@@ -60,8 +62,11 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
         generatedAt: requestedAt,
       });
 
+      const submissionOutcome = result.submission?.outcome ?? null;
       return {
-        status: "COMPLETED",
+        status: submissionOutcome === "RECONCILIATION_REQUIRED" || submissionOutcome === "LEASE_BLOCKED"
+          ? "FAILED"
+          : submissionOutcome === "DUPLICATE" ? "SKIPPED" : "COMPLETED",
         requestedAt,
         market: request.market,
         strategyDecisionId: result.strategyDecisionRecord.id,
@@ -69,6 +74,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
         orderId: result.submission?.order?.id ?? null,
         orderStatus: result.submission?.order?.status ?? null,
         submissionAccepted: result.submission?.accepted ?? null,
+        submissionOutcome,
         detail: buildStrategyRunDetail(result),
       };
     } catch (error) {
@@ -83,6 +89,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
         orderId: null,
         orderStatus: null,
         submissionAccepted: null,
+        submissionOutcome: null,
         detail: `Strategy run failed: ${message}`,
       };
     } finally {
@@ -167,6 +174,16 @@ function buildStrategyRunDetail(
 
   if (submission.accepted) {
     return `Decision ${result.strategyDecision.action} persisted and submitted through the configured execution path.`;
+  }
+
+  if (submission.outcome === "RECONCILIATION_REQUIRED") {
+    return `Decision ${result.strategyDecision.action} persisted; order outcome is uncertain and requires reconciliation: ${submission.reason}.`;
+  }
+  if (submission.outcome === "LEASE_BLOCKED") {
+    return `Decision ${result.strategyDecision.action} persisted; order submission was blocked by the account execution lease.`;
+  }
+  if (submission.outcome === "DUPLICATE") {
+    return `Decision ${result.strategyDecision.action} persisted; duplicate order intent was identified and not resent.`;
   }
 
   return `Decision ${result.strategyDecision.action} persisted; order submission rejected: ${submission.reason ?? "unknown reason"}.`;

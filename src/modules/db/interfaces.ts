@@ -34,6 +34,7 @@ export interface PersistExchangeSubmissionInput {
   order: OrderRecord;
   event: OrderEventRecord;
   fills: FillRecord[];
+  terminalEvent?: OrderEventRecord;
 }
 
 export interface PersistUncertainSubmissionInput {
