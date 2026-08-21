@@ -2,9 +2,9 @@ import type { ExchangeBalance, SupportedMarket } from "../../../domain/types.js"
 import { ExchangeOrderSubmissionError } from "../errors.js";
 import type {
   CancelOrderResult,
-  ExchangeAdapter,
   ExchangeOrderHistoryQuery,
   ExchangeOrderSnapshot,
+  LiveExecutionAdapter,
   OrderValidationResult,
   UpbitOrderChance,
   UpbitOrderRequest,
@@ -67,7 +67,9 @@ interface UpbitBalanceResponse {
 
 const DEFAULT_BASE_URL = "https://api.upbit.com";
 
-export class UpbitPrivateClient implements ExchangeAdapter {
+export class UpbitPrivateClient implements LiveExecutionAdapter {
+  readonly sendPath = "LIVE_ADAPTER" as const;
+
   private readonly credentials: UpbitCredentials;
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;

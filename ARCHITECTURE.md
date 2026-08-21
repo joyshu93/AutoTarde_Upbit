@@ -341,8 +341,8 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 11. Convert the decision into an order intent with an idempotency key and reject an existing match.
 12. Acquire the explicit-duration account execution lease before execution, risk, validation, or persistence work.
 13. Run risk guards and exchange pre-trade validation through `orders/chance` and `orders/test`.
-14. Atomically persist `PERSISTED` plus `ORDER_PERSISTED`, then transition to `SUBMITTING`.
-15. Call the exchange adapter exactly once.
+14. Atomically persist `PERSISTED` plus `ORDER_PERSISTED`, then transition to `SUBMITTING`; the order's execution mode comes from the tagged execution adapter rather than a mutable persisted-state snapshot.
+15. Renew the lease, re-read account-wide active orders, and make execution state the final awaited authority read. The exact initial mode/gate tuple must be unchanged; the tagged live adapter additionally requires `LIVE`/`ENABLED`, while the tagged dry adapter accepts any unchanged non-fully-live tuple. Then call that adapter exactly once with no intervening await.
 16. Atomically persist accepted, definitive rejection, or reconciliation-required evidence; retain the lease on active, uncertain, and post-send persistence-failure outcomes.
 17. Persist operator_notifications for significant operator-facing outcomes.
 18. Kick best-effort Telegram delivery without letting network delivery alter execution outcomes.

@@ -5,7 +5,11 @@ import path from "node:path";
 import type { ExecutionStateRecord } from "../src/domain/types.js";
 import { ExecutionService } from "../src/modules/execution/execution-service.js";
 import { ExchangeOrderSubmissionError } from "../src/modules/exchange/errors.js";
-import { DryRunExchangeAdapter, type ExchangeAdapter } from "../src/modules/exchange/interfaces.js";
+import {
+  DryRunExchangeAdapter,
+  type ExchangeAdapter,
+  type ExecutionExchangeAdapter,
+} from "../src/modules/exchange/interfaces.js";
 import { InMemoryAccountExecutionLeaseStore } from "../src/modules/db/repositories/in-memory-account-execution-lease-store.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import type { AccountExecutionLeaseStore } from "../src/modules/db/pilot-interfaces.js";
@@ -166,13 +170,12 @@ test("a final execution-state read failure pauses and prevents the send", async 
 test("a final LIVE mode transition blocks the configured live send path", async () => {
   const operatorState = new FinalAuthorityDriftOperatorStateStore(
     createRunningState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
-    createRunningState({ executionMode: "DRY_RUN", liveExecutionGate: "DISABLED" }),
+    createRunningState({ executionMode: "DRY_RUN", liveExecutionGate: "ENABLED" }),
   );
-  const exchange = createCountingAdapter();
+  const exchange = createCountingAdapter({ sendPath: "LIVE_ADAPTER" });
   const { service, repositories } = await createService({
     operatorState,
     exchangeAdapter: exchange,
-    sendPath: "LIVE_ADAPTER",
   });
 
   await assert.rejects(service.submitOrderFromDecision(validInput()), /final pre-send authority check/i);
@@ -187,11 +190,10 @@ test("a final LIVE gate transition blocks the configured live send path", async 
     createRunningState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
     createRunningState({ executionMode: "LIVE", liveExecutionGate: "DISABLED" }),
   );
-  const exchange = createCountingAdapter();
+  const exchange = createCountingAdapter({ sendPath: "LIVE_ADAPTER" });
   const { service, repositories } = await createService({
     operatorState,
     exchangeAdapter: exchange,
-    sendPath: "LIVE_ADAPTER",
   });
 
   await assert.rejects(service.submitOrderFromDecision(validInput()), /final pre-send authority check/i);
@@ -213,6 +215,142 @@ test("a final mode and gate mismatch blocks the configured dry-run send path", a
 
   assert.equal(exchange.createOrderCalls, 0);
   assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+});
+
+test("the live channel rejects a non-live initial tuple before order persistence", async () => {
+  const operatorState = new InMemoryOperatorStateStore(createRunningState());
+  const exchange = createCountingAdapter({ sendPath: "LIVE_ADAPTER" });
+  const { service, repositories } = await createService({ operatorState, exchangeAdapter: exchange });
+
+  const result = await service.submitOrderFromDecision(validInput());
+
+  assert.equal(result.outcome, "LEASE_BLOCKED");
+  assert.equal(result.order, null);
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await repositories.listOrders("primary")).length, 0);
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("the dry channel rejects a fully-live initial tuple before order persistence", async () => {
+  const operatorState = new InMemoryOperatorStateStore(
+    createRunningState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+  );
+  const exchange = createCountingAdapter();
+  const { service, repositories } = await createService({ operatorState, exchangeAdapter: exchange });
+
+  const result = await service.submitOrderFromDecision(validInput());
+
+  assert.equal(result.outcome, "LEASE_BLOCKED");
+  assert.equal(result.order, null);
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await repositories.listOrders("primary")).length, 0);
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("a dry initial tuple cannot upgrade into a live send at final authority", async () => {
+  const operatorState = new FinalAuthorityDriftOperatorStateStore(
+    createRunningState({ executionMode: "DRY_RUN", liveExecutionGate: "DISABLED" }),
+    createRunningState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+  );
+  const exchange = createCountingAdapter();
+  const { service, repositories } = await createService({
+    operatorState,
+    exchangeAdapter: exchange,
+  });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /final pre-send authority check/i);
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING");
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("a stable DRY_RUN ENABLED tuple remains simulated on the dry channel", async () => {
+  const operatorState = new InMemoryOperatorStateStore(
+    createRunningState({ executionMode: "DRY_RUN", liveExecutionGate: "ENABLED" }),
+  );
+  const { service, repositories } = await createService({ operatorState });
+
+  const result = await service.submitOrderFromDecision(validInput());
+  const events = await repositories.listOrderEvents(result.order?.id ?? "");
+  const fills = await repositories.listFills(result.order?.id);
+
+  assert.equal(result.outcome, "SIMULATED_FILLED");
+  assert.equal(result.order?.executionMode, "DRY_RUN");
+  assert.equal(result.order?.status, "FILLED");
+  assert.equal(events.find((event) => event.eventType === "ORDER_SUBMITTED")?.eventSource, "LOCAL");
+  assert.equal(events.find((event) => event.eventType === "ORDER_FILLED")?.eventSource, "LOCAL");
+  assert.equal(fills.length, 1);
+});
+
+test("a stable LIVE DISABLED tuple remains simulated on the dry channel", async () => {
+  const operatorState = new InMemoryOperatorStateStore(
+    createRunningState({ executionMode: "LIVE", liveExecutionGate: "DISABLED" }),
+  );
+  const { service, repositories } = await createService({ operatorState });
+
+  const result = await service.submitOrderFromDecision(validInput());
+  const events = await repositories.listOrderEvents(result.order?.id ?? "");
+  const fills = await repositories.listFills(result.order?.id);
+
+  assert.equal(result.outcome, "SIMULATED_FILLED");
+  assert.equal(result.order?.executionMode, "DRY_RUN");
+  assert.equal(result.order?.status, "FILLED");
+  assert.equal(events.find((event) => event.eventType === "ORDER_SUBMITTED")?.eventSource, "LOCAL");
+  assert.equal(events.find((event) => event.eventType === "ORDER_FILLED")?.eventSource, "LOCAL");
+  assert.equal(fills.length, 1);
+});
+
+test("a stable LIVE ENABLED tuple remains exchange-backed on the live channel", async () => {
+  const operatorState = new InMemoryOperatorStateStore(
+    createRunningState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+  );
+  const exchange = createCountingAdapter({ sendPath: "LIVE_ADAPTER" });
+  const { service, repositories } = await createService({ operatorState, exchangeAdapter: exchange });
+
+  const result = await service.submitOrderFromDecision(validInput());
+  const events = await repositories.listOrderEvents(result.order?.id ?? "");
+  const fills = await repositories.listFills(result.order?.id);
+
+  assert.equal(result.outcome, "SUBMITTED");
+  assert.equal(result.order?.executionMode, "LIVE");
+  assert.equal(result.order?.status, "OPEN");
+  assert.equal(events.find((event) => event.eventType === "ORDER_SUBMITTED")?.eventSource, "EXCHANGE");
+  assert.equal(events.some((event) => event.eventType === "ORDER_FILLED"), false);
+  assert.equal(fills.length, 0);
+});
+
+test("mode-only drift between accepted dry tuples blocks the dry channel", async () => {
+  const operatorState = new FinalAuthorityDriftOperatorStateStore(
+    createRunningState({ executionMode: "LIVE", liveExecutionGate: "DISABLED" }),
+    createRunningState({ executionMode: "DRY_RUN", liveExecutionGate: "DISABLED" }),
+  );
+  const exchange = createCountingAdapter();
+  const { service, repositories } = await createService({ operatorState, exchangeAdapter: exchange });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /final pre-send authority check/i);
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING");
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+});
+
+test("gate-only drift between accepted dry tuples blocks the dry channel", async () => {
+  const operatorState = new FinalAuthorityDriftOperatorStateStore(
+    createRunningState({ executionMode: "DRY_RUN", liveExecutionGate: "ENABLED" }),
+    createRunningState({ executionMode: "DRY_RUN", liveExecutionGate: "DISABLED" }),
+  );
+  const exchange = createCountingAdapter();
+  const { service, repositories } = await createService({ operatorState, exchangeAdapter: exchange });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /final pre-send authority check/i);
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING");
   assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
 });
 
@@ -453,13 +591,12 @@ test("only ExecutionService has production createOrder authority", async () => {
 });
 
 async function createService(overrides: {
-  exchangeAdapter?: ExchangeAdapter;
+  exchangeAdapter?: ExecutionExchangeAdapter;
   accountExecutionLeases?: AccountExecutionLeaseStore;
   repositories?: InMemoryExecutionRepository;
   operatorState?: InMemoryOperatorStateStore;
   accountExecutionLeaseMs?: number;
   now?: () => string;
-  sendPath?: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
 } = {}) {
   const repositories = overrides.repositories ?? new InMemoryExecutionRepository();
   const operatorState = overrides.operatorState ?? new InMemoryOperatorStateStore(createRunningState());
@@ -471,8 +608,7 @@ async function createService(overrides: {
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
     },
-    exchangeAdapter: overrides.exchangeAdapter ?? new DryRunExchangeAdapter(),
-    sendPath: overrides.sendPath ?? "DRY_RUN_ADAPTER",
+    executionAdapter: overrides.exchangeAdapter ?? new DryRunExchangeAdapter(),
     repositories,
     accountExecutionLeases,
     accountExecutionLeaseMs: overrides.accountExecutionLeaseMs ?? 30_000,
@@ -617,13 +753,14 @@ function createActiveTakeoverOrder() {
   };
 }
 
-function createCountingAdapter(options: { createOrderError?: Error; beforeTestOrder?: () => Promise<void> } = {}) {
+function createCountingAdapter(options: {
+  createOrderError?: Error;
+  beforeTestOrder?: () => Promise<void>;
+  sendPath?: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
+} = {}): ExecutionExchangeAdapter & { readonly createOrderCalls: number } {
   const baseAdapter = new DryRunExchangeAdapter();
   let createOrderCalls = 0;
-  const adapter: ExchangeAdapter & { readonly createOrderCalls: number } = {
-    get createOrderCalls() {
-      return createOrderCalls;
-    },
+  const methods: ExchangeAdapter = {
     getBalances: baseAdapter.getBalances.bind(baseAdapter),
     getOrderChance: baseAdapter.getOrderChance.bind(baseAdapter),
     async testOrder(request) {
@@ -640,7 +777,22 @@ function createCountingAdapter(options: { createOrderError?: Error; beforeTestOr
       return baseAdapter.createOrder(request);
     },
   };
-  return adapter;
+  if (options.sendPath === "LIVE_ADAPTER") {
+    return {
+      ...methods,
+      sendPath: "LIVE_ADAPTER",
+      get createOrderCalls() {
+        return createOrderCalls;
+      },
+    };
+  }
+  return {
+    ...methods,
+    sendPath: "DRY_RUN_ADAPTER",
+    get createOrderCalls() {
+      return createOrderCalls;
+    },
+  };
 }
 
 async function listTypeScriptFiles(directory: string): Promise<string[]> {

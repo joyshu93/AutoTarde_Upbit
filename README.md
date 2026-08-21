@@ -97,7 +97,7 @@ Current remaining gaps:
 - manual `LIVE` `/run BTC|ETH` now also runs persisted-health preflight before the strategy runner is invoked, even when the scheduler is disabled
 - execution minimum-value checks now derive market-sell notional from strategy reference price and requested quantity when the Upbit order shape carries volume but no order price
 - exposure cap projection now treats `ask` orders as risk-reducing instead of adding sell notional to current exposure
-- the runtime can now derive `LIVE_ADAPTER` send wiring only when mode, live gate, and Upbit credentials are all explicitly configured; otherwise it remains on `DRY_RUN_ADAPTER`
+- the runtime derives one tagged execution adapter: `LIVE_ADAPTER` only when mode, live gate, and Upbit credentials are all explicitly configured, otherwise `DRY_RUN_ADAPTER`. The adapter and path cannot be supplied independently; initial and final persisted mode/gate authority must match exactly, live requires `LIVE`/`ENABLED`, and dry accepts unchanged non-fully-live tuples while keeping lifecycle evidence simulated
 - PositionGuard REDUCE decisions now require independent weakening evidence when `weakeningStage` is still `NONE`; a losing range position with only borderline bearish momentum remains `HOLD` instead of creating a sell intent
 - PositionGuard now treats bearish invalidation evidence while flat as a no-order `HOLD`, so backtests and live previews do not emit no-position exit orders
 - PositionGuard now applies profit-protective staged defensive reductions for open positions when weak-downtrend, breakdown-risk, or range-deterioration evidence appears, suppresses below-minimum reduce intents, and keeps immediate invalidation exits and no-position HOLD behavior intact.

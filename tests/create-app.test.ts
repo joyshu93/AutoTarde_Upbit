@@ -5,7 +5,10 @@ import path from "node:path";
 import { createApp } from "../src/app/create-app.js";
 import type { AppConfig } from "../src/app/env.js";
 import { startTelegramRuntime } from "../src/index.js";
-import { DryRunExchangeAdapter } from "../src/modules/exchange/interfaces.js";
+import {
+  DryRunExchangeAdapter,
+  type LiveExecutionAdapter,
+} from "../src/modules/exchange/interfaces.js";
 import { createDryRunOperatorMarketDataReader } from "../src/smoke/dryrun-operator.js";
 import { test } from "./harness.js";
 
@@ -141,7 +144,7 @@ test("createApp refreshes live scheduler account health before before-run prefli
         strategySchedulerEnabled: true,
       }),
       {
-        privateExchangeAdapter: new DryRunExchangeAdapter(),
+        privateExchangeAdapter: createLiveExecutionAdapterFake(),
         publicMarketDataReader: createDryRunOperatorMarketDataReader(),
       },
     );
@@ -251,4 +254,19 @@ function restoreOptionalEnv(name: string, value: string | undefined): void {
   }
 
   delete process.env[name];
+}
+
+function createLiveExecutionAdapterFake(): LiveExecutionAdapter {
+  const baseAdapter = new DryRunExchangeAdapter();
+  return {
+    sendPath: "LIVE_ADAPTER",
+    getBalances: baseAdapter.getBalances.bind(baseAdapter),
+    getOrderChance: baseAdapter.getOrderChance.bind(baseAdapter),
+    testOrder: baseAdapter.testOrder.bind(baseAdapter),
+    createOrder: baseAdapter.createOrder.bind(baseAdapter),
+    cancelOrder: baseAdapter.cancelOrder.bind(baseAdapter),
+    getOrder: baseAdapter.getOrder.bind(baseAdapter),
+    listOpenOrders: baseAdapter.listOpenOrders.bind(baseAdapter),
+    listClosedOrders: baseAdapter.listClosedOrders.bind(baseAdapter),
+  };
 }

@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import type { ExecutionStateRecord, StrategyDecision } from "../src/domain/types.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { ExecutionService } from "../src/modules/execution/execution-service.js";
-import { DryRunExchangeAdapter, type ExchangeAdapter } from "../src/modules/exchange/interfaces.js";
+import {
+  DryRunExchangeAdapter,
+  type ExchangeAdapter,
+  type ExecutionExchangeAdapter,
+} from "../src/modules/exchange/interfaces.js";
 import { InMemoryAccountExecutionLeaseStore } from "../src/modules/db/repositories/in-memory-account-execution-lease-store.js";
 import type {
   UpbitCandleSnapshot,
@@ -363,7 +367,8 @@ function createExecutionService(
   exchangeAdapterOverrides: Partial<ExchangeAdapter> = {},
 ): ExecutionService {
   const baseAdapter = new DryRunExchangeAdapter();
-  const exchangeAdapter: ExchangeAdapter = {
+  const exchangeAdapter: ExecutionExchangeAdapter = {
+    sendPath: "DRY_RUN_ADAPTER",
     getBalances: exchangeAdapterOverrides.getBalances ?? baseAdapter.getBalances.bind(baseAdapter),
     getOrderChance: exchangeAdapterOverrides.getOrderChance ?? baseAdapter.getOrderChance.bind(baseAdapter),
     testOrder: exchangeAdapterOverrides.testOrder ?? baseAdapter.testOrder.bind(baseAdapter),
@@ -384,8 +389,7 @@ function createExecutionService(
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
     },
-    exchangeAdapter,
-    sendPath: "DRY_RUN_ADAPTER",
+    executionAdapter: exchangeAdapter,
     validationAdapter: exchangeAdapter,
     repositories,
     accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),

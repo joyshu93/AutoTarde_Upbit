@@ -1413,7 +1413,7 @@ async function assertAtomicLifecycleContract(repository: ExecutionRepository): P
   });
   const submissionEvent = createOrderEvent(submittedOrder.id, "atomic-submission-event", "ORDER_SUBMITTED");
   const fill = createFill(submittedOrder.id, "atomic-fill");
-  submissionEvent.eventSource = "EXCHANGE";
+  submissionEvent.eventSource = "LOCAL";
   await assert.rejects(
     repository.persistExchangeSubmission({
       order: { ...submittedOrder, status: "OPEN" },
@@ -1456,7 +1456,7 @@ async function assertAtomicLifecycleContract(repository: ExecutionRepository): P
   });
   const terminalOrder = { ...filledOrder, status: "FILLED" as const, upbitUuid: "atomic-filled-uuid" };
   const terminalSubmission = createOrderEvent(terminalOrder.id, "atomic-filled-submission", "ORDER_SUBMITTED");
-  terminalSubmission.eventSource = "EXCHANGE";
+  terminalSubmission.eventSource = "LOCAL";
   const terminalEvent = createOrderEvent(terminalOrder.id, "atomic-filled-terminal", "ORDER_FILLED");
   terminalEvent.eventSource = "LOCAL";
   const terminalFill = createFill(terminalOrder.id, "atomic-filled-fill");

@@ -3,14 +3,18 @@ import assert from "node:assert/strict";
 import type { ExecutionStateRecord } from "../src/domain/types.js";
 import { ExecutionService } from "../src/modules/execution/execution-service.js";
 import type { SubmissionOutcome, SubmitOrderFromDecisionResult } from "../src/modules/execution/interfaces.js";
-import { DryRunExchangeAdapter, type ExchangeAdapter } from "../src/modules/exchange/interfaces.js";
+import {
+  DryRunExchangeAdapter,
+  type ExchangeAdapter,
+  type ExecutionExchangeAdapter,
+} from "../src/modules/exchange/interfaces.js";
 import { InMemoryAccountExecutionLeaseStore } from "../src/modules/db/repositories/in-memory-account-execution-lease-store.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { DurableTelegramReporter, type OperatorNotificationReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
 
 function createExecutionService(overrides?: {
-  exchangeAdapter?: ExchangeAdapter;
+  exchangeAdapter?: ExecutionExchangeAdapter;
   validationAdapter?: Pick<ExchangeAdapter, "getOrderChance" | "testOrder">;
   reporter?: OperatorNotificationReporter;
   initialState?: Partial<ExecutionStateRecord>;
@@ -40,8 +44,7 @@ function createExecutionService(overrides?: {
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
     },
-    exchangeAdapter: overrides?.exchangeAdapter ?? new DryRunExchangeAdapter(),
-    sendPath: "DRY_RUN_ADAPTER" as const,
+    executionAdapter: overrides?.exchangeAdapter ?? new DryRunExchangeAdapter(),
     repositories,
     accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
     accountExecutionLeaseMs: 30_000,
@@ -208,7 +211,8 @@ test("execution service settles dry-run price bids with a synthetic fill derived
 test("execution service applies minimum order value to market asks using reference price and volume", async () => {
   let createOrderCalled = false;
   const baseAdapter = new DryRunExchangeAdapter();
-  const exchangeAdapter: ExchangeAdapter = {
+  const exchangeAdapter: ExecutionExchangeAdapter = {
+    sendPath: "DRY_RUN_ADAPTER",
     getBalances: baseAdapter.getBalances.bind(baseAdapter),
     getOrderChance: baseAdapter.getOrderChance.bind(baseAdapter),
     testOrder: baseAdapter.testOrder.bind(baseAdapter),
@@ -393,7 +397,8 @@ test("execution service blocks new orders when startup recovery has left the sys
 
 test("execution service blocks order persistence when order chance rejects the requested order type", async () => {
   let createOrderCalled = false;
-  const exchangeAdapter: ExchangeAdapter = {
+  const exchangeAdapter: ExecutionExchangeAdapter = {
+    sendPath: "DRY_RUN_ADAPTER",
     async getBalances() {
       return [];
     },
@@ -498,7 +503,8 @@ test("execution service blocks order persistence when order chance rejects the r
 });
 
 test("execution service queues an operator notification when an order is rejected before submission", async () => {
-  const exchangeAdapter: ExchangeAdapter = {
+  const exchangeAdapter: ExecutionExchangeAdapter = {
+    sendPath: "DRY_RUN_ADAPTER",
     async getBalances() {
       return [];
     },
@@ -567,8 +573,7 @@ test("execution service queues an operator notification when an order is rejecte
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
     },
-    exchangeAdapter,
-    sendPath: "DRY_RUN_ADAPTER",
+    executionAdapter: exchangeAdapter,
     validationAdapter: exchangeAdapter,
     repositories,
     accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
@@ -624,7 +629,8 @@ test("execution service queues an operator notification when an order is rejecte
 
 test("execution service blocks order persistence when exchange order test reports market offline", async () => {
   let createOrderCalled = false;
-  const exchangeAdapter: ExchangeAdapter = {
+  const exchangeAdapter: ExecutionExchangeAdapter = {
+    sendPath: "DRY_RUN_ADAPTER",
     async getBalances() {
       return [];
     },
@@ -724,7 +730,8 @@ test("execution service blocks order persistence when exchange order test report
 
 test("execution service blocks price orders below the exchange min total before persistence", async () => {
   let createOrderCalled = false;
-  const exchangeAdapter: ExchangeAdapter = {
+  const exchangeAdapter: ExecutionExchangeAdapter = {
+    sendPath: "DRY_RUN_ADAPTER",
     async getBalances() {
       return [];
     },
@@ -822,7 +829,7 @@ test("execution service blocks price orders below the exchange min total before 
   assert.equal(riskEvents[0]?.ruleCode, "EXCHANGE_MIN_TOTAL_GUARD");
 });
 
-test("execution service records order mode from persisted operator state", async () => {
+test("execution service records lifecycle evidence from the live execution adapter", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = new InMemoryOperatorStateStore({
     id: "state-2",
@@ -847,8 +854,7 @@ test("execution service records order mode from persisted operator state", async
       stalePriceThresholdMs: 30_000,
       minimumOrderValueKrw: 5_000,
     },
-    exchangeAdapter: new DryRunExchangeAdapter(),
-    sendPath: "LIVE_ADAPTER",
+    executionAdapter: createLiveExecutionAdapter(),
     repositories,
     accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
     accountExecutionLeaseMs: 30_000,
@@ -901,3 +907,18 @@ test("execution service records order mode from persisted operator state", async
   assert.equal(events.some((event) => event.eventType === "ORDER_FILLED"), false);
   assert.equal(fills.length, 0);
 });
+
+function createLiveExecutionAdapter(): ExecutionExchangeAdapter {
+  const baseAdapter = new DryRunExchangeAdapter();
+  return {
+    sendPath: "LIVE_ADAPTER",
+    getBalances: baseAdapter.getBalances.bind(baseAdapter),
+    getOrderChance: baseAdapter.getOrderChance.bind(baseAdapter),
+    testOrder: baseAdapter.testOrder.bind(baseAdapter),
+    createOrder: baseAdapter.createOrder.bind(baseAdapter),
+    cancelOrder: baseAdapter.cancelOrder.bind(baseAdapter),
+    getOrder: baseAdapter.getOrder.bind(baseAdapter),
+    listOpenOrders: baseAdapter.listOpenOrders.bind(baseAdapter),
+    listClosedOrders: baseAdapter.listClosedOrders.bind(baseAdapter),
+  };
+}

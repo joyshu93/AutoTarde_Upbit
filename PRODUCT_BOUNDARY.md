@@ -46,6 +46,7 @@ Live mode requires both:
 - explicit configuration enabling live order submission
 
 The application may wire the live Upbit adapter only when `APP_EXECUTION_MODE=LIVE`, `ENABLE_LIVE_ORDERS=true`, and Upbit credentials are configured. If any condition is missing, the runtime must fall back to the dry-run send path.
+The execution adapter itself carries the required live/dry discriminant; callers cannot supply a separate path label. A live adapter requires the persisted `LIVE`/`ENABLED` tuple both initially and immediately before its sole send. A dry adapter accepts any non-fully-live persisted tuple, but the exact initial mode-and-gate tuple must remain unchanged at the final check. Order mode, event source, simulated-fill behavior, and submission outcome follow that adapter discriminant.
 
 ## Asset And Market Limits
 - assets: `BTC`, `ETH`

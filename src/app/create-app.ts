@@ -11,7 +11,12 @@ import type { ExecutionRepository, OperatorStateStore } from "../modules/db/inte
 import type { SqlitePersistenceBundle } from "../modules/db/repositories/contracts.js";
 import { createSqlitePersistence } from "../modules/db/repositories/sqlite-repositories.js";
 import { ExecutionService } from "../modules/execution/execution-service.js";
-import { DryRunExchangeAdapter, type ExchangeAdapter } from "../modules/exchange/interfaces.js";
+import {
+  DryRunExchangeAdapter,
+  type ExchangeAdapter,
+  type ExecutionExchangeAdapter,
+  type LiveExecutionAdapter,
+} from "../modules/exchange/interfaces.js";
 import { UpbitPublicTickerClient } from "../modules/exchange/upbit/public-client.js";
 import { UpbitPrivateClient } from "../modules/exchange/upbit/private-client.js";
 import { PortfolioSyncService } from "../modules/reconciliation/portfolio-sync-service.js";
@@ -56,7 +61,7 @@ export interface AppServices {
 
 export interface CreateAppOverrides {
   publicMarketDataReader?: PositionGuardPublicMarketDataReader;
-  privateExchangeAdapter?: ExchangeAdapter;
+  privateExchangeAdapter?: LiveExecutionAdapter;
 }
 
 export function createApp(
@@ -95,8 +100,8 @@ export function createApp(
     config.executionMode === "LIVE" &&
     config.liveExecutionGate === "ENABLED" &&
     exchangeBackedReadEnabled;
-  const liveSendPath = liveSendEnabled ? "LIVE_ADAPTER" : "DRY_RUN_ADAPTER";
-  const executionExchangeAdapter = liveSendEnabled ? privateExchangeAdapter : dryRunExchangeAdapter;
+  const executionAdapter: ExecutionExchangeAdapter = liveSendEnabled ? privateExchangeAdapter : dryRunExchangeAdapter;
+  const liveSendPath = executionAdapter.sendPath;
   const telegramMessageClient = config.telegramBotToken
     ? new TelegramBotApiClient({
         botToken: config.telegramBotToken,
@@ -123,8 +128,7 @@ export function createApp(
 
   const executionService = new ExecutionService({
     riskLimits: buildExecutionRiskLimits(config),
-    exchangeAdapter: executionExchangeAdapter,
-    sendPath: liveSendPath,
+    executionAdapter,
     validationAdapter: syncExchangeAdapter,
     repositories,
     accountExecutionLeases,

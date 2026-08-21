@@ -12,7 +12,7 @@ import { createId } from "../../shared/ids.js";
 import type { ExecutionRepository, OperatorStateStore } from "../db/interfaces.js";
 import type { AccountExecutionLeaseStore } from "../db/pilot-interfaces.js";
 import { ExchangeOrderSubmissionError } from "../exchange/errors.js";
-import type { ExchangeAdapter, UpbitOrderChance } from "../exchange/interfaces.js";
+import type { ExchangeAdapter, ExecutionExchangeAdapter, UpbitOrderChance } from "../exchange/interfaces.js";
 import { evaluateRiskGuards } from "../risk/guards.js";
 import type { OperatorNotificationReporter } from "../telegram/reporter.js";
 import { buildOrderIdentifier, buildOrderIdempotencyKey } from "./idempotency.js";
@@ -22,8 +22,7 @@ export class ExecutionService {
   constructor(
     private readonly dependencies: {
       riskLimits: ExecutionRiskLimits;
-      exchangeAdapter: ExchangeAdapter;
-      sendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
+      executionAdapter: ExecutionExchangeAdapter;
       validationAdapter?: Pick<ExchangeAdapter, "getOrderChance" | "testOrder">;
       repositories: ExecutionRepository;
       accountExecutionLeases: AccountExecutionLeaseStore;
@@ -136,7 +135,25 @@ export class ExecutionService {
       return { accepted: false, outcome: "LEASE_BLOCKED", order: null, reason: message };
     }
 
-    const policy = composeExecutionPolicy(state, this.dependencies.riskLimits);
+    const initialAuthority = selectExecutionAuthority(state);
+    if (!executionAdapterAcceptsAuthority(this.dependencies.executionAdapter, initialAuthority)) {
+      const message = "The configured execution adapter is incompatible with initial persisted execution authority.";
+      try {
+        await this.recordLeaseBlockedAndPause({
+          input,
+          idempotencyKey,
+          market,
+          occurredAt: requestedAt,
+          reason: message,
+        });
+      } catch (error) {
+        releaseLease = false;
+        throw error;
+      }
+      return { accepted: false, outcome: "LEASE_BLOCKED", order: null, reason: message };
+    }
+
+    const policy = composeExecutionPolicy(state, this.dependencies.riskLimits, this.dependencies.executionAdapter);
     const openOrders = accountActiveOrders;
     const portfolio = await this.dependencies.repositories.getPortfolioExposure(input.exchangeAccountId);
 
@@ -273,7 +290,7 @@ export class ExecutionService {
       requestedAt,
       upbitUuid: null,
       status: "PERSISTED",
-      executionMode: state.executionMode,
+      executionMode: executionModeForAdapter(this.dependencies.executionAdapter),
       exchangeResponseJson: null,
       failureCode: null,
       failureMessage: null,
@@ -337,6 +354,7 @@ export class ExecutionService {
       await this.assertFinalPreSendAuthority({
         exchangeAccountId: input.exchangeAccountId,
         orderId: order.id,
+        initialAuthority,
       });
     } catch {
       releaseLease = false;
@@ -352,7 +370,7 @@ export class ExecutionService {
     }
 
     try {
-      const exchangeOrder = await this.dependencies.exchangeAdapter.createOrder({
+      const exchangeOrder = await this.dependencies.executionAdapter.createOrder({
         market,
         side: input.side,
         ordType: input.ordType,
@@ -386,7 +404,7 @@ export class ExecutionService {
           rawPayloadJson: JSON.stringify(fill.raw),
         }));
 
-      if (state.executionMode === "DRY_RUN") {
+      if (this.dependencies.executionAdapter.sendPath === "DRY_RUN_ADAPTER") {
         const settledAt = this.currentTimestamp();
         const syntheticFill = createDryRunSyntheticFill({
           orderId: order.id,
@@ -430,7 +448,7 @@ export class ExecutionService {
             id: createId("order_event"),
             orderId: order.id,
             eventType: "ORDER_SUBMITTED",
-            eventSource: "EXCHANGE",
+            eventSource: eventSourceForAdapter(this.dependencies.executionAdapter),
             payloadJson: JSON.stringify(exchangeOrder.raw),
             createdAt: updatedOrder.updatedAt,
           },
@@ -440,9 +458,9 @@ export class ExecutionService {
                 id: createId("order_event"),
                 orderId: order.id,
                 eventType: "ORDER_FILLED",
-                eventSource: state.executionMode === "DRY_RUN" ? "LOCAL" : "EXCHANGE",
+                eventSource: eventSourceForAdapter(this.dependencies.executionAdapter),
                 payloadJson: JSON.stringify(
-                  state.executionMode === "DRY_RUN"
+                  this.dependencies.executionAdapter.sendPath === "DRY_RUN_ADAPTER"
                     ? { mode: "DRY_RUN", settlement: "SIMULATED_IMMEDIATE_FILL", fillCount: fills.length }
                     : exchangeOrder.raw,
                 ),
@@ -463,7 +481,7 @@ export class ExecutionService {
 
       return {
         accepted: true,
-        outcome: state.executionMode === "DRY_RUN" ? "SIMULATED_FILLED" : "SUBMITTED",
+        outcome: this.dependencies.executionAdapter.sendPath === "DRY_RUN_ADAPTER" ? "SIMULATED_FILLED" : "SUBMITTED",
         order: updatedOrder,
         reason: null,
       };
@@ -494,7 +512,7 @@ export class ExecutionService {
               id: createId("order_event"),
               orderId: order.id,
               eventType: "ORDER_REJECTED",
-              eventSource: "EXCHANGE",
+              eventSource: eventSourceForAdapter(this.dependencies.executionAdapter),
               payloadJson: JSON.stringify(submissionError.metadata),
               createdAt: rejectedOrder.updatedAt,
             },
@@ -545,7 +563,7 @@ export class ExecutionService {
             id: createId("order_event"),
             orderId: order.id,
             eventType: "RECONCILIATION_RECOVERY_REQUIRED",
-            eventSource: "LOCAL",
+            eventSource: eventSourceForAdapter(this.dependencies.executionAdapter),
             payloadJson: JSON.stringify(submissionError.metadata),
             createdAt: uncertainOrder.updatedAt,
           },
@@ -619,19 +637,22 @@ export class ExecutionService {
   private async assertFinalPreSendAuthority(input: {
     exchangeAccountId: string;
     orderId: string;
+    initialAuthority: ExecutionAuthorityTuple;
   }): Promise<void> {
     const activeOrders = await this.dependencies.repositories.listActiveOrders(input.exchangeAccountId);
     // Keep this as the final await before createOrder so a persisted pause wins the send race.
     const state = await this.dependencies.operatorState.getState();
     const competingOrders = activeOrders.filter((order) => order.id !== input.orderId);
-    const configuredPathMatchesState = this.dependencies.sendPath === "LIVE_ADAPTER"
-      ? state.executionMode === "LIVE" && state.liveExecutionGate === "ENABLED"
-      : state.executionMode === "DRY_RUN" && state.liveExecutionGate === "DISABLED";
+    const finalAuthority = selectExecutionAuthority(state);
+    const authorityUnchanged =
+      finalAuthority.executionMode === input.initialAuthority.executionMode &&
+      finalAuthority.liveExecutionGate === input.initialAuthority.liveExecutionGate;
     if (
       competingOrders.length > 0 ||
       state.systemStatus !== "RUNNING" ||
       state.killSwitchActive ||
-      !configuredPathMatchesState
+      !authorityUnchanged ||
+      !executionAdapterAcceptsAuthority(this.dependencies.executionAdapter, finalAuthority)
     ) {
       throw new Error("final pre-send authority is blocked");
     }
@@ -761,7 +782,7 @@ export class ExecutionService {
         payload: Record<string, unknown>;
       }
   > {
-    const validator = this.dependencies.validationAdapter ?? this.dependencies.exchangeAdapter;
+    const validator = this.dependencies.validationAdapter ?? this.dependencies.executionAdapter;
     const basePayload = {
       exchangeAccountId: input.exchangeAccountId,
       strategyDecisionId: input.strategyDecisionId,
@@ -931,10 +952,11 @@ export class ExecutionService {
 function composeExecutionPolicy(
   state: ExecutionStateRecord,
   riskLimits: ExecutionRiskLimits,
+  executionAdapter: ExecutionExchangeAdapter,
 ): ExecutionPolicy {
   return {
-    executionMode: state.executionMode,
-    liveExecutionGate: state.liveExecutionGate,
+    executionMode: executionModeForAdapter(executionAdapter),
+    liveExecutionGate: executionAdapter.sendPath === "LIVE_ADAPTER" ? "ENABLED" : "DISABLED",
     globalKillSwitch: state.killSwitchActive,
     maxAllocationByAsset: riskLimits.maxAllocationByAsset,
     totalExposureCap: riskLimits.totalExposureCap,
@@ -964,6 +986,31 @@ function mapExchangeOrderStatus(
 
 function hasExecutedVolume(executedVolume: string | null): boolean {
   return Boolean(executedVolume && Number(executedVolume) > 0);
+}
+
+type ExecutionAuthorityTuple = Pick<ExecutionStateRecord, "executionMode" | "liveExecutionGate">;
+
+function selectExecutionAuthority(state: ExecutionStateRecord): ExecutionAuthorityTuple {
+  return {
+    executionMode: state.executionMode,
+    liveExecutionGate: state.liveExecutionGate,
+  };
+}
+
+function executionAdapterAcceptsAuthority(
+  executionAdapter: ExecutionExchangeAdapter,
+  authority: ExecutionAuthorityTuple,
+): boolean {
+  const fullyLive = authority.executionMode === "LIVE" && authority.liveExecutionGate === "ENABLED";
+  return executionAdapter.sendPath === "LIVE_ADAPTER" ? fullyLive : !fullyLive;
+}
+
+function executionModeForAdapter(executionAdapter: ExecutionExchangeAdapter): OrderRecord["executionMode"] {
+  return executionAdapter.sendPath === "LIVE_ADAPTER" ? "LIVE" : "DRY_RUN";
+}
+
+function eventSourceForAdapter(executionAdapter: ExecutionExchangeAdapter): "LOCAL" | "EXCHANGE" {
+  return executionAdapter.sendPath === "LIVE_ADAPTER" ? "EXCHANGE" : "LOCAL";
 }
 
 function isTerminalOrderStatus(status: OrderRecord["status"]): boolean {

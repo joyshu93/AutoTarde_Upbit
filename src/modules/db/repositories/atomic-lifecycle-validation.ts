@@ -25,6 +25,7 @@ export function validateOrderIntentInput(input: PersistOrderIntentInput): void {
 
 export function validateExchangeSubmissionInput(input: PersistExchangeSubmissionInput): void {
   const { order, event, fills } = input;
+  const expectedEventSource = eventSourceForExecutionMode(order.executionMode);
   if (input.terminalEvent && input.terminalEvent.id === event.id) {
     throw new Error("Submission and terminal order events must use distinct ids.");
   }
@@ -37,13 +38,10 @@ export function validateExchangeSubmissionInput(input: PersistExchangeSubmission
   } else {
     throw new Error(`Exchange submission has unsupported status ${order.status}.`);
   }
-  validateOrderEvent(order, event, order.status === "REJECTED" ? "ORDER_REJECTED" : "ORDER_SUBMITTED", "EXCHANGE");
+  validateOrderEvent(order, event, order.status === "REJECTED" ? "ORDER_REJECTED" : "ORDER_SUBMITTED", expectedEventSource);
   if (input.terminalEvent) {
     if (order.status !== "FILLED") throw new Error("Terminal submission events require a FILLED order.");
-    if (input.terminalEvent.eventSource !== "LOCAL" && input.terminalEvent.eventSource !== "EXCHANGE") {
-      throw new Error("Terminal submission event source is invalid.");
-    }
-    validateOrderEvent(order, input.terminalEvent, "ORDER_FILLED", input.terminalEvent.eventSource);
+    validateOrderEvent(order, input.terminalEvent, "ORDER_FILLED", expectedEventSource);
   } else if (order.status === "FILLED") {
     throw new Error("FILLED exchange submissions require terminal order evidence.");
   }
@@ -54,7 +52,7 @@ export function validateUncertainSubmissionInput(input: PersistUncertainSubmissi
   const { order, event, riskEvent } = input;
   if (order.status !== "RECONCILIATION_REQUIRED") throw new Error("Uncertain submission must have RECONCILIATION_REQUIRED status.");
   if (order.failureCode !== "RECONCILIATION_REQUIRED") throw new Error("Uncertain submission must use RECONCILIATION_REQUIRED failureCode.");
-  validateOrderEvent(order, event, "RECONCILIATION_RECOVERY_REQUIRED", "LOCAL");
+  validateOrderEvent(order, event, "RECONCILIATION_RECOVERY_REQUIRED", eventSourceForExecutionMode(order.executionMode));
   if (
     riskEvent.level !== "BLOCK" || riskEvent.ruleCode !== "POSITION_GUARD_PILOT_UNCERTAIN_ORDER" ||
     riskEvent.orderId !== order.id || riskEvent.exchangeAccountId !== order.exchangeAccountId ||
@@ -173,6 +171,10 @@ function validateOrderEvent(order: OrderRecord, event: OrderEventRecord, type: s
   if (event.orderId !== order.id || event.eventType !== type || event.eventSource !== source) {
     throw new Error(`Order event ${event.id} is not canonical for order ${order.id}.`);
   }
+}
+
+function eventSourceForExecutionMode(executionMode: OrderRecord["executionMode"]): OrderEventRecord["eventSource"] {
+  return executionMode === "DRY_RUN" ? "LOCAL" : "EXCHANGE";
 }
 
 function validateFills(order: OrderRecord, fills: FillRecord[]): void {

@@ -102,7 +102,7 @@ The intended live path is:
 4. risk approve and run Upbit order-chance and order-test validation
 5. atomically persist `PERSISTED` plus `ORDER_PERSISTED`
 6. transition the durable order to `SUBMITTING`
-7. renew and verify lease ownership, re-read account-wide active orders, then make authoritative execution state the final awaited check before calling the exchange adapter exactly once; the configured `LIVE` path requires persisted `LIVE`/`ENABLED` mode and gate, while the configured `DRY_RUN` path requires persisted `DRY_RUN`/`DISABLED`
+7. renew and verify lease ownership, re-read account-wide active orders, then make authoritative execution state the final awaited check before calling the tagged execution adapter exactly once with no intervening await; the `LIVE` adapter requires persisted `LIVE`/`ENABLED` both initially and finally, while the `DRY_RUN` adapter accepts any unchanged non-fully-live tuple, including `DRY_RUN`/`ENABLED` and `LIVE`/`DISABLED`
 8. atomically store accepted, definitive rejection, or uncertain-submission evidence; every immediate `FILLED` result includes distinct submitted and terminal event ids plus fill evidence in the same transaction
 9. reconcile until terminal state is consistent
 
@@ -113,6 +113,7 @@ The real Upbit order-create adapter distinguishes a clear exchange rejection fro
 `duplicate_identifier` is reconciliation-required rather than a simple rejection because identifier recovery must establish whether the matching exchange order is locally represented before any later send. The system never retries `createOrder` merely because the original response was lost.
 
 The live send path is selected only when mode, live gate, and credentials are explicitly configured.
+The adapter carries the live/dry discriminant; it is not paired with an independent caller-supplied label. Persisted `order.executionMode`, submission and terminal event sources, simulated-fill creation, and the submit outcome follow this discriminant. A dry adapter cannot be reported as a real exchange submission, and a live adapter cannot synthesize a dry-run terminal fill.
 Upbit `price` market buys may return exchange state `cancel` after a successful fill when only dust-sized KRW or fee lock remains. In that specific filled `bid`/`price` case, the local lifecycle records the order as `FILLED` and preserves the raw exchange `cancel` payload plus fill and fee evidence. Ordinary canceled orders without this filled market-buy pattern remain `CANCELED`.
 If an older local row already stored that filled market-buy dust-cancel pattern as `CANCELED`, terminal reconciliation must recheck the order and repair it to local `FILLED` rather than leaving misleading operator evidence.
 

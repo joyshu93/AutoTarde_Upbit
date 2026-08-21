@@ -92,7 +92,19 @@ export interface ExchangeAdapter {
   listClosedOrders(query?: ExchangeOrderHistoryQuery): Promise<ExchangeOrderSnapshot[]>;
 }
 
-export class DryRunExchangeAdapter implements ExchangeAdapter {
+export interface DryRunExecutionAdapter extends ExchangeAdapter {
+  readonly sendPath: "DRY_RUN_ADAPTER";
+}
+
+export interface LiveExecutionAdapter extends ExchangeAdapter {
+  readonly sendPath: "LIVE_ADAPTER";
+}
+
+export type ExecutionExchangeAdapter = DryRunExecutionAdapter | LiveExecutionAdapter;
+
+export class DryRunExchangeAdapter implements DryRunExecutionAdapter {
+  readonly sendPath = "DRY_RUN_ADAPTER" as const;
+
   async getBalances(): Promise<ExchangeBalance[]> {
     return [
       { currency: "KRW", balance: "0", locked: "0", avgBuyPrice: "0", unitCurrency: "KRW" },
