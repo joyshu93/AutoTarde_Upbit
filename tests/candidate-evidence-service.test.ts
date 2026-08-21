@@ -5,6 +5,7 @@ import { CandidateExecutionEvidenceService } from "../src/modules/execution/cand
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { InMemoryCandidatePilotRepository } from "../src/modules/db/repositories/in-memory-candidate-pilot-repository.js";
 import { candidateExecutionBindingMaterialHash } from "../src/modules/db/pilot-interfaces.js";
+import { ReconciliationService } from "../src/modules/reconciliation/reconciliation-service.js";
 import { TerminalCandidateProjectionSweep } from "../src/modules/reconciliation/terminal-candidate-sweep.js";
 import { createEmptyPositionGuardCandidateState } from "../src/modules/strategy/position-guard-candidate-state.js";
 import { parsePositionGuardCandidateTimestamp } from "../src/modules/strategy/position-guard-candidate-state.js";
@@ -457,6 +458,58 @@ test("candidate projection restart re-drives a legacy fault event with its origi
   assert.equal((await fixture.repositories.listOrderEvents("order-1")).length, 1);
 });
 
+for (const fault of [
+  {
+    label: "standard candidate fault",
+    id: "candidate-evidence-fault:order-1:UNVERIFIED_FEE_PROVENANCE",
+    code: "UNVERIFIED_FEE_PROVENANCE",
+    message: "Persisted terminal evidence fee provenance is unverified.",
+  },
+  {
+    label: "recovered-projection candidate fault",
+    id: "candidate-evidence-recovery-fault:order-1",
+    code: "RECOVERED_SNAPSHOT_PROJECTION_FAILED",
+    message: "Persisted recovered projection failed before its pause was written.",
+  },
+] as const) {
+  test(`complete reconciliation restart repairs an event-written ${fault.label} before disposal`, async () => {
+    const fixture = await createCandidateFixture({
+      fills: [fill(`restart-${fault.code}`, "0.1", "2026-08-21T00:00:03.000Z", "500")],
+    });
+    const eventCreatedAt = "2026-08-21T00:00:05.000Z";
+    await fixture.repositories.appendOrderEvent({
+      id: fault.id,
+      orderId: "order-1",
+      eventType: "CANDIDATE_EVIDENCE_PROJECTION_FAILED",
+      eventSource: "RECONCILIATION",
+      payloadJson: JSON.stringify({ code: fault.code, message: fault.message }),
+      createdAt: eventCreatedAt,
+    });
+    const createReconciliation = () => new ReconciliationService({
+      repositories: fixture.repositories,
+      operatorState: fixture.operatorState,
+      candidateEvidenceService: fixture.createService(),
+      maxOrderLookupsPerRun: 0,
+      maxTerminalCandidateProjectionsPerRun: 1,
+    });
+
+    const first = await createReconciliation().run("primary");
+    const restarted = await createReconciliation().run("primary");
+    const transitions = await fixture.operatorState.listTransitions(100);
+    const repairedPause = transitions.find((transition) => transition.id === fault.id);
+
+    assert.ok(first.issues.some((issue) => issue.code === "CANDIDATE_EVIDENCE_PROJECTION_FAILED"));
+    assert.ok(!restarted.issues.some((issue) => issue.code === "CANDIDATE_EVIDENCE_PROJECTION_FAILED"));
+    assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+    assert.equal(repairedPause?.command, "AUTOMATIC_PAUSE");
+    assert.equal(repairedPause?.toSystemStatus, "PAUSED");
+    assert.equal(repairedPause?.createdAt, eventCreatedAt);
+    assert.equal((await fixture.repositories.listOrderEvents("order-1"))
+      .filter((event) => event.id === fault.id).length, 1);
+    assert.deepEqual(await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null), []);
+  });
+}
+
 test("unbound terminal candidate evidence faults instead of attaching to the current deployment", async () => {
   const fixture = await createCandidateFixture({
     fills: [fill("unbound-fill", "0.1", "2026-08-21T00:00:03.000Z", "500")],
@@ -601,6 +654,74 @@ test("persisted terminal sweep progress skips applied, no-fill, and fault dispos
     fixture.deploymentId,
     "terminal-order:crash-window-order",
   ))?.materialVersion, "EXACT_V2");
+});
+
+test("bounded terminal sweep reaches every later eligible row once across multiple recreated restarts", async () => {
+  const fixture = await createCandidateFixture({
+    fills: [fill("already-applied", "0.1", "2026-08-21T00:00:03.000Z", "500")],
+  });
+  await seedFixtureTerminalOrder(fixture, "no-fill-before-eligible", []);
+  await seedFixtureTerminalOrder(fixture, "fault-before-eligible", [
+    fill("fault-before-eligible-fill", "0.1", "2026-08-21T00:00:04.000Z", "500"),
+  ], false);
+  await seedFixtureTerminalOrder(
+    fixture,
+    "preactivation-before-eligible",
+    [],
+    false,
+    "ENTER",
+    "2026-08-20T23:59:59.000Z",
+  );
+  const laterEligibleRows = [
+    ["eligible-z-first", "2026-08-21T00:00:07.000000001Z"],
+    ["eligible-a-second", "2026-08-21T00:00:08.000000001Z"],
+    ["eligible-y-third", "2026-08-21T00:00:09.000000001Z"],
+    ["eligible-b-fourth", "2026-08-21T00:00:10.000000001Z"],
+    ["eligible-x-fifth", "2026-08-21T00:00:11.000000001Z"],
+  ] as const;
+  for (const [orderId, filledAt] of laterEligibleRows) {
+    await seedFixtureTerminalOrder(fixture, orderId, [
+      fill(`fill-${orderId}`, "0.01", filledAt, "50"),
+    ], true, "ADD");
+  }
+
+  await fixture.service.processTerminalOrder("order-1");
+  await fixture.service.processTerminalOrder("no-fill-before-eligible");
+  await fixture.service.processTerminalOrder("fault-before-eligible");
+
+  const projected: string[] = [];
+  const runRestartedSweep = async () => {
+    const restartedService = fixture.createService();
+    return new TerminalCandidateProjectionSweep({
+      repositories: fixture.repositories,
+      projector: {
+        async processTerminalOrder(orderId: string) {
+          projected.push(orderId);
+          return restartedService.processTerminalOrder(orderId);
+        },
+        async classifyTerminalOrderForSweep(orderId: string) {
+          return restartedService.classifyTerminalOrderForSweep(orderId);
+        },
+      },
+      maximumPerRun: 2,
+    }).run("primary");
+  };
+
+  const runs = [
+    await runRestartedSweep(),
+    await runRestartedSweep(),
+    await runRestartedSweep(),
+    await runRestartedSweep(),
+  ];
+
+  assert.deepEqual(runs.map((run) => run.processedCount), [2, 2, 1, 0]);
+  assert.deepEqual(runs.map((run) => run.deferredCount), [3, 1, 0, 0]);
+  assert.deepEqual(projected, laterEligibleRows.map(([orderId]) => orderId));
+  assert.deepEqual(
+    (await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null))
+      .map((evidence) => evidence.evidenceId),
+    ["terminal-order:order-1", ...laterEligibleRows.map(([orderId]) => `terminal-order:${orderId}`)],
+  );
 });
 
 test("legacy and inferred fill fees never count as confirmed candidate fee evidence", async () => {

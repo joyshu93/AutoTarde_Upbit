@@ -158,6 +158,7 @@ export interface ExecutionRepository {
 export interface OperatorStateStore {
   getState(): Promise<ExecutionStateRecord>;
   listTransitions(limit?: number): Promise<ExecutionStateTransitionRecord[]>;
+  getTransitionById?(id: string): Promise<ExecutionStateTransitionRecord | null>;
   pauseForFault(input: FaultPauseInput): Promise<ExecutionStateRecord>;
   pause(reason?: string): Promise<ExecutionStateRecord>;
   resume(): Promise<ExecutionStateRecord>;

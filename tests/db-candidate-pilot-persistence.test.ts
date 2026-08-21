@@ -9,6 +9,9 @@ import { SqliteCandidatePilotRepository } from
   "../src/modules/db/repositories/sqlite-candidate-pilot-repository.js";
 import { SqliteAccountExecutionLeaseStore } from
   "../src/modules/db/repositories/sqlite-account-execution-lease-store.js";
+import { CandidateExecutionEvidenceService } from
+  "../src/modules/execution/candidate-evidence-service.js";
+import { ReconciliationService } from "../src/modules/reconciliation/reconciliation-service.js";
 import { test } from "./harness.js";
 import {
   advanceInput,
@@ -97,6 +100,87 @@ test("sqlite candidate projection fault persistence repairs an event-written pau
     assert.equal(second, "DUPLICATE");
     assert.equal((await bundle.operatorState.getState()).systemStatus, "PAUSED");
     assert.equal((await bundle.repositories.listOrderEvents(order.id)).length, 1);
+  });
+});
+
+test("malformed persisted candidate activation epoch is swept into an atomic fault pause", async () => {
+  await withFreshBundle("candidate-malformed-activation", async (bundle, _databasePath, db) => {
+    const executionState = await bundle.operatorState.getState();
+    const pending = await bundle.candidatePilots.createDeploymentWithInitialState(
+      initialDeploymentInput("candidate-malformed-activation"),
+    );
+    const activationAt = executionState.updatedAt;
+    const activationEpochNs = BigInt(Date.parse(activationAt)) * 1_000_000n;
+    const activated = await bundle.candidatePilots.activateDeployment({
+      deploymentId: pending.id,
+      expectedPhase: "PENDING_FLAT",
+      expectedUpdatedAt: pending.updatedAt,
+      activationAt,
+      activationEpochNs,
+    });
+    assert.equal(activated?.phase, "ACTIVE");
+    db.prepare(`
+      UPDATE strategy_pilot_deployments
+      SET activation_epoch_ns = ?
+      WHERE id = ?
+    `).run("malformed-epoch", pending.id);
+
+    const requestedAt = new Date(Date.parse(activationAt) + 1_000).toISOString();
+    const faultAt = new Date(Date.parse(activationAt) + 2_000).toISOString();
+    const orderId = "malformed-activation-terminal-order";
+    await bundle.repositories.saveOrder({
+      id: orderId,
+      strategyDecisionId: null,
+      exchangeAccountId: "primary",
+      market: "KRW-BTC",
+      side: "bid",
+      ordType: "price",
+      volume: null,
+      price: "10000000",
+      timeInForce: null,
+      smpType: null,
+      identifier: orderId,
+      idempotencyKey: orderId,
+      origin: "STRATEGY",
+      requestedAt,
+      upbitUuid: null,
+      status: "CANCELED",
+      executionMode: "DRY_RUN",
+      exchangeResponseJson: null,
+      failureCode: null,
+      failureMessage: null,
+      createdAt: requestedAt,
+      updatedAt: requestedAt,
+    });
+    const candidateEvidenceService = new CandidateExecutionEvidenceService({
+      exchangeAccountId: "primary",
+      repositories: bundle.repositories,
+      pilotRepository: bundle.candidatePilots,
+      operatorState: bundle.operatorState,
+      clock: {
+        now: () => ({ occurredAt: faultAt, occurredAtEpochMs: Date.parse(faultAt) }),
+      },
+    });
+    const reconciliation = new ReconciliationService({
+      repositories: bundle.repositories,
+      operatorState: bundle.operatorState,
+      candidateEvidenceService,
+      maxOrderLookupsPerRun: 0,
+      maxTerminalCandidateProjectionsPerRun: 1,
+    });
+
+    const summary = await reconciliation.run("primary");
+    const events = await bundle.repositories.listOrderEvents(orderId);
+    const faultEvent = events.find((event) =>
+      event.id === `candidate-evidence-fault:${orderId}:CANDIDATE_EVIDENCE_PROJECTION_FAILED`);
+    const transition = (await bundle.operatorState.listTransitions(100))
+      .find((candidate) => candidate.id === faultEvent?.id);
+
+    assert.ok(summary.issues.some((issue) => issue.code === "CANDIDATE_EVIDENCE_PROJECTION_FAILED"));
+    assert.equal((await bundle.operatorState.getState()).systemStatus, "PAUSED");
+    assert.equal(faultEvent?.createdAt, faultAt);
+    assert.equal(transition?.command, "AUTOMATIC_PAUSE");
+    assert.equal(transition?.createdAt, faultAt);
   });
 });
 

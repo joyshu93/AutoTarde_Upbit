@@ -164,6 +164,7 @@ Current slice:
 - terminal-order fill backfill during `/sync`
 - bounded `SUBMITTING` / `RECONCILIATION_REQUIRED` / `FAILED` / `REJECTED` identifier recovery using injected-clock, persisted lookup observations; it tries a persisted UUID before identifier fallback, never resends, and atomically records terminal exchange absence, fault pause, and audit event only after both configured persisted bounds are met
 - terminal BTC candidate evidence projection after durable order/fill backfill and a separate bounded persisted terminal sweep; it sorts by persisted fill execution epoch-nanoseconds and stable IDs, validates immutable deployment binding plus decision/order/fill/fee provenance, and uses the candidate repository's atomic evidence/state-CAS/audit contract with exact decimal text values
+- terminal candidate fault disposal requires both its immutable fault event and the matching automatic-pause transition; startup sweeps re-drive event-written/pause-missing standard and recovered-projection faults with the event timestamp, and malformed persisted activation data is classified as eligible fail-closed work
 - candidate evidence keeps legacy REAL fields and historical hashes as `LEGACY_APPROXIMATE_V1`; new `EXACT_V2` writes use canonical text decimals, and a legacy state cannot silently advance
 - balance and position drift detection by comparing new exchange-backed snapshots against the prior persisted snapshots plus local fill history, using parsed timestamp instants rather than raw timestamp text
 - fill backfill preserves Upbit order-level `paid_fee` as KRW fill-fee evidence when individual trade rows omit fee data, and KRW balance drift detection tolerates only explicit 1 KRW rounding dust after fee-adjusted fills
@@ -172,6 +173,7 @@ Current slice:
 - portfolio drift detection excludes simulated `DRY_RUN` fills because they do not mutate exchange balances
 - startup recovery sweep when exchange-backed Upbit reads are configured
 - per-run reconciliation lookup budgeting with oldest-first processing inside each priority tier
+- `FAILED` orders already finalized as `ORDER_SUBMISSION_ABSENCE_CONFIRMED` are removed before terminal lookup candidate construction, so they cannot consume later restart budgets
 - checkpointed exchange-history recovery with an explicit stop-before boundary, explicit exchange-retention assumption metadata, `IN_PROGRESS` / `COMPLETE` coverage status, and separate `HIGH` / `PARTIAL` / `FAILED` confidence classification
 - startup policy that can mark persisted operator state `DEGRADED` when unresolved portfolio drift remains after startup recovery
 

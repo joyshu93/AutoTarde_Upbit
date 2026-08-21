@@ -724,6 +724,11 @@ export class InMemoryOperatorStateStore implements OperatorStateStore {
     return this.transitions.slice(0, limit).map((record) => ({ ...record }));
   }
 
+  async getTransitionById(id: string): Promise<ExecutionStateTransitionRecord | null> {
+    const transition = this.transitions.find((candidate) => candidate.id === id);
+    return transition ? { ...transition } : null;
+  }
+
   async pauseForFault(input: FaultPauseInput): Promise<ExecutionStateRecord> {
     return this.applyFaultPauseAtomically(input);
   }

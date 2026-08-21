@@ -93,7 +93,7 @@ export class ReconciliationService {
   ) {}
 
   async recoverOrderByIdentifier(order: OrderRecord): Promise<IdentifierRecoverySummary> {
-    if (order.status === "FAILED" && order.failureCode === "ORDER_SUBMISSION_ABSENCE_CONFIRMED") {
+    if (isSubmissionAbsenceConfirmed(order)) {
       return {
         outcome: "ABSENCE_CONFIRMED",
         orderId: order.id,
@@ -404,6 +404,7 @@ export class ReconciliationService {
     const candidates = orders.filter(
       (order) =>
         !isLocalDryRunExchangeArtifact(order) &&
+        !isSubmissionAbsenceConfirmed(order) &&
         TERMINAL_RECONCILIATION_STATUSES.has(order.status) &&
         Boolean(order.upbitUuid || order.identifier),
     );
@@ -1432,6 +1433,10 @@ function shouldReconcileTerminalOrder(order: OrderRecord, fillCount: number): bo
     default:
       return false;
   }
+}
+
+function isSubmissionAbsenceConfirmed(order: OrderRecord): boolean {
+  return order.status === "FAILED" && order.failureCode === "ORDER_SUBMISSION_ABSENCE_CONFIRMED";
 }
 
 function isFilledPriceBidDustCancelCandidate(order: OrderRecord, fillCount: number): boolean {

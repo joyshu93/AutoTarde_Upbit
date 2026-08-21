@@ -3,7 +3,9 @@ import type {
   PositionGuardPilotDeploymentRecord,
 } from "../../domain/pilot-types.js";
 import type {
+  ExecutionStateTransitionRecord,
   FillRecord,
+  OrderEventRecord,
   OrderRecord,
   StrategyDecisionRecord,
 } from "../../domain/types.js";
@@ -77,12 +79,15 @@ export class CandidateExecutionEvidenceService {
       return { outcome: "NOT_TERMINAL", orderId, detail: `Order lifecycle ${order.status} is not terminal.` };
     }
 
-    const deployment = await this.dependencies.pilotRepository.getDeploymentForExchangeAccount(order.exchangeAccountId);
-    if (!deployment || (deployment.phase !== "ACTIVE" && deployment.phase !== "DRAINING")) {
-      return { outcome: "NO_ACTIVE_DEPLOYMENT", orderId, detail: "No active candidate deployment is persisted." };
-    }
-
     try {
+      const incompleteFault = await this.findIncompleteFaultPause(order);
+      if (incompleteFault) {
+        return this.repairPersistedFaultPause(order, incompleteFault);
+      }
+      const deployment = await this.dependencies.pilotRepository.getDeploymentForExchangeAccount(order.exchangeAccountId);
+      if (!deployment || (deployment.phase !== "ACTIVE" && deployment.phase !== "DRAINING")) {
+        return { outcome: "NO_ACTIVE_DEPLOYMENT", orderId, detail: "No active candidate deployment is persisted." };
+      }
       if (!hasVerifiedDeploymentActivation(deployment)) {
         throw new CandidateEvidenceFault(
           "CANDIDATE_DEPLOYMENT_ACTIVATION_UNVERIFIED",
@@ -207,16 +212,25 @@ export class CandidateExecutionEvidenceService {
       (order.status !== "FILLED" && order.status !== "CANCELED")) {
       return "OUTSIDE_SCOPE";
     }
-    const deployment = await this.dependencies.pilotRepository.getDeploymentForExchangeAccount(order.exchangeAccountId);
+    const events = await this.dependencies.repositories.listOrderEvents(order.id);
+    const faultEvents = candidateProjectionFaultEvents(events, order.id);
+    for (const event of faultEvents) {
+      if (!(await this.hasMatchingFaultPauseTransition(order, event))) {
+        return "ELIGIBLE";
+      }
+    }
+    if (faultEvents.length > 0 || events.some((event) => event.id === `candidate-evidence-no-fill:${order.id}`)) {
+      return "DISPOSED";
+    }
+    let deployment: PositionGuardPilotDeploymentRecord | null;
+    try {
+      deployment = await this.dependencies.pilotRepository.getDeploymentForExchangeAccount(order.exchangeAccountId);
+    } catch {
+      // Malformed persisted deployment evidence must enter projection so it can fault and pause atomically.
+      return "ELIGIBLE";
+    }
     if (!deployment || (deployment.phase !== "ACTIVE" && deployment.phase !== "DRAINING")) {
       return "OUTSIDE_SCOPE";
-    }
-    const events = await this.dependencies.repositories.listOrderEvents(order.id);
-    if (events.some((event) =>
-      event.id === `candidate-evidence-no-fill:${order.id}` ||
-      event.id.startsWith(`candidate-evidence-fault:${order.id}:`),
-    )) {
-      return "DISPOSED";
     }
     let binding: CandidateExecutionBindingRecord | null;
     try {
@@ -235,6 +249,57 @@ export class CandidateExecutionEvidenceService {
       return "DISPOSED";
     }
     return "ELIGIBLE";
+  }
+
+  private async findIncompleteFaultPause(order: OrderRecord): Promise<OrderEventRecord | null> {
+    const events = candidateProjectionFaultEvents(
+      await this.dependencies.repositories.listOrderEvents(order.id),
+      order.id,
+    ).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+    for (const event of events) {
+      if (!(await this.hasMatchingFaultPauseTransition(order, event))) {
+        return event;
+      }
+    }
+    return null;
+  }
+
+  private async hasMatchingFaultPauseTransition(
+    order: OrderRecord,
+    event: OrderEventRecord,
+  ): Promise<boolean> {
+    const getTransitionById = this.dependencies.operatorState.getTransitionById;
+    const transition = getTransitionById
+      ? await getTransitionById.call(this.dependencies.operatorState, event.id)
+      : (await this.dependencies.operatorState.listTransitions(Number.MAX_SAFE_INTEGER))
+        .find((candidate) => candidate.id === event.id) ?? null;
+    return isMatchingFaultPauseTransition(transition, order, event);
+  }
+
+  private async repairPersistedFaultPause(
+    order: OrderRecord,
+    event: OrderEventRecord,
+  ): Promise<CandidateEvidenceProjectionResult> {
+    const persistCandidateProjectionFault = this.dependencies.repositories.persistCandidateProjectionFault;
+    if (!persistCandidateProjectionFault) {
+      throw new Error("Candidate projection fault persistence requires an atomic repository implementation.");
+    }
+    const reason = persistedFaultReason(event);
+    await persistCandidateProjectionFault.call(this.dependencies.repositories, {
+      orderId: order.id,
+      event,
+      faultPause: {
+        exchangeAccountId: order.exchangeAccountId,
+        faultId: event.id,
+        reason,
+        occurredAt: event.createdAt,
+      },
+    });
+    return {
+      outcome: "FAULT",
+      orderId: order.id,
+      detail: `Repaired persisted candidate projection fault pause: ${reason}`,
+    };
   }
 
   private async getVerifiedDecision(
@@ -605,4 +670,47 @@ function validateClock(value: ReturnType<CandidateEvidenceClock["now"]>): void {
   if (!Number.isSafeInteger(value.occurredAtEpochMs) || value.occurredAtEpochMs < 0 || Date.parse(value.occurredAt) !== value.occurredAtEpochMs) {
     throw new Error("Candidate evidence clock must provide matching persisted ISO and epoch-millisecond values.");
   }
+}
+
+function candidateProjectionFaultEvents(
+  events: OrderEventRecord[],
+  orderId: string,
+): OrderEventRecord[] {
+  const projectionPrefix = `candidate-evidence-fault:${orderId}:`;
+  const recoveryPrefix = `candidate-evidence-recovery-fault:${orderId}`;
+  return events.filter((event) =>
+    event.eventType === "CANDIDATE_EVIDENCE_PROJECTION_FAILED" &&
+    (event.id.startsWith(projectionPrefix) || event.id.startsWith(recoveryPrefix)),
+  );
+}
+
+function isMatchingFaultPauseTransition(
+  transition: ExecutionStateTransitionRecord | null,
+  order: OrderRecord,
+  event: OrderEventRecord,
+): boolean {
+  return transition !== null &&
+    transition.id === event.id &&
+    transition.exchangeAccountId === order.exchangeAccountId &&
+    transition.command === "AUTOMATIC_PAUSE" &&
+    (transition.toSystemStatus === "PAUSED" || transition.toSystemStatus === "KILL_SWITCHED") &&
+    transition.createdAt === event.createdAt &&
+    transition.reason === `faultId=${event.id}; reason=${persistedFaultReason(event)}`;
+}
+
+function persistedFaultReason(event: OrderEventRecord): string {
+  try {
+    const payload = JSON.parse(event.payloadJson) as unknown;
+    if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+      const record = payload as Record<string, unknown>;
+      const code = typeof record.code === "string" && record.code.trim() ? record.code.trim() : null;
+      const message = typeof record.message === "string" && record.message.trim() ? record.message.trim() : null;
+      if (code && message) return `${code}: ${message}`;
+      if (code) return code;
+      if (message) return message;
+    }
+  } catch {
+    // The immutable event still requires a deterministic fail-closed pause reason.
+  }
+  return `Persisted candidate projection fault ${event.id}.`;
 }

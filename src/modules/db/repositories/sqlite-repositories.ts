@@ -1444,6 +1444,15 @@ export class SqliteOperatorStateStore implements OperatorStateStore {
     return rows.map(mapExecutionStateTransitionRow);
   }
 
+  async getTransitionById(id: string): Promise<ExecutionStateTransitionRecord | null> {
+    const row = this.db.prepare(`
+      SELECT * FROM execution_state_transitions
+      WHERE exchange_account_id = ? AND id = ?
+      LIMIT 1
+    `).get(this.exchangeAccountId, id) as SqliteExecutionStateTransitionRow | undefined;
+    return row ? mapExecutionStateTransitionRow(row) : null;
+  }
+
   async pauseForFault(input: FaultPauseInput): Promise<ExecutionStateRecord> {
     validateFaultPauseInput(input);
     if (input.exchangeAccountId !== this.exchangeAccountId) {

@@ -1713,39 +1713,70 @@ test("immediate persisted terminal strategy orders are swept without consuming e
   assert.deepEqual(projected, [order.id]);
 });
 
-test("complete reconciliation restarts never spend terminal projection budget on absence-confirmed orders", async () => {
+test("complete reconciliation restarts exclude actual absence-confirmed failures before constrained lookup candidates", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = pausedUncertainSubmissionState();
   const absenceConfirmed = uncertainSubmissionOrder({
-    id: "absence-confirmed-terminal",
-    status: "CANCELED",
+    id: "absence-confirmed-failed",
+    identifier: "absence-confirmed-failed",
+    idempotencyKey: "absence-confirmed-failed",
+    status: "FAILED",
     failureCode: "ORDER_SUBMISSION_ABSENCE_CONFIRMED",
     failureMessage: "Bounded identifier recovery confirmed persistent exchange absence.",
+    updatedAt: "2026-08-21T00:00:00.000Z",
   });
   const eligible = uncertainSubmissionOrder({
-    id: "eligible-terminal-after-absence",
-    status: "FILLED",
+    id: "eligible-failed-after-absence",
+    identifier: "eligible-failed-after-absence",
+    idempotencyKey: "eligible-failed-after-absence",
+    status: "FAILED",
+    failureCode: "ORDER_SUBMISSION_UNCERTAIN",
+    updatedAt: "2026-08-21T00:00:01.000Z",
   });
   await repositories.saveOrder(absenceConfirmed);
   await repositories.saveOrder(eligible);
-  const projected: string[] = [];
-  const reconciliation = new ReconciliationService({
-    repositories,
-    operatorState,
-    maxOrderLookupsPerRun: 0,
-    maxTerminalCandidateProjectionsPerRun: 1,
-    candidateEvidenceService: {
-      async processTerminalOrder(orderId) {
-        projected.push(orderId);
-        return { outcome: "ADVANCED", orderId, detail: "projected" };
+  const lookupQueries: Array<{ uuid?: string; identifier?: string }> = [];
+  const createReconciliation = (observedAt: string, observedAtEpochMs: number) =>
+    new ReconciliationService({
+      repositories,
+      operatorState,
+      maxOrderLookupsPerRun: 1,
+      orderReader: {
+        async getOrder(query) {
+          lookupQueries.push(query);
+          return null;
+        },
       },
-    },
-  });
+      identifierRecovery: {
+        minimumNotFoundObservations: 3,
+        minimumElapsedMs: 60_000,
+      },
+      recoveryClock: {
+        now: () => ({ observedAt, observedAtEpochMs }),
+      },
+    });
 
-  await reconciliation.run("primary");
-  await reconciliation.run("primary");
+  const first = await createReconciliation(
+    "2026-08-21T00:00:02.000Z",
+    1_787_270_402_000,
+  ).run("primary");
+  const restarted = await createReconciliation(
+    "2026-08-21T00:00:03.000Z",
+    1_787_270_403_000,
+  ).run("primary");
 
-  assert.deepEqual(projected, [eligible.id, eligible.id]);
+  assert.deepEqual(lookupQueries, [
+    { identifier: eligible.identifier! },
+    { identifier: eligible.identifier! },
+  ]);
+  assert.deepEqual([first.candidateCount, restarted.candidateCount], [1, 1]);
+  assert.deepEqual([first.processedCount, restarted.processedCount], [1, 1]);
+  assert.deepEqual([first.deferredCount, restarted.deferredCount], [0, 0]);
+  assert.deepEqual(
+    await repositories.listOrderSubmissionRecoveryObservations(absenceConfirmed.id),
+    [],
+  );
+  assert.equal((await repositories.listOrderSubmissionRecoveryObservations(eligible.id)).length, 2);
 });
 
 test("terminal sweep orders persisted fill instants before order update time with deterministic order IDs", async () => {
