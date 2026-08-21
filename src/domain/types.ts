@@ -263,6 +263,8 @@ export interface FillRecord {
   feeCurrency: string | null;
   feeAmount: string | null;
   feeProvenance?: FillFeeProvenance;
+  executionTimestampProvenance?: FillExecutionTimestampProvenance;
+  executionEpochNs?: string | null;
   filledAt: string;
   rawPayloadJson: string;
 }
@@ -274,6 +276,13 @@ export type FillFeeProvenance =
   | "MISSING"
   | "LEGACY_UNVERIFIED"
   | "SIMULATED";
+
+export type FillExecutionTimestampProvenance =
+  | "EXCHANGE_FILL_CONFIRMED"
+  | "RECONCILIATION_OBSERVED_AT_FALLBACK"
+  | "ORDER_UPDATED_AT_FALLBACK"
+  | "LOCAL_SYNTHETIC"
+  | "LEGACY_UNVERIFIED";
 
 export interface ReconciliationRunRecord {
   id: string;

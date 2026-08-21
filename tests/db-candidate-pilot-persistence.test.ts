@@ -24,6 +24,7 @@ import { verifyAccountExecutionLeaseContract } from "./account-execution-lease-c
 const MIGRATION_0018 = "0018_scope_candidate_evidence_identity_to_deployment.sql";
 const MIGRATION_0019 = "0019_store_candidate_evidence_decimals_as_text.sql";
 const MIGRATION_0020 = "0020_add_candidate_execution_bindings.sql";
+const MIGRATION_0021 = "0021_add_candidate_fill_timestamp_and_binding_shape.sql";
 
 test("sqlite candidate pilot repository satisfies the common contracts", async () => {
   await withFreshBundle("candidate-contract", async (bundle) => {
@@ -89,7 +90,7 @@ test("migration 0019 preserves legacy mirrors and writes authoritative canonical
   });
 });
 
-test("fresh migration list applies 0019 before candidate execution bindings", async () => {
+test("fresh migration list applies 0019, candidate execution bindings, and fill provenance in order", async () => {
   await withFreshBundle("migration-list-0019-0020", async (_bundle, _databasePath, db) => {
     const filenames = (db.prepare(
       "SELECT filename FROM _schema_migrations ORDER BY filename ASC",
@@ -97,9 +98,80 @@ test("fresh migration list applies 0019 before candidate execution bindings", as
 
     assert.ok(filenames.includes(MIGRATION_0019));
     assert.ok(filenames.includes(MIGRATION_0020));
+    assert.ok(filenames.includes(MIGRATION_0021));
     assert.ok(filenames.indexOf(MIGRATION_0019) < filenames.indexOf(MIGRATION_0020));
+    assert.ok(filenames.indexOf(MIGRATION_0020) < filenames.indexOf(MIGRATION_0021));
+    const fillColumns = db.prepare("PRAGMA table_info(fills)").all() as Array<{ name: string; type: string }>;
+    assert.equal(fillColumns.find((column) => column.name === "execution_epoch_ns")?.type, "TEXT");
     assertDatabaseIntegrity(db);
   });
+});
+
+test("recorded unsafe 0019 TEXT-affinity exact columns remain legacy and preserve original hashes", async () => {
+  const databasePath = await createTempDatabasePath("recorded-unsafe-0019-text-affinity");
+  await createAppliedOriginal0017Fixture(databasePath);
+  const before = new DatabaseSync(databasePath);
+  try {
+    before.exec(await readFile(path.resolve(process.cwd(), "migrations", MIGRATION_0018), "utf8"));
+    before.prepare("INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)")
+      .run(MIGRATION_0018, "2026-08-21T00:00:00.000Z");
+    before.exec(`
+      ALTER TABLE strategy_candidate_execution_evidence ADD COLUMN material_version TEXT NOT NULL DEFAULT 'LEGACY_APPROXIMATE_V1';
+      ALTER TABLE strategy_candidate_execution_evidence ADD COLUMN executed_quantity_exact TEXT;
+      ALTER TABLE strategy_candidate_execution_evidence ADD COLUMN gross_quote_value_krw_exact TEXT;
+      ALTER TABLE strategy_candidate_execution_evidence ADD COLUMN confirmed_fee_krw_exact TEXT;
+      ALTER TABLE strategy_candidate_execution_evidence ADD COLUMN remaining_quantity_exact TEXT;
+    `);
+    before.exec("DROP TRIGGER strategy_candidate_execution_evidence_no_update;");
+    before.prepare(`
+      UPDATE strategy_candidate_execution_evidence
+      SET executed_quantity_exact = ?, gross_quote_value_krw_exact = ?,
+          confirmed_fee_krw_exact = ?, remaining_quantity_exact = ?
+      WHERE deployment_id = ? AND id = ?
+    `).run(
+      "1e-20",
+      "123456789.123456789123456789",
+      "0.000000000000000001",
+      "1e-20",
+      "original-0017-primary",
+      "original-evidence",
+    );
+    before.exec(`
+      CREATE TRIGGER strategy_candidate_execution_evidence_no_update
+      BEFORE UPDATE ON strategy_candidate_execution_evidence
+      BEGIN
+        SELECT RAISE(ABORT, 'strategy candidate execution evidence is append-only');
+      END;
+    `);
+    before.prepare("INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)")
+      .run(MIGRATION_0019, "2026-08-21T00:00:00.000Z");
+  } finally {
+    before.close();
+  }
+
+  const handle = openSqliteDatabase(databasePath);
+  try {
+    const evidence = handle.db.prepare(`
+      SELECT material_hash, material_version, executed_quantity_exact, gross_quote_value_krw_exact
+      FROM strategy_candidate_execution_evidence
+      WHERE deployment_id = ? AND id = ?
+    `).get("original-0017-primary", "original-evidence") as {
+      material_hash: string;
+      material_version: string;
+      executed_quantity_exact: string | null;
+      gross_quote_value_krw_exact: string | null;
+    } | undefined;
+
+    assert.equal(evidence?.material_hash, "c".repeat(64));
+    assert.equal(evidence?.material_version, "LEGACY_APPROXIMATE_V1");
+    assert.equal(evidence?.executed_quantity_exact, "1e-20");
+    assert.equal(evidence?.gross_quote_value_krw_exact, "123456789.123456789123456789");
+    assert.equal(await new SqliteCandidatePilotRepository(handle.db).getExactState("original-0017-primary"), null);
+    assertDatabaseIntegrity(handle.db);
+  } finally {
+    handle.close();
+    await cleanupTempDatabase(databasePath);
+  }
 });
 
 test("migration 0019 rolls back every added compatibility column when a required table is unavailable", async () => {

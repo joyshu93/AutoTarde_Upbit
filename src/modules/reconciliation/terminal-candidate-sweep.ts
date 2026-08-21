@@ -1,6 +1,9 @@
 import type { OrderRecord } from "../../domain/types.js";
 import type { ExecutionRepository } from "../db/interfaces.js";
-import type { CandidateExecutionEvidenceService } from "../execution/candidate-evidence-service.js";
+import type {
+  CandidateExecutionEvidenceService,
+  TerminalCandidateSweepDisposition,
+} from "../execution/candidate-evidence-service.js";
 import {
   compareDeterministicIdentifiers,
   parseCandidateEvidenceTimestamp,
@@ -18,7 +21,8 @@ export class TerminalCandidateProjectionSweep {
   constructor(
     private readonly dependencies: {
       repositories: ExecutionRepository;
-      projector: Pick<CandidateExecutionEvidenceService, "processTerminalOrder">;
+      projector: Pick<CandidateExecutionEvidenceService, "processTerminalOrder"> &
+        Partial<Pick<CandidateExecutionEvidenceService, "classifyTerminalOrderForSweep">>;
       maximumPerRun?: number;
     },
   ) {}
@@ -29,11 +33,16 @@ export class TerminalCandidateProjectionSweep {
       throw new Error("Terminal candidate projection sweep maximum must be a non-negative safe integer.");
     }
     const orders = await this.dependencies.repositories.listOrders(exchangeAccountId);
-    const candidates = await Promise.all(
+    const allCandidates = await Promise.all(
       orders
         .filter(isTerminalBtcStrategyOrder)
-        .map(async (order) => ({ order, sort: await terminalSortKey(this.dependencies.repositories, order) })),
+        .map(async (order) => ({
+          order,
+          disposition: await this.classify(order.id),
+          sort: await terminalSortKey(this.dependencies.repositories, order),
+        })),
     );
+    const candidates = allCandidates.filter((candidate) => candidate.disposition === "ELIGIBLE");
     candidates.sort((left, right) => compareTerminalCandidates(left, right));
     const selected = candidates.slice(0, maximumPerRun);
     const failedOrderIds: string[] = [];
@@ -47,6 +56,12 @@ export class TerminalCandidateProjectionSweep {
       failedOrderIds,
     };
   }
+
+  private async classify(orderId: string): Promise<TerminalCandidateSweepDisposition> {
+    return this.dependencies.projector.classifyTerminalOrderForSweep
+      ? this.dependencies.projector.classifyTerminalOrderForSweep(orderId)
+      : "ELIGIBLE";
+  }
 }
 
 async function terminalSortKey(
@@ -57,7 +72,16 @@ async function terminalSortKey(
   let latestFillEpochNanoseconds: bigint | null = null;
   for (const fill of fills) {
     try {
-      const epoch = parseCandidateEvidenceTimestamp(fill.filledAt, "terminal sweep fill filledAt");
+      if (fill.executionTimestampProvenance !== "EXCHANGE_FILL_CONFIRMED" || !fill.executionEpochNs ||
+        !/^(0|[1-9][0-9]*)$/u.test(fill.executionEpochNs)) {
+        latestFillEpochNanoseconds = null;
+        break;
+      }
+      const epoch = BigInt(fill.executionEpochNs);
+      if (parseCandidateEvidenceTimestamp(fill.filledAt, "terminal sweep fill filledAt") !== epoch) {
+        latestFillEpochNanoseconds = null;
+        break;
+      }
       if (latestFillEpochNanoseconds === null || epoch > latestFillEpochNanoseconds) {
         latestFillEpochNanoseconds = epoch;
       }

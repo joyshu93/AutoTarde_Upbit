@@ -1,5 +1,5 @@
 import type { ExchangeBalance, SupportedMarket } from "../../../domain/types.js";
-import { ExchangeOrderSubmissionError } from "../errors.js";
+import { ExchangeOrderLookupError, ExchangeOrderSubmissionError } from "../errors.js";
 import type {
   CancelOrderResult,
   ExchangeOrderHistoryQuery,
@@ -229,7 +229,12 @@ export class UpbitPrivateClient implements LiveExecutionAdapter {
         return null;
       }
 
-      throw error;
+      throw new ExchangeOrderLookupError({
+        kind: error instanceof UpbitPrivateRequestError && !isTransientLookupStatus(error.status)
+          ? "PERMANENT"
+          : "TRANSIENT",
+        status: error instanceof UpbitPrivateRequestError ? error.status : null,
+      });
     }
   }
 
@@ -362,6 +367,10 @@ function looksLikeToken(value: string): boolean {
 
 function isDefinitiveOrderRejection(status: number): boolean {
   return status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
+function isTransientLookupStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
 function isValidOrderSubmissionResponse(response: unknown): response is UpbitOrderResponse {

@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 
 import type { OrderRecord } from "../src/domain/types.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
+import { ExchangeOrderLookupError } from "../src/modules/exchange/errors.js";
+import { parseCandidateEvidenceTimestamp } from "../src/modules/execution/candidate-evidence-decimals.js";
 import { ReconciliationService } from "../src/modules/reconciliation/reconciliation-service.js";
 import { DurableTelegramReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
@@ -151,6 +153,11 @@ test("reconciliation service updates active orders from exchange state and captu
   assert.equal(orders[0]?.status, "FILLED");
   assert.equal(fills.length, 1);
   assert.equal(fills[0]?.exchangeFillId, "trade-1");
+  assert.equal(fills[0]?.executionTimestampProvenance, "EXCHANGE_FILL_CONFIRMED");
+  assert.equal(
+    fills[0]?.executionEpochNs,
+    parseCandidateEvidenceTimestamp("2026-04-20T00:01:00.000Z", "fixture fill").toString(),
+  );
 });
 
 test("reconciliation projects persisted terminal order evidence after fill backfill", async () => {
@@ -231,7 +238,7 @@ test("reconciliation projects persisted terminal order evidence after fill backf
   assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
 });
 
-test("reconciliation service preserves an unallocated order fee when an Upbit trade fill omits fee", async () => {
+test("reconciliation preserves an unallocated order fee and never substitutes a missing exchange fill instant", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = new InMemoryOperatorStateStore({
     id: "state-paid-fee-fallback",
@@ -296,7 +303,7 @@ test("reconciliation service preserves an unallocated order fee when an Upbit tr
               volume: "0.00036247",
               funds: "33882.97066",
               fee: null,
-              createdAt: "2026-07-13T19:31:57+09:00",
+              createdAt: null,
               raw: {
                 uuid: "trade-paid-fee-fallback",
                 funds: "33882.97066",
@@ -319,6 +326,9 @@ test("reconciliation service preserves an unallocated order fee when an Upbit tr
   assert.equal(fills[0]?.feeCurrency, "KRW");
   assert.equal(fills[0]?.feeAmount, null);
   assert.equal(fills[0]?.feeProvenance, "ORDER_LEVEL_UNALLOCATED");
+  assert.equal(fills[0]?.executionTimestampProvenance, "LEGACY_UNVERIFIED");
+  assert.equal(fills[0]?.executionEpochNs, null);
+  assert.equal(fills[0]?.filledAt, "");
 });
 
 test("reconciliation service treats filled Upbit price bids with canceled dust as filled", async () => {
@@ -1441,7 +1451,7 @@ test("reconciliation service records transient lookup failures without forcing r
     operatorState,
     orderReader: {
       async getOrder() {
-        throw new Error("429 Too Many Requests");
+        throw new ExchangeOrderLookupError({ kind: "TRANSIENT", status: 429 });
       },
     },
   });
@@ -1454,7 +1464,7 @@ test("reconciliation service records transient lookup failures without forcing r
   assert.deepEqual(summary.issues, [
     {
       code: "ORDER_LOOKUP_TRANSIENT_FAILURE",
-      message: "Transient exchange lookup failure for order order-6. 429 Too Many Requests",
+      message: "Transient exchange lookup failure for order order-6. Upbit order lookup failed transiently.",
     },
   ]);
   assert.equal(orders[0]?.status, "OPEN");
@@ -1641,6 +1651,27 @@ test("first identifier recovery absence remains uncertain without resuming or se
   assert.deepEqual(observations.map((observation) => observation.outcome), ["NOT_FOUND"]);
 });
 
+test("generic lookup error messages are not treated as typed transient exchange failures", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = pausedUncertainSubmissionState();
+  const order = uncertainSubmissionOrder({ id: "generic-lookup-error" });
+  await repositories.saveOrder(order);
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: { async getOrder() { throw new Error("network timeout"); } },
+    recoveryClock: {
+      now: () => ({ observedAt: "2026-08-21T00:00:01.000Z", observedAtEpochMs: 1_787_270_401_000 }),
+    },
+  });
+
+  await assert.rejects(
+    () => reconciliation.recoverOrderByIdentifier(order),
+    /network timeout/,
+  );
+  assert.deepEqual(await repositories.listOrderSubmissionRecoveryObservations(order.id), []);
+});
+
 test("immediate persisted terminal strategy orders are swept without consuming exchange lookup budget", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = pausedUncertainSubmissionState();
@@ -1709,6 +1740,8 @@ test("terminal sweep orders persisted fill instants before order update time wit
       feeCurrency: "KRW",
       feeAmount: "500",
       feeProvenance: "EXCHANGE_FILL_CONFIRMED",
+      executionTimestampProvenance: "EXCHANGE_FILL_CONFIRMED",
+      executionEpochNs: parseCandidateEvidenceTimestamp(filledAt, "terminal sweep fixture").toString(),
       filledAt,
       rawPayloadJson: "{}",
     });
@@ -1929,6 +1962,50 @@ test("bounded persisted identifier absence reaches a terminal fault only after c
   assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
 });
 
+test("bounded absence confirmation is idempotent across a complete reconciliation restart", async () => {
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-bounded-absence-restart",
+    exchangeAccountId: "primary",
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-08-21T00:00:00.000Z",
+  });
+  const repositories = new InMemoryExecutionRepository(operatorState);
+  const order = uncertainSubmissionOrder({ id: "bounded-absence-restart-order" });
+  await repositories.saveOrder(order);
+  let now = { observedAt: "2026-08-21T00:00:01.000Z", observedAtEpochMs: 1_787_270_401_000 };
+  const beforeRestart = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: { async getOrder() { return null; } },
+    identifierRecovery: { minimumNotFoundObservations: 2, minimumElapsedMs: 60_000 },
+    recoveryClock: { now: () => now },
+  });
+  await beforeRestart.recoverOrderByIdentifier(order);
+  now = { observedAt: "2026-08-21T00:01:01.000Z", observedAtEpochMs: 1_787_270_461_000 };
+  const confirmation = await beforeRestart.recoverOrderByIdentifier(order);
+  const persisted = (await repositories.findOrderByReference("primary", order.id))!;
+  const restarted = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: { async getOrder() { throw new Error("lookup must not run after absence confirmation"); } },
+    identifierRecovery: { minimumNotFoundObservations: 2, minimumElapsedMs: 60_000 },
+    recoveryClock: { now: () => now },
+  });
+
+  const replay = await restarted.recoverOrderByIdentifier(persisted);
+
+  assert.equal(confirmation.outcome, "ABSENCE_CONFIRMED");
+  assert.equal(replay.outcome, "ABSENCE_CONFIRMED");
+  assert.equal((await repositories.listOrderEvents(order.id))
+    .filter((event) => event.eventType === "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED").length, 1);
+});
+
 test("bounded absence keeps count and elapsed thresholds independently uncertain across restart", async () => {
   for (const policy of [
     { minimumNotFoundObservations: 3, minimumElapsedMs: 60_000 },
@@ -2042,7 +2119,7 @@ test("transient identifier lookup failures never count toward bounded absence", 
     orderReader: {
       async getOrder() {
         attempt += 1;
-        if (attempt === 1) throw new Error("network timeout");
+        if (attempt === 1) throw new ExchangeOrderLookupError({ kind: "TRANSIENT", status: null });
         return null;
       },
     },

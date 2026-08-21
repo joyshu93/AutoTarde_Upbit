@@ -295,6 +295,12 @@ function sameBinding(left: CandidateExecutionBindingRecord, right: CandidateExec
     left.side === right.side &&
     left.intendedQuantity === right.intendedQuantity &&
     left.intendedNotionalKrw === right.intendedNotionalKrw &&
+    left.boundPrice === right.boundPrice &&
+    left.boundVolume === right.boundVolume &&
+    left.boundTimeInForce === right.boundTimeInForce &&
+    left.boundSmpType === right.boundSmpType &&
+    left.materialVersion === right.materialVersion &&
+    left.orderMaterialHash === right.orderMaterialHash &&
     left.createdAt === right.createdAt;
 }
 

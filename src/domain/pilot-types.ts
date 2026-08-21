@@ -86,6 +86,12 @@ export interface CandidateExecutionBindingRecord {
   side: "bid" | "ask";
   intendedQuantity: string | null;
   intendedNotionalKrw: string | null;
+  boundPrice: string | null;
+  boundVolume: string | null;
+  boundTimeInForce: "ioc" | "fok" | "post_only" | null;
+  boundSmpType: "cancel_maker" | "cancel_taker" | "reduce" | null;
+  materialVersion: "BINDING_V2";
+  orderMaterialHash: string;
   createdAt: string;
 }
 

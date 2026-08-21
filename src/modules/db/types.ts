@@ -146,6 +146,8 @@ export interface SqliteFillRow {
   fee_currency: string | null;
   fee_amount: string | null;
   fee_provenance: "EXCHANGE_FILL_CONFIRMED" | "ORDER_LEVEL_UNALLOCATED" | "ORDER_LEVEL_ALLOCATED" | "MISSING" | "LEGACY_UNVERIFIED" | "SIMULATED";
+  execution_timestamp_provenance: "EXCHANGE_FILL_CONFIRMED" | "RECONCILIATION_OBSERVED_AT_FALLBACK" | "ORDER_UPDATED_AT_FALLBACK" | "LOCAL_SYNTHETIC" | "LEGACY_UNVERIFIED";
+  execution_epoch_ns: string | null;
   filled_at: string;
   raw_payload_json: string;
 }

@@ -107,6 +107,12 @@ interface BindingRow {
   side: CandidateExecutionBindingRecord["side"];
   intended_quantity_exact: string | null;
   intended_notional_krw_exact: string | null;
+  bound_price_exact: string | null;
+  bound_volume_exact: string | null;
+  bound_time_in_force: CandidateExecutionBindingRecord["boundTimeInForce"];
+  bound_smp_type: CandidateExecutionBindingRecord["boundSmpType"];
+  material_version: CandidateExecutionBindingRecord["materialVersion"] | "LEGACY_UNVERIFIED";
+  order_material_hash: string | null;
   created_at: string;
 }
 
@@ -277,8 +283,10 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
           id, deployment_id, strategy_decision_id, order_id, exchange_account_id,
           activation_at, activation_epoch_ns, market, strategy_key, policy_id,
           policy_version, execution_mode, ord_type, action, side,
-          intended_quantity_exact, intended_notional_krw_exact, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          intended_quantity_exact, intended_notional_krw_exact, bound_price_exact,
+          bound_volume_exact, bound_time_in_force, bound_smp_type, material_version,
+          order_material_hash, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(order_id) DO NOTHING
       `).run(
         binding.id,
@@ -298,6 +306,12 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
         binding.side,
         binding.intendedQuantity,
         binding.intendedNotionalKrw,
+        binding.boundPrice,
+        binding.boundVolume,
+        binding.boundTimeInForce,
+        binding.boundSmpType,
+        binding.materialVersion,
+        binding.orderMaterialHash,
         binding.createdAt,
       );
       const persisted = selectBindingByOrderId(this.db, binding.orderId);
@@ -675,7 +689,8 @@ function selectBindingByOrderId(db: DatabaseSync, orderId: string): CandidateExe
     SELECT id, deployment_id, strategy_decision_id, order_id, exchange_account_id,
       activation_at, activation_epoch_ns, market, strategy_key, policy_id, policy_version,
       execution_mode, ord_type, action, side, intended_quantity_exact,
-      intended_notional_krw_exact, created_at
+      intended_notional_krw_exact, bound_price_exact, bound_volume_exact,
+      bound_time_in_force, bound_smp_type, material_version, order_material_hash, created_at
     FROM strategy_candidate_execution_bindings WHERE order_id = ?
   `);
   statement.setReadBigInts(true);
@@ -698,6 +713,14 @@ function selectBindingByOrderId(db: DatabaseSync, orderId: string): CandidateExe
     side: row.side,
     intendedQuantity: row.intended_quantity_exact,
     intendedNotionalKrw: row.intended_notional_krw_exact,
+    boundPrice: row.bound_price_exact,
+    boundVolume: row.bound_volume_exact,
+    boundTimeInForce: row.bound_time_in_force,
+    boundSmpType: row.bound_smp_type,
+    materialVersion: row.material_version === "BINDING_V2" ? row.material_version : (() => {
+      throw new Error("Legacy candidate execution binding cannot be used for projection.");
+    })(),
+    orderMaterialHash: row.order_material_hash ?? "",
     createdAt: row.created_at,
   }) : null;
 }
@@ -711,5 +734,8 @@ function sameBinding(left: CandidateExecutionBindingRecord, right: CandidateExec
     left.policyVersion === right.policyVersion && left.executionMode === right.executionMode &&
     left.ordType === right.ordType && left.action === right.action && left.side === right.side &&
     left.intendedQuantity === right.intendedQuantity && left.intendedNotionalKrw === right.intendedNotionalKrw &&
+    left.boundPrice === right.boundPrice && left.boundVolume === right.boundVolume &&
+    left.boundTimeInForce === right.boundTimeInForce && left.boundSmpType === right.boundSmpType &&
+    left.materialVersion === right.materialVersion && left.orderMaterialHash === right.orderMaterialHash &&
     left.createdAt === right.createdAt;
 }

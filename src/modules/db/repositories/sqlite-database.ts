@@ -77,6 +77,8 @@ function applyMigrations(db: DatabaseSync, migrationsDir: string): void {
     if (applied) {
       if (filename === "0019_store_candidate_evidence_decimals_as_text.sql") {
         repairMigration0019(db);
+      } else if (filename === "0021_add_candidate_fill_timestamp_and_binding_shape.sql") {
+        repairMigration0021(db);
       }
       continue;
     }
@@ -229,6 +231,45 @@ function repairMigration0019(db: DatabaseSync): void {
   }
 }
 
+function repairMigration0021(db: DatabaseSync): void {
+  db.exec("BEGIN IMMEDIATE;");
+  try {
+    if (tableExists(db, "fills")) {
+      ensureCandidatePilotColumn(
+        db,
+        "fills",
+        "execution_timestamp_provenance",
+        "TEXT NOT NULL DEFAULT 'LEGACY_UNVERIFIED' " +
+          "CHECK (execution_timestamp_provenance IN (" +
+          "'EXCHANGE_FILL_CONFIRMED', 'RECONCILIATION_OBSERVED_AT_FALLBACK', " +
+          "'ORDER_UPDATED_AT_FALLBACK', 'LOCAL_SYNTHETIC', 'LEGACY_UNVERIFIED'))",
+      );
+      ensureCandidatePilotColumn(db, "fills", "execution_epoch_ns", "TEXT");
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_fills_candidate_execution_epoch
+          ON fills(order_id, execution_timestamp_provenance, execution_epoch_ns, exchange_fill_id);
+      `);
+    }
+    if (tableExists(db, "strategy_candidate_execution_bindings")) {
+      ensureCandidatePilotColumn(db, "strategy_candidate_execution_bindings", "bound_price_exact", "TEXT");
+      ensureCandidatePilotColumn(db, "strategy_candidate_execution_bindings", "bound_volume_exact", "TEXT");
+      ensureCandidatePilotColumn(db, "strategy_candidate_execution_bindings", "bound_time_in_force", "TEXT");
+      ensureCandidatePilotColumn(db, "strategy_candidate_execution_bindings", "bound_smp_type", "TEXT");
+      ensureCandidatePilotColumn(
+        db,
+        "strategy_candidate_execution_bindings",
+        "material_version",
+        "TEXT NOT NULL DEFAULT 'LEGACY_UNVERIFIED' CHECK (material_version IN ('LEGACY_UNVERIFIED', 'BINDING_V2'))",
+      );
+      ensureCandidatePilotColumn(db, "strategy_candidate_execution_bindings", "order_material_hash", "TEXT");
+    }
+    db.exec("COMMIT;");
+  } catch (error) {
+    if (db.isTransaction) db.exec("ROLLBACK;");
+    throw error;
+  }
+}
+
 function ensureExecutionStateColumn(
   db: DatabaseSync,
   columnName: "degraded_reason" | "degraded_at",
@@ -261,7 +302,11 @@ function ensureOperatorNotificationColumn(
 
 function ensureCandidatePilotColumn(
   db: DatabaseSync,
-  tableName: "strategy_candidate_execution_evidence" | "strategy_candidate_states" | "fills",
+  tableName:
+    | "strategy_candidate_execution_evidence"
+    | "strategy_candidate_states"
+    | "fills"
+    | "strategy_candidate_execution_bindings",
   columnName: string,
   columnType: string,
 ): void {

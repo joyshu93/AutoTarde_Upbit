@@ -4,8 +4,10 @@ import type { FillRecord } from "../src/domain/types.js";
 import { CandidateExecutionEvidenceService } from "../src/modules/execution/candidate-evidence-service.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { InMemoryCandidatePilotRepository } from "../src/modules/db/repositories/in-memory-candidate-pilot-repository.js";
+import { candidateExecutionBindingMaterialHash } from "../src/modules/db/pilot-interfaces.js";
 import { TerminalCandidateProjectionSweep } from "../src/modules/reconciliation/terminal-candidate-sweep.js";
 import { createEmptyPositionGuardCandidateState } from "../src/modules/strategy/position-guard-candidate-state.js";
+import { parsePositionGuardCandidateTimestamp } from "../src/modules/strategy/position-guard-candidate-state.js";
 import { test } from "./harness.js";
 
 test("partial fills aggregate once per terminal order and canceled-with-fill advances once", async () => {
@@ -165,6 +167,23 @@ test("missing fill fee evidence faults without advancing candidate state", async
   assert.equal(events.filter((event) => event.eventType === "CANDIDATE_EVIDENCE_PROJECTION_FAILED").length, 1);
 });
 
+test("candidate evidence rejects a reconciliation timestamp substituted for an exchange fill execution instant", async () => {
+  const fixture = await createCandidateFixture({
+    fills: [{
+      ...fill("fallback-timestamp", "0.1", "2026-08-21T00:00:03.000Z", "500"),
+      executionTimestampProvenance: "RECONCILIATION_OBSERVED_AT_FALLBACK",
+      executionEpochNs: null,
+    } as FillRecord],
+  });
+
+  const result = await fixture.service.processTerminalOrder("order-1");
+
+  assert.equal(result.outcome, "FAULT");
+  assert.match(result.detail, /EXECUTION_TIMESTAMP.*UNVERIFIED|TIMESTAMP.*PROVENANCE/i);
+  assert.equal((await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null)).length, 0);
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+});
+
 test("conflicting persisted terminal evidence faults instead of advancing twice", async () => {
   const fixture = await createCandidateFixture({
     fills: [fill("conflict-fill", "0.1", "2026-08-21T00:00:03.000Z", "500")],
@@ -243,11 +262,65 @@ test("terminal sweep projects persisted FILLED and CANCELED-with-fill orders exa
     const restarted = await restartSweep.run("primary");
 
     assert.equal(first.processedCount, 1);
-    assert.equal(restarted.processedCount, 1);
+    assert.equal(restarted.processedCount, 0);
     assert.equal((await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null)).length, 1);
     assert.equal((await fixture.pilotRepository.getState(fixture.deploymentId))?.stateVersion, 1);
     assert.equal((await fixture.pilotRepository.listAuditEvents(fixture.deploymentId)).length, 2);
   }
+});
+
+test("bounded terminal sweep filters durable disposed rows before applying its projection limit", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const projected: string[] = [];
+  for (const id of ["disposed-applied", "disposed-no-fill", "disposed-fault", "crash-window-order"]) {
+    await repositories.saveOrder({
+      id,
+      strategyDecisionId: `decision-${id}`,
+      exchangeAccountId: "primary",
+      market: "KRW-BTC",
+      side: "bid",
+      ordType: "price",
+      volume: null,
+      price: "10000000",
+      timeInForce: null,
+      smpType: null,
+      identifier: id,
+      idempotencyKey: id,
+      origin: "STRATEGY",
+      requestedAt: "2026-08-21T00:00:01.000Z",
+      upbitUuid: `uuid-${id}`,
+      status: "FILLED",
+      executionMode: "LIVE",
+      exchangeResponseJson: null,
+      failureCode: null,
+      failureMessage: null,
+      createdAt: "2026-08-21T00:00:01.000Z",
+      updatedAt: "2026-08-21T00:00:09.000Z",
+    });
+    await repositories.saveFill({
+      ...fill(`fill-${id}`, "0.1", "2026-08-21T00:00:02.000000001Z", "500"),
+      orderId: id,
+      exchangeFillId: `fill-${id}`,
+    });
+  }
+  const sweep = new TerminalCandidateProjectionSweep({
+    repositories,
+    projector: {
+      async processTerminalOrder(orderId: string) {
+        projected.push(orderId);
+        return { outcome: "ADVANCED", orderId, detail: "projected" };
+      },
+      async classifyTerminalOrderForSweep(orderId: string) {
+        return orderId === "crash-window-order" ? "ELIGIBLE" : "DISPOSED";
+      },
+    } as never,
+    maximumPerRun: 1,
+  });
+
+  const result = await sweep.run("primary");
+
+  assert.equal(result.processedCount, 1);
+  assert.deepEqual(projected, ["crash-window-order"]);
 });
 
 test("unbound terminal candidate evidence faults instead of attaching to the current deployment", async () => {
@@ -264,19 +337,38 @@ test("unbound terminal candidate evidence faults instead of attaching to the cur
   assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
 });
 
+test("pre-deployment terminal strategy history is excluded without a candidate fault", async () => {
+  const fixture = await createCandidateFixture({
+    bound: false,
+    orderRequestedAt: "2026-08-20T23:59:59.000Z",
+    fills: [fill("pre-deployment-fill", "0.1", "2026-08-21T00:00:03.000Z", "500")],
+  });
+
+  const result = await fixture.service.processTerminalOrder("order-1");
+
+  assert.equal(result.outcome, "NOT_CANDIDATE_ORDER");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "RUNNING");
+  assert.equal((await fixture.repositories.listOrderEvents("order-1"))
+    .filter((event) => event.eventType === "CANDIDATE_EVIDENCE_PROJECTION_FAILED").length, 0);
+});
+
 test("bound execution mode must match the persisted terminal order", async () => {
   const fixture = await createCandidateFixture({
     bound: false,
     fills: [fill("mode-mismatch-fill", "0.1", "2026-08-21T00:00:03.000Z", "500")],
   });
-  await fixture.pilotRepository.createExecutionBinding({
+  const binding = {
     ...candidateBinding({
       deploymentId: fixture.deploymentId,
       strategyDecisionId: "fixture-decision",
       orderId: "order-1",
       intendedNotionalKrw: "10000000",
     }),
-    executionMode: "DRY_RUN",
+    executionMode: "DRY_RUN" as const,
+  };
+  await fixture.pilotRepository.createExecutionBinding({
+    ...binding,
+    orderMaterialHash: candidateExecutionBindingMaterialHash(binding),
   });
 
   const result = await fixture.service.processTerminalOrder("order-1");
@@ -285,6 +377,68 @@ test("bound execution mode must match the persisted terminal order", async () =>
   assert.match(result.detail, /BINDING_INVALID/i);
   assert.equal((await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null)).length, 0);
   assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("a complete bound order shape mismatch faults before candidate state advancement", async () => {
+  const fixture = await createCandidateFixture({
+    bound: false,
+    fills: [fill("bound-price-mismatch", "0.1", "2026-08-21T00:00:03.000Z", "500")],
+  });
+  const binding = {
+    ...candidateBinding({
+      deploymentId: fixture.deploymentId,
+      strategyDecisionId: "fixture-decision",
+      orderId: "order-1",
+      intendedNotionalKrw: "10000000",
+    }),
+    boundPrice: "9999999",
+  };
+  await fixture.pilotRepository.createExecutionBinding({
+    ...binding,
+    orderMaterialHash: candidateExecutionBindingMaterialHash(binding),
+  });
+
+  const result = await fixture.service.processTerminalOrder("order-1");
+
+  assert.equal(result.outcome, "FAULT");
+  assert.match(result.detail, /BINDING_INVALID/i);
+  assert.equal((await fixture.pilotRepository.getState(fixture.deploymentId))?.stateVersion, 0);
+});
+
+test("persisted terminal sweep progress skips applied, no-fill, and fault dispositions before its limit after restart", async () => {
+  const fixture = await createCandidateFixture({
+    fills: [fill("already-applied", "0.1", "2026-08-21T00:00:02.000Z", "500")],
+  });
+  await seedFixtureTerminalOrder(fixture, "no-fill-before-crash", []);
+  await seedFixtureTerminalOrder(fixture, "fault-before-crash", [
+    fill("fault-before-crash-fill", "0.1", "2026-08-21T00:00:03.000Z", "500"),
+  ], false);
+  await seedFixtureTerminalOrder(fixture, "crash-window-order", [
+    fill("crash-window-fill", "0.1", "2026-08-21T00:00:04.000Z", "500"),
+  ], true, "ADD");
+
+  await fixture.service.processTerminalOrder("order-1");
+  await fixture.service.processTerminalOrder("no-fill-before-crash");
+  await fixture.service.processTerminalOrder("fault-before-crash");
+  const restartedSweep = new TerminalCandidateProjectionSweep({
+    repositories: fixture.repositories,
+    projector: fixture.createService(),
+    maximumPerRun: 1,
+  });
+
+  const firstAfterRestart = await restartedSweep.run("primary");
+  const replay = await new TerminalCandidateProjectionSweep({
+    repositories: fixture.repositories,
+    projector: fixture.createService(),
+    maximumPerRun: 1,
+  }).run("primary");
+
+  assert.equal(firstAfterRestart.processedCount, 1);
+  assert.equal(replay.processedCount, 0);
+  assert.equal((await fixture.pilotRepository.getEvidenceRecord(
+    fixture.deploymentId,
+    "terminal-order:crash-window-order",
+  ))?.materialVersion, "EXACT_V2");
 });
 
 test("legacy and inferred fill fees never count as confirmed candidate fee evidence", async () => {
@@ -308,6 +462,7 @@ async function createCandidateFixture(input: {
   fills: FillRecord[];
   bound?: boolean;
   terminalStatus?: "FILLED" | "CANCELED";
+  orderRequestedAt?: string;
 }): Promise<{
   repositories: InMemoryExecutionRepository;
   pilotRepository: InMemoryCandidatePilotRepository;
@@ -374,14 +529,14 @@ async function createCandidateFixture(input: {
     identifier: "candidate-fixture-order",
     idempotencyKey: "candidate-fixture-order",
     origin: "STRATEGY",
-    requestedAt: "2026-08-21T00:00:02.000Z",
+    requestedAt: input.orderRequestedAt ?? "2026-08-21T00:00:02.000Z",
     upbitUuid: "candidate-fixture-uuid",
     status: input.terminalStatus ?? "CANCELED",
     executionMode: "LIVE",
     exchangeResponseJson: null,
     failureCode: null,
     failureMessage: null,
-    createdAt: "2026-08-21T00:00:02.000Z",
+    createdAt: input.orderRequestedAt ?? "2026-08-21T00:00:02.000Z",
     updatedAt: "2026-08-21T00:00:05.000Z",
   });
   if (input.bound !== false) {
@@ -436,6 +591,8 @@ function fill(
     feeCurrency: "KRW",
     feeAmount,
     feeProvenance: "EXCHANGE_FILL_CONFIRMED",
+    executionTimestampProvenance: "EXCHANGE_FILL_CONFIRMED",
+    executionEpochNs: parsePositionGuardCandidateTimestamp(filledAt, "fixture fill timestamp").toString(),
     filledAt,
     rawPayloadJson: "{}",
   };
@@ -447,7 +604,7 @@ function candidateBinding(input: {
   orderId: string;
   intendedNotionalKrw: string;
 }) {
-  return {
+  const binding = {
     id: `binding:${input.orderId}`,
     deploymentId: input.deploymentId,
     strategyDecisionId: input.strategyDecisionId,
@@ -465,6 +622,83 @@ function candidateBinding(input: {
     side: "bid" as const,
     intendedQuantity: null,
     intendedNotionalKrw: input.intendedNotionalKrw,
-    createdAt: "2026-08-21T00:00:02.000Z",
+    boundPrice: input.intendedNotionalKrw,
+    boundVolume: null,
+    boundTimeInForce: null,
+    boundSmpType: null,
+    materialVersion: "BINDING_V2" as const,
+    createdAt: "2026-08-21T00:00:01.500Z",
   };
+  return {
+    ...binding,
+    orderMaterialHash: candidateExecutionBindingMaterialHash(binding),
+  };
+}
+
+async function seedFixtureTerminalOrder(
+  fixture: Awaited<ReturnType<typeof createCandidateFixture>>,
+  id: string,
+  fills: FillRecord[],
+  bound = true,
+  action: "ENTER" | "ADD" = "ENTER",
+): Promise<void> {
+  const decisionId = `decision-${id}`;
+  await fixture.repositories.saveStrategyDecision({
+    id: decisionId,
+    exchangeAccountId: "primary",
+    strategyKey: "position_guard.paper_core.v1",
+    market: "KRW-BTC",
+    action,
+    status: "READY",
+    decisionBasisJson: JSON.stringify({
+      strategyDecision: { market: "KRW-BTC", action },
+      engineDecision: { entryPath: "PULLBACK" },
+    }),
+    intendedNotionalKrw: "10000000",
+    intendedQuantity: null,
+    referencePrice: "100000000",
+    createdAt: "2026-08-21T00:00:01.000Z",
+  });
+  await fixture.repositories.saveOrder({
+    id,
+    strategyDecisionId: decisionId,
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    side: "bid",
+    ordType: "price",
+    volume: null,
+    price: "10000000",
+    timeInForce: null,
+    smpType: null,
+    identifier: id,
+    idempotencyKey: id,
+    origin: "STRATEGY",
+    requestedAt: "2026-08-21T00:00:02.000Z",
+    upbitUuid: `uuid-${id}`,
+    status: fills.length === 0 ? "CANCELED" : "FILLED",
+    executionMode: "LIVE",
+    exchangeResponseJson: null,
+    failureCode: null,
+    failureMessage: null,
+    createdAt: "2026-08-21T00:00:02.000Z",
+    updatedAt: "2026-08-21T00:00:05.000Z",
+  });
+  if (bound) {
+    const binding = {
+      ...candidateBinding({
+      deploymentId: fixture.deploymentId,
+      strategyDecisionId: decisionId,
+      orderId: id,
+      intendedNotionalKrw: "10000000",
+      }),
+      action,
+    };
+    await fixture.pilotRepository.createExecutionBinding({
+      ...binding,
+      orderMaterialHash: candidateExecutionBindingMaterialHash(binding),
+    });
+  }
+  for (const fillRecord of fills) {
+    await fixture.repositories.saveFill({ ...fillRecord, orderId: id });
+  }
 }

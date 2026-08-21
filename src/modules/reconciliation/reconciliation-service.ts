@@ -12,7 +12,9 @@ import { SUPPORTED_MARKETS } from "../../domain/types.js";
 import { createFingerprint, createId } from "../../shared/ids.js";
 import type { ExecutionRepository, OperatorStateStore } from "../db/interfaces.js";
 import type { CandidateExecutionEvidenceService } from "../execution/candidate-evidence-service.js";
+import { ExchangeOrderLookupError } from "../exchange/errors.js";
 import type { ExchangeAdapter, ExchangeOrderSnapshot, ExchangeFillSnapshot } from "../exchange/interfaces.js";
+import { parseCandidateEvidenceTimestamp } from "../execution/candidate-evidence-decimals.js";
 import type { OperatorNotificationReporter } from "../telegram/reporter.js";
 import type { ReconciliationIssue, ReconciliationSummary, ReconciliationTrigger } from "./interfaces.js";
 import { detectPortfolioDrift } from "./portfolio-drift.js";
@@ -91,6 +93,13 @@ export class ReconciliationService {
   ) {}
 
   async recoverOrderByIdentifier(order: OrderRecord): Promise<IdentifierRecoverySummary> {
+    if (order.status === "FAILED" && order.failureCode === "ORDER_SUBMISSION_ABSENCE_CONFIRMED") {
+      return {
+        outcome: "ABSENCE_CONFIRMED",
+        orderId: order.id,
+        detail: "Bounded identifier recovery previously confirmed persistent exchange absence.",
+      };
+    }
     if (!isPotentiallyDispatchedRecoveryStatus(order.status)) {
       throw new Error(`Order ${order.id} is not eligible for submission recovery.`);
     }
@@ -121,7 +130,7 @@ export class ReconciliationService {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown identifier recovery lookup failure.";
-      if (isTransientLookupError(message)) {
+      if (isTypedTransientLookupError(error)) {
         await this.recordRecoveryObservation(order, "TRANSIENT_FAILURE", now, {
           attemptedQueries: queries,
           reason: message,
@@ -529,6 +538,8 @@ export class ReconciliationService {
       volume,
       feeCurrency: null,
       feeAmount: null,
+      executionTimestampProvenance: "LOCAL_SYNTHETIC",
+      executionEpochNs: tryParseEpochNanoseconds(repairedAt),
       filledAt: repairedAt,
       rawPayloadJson: JSON.stringify({
         mode: "DRY_RUN",
@@ -905,7 +916,7 @@ export class ReconciliationService {
       return this.applyExchangeSnapshot(order, snapshot, reconciledAt);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown reconciliation query failure.";
-      if (isTransientLookupError(message)) {
+      if (isTypedTransientLookupError(error)) {
         await this.dependencies.repositories.appendOrderEvent({
           id: createId("order_event"),
           orderId: order.id,
@@ -976,7 +987,7 @@ export class ReconciliationService {
       return issues;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown terminal reconciliation query failure.";
-      if (isTransientLookupError(message)) {
+      if (isTypedTransientLookupError(error)) {
         await this.dependencies.repositories.appendOrderEvent({
           id: createId("order_event"),
           orderId: order.id,
@@ -1054,7 +1065,7 @@ export class ReconciliationService {
     }
 
     let newFillCount = 0;
-    for (const fillRecord of buildFillRecords(order, snapshot, reconciledAt)) {
+    for (const fillRecord of buildFillRecords(order, snapshot)) {
       if (!existingFillIds.has(fillRecord.exchangeFillId)) {
         newFillCount += 1;
         existingFillIds.add(fillRecord.exchangeFillId);
@@ -1586,10 +1597,8 @@ function getTerminalOrderPriority(status: OrderLifecycleStatus): number {
   }
 }
 
-function isTransientLookupError(message: string): boolean {
-  return /429|too many requests|timeout|temporar|network|unavailable|503|502|504|connection|econnreset|fetch failed/iu.test(
-    message,
-  );
+function isTypedTransientLookupError(error: unknown): error is ExchangeOrderLookupError {
+  return error instanceof ExchangeOrderLookupError && error.kind === "TRANSIENT";
 }
 
 function validateIdentifierRecoveryPolicy(policy: IdentifierRecoveryPolicy): IdentifierRecoveryPolicy {
@@ -1619,17 +1628,16 @@ function validateRecoveryObservationTime(value: ReturnType<ReconciliationRecover
 function buildFillRecords(
   order: OrderRecord,
   snapshot: ExchangeOrderSnapshot,
-  reconciledAt: string,
 ): FillRecord[] {
-  return snapshot.fills.map((fill) => buildFillRecord(order, fill, reconciledAt, snapshot.paidFee));
+  return snapshot.fills.map((fill) => buildFillRecord(order, fill, snapshot.paidFee));
 }
 
 function buildFillRecord(
   order: OrderRecord,
   fill: ExchangeFillSnapshot,
-  reconciledAt: string,
   orderPaidFee: string | null,
 ): FillRecord {
+  const executionEpochNs = fill.createdAt === null ? null : tryParseEpochNanoseconds(fill.createdAt);
   return {
     id: createId("fill"),
     orderId: order.id,
@@ -1645,9 +1653,22 @@ function buildFillRecord(
       : orderPaidFee !== null
         ? "ORDER_LEVEL_UNALLOCATED"
         : "MISSING",
-    filledAt: fill.createdAt ?? reconciledAt,
+    executionTimestampProvenance: fill.createdAt === null
+      ? "LEGACY_UNVERIFIED"
+      : "EXCHANGE_FILL_CONFIRMED",
+    executionEpochNs,
+    // Empty is a persisted absence marker, never a reconciliation-time substitution.
+    filledAt: fill.createdAt ?? "",
     rawPayloadJson: JSON.stringify(fill.raw),
   };
+}
+
+function tryParseEpochNanoseconds(timestamp: string): string | null {
+  try {
+    return parseCandidateEvidenceTimestamp(timestamp, "exchange fill createdAt").toString();
+  } catch {
+    return null;
+  }
 }
 
 function resolveExchangeFillId(order: OrderRecord, fill: ExchangeFillSnapshot): string {

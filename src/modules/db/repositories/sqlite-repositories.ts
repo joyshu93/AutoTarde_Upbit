@@ -418,8 +418,9 @@ export class SqliteExecutionRepository implements ExecutionRepository {
     this.db.prepare(`
       INSERT INTO fills (
         id, order_id, exchange_fill_id, market, side, price, volume,
-        fee_currency, fee_amount, fee_provenance, filled_at, raw_payload_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        fee_currency, fee_amount, fee_provenance, execution_timestamp_provenance,
+        execution_epoch_ns, filled_at, raw_payload_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(order_id, exchange_fill_id) DO UPDATE SET
         market = excluded.market,
         side = excluded.side,
@@ -428,6 +429,8 @@ export class SqliteExecutionRepository implements ExecutionRepository {
         fee_currency = excluded.fee_currency,
         fee_amount = excluded.fee_amount,
         fee_provenance = excluded.fee_provenance,
+        execution_timestamp_provenance = excluded.execution_timestamp_provenance,
+        execution_epoch_ns = excluded.execution_epoch_ns,
         filled_at = excluded.filled_at,
         raw_payload_json = excluded.raw_payload_json
     `).run(
@@ -441,6 +444,8 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       record.feeCurrency,
       record.feeAmount,
       record.feeProvenance ?? "LEGACY_UNVERIFIED",
+      record.executionTimestampProvenance ?? "LEGACY_UNVERIFIED",
+      record.executionEpochNs ?? null,
       record.filledAt,
       record.rawPayloadJson,
     );
@@ -1834,6 +1839,8 @@ function mapFillRow(row: SqliteFillRow): FillRecord {
     feeCurrency: row.fee_currency,
     feeAmount: row.fee_amount,
     feeProvenance: row.fee_provenance,
+    executionTimestampProvenance: row.execution_timestamp_provenance,
+    executionEpochNs: row.execution_epoch_ns,
     filledAt: row.filled_at,
     rawPayloadJson: row.raw_payload_json,
   };

@@ -1,5 +1,26 @@
 export type ExchangeOrderSubmissionErrorKind = "DEFINITIVE_REJECTION" | "UNCERTAIN";
 
+export type ExchangeOrderLookupErrorKind = "TRANSIENT" | "PERMANENT";
+
+export interface ExchangeOrderLookupErrorOptions {
+  kind: ExchangeOrderLookupErrorKind;
+  status: number | null;
+}
+
+export class ExchangeOrderLookupError extends Error {
+  readonly kind: ExchangeOrderLookupErrorKind;
+  readonly status: number | null;
+
+  constructor(options: ExchangeOrderLookupErrorOptions) {
+    super(options.kind === "TRANSIENT"
+      ? "Upbit order lookup failed transiently."
+      : "Upbit order lookup failed permanently.");
+    this.name = "ExchangeOrderLookupError";
+    this.kind = options.kind;
+    this.status = options.status;
+  }
+}
+
 export interface ExchangeOrderSubmissionErrorOptions {
   kind: ExchangeOrderSubmissionErrorKind;
   status: number | null;

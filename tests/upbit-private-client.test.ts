@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { ExchangeOrderSubmissionError } from "../src/modules/exchange/errors.js";
+import { ExchangeOrderLookupError, ExchangeOrderSubmissionError } from "../src/modules/exchange/errors.js";
 import { UpbitPrivateClient } from "../src/modules/exchange/upbit/private-client.js";
 import { test } from "./harness.js";
 
@@ -236,6 +236,34 @@ test("authenticated order lookup returns null for a confirmed Upbit not-found re
   const order = await client.getOrder({ identifier: "missing-order" });
 
   assert.equal(order, null);
+});
+
+test("authenticated order lookup exposes only a typed transient discriminant for retryable exchange failures", async () => {
+  const client = createPrivateClient(async () => upbitErrorResponse(429, "too_many_requests", "rate limited"));
+
+  await assert.rejects(
+    () => client.getOrder({ identifier: "retryable-order" }),
+    (error: unknown) => {
+      assert.ok(error instanceof ExchangeOrderLookupError);
+      assert.equal(error.kind, "TRANSIENT");
+      assert.equal(error.status, 429);
+      return true;
+    },
+  );
+});
+
+test("authenticated order lookup exposes a typed permanent discriminant for non-not-found 4xx failures", async () => {
+  const client = createPrivateClient(async () => upbitErrorResponse(400, "invalid_query_payload", "invalid payload"));
+
+  await assert.rejects(
+    () => client.getOrder({ identifier: "invalid-order" }),
+    (error: unknown) => {
+      assert.ok(error instanceof ExchangeOrderLookupError);
+      assert.equal(error.kind, "PERMANENT");
+      assert.equal(error.status, 400);
+      return true;
+    },
+  );
 });
 
 test("non-order private endpoint failures remain generic request failures", async () => {

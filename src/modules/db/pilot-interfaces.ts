@@ -132,6 +132,12 @@ const BINDING_KEYS = [
   "side",
   "intendedQuantity",
   "intendedNotionalKrw",
+  "boundPrice",
+  "boundVolume",
+  "boundTimeInForce",
+  "boundSmpType",
+  "materialVersion",
+  "orderMaterialHash",
   "createdAt",
 ] as const;
 const PILOT_PHASES = ["DISABLED", "PENDING_FLAT", "ACTIVE", "PAUSED_FAULT", "DRAINING"] as const;
@@ -277,6 +283,12 @@ export function validateCandidateExecutionBinding(
     side: record.side,
     intendedQuantity: record.intendedQuantity,
     intendedNotionalKrw: record.intendedNotionalKrw,
+    boundPrice: record.boundPrice,
+    boundVolume: record.boundVolume,
+    boundTimeInForce: record.boundTimeInForce,
+    boundSmpType: record.boundSmpType,
+    materialVersion: record.materialVersion,
+    orderMaterialHash: record.orderMaterialHash,
     createdAt: record.createdAt,
   } as CandidateExecutionBindingRecord;
   for (const field of [
@@ -311,7 +323,60 @@ export function validateCandidateExecutionBinding(
   if (binding.intendedNotionalKrw !== null) {
     canonicalNonNegativeDecimal(binding.intendedNotionalKrw, "binding intendedNotionalKrw");
   }
+  if (binding.boundPrice !== null) {
+    canonicalNonNegativeDecimal(binding.boundPrice, "binding boundPrice");
+  }
+  if (binding.boundVolume !== null) {
+    canonicalNonNegativeDecimal(binding.boundVolume, "binding boundVolume");
+  }
+  if (binding.boundTimeInForce !== null && !["ioc", "fok", "post_only"].includes(binding.boundTimeInForce)) {
+    throw new Error("Candidate execution binding boundTimeInForce is invalid.");
+  }
+  if (binding.boundSmpType !== null && !["cancel_maker", "cancel_taker", "reduce"].includes(binding.boundSmpType)) {
+    throw new Error("Candidate execution binding boundSmpType is invalid.");
+  }
+  if (binding.materialVersion !== "BINDING_V2" || !/^[a-f0-9]{64}$/u.test(binding.orderMaterialHash)) {
+    throw new Error("Candidate execution binding material version or hash is invalid.");
+  }
+  if (parsePositionGuardCandidateTimestamp(binding.createdAt, "binding createdAt") <= activationEpochNs) {
+    throw new Error("Candidate execution binding must be created after its activation instant.");
+  }
+  if (candidateExecutionBindingMaterialHash(binding) !== binding.orderMaterialHash) {
+    throw new Error("Candidate execution binding material hash does not match its persisted shape.");
+  }
   return binding;
+}
+
+export function candidateExecutionBindingMaterialHash(
+  binding: Omit<CandidateExecutionBindingRecord, "orderMaterialHash"> & { orderMaterialHash?: string },
+): string {
+  const canonical = JSON.stringify({
+    schemaVersion: 2,
+    materialVersion: binding.materialVersion,
+    id: binding.id,
+    deploymentId: binding.deploymentId,
+    strategyDecisionId: binding.strategyDecisionId,
+    orderId: binding.orderId,
+    exchangeAccountId: binding.exchangeAccountId,
+    activationAt: binding.activationAt,
+    activationEpochNs: binding.activationEpochNs.toString(),
+    market: binding.market,
+    strategyKey: binding.strategyKey,
+    policyId: binding.policyId,
+    policyVersion: binding.policyVersion,
+    executionMode: binding.executionMode,
+    ordType: binding.ordType,
+    action: binding.action,
+    side: binding.side,
+    intendedQuantity: binding.intendedQuantity,
+    intendedNotionalKrw: binding.intendedNotionalKrw,
+    boundPrice: binding.boundPrice,
+    boundVolume: binding.boundVolume,
+    boundTimeInForce: binding.boundTimeInForce,
+    boundSmpType: binding.boundSmpType,
+    createdAt: binding.createdAt,
+  });
+  return createHash("sha256").update(canonical, "utf8").digest("hex");
 }
 
 export function validateLeaseWindow(

@@ -44,6 +44,12 @@ export interface CandidateEvidenceProjectionResult {
   detail: string;
 }
 
+export type TerminalCandidateSweepDisposition =
+  | "ELIGIBLE"
+  | "DISPOSED"
+  | "PRE_ACTIVATION"
+  | "OUTSIDE_SCOPE";
+
 export class CandidateExecutionEvidenceService {
   constructor(
     private readonly dependencies: {
@@ -78,6 +84,13 @@ export class CandidateExecutionEvidenceService {
     try {
       const binding = await this.dependencies.pilotRepository.getExecutionBindingForOrder(order.id);
       if (!binding) {
+        if (isPreDeploymentOrder(order, deployment)) {
+          return {
+            outcome: "NOT_CANDIDATE_ORDER",
+            orderId: order.id,
+            detail: "Terminal strategy order predates the persisted candidate deployment.",
+          };
+        }
         throw new CandidateEvidenceFault(
           "CANDIDATE_EXECUTION_BINDING_MISSING",
           "Terminal candidate order has no persisted deployment binding.",
@@ -178,6 +191,44 @@ export class CandidateExecutionEvidenceService {
     }
   }
 
+  async classifyTerminalOrderForSweep(orderId: string): Promise<TerminalCandidateSweepDisposition> {
+    const order = await this.dependencies.repositories.findOrderByReference(
+      this.dependencies.exchangeAccountId,
+      orderId,
+    );
+    if (!order || order.origin !== "STRATEGY" || order.market !== "KRW-BTC" ||
+      (order.status !== "FILLED" && order.status !== "CANCELED")) {
+      return "OUTSIDE_SCOPE";
+    }
+    const deployment = await this.dependencies.pilotRepository.getDeploymentForExchangeAccount(order.exchangeAccountId);
+    if (!deployment || (deployment.phase !== "ACTIVE" && deployment.phase !== "DRAINING")) {
+      return "OUTSIDE_SCOPE";
+    }
+    const events = await this.dependencies.repositories.listOrderEvents(order.id);
+    if (events.some((event) =>
+      event.id === `candidate-evidence-no-fill:${order.id}` ||
+      event.id.startsWith(`candidate-evidence-fault:${order.id}:`),
+    )) {
+      return "DISPOSED";
+    }
+    let binding: CandidateExecutionBindingRecord | null;
+    try {
+      binding = await this.dependencies.pilotRepository.getExecutionBindingForOrder(order.id);
+    } catch {
+      // A persisted legacy or malformed binding remains eligible so projection records a fault.
+      return "ELIGIBLE";
+    }
+    if (!binding && isPreDeploymentOrder(order, deployment)) {
+      return "PRE_ACTIVATION";
+    }
+    if (!binding) return "ELIGIBLE";
+    if (binding.deploymentId !== deployment.id) return "ELIGIBLE";
+    if (await this.dependencies.pilotRepository.getEvidenceRecord(deployment.id, `terminal-order:${order.id}`)) {
+      return "DISPOSED";
+    }
+    return "ELIGIBLE";
+  }
+
   private async getVerifiedDecision(
     order: OrderRecord,
     deployment: Awaited<ReturnType<CandidatePilotRepository["getDeployment"]>> & {},
@@ -200,7 +251,11 @@ export class CandidateExecutionEvidenceService {
       binding.policyId !== deployment.policyId ||
       binding.policyVersion !== deployment.policyVersion ||
       binding.executionMode !== order.executionMode ||
-      binding.ordType !== order.ordType
+      binding.ordType !== order.ordType ||
+      !sameOptionalCanonicalDecimal(binding.boundPrice, order.price) ||
+      !sameOptionalCanonicalDecimal(binding.boundVolume, order.volume) ||
+      binding.boundTimeInForce !== order.timeInForce ||
+      binding.boundSmpType !== order.smpType
     ) {
       throw new CandidateEvidenceFault("CANDIDATE_EXECUTION_BINDING_INVALID", "Persisted order binding does not match deployment provenance.");
     }
@@ -229,11 +284,12 @@ export class CandidateExecutionEvidenceService {
     const decisionAt = parseTimestamp(decision.createdAt, "strategy decision createdAt");
     const requestedAt = parseTimestamp(order.requestedAt, "order requestedAt");
     const activationAt = binding.activationEpochNs;
-    if (decisionAt > requestedAt || requestedAt < activationAt) {
+    const bindingCreatedAt = parseTimestamp(binding.createdAt, "candidate execution binding createdAt");
+    if (decisionAt > requestedAt || requestedAt < activationAt || bindingCreatedAt >= requestedAt) {
       throw new CandidateEvidenceFault("ORDER_TIMESTAMP_INVALID", "Decision, activation, and order timestamps are inconsistent.");
     }
     const basis = parseDecisionBasis(decision);
-    return { action: decision.action, entryPath: basis.entryPath, decision, requestedAt };
+    return { action: decision.action, entryPath: basis.entryPath, decision, requestedAt, bindingCreatedAt };
   }
 
   private async fault(
@@ -307,6 +363,7 @@ interface VerifiedDecision {
   entryPath: StrategyEntryPath;
   decision: StrategyDecisionRecord;
   requestedAt: bigint;
+  bindingCreatedAt: bigint;
 }
 
 interface TerminalFillAggregate {
@@ -332,7 +389,7 @@ function aggregateTerminalFills(
   let confirmedFeeKrw = parseCanonicalNonNegativeDecimal("0", "aggregate confirmed fee");
   const ordered = fills.map((fill) => ({
     fill,
-    epochNanoseconds: parseTimestamp(fill.filledAt, "fill filledAt"),
+    epochNanoseconds: verifiedExchangeFillEpoch(fill),
   })).sort((left, right) => {
     if (left.epochNanoseconds < right.epochNanoseconds) return -1;
     if (left.epochNanoseconds > right.epochNanoseconds) return 1;
@@ -344,6 +401,12 @@ function aggregateTerminalFills(
     }
     if (epochNanoseconds < decision.requestedAt) {
       throw new CandidateEvidenceFault("FILL_TIMESTAMP_INVALID", "Persisted fill precedes the terminal order request.");
+    }
+    if (epochNanoseconds <= decision.bindingCreatedAt) {
+      throw new CandidateEvidenceFault(
+        "FILL_TIMESTAMP_INVALID",
+        "Persisted fill does not occur strictly after candidate binding creation.",
+      );
     }
     if (fill.feeCurrency !== "KRW" || fill.feeAmount === null || fill.feeProvenance !== "EXCHANGE_FILL_CONFIRMED") {
       throw new CandidateEvidenceFault(
@@ -383,6 +446,36 @@ function aggregateTerminalFills(
     grossQuoteValueKrw: formatExactDecimal(grossQuoteValueKrw),
     confirmedFeeKrw: formatExactDecimal(confirmedFeeKrw),
   };
+}
+
+function verifiedExchangeFillEpoch(fill: FillRecord): bigint {
+  if (fill.executionTimestampProvenance !== "EXCHANGE_FILL_CONFIRMED" || fill.executionEpochNs === null ||
+    fill.executionEpochNs === undefined) {
+    throw new CandidateEvidenceFault(
+      "FILL_EXECUTION_TIMESTAMP_UNVERIFIED",
+      "Every candidate fill requires an exchange-confirmed execution timestamp and epoch nanoseconds.",
+    );
+  }
+  if (!/^(0|[1-9][0-9]*)$/u.test(fill.executionEpochNs)) {
+    throw new CandidateEvidenceFault("FILL_EXECUTION_TIMESTAMP_UNVERIFIED", "Persisted fill execution epoch nanoseconds are invalid.");
+  }
+  const parsed = parseTimestamp(fill.filledAt, "fill filledAt");
+  if (parsed.toString() !== fill.executionEpochNs) {
+    throw new CandidateEvidenceFault("FILL_EXECUTION_TIMESTAMP_UNVERIFIED", "Persisted fill execution timestamp and epoch nanoseconds disagree.");
+  }
+  return parsed;
+}
+
+function isPreDeploymentOrder(
+  order: OrderRecord,
+  deployment: { createdAt: string },
+): boolean {
+  try {
+    return parseTimestamp(order.requestedAt, "order requestedAt") <
+      parseTimestamp(deployment.createdAt, "candidate deployment createdAt");
+  } catch {
+    return false;
+  }
 }
 
 function parseDecisionBasis(decision: StrategyDecisionRecord): { entryPath: StrategyEntryPath } {
@@ -439,6 +532,12 @@ function assertSameOptionalExactDecimal(left: string | null, right: string | nul
   if (canonicalNonNegativeDecimal(left, `binding ${label}`) !== canonicalNonNegativeDecimal(right, `decision ${label}`)) {
     throw new CandidateEvidenceFault("CANDIDATE_EXECUTION_BINDING_INVALID", `Binding ${label} does not match strategy decision.`);
   }
+}
+
+function sameOptionalCanonicalDecimal(left: string | null, right: string | null): boolean {
+  if (left === null || right === null) return left === right;
+  return canonicalNonNegativeDecimal(left, "candidate order binding decimal") ===
+    canonicalNonNegativeDecimal(right, "candidate order decimal");
 }
 
 function isCandidateAction(value: StrategyDecisionRecord["action"]): value is CandidateAction {
