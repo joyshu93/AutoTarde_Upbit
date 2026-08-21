@@ -87,7 +87,8 @@ export class ReconciliationService {
       historyRetentionAssumptionDays?: number;
       identifierRecovery?: IdentifierRecoveryPolicy;
       recoveryClock?: ReconciliationRecoveryClock;
-      candidateEvidenceService?: Pick<CandidateExecutionEvidenceService, "processTerminalOrder">;
+      candidateEvidenceService?: Pick<CandidateExecutionEvidenceService, "processTerminalOrder"> &
+        Partial<Pick<CandidateExecutionEvidenceService, "classifyTerminalOrderForSweep">>;
       maxTerminalCandidateProjectionsPerRun?: number;
     },
   ) {}
@@ -1158,6 +1159,7 @@ export class ReconciliationService {
         faultId: eventId,
         reason: `RECOVERED_SNAPSHOT_PROJECTION_FAILED: ${message}`,
         occurredAt: event.createdAt,
+        transitionAt: occurredAt,
       },
     });
   }

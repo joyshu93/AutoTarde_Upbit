@@ -82,7 +82,7 @@ export class CandidateExecutionEvidenceService {
     try {
       const incompleteFault = await this.findIncompleteFaultPause(order);
       if (incompleteFault) {
-        return this.repairPersistedFaultPause(order, incompleteFault);
+        return await this.repairPersistedFaultPause(order, incompleteFault);
       }
       const deployment = await this.dependencies.pilotRepository.getDeploymentForExchangeAccount(order.exchangeAccountId);
       if (!deployment || (deployment.phase !== "ACTIVE" && deployment.phase !== "DRAINING")) {
@@ -219,7 +219,11 @@ export class CandidateExecutionEvidenceService {
         return "ELIGIBLE";
       }
     }
-    if (faultEvents.length > 0 || events.some((event) => event.id === `candidate-evidence-no-fill:${order.id}`)) {
+    if (faultEvents.length > 0) {
+      return "DISPOSED";
+    }
+    const hasNoFillMarker = events.some((event) => event.id === `candidate-evidence-no-fill:${order.id}`);
+    if (hasNoFillMarker && (await this.dependencies.repositories.listFills(order.id)).length === 0) {
       return "DISPOSED";
     }
     let deployment: PositionGuardPilotDeploymentRecord | null;
@@ -285,6 +289,8 @@ export class CandidateExecutionEvidenceService {
       throw new Error("Candidate projection fault persistence requires an atomic repository implementation.");
     }
     const reason = persistedFaultReason(event);
+    const repairAttempt = this.dependencies.clock.now();
+    validateClock(repairAttempt);
     await persistCandidateProjectionFault.call(this.dependencies.repositories, {
       orderId: order.id,
       event,
@@ -293,6 +299,7 @@ export class CandidateExecutionEvidenceService {
         faultId: event.id,
         reason,
         occurredAt: event.createdAt,
+        transitionAt: repairAttempt.occurredAt,
       },
     });
     return {
@@ -404,6 +411,7 @@ export class CandidateExecutionEvidenceService {
         reason: `${code}: ${message}`,
         // Reuse immutable evidence time so restart retries are exactly idempotent.
         occurredAt: event.createdAt,
+        transitionAt: now.occurredAt,
       },
     });
     return { outcome: "FAULT", orderId: order.id, detail: `${code}: ${message}` };
@@ -689,12 +697,23 @@ function isMatchingFaultPauseTransition(
   order: OrderRecord,
   event: OrderEventRecord,
 ): boolean {
+  let followsFaultOccurrence = false;
+  if (transition) {
+    try {
+      followsFaultOccurrence = parsePositionGuardCandidateTimestamp(
+        transition.createdAt,
+        "automatic fault pause createdAt",
+      ) >= parsePositionGuardCandidateTimestamp(event.createdAt, "candidate fault event createdAt");
+    } catch {
+      followsFaultOccurrence = false;
+    }
+  }
   return transition !== null &&
     transition.id === event.id &&
     transition.exchangeAccountId === order.exchangeAccountId &&
     transition.command === "AUTOMATIC_PAUSE" &&
     (transition.toSystemStatus === "PAUSED" || transition.toSystemStatus === "KILL_SWITCHED") &&
-    transition.createdAt === event.createdAt &&
+    followsFaultOccurrence &&
     transition.reason === `faultId=${event.id}; reason=${persistedFaultReason(event)}`;
 }
 

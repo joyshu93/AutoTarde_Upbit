@@ -49,6 +49,7 @@ export interface FaultPauseInput {
   faultId: string;
   reason: string;
   occurredAt: string;
+  transitionAt?: string;
 }
 
 export interface FinalizeBoundedSubmissionAbsenceInput {

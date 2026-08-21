@@ -49,6 +49,9 @@ test("sqlite candidate pilot repository satisfies the common contracts", async (
 test("sqlite candidate projection fault persistence repairs an event-written pause-missing state atomically", async () => {
   await withFreshBundle("candidate-fault-atomic", async (bundle) => {
     const state = await bundle.operatorState.getState();
+    const eventOccurredAt = state.updatedAt;
+    const newerStateAt = new Date(Date.parse(state.updatedAt) + 5_000).toISOString();
+    const repairAttemptAt = new Date(Date.parse(state.updatedAt) + 4_000).toISOString();
     const order = {
       id: "candidate-fault-atomic-order",
       strategyDecisionId: null,
@@ -70,7 +73,7 @@ test("sqlite candidate projection fault persistence repairs an event-written pau
       exchangeResponseJson: null,
       failureCode: null,
       failureMessage: null,
-      createdAt: state.updatedAt,
+      createdAt: eventOccurredAt,
       updatedAt: state.updatedAt,
     };
     const event = {
@@ -83,6 +86,12 @@ test("sqlite candidate projection fault persistence repairs an event-written pau
     };
     await bundle.repositories.saveOrder(order);
     await bundle.repositories.appendOrderEvent(event);
+    await bundle.operatorState.pauseForFault({
+      exchangeAccountId: "primary",
+      faultId: "candidate-fault-newer-state-transition",
+      reason: "newer durable state",
+      occurredAt: newerStateAt,
+    });
     const input = {
       orderId: order.id,
       event,
@@ -90,7 +99,8 @@ test("sqlite candidate projection fault persistence repairs an event-written pau
         exchangeAccountId: "primary",
         faultId: event.id,
         reason: "UNVERIFIED_FEE_PROVENANCE",
-        occurredAt: state.updatedAt,
+        occurredAt: eventOccurredAt,
+        transitionAt: repairAttemptAt,
       },
     };
     const first = await bundle.repositories.persistCandidateProjectionFault?.(input);
@@ -99,6 +109,10 @@ test("sqlite candidate projection fault persistence repairs an event-written pau
     assert.equal(first, "DUPLICATE");
     assert.equal(second, "DUPLICATE");
     assert.equal((await bundle.operatorState.getState()).systemStatus, "PAUSED");
+    assert.equal((await bundle.operatorState.getState()).updatedAt, newerStateAt);
+    assert.equal((await bundle.operatorState.listTransitions(100))
+      .find((transition) => transition.id === event.id)?.createdAt, newerStateAt);
+    assert.equal((await bundle.repositories.listOrderEvents(order.id))[0]?.createdAt, eventOccurredAt);
     assert.equal((await bundle.repositories.listOrderEvents(order.id)).length, 1);
   });
 });

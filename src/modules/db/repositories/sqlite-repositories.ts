@@ -65,6 +65,7 @@ import { SqliteAccountExecutionLeaseStore } from "./sqlite-account-execution-lea
 import { SqliteCandidatePilotRepository } from "./sqlite-candidate-pilot-repository.js";
 import { withImmediateTransaction } from "./sqlite-transaction.js";
 import {
+  faultPauseTransitionMatchesOccurrence,
   recordsEqual,
   normalizeFillFeeProvenance,
   validateExchangeSubmissionInput,
@@ -1189,6 +1190,9 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       if (input.event.orderId !== currentOrder.id || input.faultPause.exchangeAccountId !== currentOrder.exchangeAccountId) {
         throw new Error("Bounded absence finalization provenance does not match the expected order.");
       }
+      if (input.event.createdAt !== input.faultPause.occurredAt) {
+        throw new Error("Bounded absence fault occurrence does not match its immutable event timestamp.");
+      }
       if (this.getOrderEventById(input.event.id)) {
         throw new Error(`Conflicting bounded absence event ${input.event.id}.`);
       }
@@ -1200,7 +1204,7 @@ export class SqliteExecutionRepository implements ExecutionRepository {
         throw new Error(`Execution state is missing for exchange account ${currentOrder.exchangeAccountId}.`);
       }
       const currentState = mapExecutionStateRow(stateRow);
-      validateFaultPauseTimestamp(input.faultPause, currentState);
+      const transitionAt = validateFaultPauseTimestamp(input.faultPause, currentState);
       const orderUpdate = this.db.prepare(`
         UPDATE orders
         SET status = 'FAILED', failure_code = ?, failure_message = ?, updated_at = ?
@@ -1223,7 +1227,7 @@ export class SqliteExecutionRepository implements ExecutionRepository {
         ...currentState,
         systemStatus: preservesKillSwitch ? "KILL_SWITCHED" : "PAUSED",
         pauseReason: preservesKillSwitch ? currentState.pauseReason : reason,
-        updatedAt: input.faultPause.occurredAt,
+        updatedAt: transitionAt,
       };
       this.db.prepare(`
         UPDATE execution_state
@@ -1254,7 +1258,7 @@ export class SqliteExecutionRepository implements ExecutionRepository {
         fromKillSwitchActive: currentState.killSwitchActive,
         toKillSwitchActive: nextState.killSwitchActive,
         reason,
-        createdAt: input.faultPause.occurredAt,
+        createdAt: transitionAt,
       });
       return true;
     });
@@ -1267,6 +1271,9 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       const order = this.getOrderById(input.orderId);
       if (!order || input.event.orderId !== order.id || input.faultPause.exchangeAccountId !== order.exchangeAccountId) {
         throw new Error("Candidate projection fault provenance does not match a persisted order.");
+      }
+      if (input.event.createdAt !== input.faultPause.occurredAt) {
+        throw new Error("Candidate projection fault occurrence does not match its immutable event timestamp.");
       }
       validateFaultPauseInput(input.faultPause);
       const existingEvent = this.getOrderEventById(input.event.id);
@@ -1284,25 +1291,26 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       const existingTransitionRow = this.db.prepare(`
         SELECT * FROM execution_state_transitions WHERE id = ? LIMIT 1
       `).get(input.faultPause.faultId) as SqliteExecutionStateTransitionRow | undefined;
+      let transitionAt = input.faultPause.transitionAt ?? input.faultPause.occurredAt;
       if (existingTransitionRow) {
         const existingTransition = mapExecutionStateTransitionRow(existingTransitionRow);
         if (
           existingTransition.command !== "AUTOMATIC_PAUSE" ||
           existingTransition.exchangeAccountId !== order.exchangeAccountId ||
           existingTransition.reason !== reason ||
-          existingTransition.createdAt !== input.faultPause.occurredAt
+          !faultPauseTransitionMatchesOccurrence(input.faultPause, existingTransition.createdAt)
         ) {
           throw new Error(`Conflicting duplicate automatic pause ${input.faultPause.faultId}.`);
         }
       } else {
-        validateFaultPauseTimestamp(input.faultPause, currentState);
+        transitionAt = validateFaultPauseTimestamp(input.faultPause, currentState);
       }
       const preservesKillSwitch = currentState.killSwitchActive || currentState.systemStatus === "KILL_SWITCHED";
       const nextState: ExecutionStateRecord = {
         ...currentState,
         systemStatus: preservesKillSwitch ? "KILL_SWITCHED" : "PAUSED",
         pauseReason: preservesKillSwitch ? currentState.pauseReason : reason,
-        updatedAt: existingTransitionRow ? currentState.updatedAt : input.faultPause.occurredAt,
+        updatedAt: existingTransitionRow ? currentState.updatedAt : transitionAt,
       };
       if (!existingEvent) {
         this.insertOrderEvent(input.event);
@@ -1337,7 +1345,7 @@ export class SqliteExecutionRepository implements ExecutionRepository {
           fromKillSwitchActive: currentState.killSwitchActive,
           toKillSwitchActive: nextState.killSwitchActive,
           reason,
-          createdAt: input.faultPause.occurredAt,
+          createdAt: transitionAt,
         });
       }
       return existingEvent ? "DUPLICATE" : "APPLIED";
@@ -1471,21 +1479,21 @@ export class SqliteOperatorStateStore implements OperatorStateStore {
           existing.command === "AUTOMATIC_PAUSE" &&
           existing.exchangeAccountId === input.exchangeAccountId &&
           existing.reason === reason &&
-          existing.createdAt === input.occurredAt &&
+          faultPauseTransitionMatchesOccurrence(input, existing.createdAt) &&
           (current.systemStatus === "PAUSED" || current.systemStatus === "KILL_SWITCHED")
         ) {
           return current;
         }
         throw new Error(`Conflicting duplicate automatic pause ${input.faultId}.`);
       }
-      validateFaultPauseTimestamp(input, current);
+      const transitionAt = validateFaultPauseTimestamp(input, current);
 
       const preservesKillSwitch = current.killSwitchActive || current.systemStatus === "KILL_SWITCHED";
       const nextState: ExecutionStateRecord = {
         ...current,
         systemStatus: preservesKillSwitch ? "KILL_SWITCHED" : "PAUSED",
         pauseReason: preservesKillSwitch ? current.pauseReason : reason,
-        updatedAt: input.occurredAt,
+        updatedAt: transitionAt,
       };
       this.writeState(nextState);
       recordExecutionStateTransition(this.db, {
@@ -1501,7 +1509,7 @@ export class SqliteOperatorStateStore implements OperatorStateStore {
         fromKillSwitchActive: current.killSwitchActive,
         toKillSwitchActive: nextState.killSwitchActive,
         reason,
-        createdAt: input.occurredAt,
+        createdAt: transitionAt,
       });
       return nextState;
     });

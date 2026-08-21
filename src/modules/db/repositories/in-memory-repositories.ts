@@ -37,6 +37,7 @@ import type {
 } from "../interfaces.js";
 import {
   recordsEqual,
+  faultPauseTransitionMatchesOccurrence,
   normalizeFillFeeProvenance,
   validateExchangeSubmissionInput,
   validateFaultPauseInput,
@@ -345,6 +346,9 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     const order = this.orders.find((candidate) => candidate.id === input.orderId);
     if (!order || input.event.orderId !== order.id || input.faultPause.exchangeAccountId !== order.exchangeAccountId) {
       throw new Error("Candidate projection fault provenance does not match a persisted order.");
+    }
+    if (input.event.createdAt !== input.faultPause.occurredAt) {
+      throw new Error("Candidate projection fault occurrence does not match its immutable event timestamp.");
     }
     validateFaultPauseInput(input.faultPause);
     const existing = this.orderEvents.find((event) => event.id === input.event.id);
@@ -745,14 +749,14 @@ export class InMemoryOperatorStateStore implements OperatorStateStore {
         existing.command === "AUTOMATIC_PAUSE" &&
         existing.exchangeAccountId === input.exchangeAccountId &&
         existing.reason === reason &&
-        existing.createdAt === input.occurredAt &&
+        faultPauseTransitionMatchesOccurrence(input, existing.createdAt) &&
         (this.state.systemStatus === "PAUSED" || this.state.systemStatus === "KILL_SWITCHED")
       ) {
         return { ...this.state };
       }
       throw new Error(`Conflicting duplicate automatic pause ${input.faultId}.`);
     }
-    validateFaultPauseTimestamp(input, this.state);
+    const transitionAt = validateFaultPauseTimestamp(input, this.state);
 
     const previousState = { ...this.state };
     const preservesKillSwitch = this.state.killSwitchActive || this.state.systemStatus === "KILL_SWITCHED";
@@ -760,7 +764,7 @@ export class InMemoryOperatorStateStore implements OperatorStateStore {
       ...this.state,
       systemStatus: preservesKillSwitch ? "KILL_SWITCHED" : "PAUSED",
       pauseReason: preservesKillSwitch ? this.state.pauseReason : reason,
-      updatedAt: input.occurredAt,
+      updatedAt: transitionAt,
     };
     this.recordTransition(
       previousState,

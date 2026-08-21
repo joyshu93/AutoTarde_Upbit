@@ -135,11 +135,32 @@ export function validateFaultPauseInput(input: FaultPauseInput): void {
     throw new Error("Automatic fault pauses require non-empty account, faultId, and reason.");
   }
   parseStrictIsoTimestamp(input.occurredAt, "occurredAt");
+  if (input.transitionAt !== undefined) {
+    const occurredAt = parseStrictIsoTimestamp(input.occurredAt, "occurredAt");
+    const transitionAt = parseStrictIsoTimestamp(input.transitionAt, "transitionAt");
+    if (transitionAt < occurredAt) {
+      throw new Error("Automatic fault pause transitionAt cannot predate fault occurrence.");
+    }
+  }
 }
 
-export function validateFaultPauseTimestamp(input: FaultPauseInput, current: ExecutionStateRecord): void {
-  if (parseStrictIsoTimestamp(input.occurredAt, "occurredAt") < parseStrictIsoTimestamp(current.updatedAt, "current updatedAt")) {
+export function validateFaultPauseTimestamp(input: FaultPauseInput, current: ExecutionStateRecord): string {
+  const requestedTransitionAt = input.transitionAt ?? input.occurredAt;
+  const requestedEpoch = parseStrictIsoTimestamp(requestedTransitionAt, "transitionAt");
+  const currentEpoch = parseStrictIsoTimestamp(current.updatedAt, "current updatedAt");
+  if (input.transitionAt === undefined && requestedEpoch < currentEpoch) {
     throw new Error("Automatic fault pause occurredAt cannot predate current execution state.");
+  }
+  return requestedEpoch < currentEpoch ? current.updatedAt : requestedTransitionAt;
+}
+
+export function faultPauseTransitionMatchesOccurrence(input: FaultPauseInput, transitionAt: string): boolean {
+  try {
+    if (input.transitionAt === undefined) return transitionAt === input.occurredAt;
+    return parseStrictIsoTimestamp(transitionAt, "persisted transition createdAt") >=
+      parseStrictIsoTimestamp(input.occurredAt, "occurredAt");
+  } catch {
+    return false;
   }
 }
 

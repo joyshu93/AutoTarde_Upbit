@@ -472,7 +472,7 @@ for (const fault of [
     message: "Persisted recovered projection failed before its pause was written.",
   },
 ] as const) {
-  test(`complete reconciliation restart repairs an event-written ${fault.label} before disposal`, async () => {
+  test(`complete startup reconciliation restart repairs historical event-written ${fault.label} monotonically`, async () => {
     const fixture = await createCandidateFixture({
       fills: [fill(`restart-${fault.code}`, "0.1", "2026-08-21T00:00:03.000Z", "500")],
     });
@@ -485,30 +485,111 @@ for (const fault of [
       payloadJson: JSON.stringify({ code: fault.code, message: fault.message }),
       createdAt: eventCreatedAt,
     });
+    await fixture.operatorState.pauseForFault({
+      exchangeAccountId: "primary",
+      faultId: `newer-state-transition:${fault.code}`,
+      reason: "A newer durable execution-state transition already exists.",
+      occurredAt: "2026-08-21T00:00:10.000Z",
+    });
+    const createCandidateService = () => new CandidateExecutionEvidenceService({
+      exchangeAccountId: "primary",
+      repositories: fixture.repositories,
+      pilotRepository: fixture.pilotRepository,
+      operatorState: fixture.operatorState,
+      clock: {
+        now: () => ({ occurredAt: "2026-08-21T00:00:11.000Z", occurredAtEpochMs: 1_787_270_411_000 }),
+      },
+    });
     const createReconciliation = () => new ReconciliationService({
       repositories: fixture.repositories,
       operatorState: fixture.operatorState,
-      candidateEvidenceService: fixture.createService(),
+      candidateEvidenceService: createCandidateService(),
       maxOrderLookupsPerRun: 0,
       maxTerminalCandidateProjectionsPerRun: 1,
     });
 
-    const first = await createReconciliation().run("primary");
-    const restarted = await createReconciliation().run("primary");
+    const first = await createReconciliation().run("primary", { source: "STARTUP_RECOVERY" });
+    const restarted = await createReconciliation().run("primary", { source: "STARTUP_RECOVERY" });
     const transitions = await fixture.operatorState.listTransitions(100);
     const repairedPause = transitions.find((transition) => transition.id === fault.id);
+    const persistedFault = (await fixture.repositories.listOrderEvents("order-1"))
+      .find((event) => event.id === fault.id);
 
     assert.ok(first.issues.some((issue) => issue.code === "CANDIDATE_EVIDENCE_PROJECTION_FAILED"));
     assert.ok(!restarted.issues.some((issue) => issue.code === "CANDIDATE_EVIDENCE_PROJECTION_FAILED"));
     assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+    assert.equal((await fixture.operatorState.getState()).updatedAt, "2026-08-21T00:00:11.000Z");
     assert.equal(repairedPause?.command, "AUTOMATIC_PAUSE");
     assert.equal(repairedPause?.toSystemStatus, "PAUSED");
-    assert.equal(repairedPause?.createdAt, eventCreatedAt);
+    assert.equal(repairedPause?.createdAt, "2026-08-21T00:00:11.000Z");
+    assert.equal(persistedFault?.createdAt, eventCreatedAt);
+    assert.equal(transitions.filter((transition) => transition.id === fault.id).length, 1);
     assert.equal((await fixture.repositories.listOrderEvents("order-1"))
       .filter((event) => event.id === fault.id).length, 1);
     assert.deepEqual(await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null), []);
   });
 }
+
+test("a terminal no-fill marker with later durable fills is reprojected once across complete reconciliation restart", async () => {
+  const fixture = await createCandidateFixture({ fills: [], terminalStatus: "CANCELED" });
+  const marker = await fixture.service.processTerminalOrder("order-1");
+  const canceledOrder = await fixture.repositories.findOrderByReference("primary", "order-1");
+  assert.ok(canceledOrder);
+  await fixture.repositories.updateOrder({
+    ...canceledOrder,
+    status: "FILLED",
+    exchangeResponseJson: JSON.stringify({ uuid: "candidate-fixture-uuid", state: "done" }),
+    updatedAt: "2026-08-21T00:00:08.000Z",
+  });
+  await fixture.repositories.saveFill(fill(
+    "fill-persisted-after-no-fill-marker",
+    "0.1",
+    "2026-08-21T00:00:07.000000001Z",
+    "500",
+  ));
+
+  const projectedOrderIds: string[] = [];
+  let orderLookupCount = 0;
+  const createReconciliation = () => {
+    const candidateService = fixture.createService();
+    return new ReconciliationService({
+      repositories: fixture.repositories,
+      operatorState: fixture.operatorState,
+      orderReader: {
+        async getOrder() {
+          orderLookupCount += 1;
+          throw new Error("FILLED order with stored response and durable fills must not consume lookup budget.");
+        },
+      },
+      candidateEvidenceService: {
+        async processTerminalOrder(orderId: string) {
+          projectedOrderIds.push(orderId);
+          return candidateService.processTerminalOrder(orderId);
+        },
+        async classifyTerminalOrderForSweep(orderId: string) {
+          return candidateService.classifyTerminalOrderForSweep(orderId);
+        },
+      },
+      maxOrderLookupsPerRun: 1,
+      maxTerminalCandidateProjectionsPerRun: 1,
+    });
+  };
+
+  const first = await createReconciliation().run("primary", { source: "STARTUP_RECOVERY" });
+  const restarted = await createReconciliation().run("primary", { source: "STARTUP_RECOVERY" });
+
+  assert.equal(marker.outcome, "TERMINAL_NO_FILL");
+  assert.equal(first.processedCount, 0);
+  assert.equal(restarted.processedCount, 0);
+  assert.equal(orderLookupCount, 0);
+  assert.deepEqual(projectedOrderIds, ["order-1"]);
+  assert.equal((await fixture.pilotRepository.getState(fixture.deploymentId))?.stateVersion, 1);
+  assert.equal((await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null)).length, 1);
+  assert.equal((await fixture.repositories.listOrderEvents("order-1"))
+    .filter((event) => event.id === "candidate-evidence-no-fill:order-1").length, 1);
+  assert.ok(!first.issues.some((issue) => issue.code === "CANDIDATE_EVIDENCE_PROJECTION_FAILED"));
+  assert.ok(!restarted.issues.some((issue) => issue.code === "CANDIDATE_EVIDENCE_PROJECTION_FAILED"));
+});
 
 test("unbound terminal candidate evidence faults instead of attaching to the current deployment", async () => {
   const fixture = await createCandidateFixture({
