@@ -29,6 +29,7 @@ await import("./upbit-public-client.test.js");
 await import("./upbit-private-client.test.js");
 await import("./execution-service.test.js");
 await import("./execution-send-authority.test.js");
+await import("./execution-candidate-intent.test.js");
 await import("./telegram-delivery.test.js");
 await import("./telegram-inbound.test.js");
 await import("./telegram-inbound-smoke.test.js");

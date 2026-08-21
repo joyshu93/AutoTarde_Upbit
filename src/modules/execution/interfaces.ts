@@ -44,6 +44,7 @@ export interface SubmitOrderFromDecisionInput {
   volume: string | null;
   origin?: OrderOrigin;
   market?: SupportedMarket;
+  candidateAuthority?: CandidateExecutionAuthority;
 }
 
 export type SubmitOrderFromDecisionResult =

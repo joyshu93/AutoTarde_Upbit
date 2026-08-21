@@ -7,17 +7,30 @@ import type {
   OrderRecord,
   RiskEventRecord,
   StrategyDecision,
+  StrategyDecisionRecord,
   TimeInForce,
 } from "../../domain/types.js";
 import { createId } from "../../shared/ids.js";
 import type { ExecutionRepository, OperatorStateStore } from "../db/interfaces.js";
-import type { AccountExecutionLeaseStore } from "../db/pilot-interfaces.js";
+import type { AccountExecutionLeaseStore, CandidatePilotRepository } from "../db/pilot-interfaces.js";
 import { ExchangeOrderSubmissionError } from "../exchange/errors.js";
 import type { ExchangeAdapter, ExecutionExchangeAdapter, UpbitOrderChance } from "../exchange/interfaces.js";
 import { evaluateRiskGuards } from "../risk/guards.js";
 import type { OperatorNotificationReporter } from "../telegram/reporter.js";
 import { buildOrderIdentifier, buildOrderIdempotencyKey } from "./idempotency.js";
-import type { SubmitOrderFromDecisionInput, SubmitOrderFromDecisionResult } from "./interfaces.js";
+import {
+  createCandidateExecutionAttemptTimestamps,
+  deriveCandidateExecutionBinding,
+  formatCanonicalUtcIsoNanoseconds,
+  validateCandidateExecutionAuthority,
+} from "./candidate-execution-authority.js";
+import { createHash } from "node:crypto";
+
+import type {
+  CandidateExecutionAuthority,
+  SubmitOrderFromDecisionInput,
+  SubmitOrderFromDecisionResult,
+} from "./interfaces.js";
 import { parseCandidateEvidenceTimestamp } from "./candidate-evidence-decimals.js";
 
 export class ExecutionService {
@@ -30,13 +43,17 @@ export class ExecutionService {
       accountExecutionLeases: AccountExecutionLeaseStore;
       accountExecutionLeaseMs: number;
       operatorState: OperatorStateStore;
+      candidatePilots?: Pick<
+        CandidatePilotRepository,
+        "getDeployment" | "getExactState" | "getExecutionBindingForOrder" | "pauseForRecoveryFault"
+      >;
       reporter?: OperatorNotificationReporter;
       now?: () => string;
     },
   ) {}
 
   async submitOrderFromDecision(input: SubmitOrderFromDecisionInput): Promise<SubmitOrderFromDecisionResult> {
-    const requestedAt = this.dependencies.now?.() ?? new Date().toISOString();
+    const attemptStartedAt = this.dependencies.now?.() ?? new Date().toISOString();
     const decision = input.decision;
     const market = input.market ?? decision.market;
     const idempotencyKey = buildOrderIdempotencyKey({
@@ -62,11 +79,13 @@ export class ExecutionService {
       };
     }
 
+    const candidateContext = await this.prepareCandidateContext(input, market);
+
     const leaseOwnerToken = createId("account_execution_lease");
     let acquisitionWindow: { atEpochMs: number; expiresAtEpochMs: number };
     let lease;
     try {
-      acquisitionWindow = this.leaseWindow(requestedAt, "acquisition");
+      acquisitionWindow = this.leaseWindow(attemptStartedAt, "acquisition");
       lease = await this.dependencies.accountExecutionLeases.acquireLease({
         exchangeAccountId: input.exchangeAccountId,
         ownerToken: leaseOwnerToken,
@@ -79,7 +98,7 @@ export class ExecutionService {
         input,
         idempotencyKey,
         market,
-        occurredAt: requestedAt,
+        occurredAt: attemptStartedAt,
         reason: "Account execution lease acquisition is ambiguous; order submission is blocked pending recovery.",
       });
       throw new AccountExecutionLeaseSafetyError("Account execution lease acquisition is ambiguous.");
@@ -87,7 +106,7 @@ export class ExecutionService {
 
     if (!lease) {
       const message = "Account execution lease is unavailable; order submission is blocked pending recovery.";
-      await this.recordLeaseBlockedAndPause({ input, idempotencyKey, market, occurredAt: requestedAt, reason: message });
+      await this.recordLeaseBlockedAndPause({ input, idempotencyKey, market, occurredAt: attemptStartedAt, reason: message });
       return {
         accepted: false,
         outcome: "LEASE_BLOCKED",
@@ -101,7 +120,7 @@ export class ExecutionService {
         input,
         idempotencyKey,
         market,
-        occurredAt: requestedAt,
+        occurredAt: attemptStartedAt,
         reason: "Account execution lease acquisition returned ambiguous ownership; order submission is blocked pending recovery.",
       });
       throw new AccountExecutionLeaseSafetyError("Account execution lease acquisition is ambiguous.");
@@ -129,7 +148,7 @@ export class ExecutionService {
     if (accountActiveOrders.length > 0) {
       const message = "Account execution lease is blocked by active or uncertain local orders pending recovery.";
       try {
-        await this.recordLeaseBlockedAndPause({ input, idempotencyKey, market, occurredAt: requestedAt, reason: message });
+        await this.recordLeaseBlockedAndPause({ input, idempotencyKey, market, occurredAt: attemptStartedAt, reason: message });
       } catch (error) {
         releaseLease = false;
         throw error;
@@ -145,7 +164,7 @@ export class ExecutionService {
           input,
           idempotencyKey,
           market,
-          occurredAt: requestedAt,
+          occurredAt: attemptStartedAt,
           reason: message,
         });
       } catch (error) {
@@ -174,7 +193,7 @@ export class ExecutionService {
       market,
       side: input.side,
       strategyDecisionId: input.strategyDecisionId,
-      requestedAt,
+      requestedAt: attemptStartedAt,
     });
 
     const risk = evaluateRiskGuards({
@@ -194,7 +213,7 @@ export class ExecutionService {
       requestedVolume: input.volume,
       requestedNotionalKrw,
       requestedQuantity,
-      now: requestedAt,
+      now: attemptStartedAt,
     });
 
     if (!risk.accepted) {
@@ -234,7 +253,7 @@ export class ExecutionService {
       ordType: input.ordType,
       price: input.price,
       volume: input.volume,
-      requestedAt,
+      requestedAt: attemptStartedAt,
       requestedNotionalKrw,
       identifier,
       idempotencyKey,
@@ -275,8 +294,36 @@ export class ExecutionService {
       };
     }
 
+    const orderId = createId("order");
+    const eventId = createId("order_event");
+    const bindingId = candidateContext ? createId("candidate_execution_binding") : null;
+    let candidateTimestamps = null;
+    if (candidateContext) {
+      try {
+        candidateTimestamps = createCandidateExecutionAttemptTimestamps({
+          activationEpochNs: candidateContext.authority.activationEpochNs,
+          bindingCreatedAt: this.currentTimestamp(),
+        });
+      } catch (error) {
+        releaseLease = false;
+        await this.pauseCandidateIntentFault({
+          authority: candidateContext.authority,
+          decision: candidateContext.decision,
+          input,
+          orderId,
+          bindingId: bindingId!,
+          stage: "DERIVATION",
+          occurredAt: candidateFaultOccurredAt(candidateContext.authority, null),
+        });
+        throw new CandidateExecutionSafetyError(
+          "Candidate execution timestamps could not be derived safely; execution is paused.",
+          error,
+        );
+      }
+    }
+    const orderRequestedAt = candidateTimestamps?.orderRequestedAt ?? attemptStartedAt;
     const order: OrderRecord = {
-      id: createId("order"),
+      id: orderId,
       strategyDecisionId: input.strategyDecisionId,
       exchangeAccountId: input.exchangeAccountId,
       market,
@@ -289,21 +336,19 @@ export class ExecutionService {
       identifier,
       idempotencyKey,
       origin: input.origin ?? "STRATEGY",
-      requestedAt,
+      requestedAt: orderRequestedAt,
       upbitUuid: null,
       status: "PERSISTED",
       executionMode: executionModeForAdapter(this.dependencies.executionAdapter),
       exchangeResponseJson: null,
       failureCode: null,
       failureMessage: null,
-      createdAt: requestedAt,
-      updatedAt: requestedAt,
+      createdAt: orderRequestedAt,
+      updatedAt: orderRequestedAt,
     };
 
-    await this.dependencies.repositories.persistOrderIntent({
-      order,
-      event: {
-        id: createId("order_event"),
+    const persistedEvent = {
+        id: eventId,
         orderId: order.id,
         eventType: "ORDER_PERSISTED",
         eventSource: "LOCAL",
@@ -311,14 +356,68 @@ export class ExecutionService {
           idempotencyKey,
           decisionAction: decision.action,
         }),
-        createdAt: requestedAt,
-      },
-    });
+        createdAt: orderRequestedAt,
+      } as const;
+
+    if (candidateContext && candidateTimestamps) {
+      let binding: ReturnType<typeof deriveCandidateExecutionBinding>;
+      try {
+        binding = deriveCandidateExecutionBinding({
+          authority: candidateContext.authority,
+          order,
+          decision: candidateContext.decision,
+          bindingId: bindingId!,
+          createdAt: candidateTimestamps.bindingCreatedAt,
+        });
+      } catch (error) {
+        releaseLease = false;
+        await this.pauseCandidateIntentFault({
+          authority: candidateContext.authority,
+          decision: candidateContext.decision,
+          input,
+          orderId,
+          bindingId: bindingId!,
+          stage: "DERIVATION",
+          occurredAt: candidateTimestamps.bindingCreatedAt,
+        });
+        throw new CandidateExecutionSafetyError(
+          "Candidate order binding could not be derived safely; execution is paused.",
+          error,
+        );
+      }
+      try {
+        await this.dependencies.repositories.persistCandidateBoundOrderIntent({
+          order,
+          event: persistedEvent,
+          binding,
+          expectedPhase: candidateContext.authority.expectedPhase,
+          expectedDeploymentUpdatedAt: candidateContext.authority.expectedDeploymentUpdatedAt,
+          expectedStateVersion: candidateContext.authority.expectedStateVersion,
+        });
+      } catch (error) {
+        releaseLease = false;
+        await this.pauseCandidateIntentFault({
+          authority: candidateContext.authority,
+          decision: candidateContext.decision,
+          input,
+          orderId,
+          bindingId: bindingId!,
+          stage: "PERSISTENCE",
+          occurredAt: candidateTimestamps.bindingCreatedAt,
+        });
+        throw new CandidateExecutionSafetyError(
+          "Candidate order intent could not be persisted atomically; execution is paused.",
+          error,
+        );
+      }
+    } else {
+      await this.dependencies.repositories.persistOrderIntent({ order, event: persistedEvent });
+    }
 
     const submittingOrder: OrderRecord = {
       ...order,
       status: "SUBMITTING",
-      updatedAt: requestedAt,
+      updatedAt: orderRequestedAt,
     };
     await this.dependencies.repositories.updateOrder(submittingOrder);
 
@@ -609,6 +708,108 @@ export class ExecutionService {
       if (releaseLease) {
         await this.releaseLeaseOrFail({ input, idempotencyKey, market, occurredAt: this.currentTimestamp(), leaseOwnerToken });
       }
+    }
+  }
+
+  private async prepareCandidateContext(
+    input: SubmitOrderFromDecisionInput,
+    market: SubmitOrderFromDecisionInput["decision"]["market"],
+  ): Promise<{
+    authority: CandidateExecutionAuthority;
+    decision: StrategyDecisionRecord;
+  } | null> {
+    if (!input.candidateAuthority) return null;
+
+    let authority: CandidateExecutionAuthority;
+    try {
+      authority = validateCandidateExecutionAuthority(input.candidateAuthority);
+    } catch (error) {
+      throw new CandidateExecutionSafetyError("Candidate execution authority is malformed.", error);
+    }
+    if (!this.dependencies.candidatePilots || !this.dependencies.repositories.getStrategyDecisionById) {
+      throw new CandidateExecutionSafetyError(
+        "Candidate execution dependencies are not configured; order submission is blocked.",
+      );
+    }
+    if (
+      authority.exchangeAccountId !== input.exchangeAccountId ||
+      authority.market !== market ||
+      input.strategyDecisionId === null ||
+      input.decision.strategyKey !== authority.strategyKey ||
+      (input.origin ?? "STRATEGY") !== "STRATEGY"
+    ) {
+      throw new CandidateExecutionSafetyError("Candidate execution authority does not match the submitted route.");
+    }
+
+    const decision = await this.dependencies.repositories.getStrategyDecisionById(input.strategyDecisionId);
+    if (
+      !decision ||
+      decision.id !== input.strategyDecisionId ||
+      decision.exchangeAccountId !== input.exchangeAccountId ||
+      decision.market !== authority.market ||
+      decision.strategyKey !== authority.strategyKey ||
+      decision.action !== input.decision.action ||
+      decision.status !== "READY" ||
+      decision.referencePrice !== String(input.decision.referencePrice) ||
+      decision.intendedNotionalKrw !== nullableNumberString(input.decision.requestedNotionalKrw) ||
+      decision.intendedQuantity !== nullableNumberString(input.decision.requestedQuantity)
+    ) {
+      throw new CandidateExecutionSafetyError(
+        "Persisted candidate strategy decision does not match the submitted authority and decision.",
+      );
+    }
+    return { authority, decision };
+  }
+
+  private async pauseCandidateIntentFault(input: {
+    authority: CandidateExecutionAuthority;
+    decision: StrategyDecisionRecord;
+    input: SubmitOrderFromDecisionInput;
+    orderId: string;
+    bindingId: string;
+    stage: "DERIVATION" | "PERSISTENCE";
+    occurredAt: string;
+  }): Promise<void> {
+    const candidatePilots = this.dependencies.candidatePilots;
+    if (!candidatePilots) {
+      throw new CandidateExecutionSafetyError(
+        "Candidate recovery dependency is unavailable; lease remains retained.",
+      );
+    }
+    const provenance = {
+      schemaVersion: "CANDIDATE_INTENT_FAULT_V1",
+      stage: input.stage,
+      deploymentId: input.authority.deploymentId,
+      exchangeAccountId: input.authority.exchangeAccountId,
+      strategyDecisionId: input.decision.id,
+      orderId: input.orderId,
+      bindingId: input.bindingId,
+      market: input.authority.market,
+      action: input.decision.action,
+      side: input.input.side,
+      ordType: input.input.ordType,
+      price: input.input.price,
+      volume: input.input.volume,
+      expectedPhase: input.authority.expectedPhase,
+      expectedDeploymentUpdatedAt: input.authority.expectedDeploymentUpdatedAt,
+      expectedStateVersion: input.authority.expectedStateVersion,
+    } as const;
+    const provenanceJson = JSON.stringify(provenance);
+    const faultId = `candidate-intent:${createHash("sha256").update(provenanceJson, "utf8").digest("hex")}`;
+    try {
+      await candidatePilots.pauseForRecoveryFault({
+        deploymentId: input.authority.deploymentId,
+        exchangeAccountId: input.authority.exchangeAccountId,
+        faultId,
+        reasonCode: input.stage === "DERIVATION" ? "IDENTITY_MISMATCH" : "ACTIVATION_CAS_CONFLICT",
+        provenanceJson,
+        occurredAt: input.occurredAt,
+      });
+    } catch (error) {
+      throw new CandidateExecutionSafetyError(
+        "Candidate intent failure could not be atomically paused; lease remains retained.",
+        error,
+      );
     }
   }
 
@@ -1080,6 +1281,13 @@ export class AccountExecutionLeaseSafetyError extends Error {
   }
 }
 
+export class CandidateExecutionSafetyError extends Error {
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = "CandidateExecutionSafetyError";
+  }
+}
+
 export class AutomaticFaultPauseSafetyError extends Error {
   constructor(message: string) {
     super(message);
@@ -1230,6 +1438,34 @@ function deriveRequestedNotionalKrw(
   }
 
   return null;
+}
+
+function nullableNumberString(value: number | null): string | null {
+  return value === null ? null : String(value);
+}
+
+function candidateFaultOccurredAt(
+  authority: CandidateExecutionAuthority,
+  attemptedAt: string | null,
+): string {
+  const minimumEpochNs = [
+    authority.activationEpochNs,
+    parseCandidateEvidenceTimestamp(
+      authority.expectedDeploymentUpdatedAt,
+      "candidate authority expected deployment updatedAt",
+    ),
+  ].reduce((maximum, value) => value > maximum ? value : maximum);
+  if (attemptedAt !== null) {
+    try {
+      const attemptedEpochNs = parseCandidateEvidenceTimestamp(attemptedAt, "candidate fault attemptedAt");
+      if (attemptedEpochNs >= minimumEpochNs) {
+        return formatCanonicalUtcIsoNanoseconds(attemptedEpochNs);
+      }
+    } catch {
+      // Persist a canonical successor rather than carrying an invalid clock value into fault evidence.
+    }
+  }
+  return formatCanonicalUtcIsoNanoseconds(minimumEpochNs + 1n);
 }
 
 function resolveChanceTypeToken(
