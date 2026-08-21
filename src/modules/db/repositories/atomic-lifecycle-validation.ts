@@ -25,6 +25,9 @@ export function validateOrderIntentInput(input: PersistOrderIntentInput): void {
 
 export function validateExchangeSubmissionInput(input: PersistExchangeSubmissionInput): void {
   const { order, event, fills } = input;
+  if (input.terminalEvent && input.terminalEvent.id === event.id) {
+    throw new Error("Submission and terminal order events must use distinct ids.");
+  }
   if (order.status === "OPEN") {
     if (fills.length !== 0) throw new Error("OPEN exchange submissions must not contain fills.");
   } else if (order.status === "PARTIALLY_FILLED" || order.status === "FILLED") {

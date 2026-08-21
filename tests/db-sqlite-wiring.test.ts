@@ -1463,6 +1463,15 @@ async function assertAtomicLifecycleContract(repository: ExecutionRepository): P
   await assert.rejects(repository.persistExchangeSubmission({
     order: terminalOrder,
     event: terminalSubmission,
+    terminalEvent: { ...terminalEvent, id: terminalSubmission.id },
+    fills: [terminalFill],
+  }));
+  assert.equal((await repository.findOrderByReference("primary", terminalOrder.id))?.status, "PERSISTED");
+  assert.equal((await repository.listOrderEvents(terminalOrder.id)).length, 1);
+  assert.equal((await repository.listFills(terminalOrder.id)).length, 0);
+  await assert.rejects(repository.persistExchangeSubmission({
+    order: terminalOrder,
+    event: terminalSubmission,
     fills: [terminalFill],
   }));
   assert.equal((await repository.findOrderByReference("primary", terminalOrder.id))?.status, "PERSISTED");

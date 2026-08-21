@@ -109,6 +109,60 @@ test("slow validation expiry cannot turn into a concurrent send because pre-send
   assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING");
 });
 
+test("a takeover persisted after renewal blocks the final pre-send authority check", async () => {
+  const base = new InMemoryAccountExecutionLeaseStore();
+  let persistTakeover = async (): Promise<void> => undefined;
+  const leases: AccountExecutionLeaseStore = {
+    getLease: base.getLease.bind(base),
+    acquireLease: base.acquireLease.bind(base),
+    async renewLease(input) {
+      const lease = await base.renewLease(input);
+      await persistTakeover();
+      return lease;
+    },
+    releaseLease: base.releaseLease.bind(base),
+  };
+  const exchange = createCountingAdapter();
+  const { service, repositories, operatorState } = await createService({ exchangeAdapter: exchange, accountExecutionLeases: leases });
+  persistTakeover = async () => {
+    await repositories.saveOrder(createActiveTakeoverOrder());
+    await operatorState.pauseForFault({
+      exchangeAccountId: "primary", faultId: "concurrent-takeover", reason: "concurrent SUBMITTING order",
+      occurredAt: "2026-04-20T00:00:20.000Z",
+    });
+  };
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /final pre-send authority check/i);
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await repositories.listOrders("primary")).filter((order) => order.status === "SUBMITTING").length, 2);
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("a final active-order read failure pauses and prevents the send", async () => {
+  const repositories = new FailingFinalActiveOrdersRepository();
+  const exchange = createCountingAdapter();
+  const { service, operatorState } = await createService({ repositories, exchangeAdapter: exchange });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /final pre-send authority check/i);
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+});
+
+test("a final execution-state read failure pauses and prevents the send", async () => {
+  const operatorState = new FailingFinalStateReadOperatorStateStore(createRunningState());
+  const exchange = createCountingAdapter();
+  const { service, repositories } = await createService({ operatorState, exchangeAdapter: exchange });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /final pre-send authority check/i);
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+});
+
 test("unsafe lease expiry arithmetic records risk and pauses before any order exists", async () => {
   const { service, repositories, operatorState } = await createService({ accountExecutionLeaseMs: Number.MAX_SAFE_INTEGER });
 
@@ -125,9 +179,44 @@ test("automatic pause failure after lease conflict is fatal rather than a safe b
     accountExecutionLeases: blocker,
     operatorState: new FailingPauseOperatorStateStore(createRunningState()),
   });
-  await blocker.acquireLease({ exchangeAccountId: "primary", ownerToken: "other", purpose: "ORDER_SUBMISSION", acquiredAtEpochMs: 1, expiresAtEpochMs: 2 });
+  await blocker.acquireLease({
+    exchangeAccountId: "primary", ownerToken: "other", purpose: "ORDER_SUBMISSION",
+    acquiredAtEpochMs: Date.parse("2026-04-20T00:00:20.000Z"),
+    expiresAtEpochMs: Date.parse("2026-04-20T00:01:20.000Z"),
+  });
 
   await assert.rejects(service.submitOrderFromDecision(validInput()), /Automatic fault pause could not be persisted/);
+});
+
+test("lease risk evidence failure still pauses and fails closed", async () => {
+  const blocker = new InMemoryAccountExecutionLeaseStore();
+  const repositories = new FailingLeaseRiskRepository();
+  const { service, operatorState } = await createService({ accountExecutionLeases: blocker, repositories });
+  await blocker.acquireLease({
+    exchangeAccountId: "primary", ownerToken: "other", purpose: "ORDER_SUBMISSION",
+    acquiredAtEpochMs: Date.parse("2026-04-20T00:00:20.000Z"),
+    expiresAtEpochMs: Date.parse("2026-04-20T00:01:20.000Z"),
+  });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /risk evidence could not be persisted/i);
+
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("lease risk and pause persistence failures are reported together", async () => {
+  const blocker = new InMemoryAccountExecutionLeaseStore();
+  const { service } = await createService({
+    accountExecutionLeases: blocker,
+    repositories: new FailingLeaseRiskRepository(),
+    operatorState: new FailingPauseOperatorStateStore(createRunningState()),
+  });
+  await blocker.acquireLease({
+    exchangeAccountId: "primary", ownerToken: "other", purpose: "ORDER_SUBMISSION",
+    acquiredAtEpochMs: Date.parse("2026-04-20T00:00:20.000Z"),
+    expiresAtEpochMs: Date.parse("2026-04-20T00:01:20.000Z"),
+  });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /risk evidence and automatic fault pause could not be persisted/i);
 });
 
 test("release ambiguity is fatal after a terminal dry-run outcome", async () => {
@@ -341,6 +430,32 @@ class FailingPauseOperatorStateStore extends InMemoryOperatorStateStore {
   }
 }
 
+class FailingFinalStateReadOperatorStateStore extends InMemoryOperatorStateStore {
+  private reads = 0;
+
+  override async getState(): Promise<ExecutionStateRecord> {
+    this.reads += 1;
+    if (this.reads === 2) throw new Error("injected final state read failure");
+    return super.getState();
+  }
+}
+
+class FailingFinalActiveOrdersRepository extends InMemoryExecutionRepository {
+  private reads = 0;
+
+  override async listActiveOrders(...args: Parameters<InMemoryExecutionRepository["listActiveOrders"]>) {
+    this.reads += 1;
+    if (this.reads === 2) throw new Error("injected final active-order read failure");
+    return super.listActiveOrders(...args);
+  }
+}
+
+class FailingLeaseRiskRepository extends InMemoryExecutionRepository {
+  override async saveRiskEvent(): Promise<void> {
+    throw new Error("injected lease risk persistence failure");
+  }
+}
+
 function createRunningState(): ExecutionStateRecord {
   return {
     id: "state-1",
@@ -375,6 +490,17 @@ function validInput() {
     ordType: "limit" as const,
     price: "100000000",
     volume: "0.001",
+  };
+}
+
+function createActiveTakeoverOrder() {
+  return {
+    id: "concurrent-submitting-order", strategyDecisionId: "concurrent-decision", exchangeAccountId: "primary",
+    market: "KRW-ETH" as const, side: "bid" as const, ordType: "limit" as const, volume: "0.001", price: "1000000",
+    timeInForce: null, smpType: null, identifier: "concurrent-submitting-identifier", idempotencyKey: "concurrent-key",
+    origin: "STRATEGY" as const, requestedAt: "2026-04-20T00:00:20.000Z", upbitUuid: null,
+    status: "SUBMITTING" as const, executionMode: "DRY_RUN" as const, exchangeResponseJson: null,
+    failureCode: null, failureMessage: null, createdAt: "2026-04-20T00:00:20.000Z", updatedAt: "2026-04-20T00:00:20.000Z",
   };
 }
 

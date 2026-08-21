@@ -111,7 +111,12 @@ export class ExecutionService {
     const accountActiveOrders = await this.dependencies.repositories.listActiveOrders(input.exchangeAccountId);
     if (accountActiveOrders.length > 0) {
       const message = "Account execution lease is blocked by active or uncertain local orders pending recovery.";
-      await this.recordLeaseBlockedAndPause({ input, idempotencyKey, market, occurredAt: requestedAt, reason: message });
+      try {
+        await this.recordLeaseBlockedAndPause({ input, idempotencyKey, market, occurredAt: requestedAt, reason: message });
+      } catch (error) {
+        releaseLease = false;
+        throw error;
+      }
       return { accepted: false, outcome: "LEASE_BLOCKED", order: null, reason: message };
     }
 
@@ -311,6 +316,24 @@ export class ExecutionService {
         orderId: order.id,
       });
       throw new AccountExecutionLeaseSafetyError("Account execution lease renewal is ambiguous.");
+    }
+
+    try {
+      await this.assertFinalPreSendAuthority({
+        exchangeAccountId: input.exchangeAccountId,
+        orderId: order.id,
+      });
+    } catch {
+      releaseLease = false;
+      await this.recordLeaseBlockedAndPause({
+        input,
+        idempotencyKey,
+        market,
+        occurredAt: this.currentTimestamp(),
+        reason: "Final pre-send authority check is ambiguous or blocked; reconciliation is required before any send.",
+        orderId: order.id,
+      });
+      throw new AccountExecutionLeaseSafetyError("Final pre-send authority check failed.");
     }
 
     try {
@@ -578,6 +601,19 @@ export class ExecutionService {
     );
   }
 
+  private async assertFinalPreSendAuthority(input: {
+    exchangeAccountId: string;
+    orderId: string;
+  }): Promise<void> {
+    const activeOrders = await this.dependencies.repositories.listActiveOrders(input.exchangeAccountId);
+    // Keep this as the final await before createOrder so a persisted pause wins the send race.
+    const state = await this.dependencies.operatorState.getState();
+    const competingOrders = activeOrders.filter((order) => order.id !== input.orderId);
+    if (competingOrders.length > 0 || state.systemStatus !== "RUNNING" || state.killSwitchActive) {
+      throw new Error("final pre-send authority is blocked");
+    }
+  }
+
   private async recordLeaseBlockedAndPause(input: {
     input: SubmitOrderFromDecisionInput;
     idempotencyKey: string;
@@ -586,22 +622,47 @@ export class ExecutionService {
     reason: string;
     orderId?: string;
   }): Promise<void> {
-    await this.dependencies.repositories.saveRiskEvent(
-      createRiskEvent(
-        input.input.exchangeAccountId,
-        input.input.strategyDecisionId,
-        "ACCOUNT_EXECUTION_LEASE_BLOCKED",
-        input.reason,
-        { idempotencyKey: input.idempotencyKey, market: input.market, occurredAt: input.occurredAt },
-        input.orderId ?? null,
-      ),
-    );
-    await this.pauseForFault({
-      exchangeAccountId: input.input.exchangeAccountId,
-      faultId: `account-execution-lease:${input.idempotencyKey}`,
-      reason: input.reason,
-      occurredAt: input.occurredAt,
-    });
+    let riskEvidenceFailure: unknown = null;
+    let pauseFailure: unknown = null;
+    try {
+      await this.dependencies.repositories.saveRiskEvent(
+        createRiskEvent(
+          input.input.exchangeAccountId,
+          input.input.strategyDecisionId,
+          "ACCOUNT_EXECUTION_LEASE_BLOCKED",
+          input.reason,
+          { idempotencyKey: input.idempotencyKey, market: input.market, occurredAt: input.occurredAt },
+          input.orderId ?? null,
+        ),
+      );
+    } catch (error) {
+      riskEvidenceFailure = error;
+    }
+    try {
+      await this.pauseForFault({
+        exchangeAccountId: input.input.exchangeAccountId,
+        faultId: `account-execution-lease:${input.idempotencyKey}`,
+        reason: input.reason,
+        occurredAt: input.occurredAt,
+      });
+    } catch (error) {
+      pauseFailure = error;
+    }
+    if (riskEvidenceFailure && pauseFailure) {
+      throw new LeaseBlockPersistenceSafetyError(
+        "Account execution lease risk evidence and automatic fault pause could not be persisted.",
+        riskEvidenceFailure,
+        pauseFailure,
+      );
+    }
+    if (pauseFailure) throw pauseFailure;
+    if (riskEvidenceFailure) {
+      throw new LeaseBlockPersistenceSafetyError(
+        "Account execution lease risk evidence could not be persisted after automatic pause.",
+        riskEvidenceFailure,
+        null,
+      );
+    }
   }
 
   private async releaseLeaseOrFail(input: {
@@ -945,6 +1006,17 @@ export class AutomaticFaultPauseSafetyError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "AutomaticFaultPauseSafetyError";
+  }
+}
+
+export class LeaseBlockPersistenceSafetyError extends Error {
+  constructor(
+    message: string,
+    readonly riskEvidenceFailure: unknown | null,
+    readonly pauseFailure: unknown | null,
+  ) {
+    super(message);
+    this.name = "LeaseBlockPersistenceSafetyError";
   }
 }
 
