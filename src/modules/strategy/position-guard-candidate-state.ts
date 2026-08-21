@@ -5,15 +5,15 @@ export const POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE = 1e-12;
 
 export interface PositionGuardCandidateState {
   currentEpisodeAddCount: number;
-  currentEpisodeCostBasisKrw?: number;
-  currentEpisodeInventoryQuantity?: number;
+  currentEpisodeCostBasisKrw: number;
+  currentEpisodeInventoryQuantity: number;
   currentEpisodeRealizedPnlKrw: number;
   lastFullExitAt: string | null;
   lastFullExitRealizedPnlKrw: number | null;
   lastEntryPath: StrategyEntryPath | null;
   lastEvidenceAt: string | null;
   lastEvidenceId: string | null;
-  stateVersion?: number;
+  stateVersion: number;
 }
 
 export interface PositionGuardCandidateExecutionEvidence {
@@ -21,12 +21,11 @@ export interface PositionGuardCandidateExecutionEvidence {
   executedAt: string;
   action: Extract<StrategyDecisionAction, "ENTER" | "ADD" | "REDUCE" | "EXIT">;
   entryPath: StrategyEntryPath;
-  terminalStatus?: "FILLED" | "CANCELED";
-  executedQuantity?: number;
-  grossQuoteValueKrw?: number;
-  confirmedFeeKrw?: number;
+  terminalStatus: "FILLED" | "CANCELED";
+  executedQuantity: number;
+  grossQuoteValueKrw: number;
+  confirmedFeeKrw: number;
   remainingQuantity: number;
-  realizedPnlKrw?: number | null;
 }
 
 const EXPLICIT_ISO_TIMESTAMP =
@@ -44,6 +43,29 @@ const EXECUTED_ACTIONS: readonly PositionGuardCandidateExecutionEvidence["action
   "REDUCE",
   "EXIT",
 ];
+const STATE_KEYS = [
+  "currentEpisodeAddCount",
+  "currentEpisodeCostBasisKrw",
+  "currentEpisodeInventoryQuantity",
+  "currentEpisodeRealizedPnlKrw",
+  "lastFullExitAt",
+  "lastFullExitRealizedPnlKrw",
+  "lastEntryPath",
+  "lastEvidenceAt",
+  "lastEvidenceId",
+  "stateVersion",
+] as const;
+const EVIDENCE_KEYS = [
+  "evidenceId",
+  "executedAt",
+  "action",
+  "entryPath",
+  "terminalStatus",
+  "executedQuantity",
+  "grossQuoteValueKrw",
+  "confirmedFeeKrw",
+  "remainingQuantity",
+] as const;
 
 export function createEmptyPositionGuardCandidateState(): Readonly<PositionGuardCandidateState> {
   return Object.freeze({
@@ -61,22 +83,7 @@ export function createEmptyPositionGuardCandidateState(): Readonly<PositionGuard
 }
 
 export function validatePositionGuardCandidateState(state: PositionGuardCandidateState): void {
-  if (state === null || typeof state !== "object") {
-    throw new Error("PositionGuard candidate state must be an object.");
-  }
-  if (!Number.isInteger(state.currentEpisodeAddCount) || state.currentEpisodeAddCount < 0) {
-    throw new Error("PositionGuard candidate state currentEpisodeAddCount must be a non-negative integer.");
-  }
-  if (!Number.isFinite(state.currentEpisodeRealizedPnlKrw)) {
-    throw new Error("PositionGuard candidate state currentEpisodeRealizedPnlKrw must be finite.");
-  }
-  validateFullExitMetadata(state);
-  validateEntryPath(state);
-  validateCursor(state);
-
-  if (hasAnyFeeInclusiveStateField(state)) {
-    validateFeeInclusiveState(state);
-  }
+  validateStateSnapshot(snapshotState(state));
 }
 
 export function parsePositionGuardCandidateTimestamp(value: string, label: string): bigint {
@@ -117,91 +124,76 @@ export function advancePositionGuardCandidateState(
   state: PositionGuardCandidateState,
   evidence: PositionGuardCandidateExecutionEvidence,
 ): Readonly<PositionGuardCandidateState> {
-  validatePositionGuardCandidateState(state);
-  const evidenceKind = validateExecutionEvidence(evidence);
-  assertEvidenceAfterStateCursor(state, evidence);
-
-  if (evidenceKind === "LEGACY") {
-    if (hasAnyFeeInclusiveStateField(state)) {
-      throw new Error("Legacy PositionGuard candidate evidence cannot advance a fee-inclusive state.");
-    }
-    return advanceLegacyState(state, evidence);
-  }
-  if (!hasCompleteFeeInclusiveState(state)) {
-    throw new Error("Fee-inclusive PositionGuard candidate evidence requires inventory, cost basis, and stateVersion.");
-  }
-  return advanceFeeInclusiveState(state, evidence);
+  const stateSnapshot = snapshotState(state);
+  validateStateSnapshot(stateSnapshot);
+  const evidenceSnapshot = snapshotExecutionEvidence(evidence);
+  validateExecutionEvidence(evidenceSnapshot);
+  return advanceValidatedPositionGuardCandidateState(stateSnapshot, evidenceSnapshot);
 }
 
 export function projectPositionGuardCandidateState(input: {
   initialState: PositionGuardCandidateState;
   evidence: readonly PositionGuardCandidateExecutionEvidence[];
 }): Readonly<PositionGuardCandidateState> {
-  validatePositionGuardCandidateState(input.initialState);
+  const initialState = snapshotState(input.initialState);
+  validateStateSnapshot(initialState);
   const evidenceIds = new Set<string>();
-  if (input.initialState.lastEvidenceId !== null) {
-    evidenceIds.add(input.initialState.lastEvidenceId);
-  }
+  if (initialState.lastEvidenceId !== null) evidenceIds.add(initialState.lastEvidenceId);
 
   const ordered = input.evidence.map((item) => {
-    const kind = validateExecutionEvidence(item);
-    if (evidenceIds.has(item.evidenceId)) {
-      throw new Error(`Duplicate PositionGuard candidate evidenceId ${item.evidenceId}.`);
+    const snapshot = snapshotExecutionEvidence(item);
+    validateExecutionEvidence(snapshot);
+    if (evidenceIds.has(snapshot.evidenceId)) {
+      throw new Error(`Duplicate PositionGuard candidate evidenceId ${snapshot.evidenceId}.`);
     }
-    evidenceIds.add(item.evidenceId);
-    return { item, kind, epochNanoseconds: parsePositionGuardCandidateTimestamp(item.executedAt, "evidence executedAt") };
+    evidenceIds.add(snapshot.evidenceId);
+    return {
+      evidence: snapshot,
+      epochNanoseconds: parsePositionGuardCandidateTimestamp(snapshot.executedAt, "evidence executedAt"),
+    };
   });
   ordered.sort((left, right) => {
     if (left.epochNanoseconds < right.epochNanoseconds) return -1;
     if (left.epochNanoseconds > right.epochNanoseconds) return 1;
-    if (left.item.evidenceId < right.item.evidenceId) return -1;
-    if (left.item.evidenceId > right.item.evidenceId) return 1;
+    if (left.evidence.evidenceId < right.evidence.evidenceId) return -1;
+    if (left.evidence.evidenceId > right.evidence.evidenceId) return 1;
     return 0;
   });
 
-  let state: Readonly<PositionGuardCandidateState> = Object.freeze(cloneState(input.initialState));
-  for (const { item, kind } of ordered) {
-    if (kind === "LEGACY" && hasAnyFeeInclusiveStateField(state)) {
-      throw new Error("Legacy PositionGuard candidate evidence cannot advance a fee-inclusive state.");
-    }
-    if (kind === "FEE_INCLUSIVE" && !hasCompleteFeeInclusiveState(state)) {
-      throw new Error("Fee-inclusive PositionGuard candidate evidence requires inventory, cost basis, and stateVersion.");
-    }
-    state = advancePositionGuardCandidateState(state, item);
+  let state: Readonly<PositionGuardCandidateState> = Object.freeze(cloneState(initialState));
+  for (const { evidence } of ordered) {
+    state = advanceValidatedPositionGuardCandidateState(state, evidence);
   }
   return state;
 }
 
-function advanceFeeInclusiveState(
+function advanceValidatedPositionGuardCandidateState(
   state: PositionGuardCandidateState,
-  evidence: PositionGuardCandidateExecutionEvidence,
+  evidence: Readonly<PositionGuardCandidateExecutionEvidence>,
 ): Readonly<PositionGuardCandidateState> {
-  const executedQuantity = evidence.executedQuantity!;
-  const grossQuoteValueKrw = evidence.grossQuoteValueKrw!;
-  const confirmedFeeKrw = evidence.confirmedFeeKrw!;
-  const inventory = state.currentEpisodeInventoryQuantity!;
-  const costBasis = state.currentEpisodeCostBasisKrw!;
-
-  if (executedQuantity === 0) {
+  assertEvidenceAfterStateCursor(state, evidence);
+  if (evidence.executedQuantity === 0) {
     assertNoFillEvidenceMatchesState(state, evidence);
-    return state as Readonly<PositionGuardCandidateState>;
+    return Object.freeze(cloneState(state));
   }
-  assertNonZeroFillLifecycle(state, evidence);
 
-  const next = cloneState(state) as RequiredFeeInclusiveCandidateState;
+  assertNonZeroFillLifecycle(state, evidence);
+  const next = cloneState(state);
   if (isBuyAction(evidence.action)) {
-    next.currentEpisodeInventoryQuantity = inventory + executedQuantity;
-    next.currentEpisodeCostBasisKrw = costBasis + grossQuoteValueKrw + confirmedFeeKrw;
-    next.currentEpisodeRealizedPnlKrw = state.currentEpisodeRealizedPnlKrw;
+    next.currentEpisodeInventoryQuantity += evidence.executedQuantity;
+    next.currentEpisodeCostBasisKrw += evidence.grossQuoteValueKrw + evidence.confirmedFeeKrw;
     if (evidence.action === "ENTER") next.lastEntryPath = evidence.entryPath;
     if (evidence.action === "ADD") next.currentEpisodeAddCount += 1;
     assertResidualMatches(next.currentEpisodeInventoryQuantity, evidence.remainingQuantity, evidence.evidenceId);
   } else {
-    const expectedRemaining = inventory - executedQuantity;
+    const expectedRemaining = state.currentEpisodeInventoryQuantity - evidence.executedQuantity;
     const closesEpisode = expectedRemaining <= POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE;
     assertResidualMatches(closesEpisode ? 0 : expectedRemaining, evidence.remainingQuantity, evidence.evidenceId);
-    const removedCost = closesEpisode ? costBasis : costBasis * (executedQuantity / inventory);
-    const realizedPnl = state.currentEpisodeRealizedPnlKrw + grossQuoteValueKrw - confirmedFeeKrw - removedCost;
+    const removedCost = closesEpisode
+      ? state.currentEpisodeCostBasisKrw
+      : state.currentEpisodeCostBasisKrw * (evidence.executedQuantity / state.currentEpisodeInventoryQuantity);
+    const realizedPnl = state.currentEpisodeRealizedPnlKrw +
+      evidence.grossQuoteValueKrw - evidence.confirmedFeeKrw - removedCost;
 
     if (closesEpisode) {
       next.currentEpisodeAddCount = 0;
@@ -211,7 +203,7 @@ function advanceFeeInclusiveState(
       next.lastFullExitAt = evidence.executedAt;
       next.lastFullExitRealizedPnlKrw = realizedPnl;
     } else {
-      next.currentEpisodeCostBasisKrw = costBasis - removedCost;
+      next.currentEpisodeCostBasisKrw -= removedCost;
       next.currentEpisodeInventoryQuantity = expectedRemaining;
       next.currentEpisodeRealizedPnlKrw = realizedPnl;
     }
@@ -220,107 +212,82 @@ function advanceFeeInclusiveState(
   next.lastEvidenceAt = evidence.executedAt;
   next.lastEvidenceId = evidence.evidenceId;
   next.stateVersion += 1;
-  validatePositionGuardCandidateState(next);
+  validateStateSnapshot(next);
   return Object.freeze(next);
 }
 
-function advanceLegacyState(
-  state: PositionGuardCandidateState,
-  evidence: PositionGuardCandidateExecutionEvidence,
-): Readonly<PositionGuardCandidateState> {
-  const next = cloneState(state);
-  if (evidence.action === "ENTER") next.lastEntryPath = evidence.entryPath;
-  if (evidence.action === "ADD") next.currentEpisodeAddCount += 1;
-  if (evidence.action === "REDUCE" || evidence.action === "EXIT") {
-    next.currentEpisodeRealizedPnlKrw = roundLegacyMoney(
-      next.currentEpisodeRealizedPnlKrw + evidence.realizedPnlKrw!,
-    );
-  }
-  if (
-    evidence.action === "EXIT" &&
-    evidence.remainingQuantity <= POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE
-  ) {
-    next.currentEpisodeAddCount = 0;
-    next.lastFullExitAt = evidence.executedAt;
-    next.lastFullExitRealizedPnlKrw = next.currentEpisodeRealizedPnlKrw;
-    next.currentEpisodeRealizedPnlKrw = 0;
-  }
-  next.lastEvidenceAt = evidence.executedAt;
-  next.lastEvidenceId = evidence.evidenceId;
-
-  validatePositionGuardCandidateState(next);
-  return Object.freeze(next);
+function snapshotState(value: PositionGuardCandidateState): PositionGuardCandidateState {
+  const record = exactOwnDataRecord(value, "state", STATE_KEYS);
+  return {
+    currentEpisodeAddCount: record.currentEpisodeAddCount as number,
+    currentEpisodeCostBasisKrw: record.currentEpisodeCostBasisKrw as number,
+    currentEpisodeInventoryQuantity: record.currentEpisodeInventoryQuantity as number,
+    currentEpisodeRealizedPnlKrw: record.currentEpisodeRealizedPnlKrw as number,
+    lastFullExitAt: record.lastFullExitAt as string | null,
+    lastFullExitRealizedPnlKrw: record.lastFullExitRealizedPnlKrw as number | null,
+    lastEntryPath: record.lastEntryPath as StrategyEntryPath | null,
+    lastEvidenceAt: record.lastEvidenceAt as string | null,
+    lastEvidenceId: record.lastEvidenceId as string | null,
+    stateVersion: record.stateVersion as number,
+  };
 }
 
-function validateExecutionEvidence(
-  evidence: PositionGuardCandidateExecutionEvidence,
-): "FEE_INCLUSIVE" | "LEGACY" {
-  if (evidence === null || typeof evidence !== "object") {
-    throw new Error("PositionGuard candidate execution evidence must be an object.");
-  }
-  if (typeof evidence.evidenceId !== "string" || evidence.evidenceId.trim() === "") {
-    throw new Error("PositionGuard candidate evidenceId must be a non-empty string.");
-  }
-  parsePositionGuardCandidateTimestamp(evidence.executedAt, "evidence executedAt");
-  if (!EXECUTED_ACTIONS.includes(evidence.action)) {
-    throw new Error(`PositionGuard candidate evidence action ${String(evidence.action)} is invalid.`);
-  }
-  if (!STRATEGY_ENTRY_PATHS.includes(evidence.entryPath)) {
-    throw new Error(`PositionGuard candidate evidence entryPath ${String(evidence.entryPath)} is invalid.`);
-  }
-  if (!Number.isFinite(evidence.remainingQuantity) || evidence.remainingQuantity < 0) {
-    throw new Error("PositionGuard candidate evidence remainingQuantity must be finite and non-negative.");
-  }
+function snapshotExecutionEvidence(
+  value: PositionGuardCandidateExecutionEvidence,
+): Readonly<PositionGuardCandidateExecutionEvidence> {
+  const record = exactOwnDataRecord(value, "execution evidence", EVIDENCE_KEYS);
+  return Object.freeze({
+    evidenceId: record.evidenceId as string,
+    executedAt: record.executedAt as string,
+    action: record.action as PositionGuardCandidateExecutionEvidence["action"],
+    entryPath: record.entryPath as StrategyEntryPath,
+    terminalStatus: record.terminalStatus as PositionGuardCandidateExecutionEvidence["terminalStatus"],
+    executedQuantity: record.executedQuantity as number,
+    grossQuoteValueKrw: record.grossQuoteValueKrw as number,
+    confirmedFeeKrw: record.confirmedFeeKrw as number,
+    remainingQuantity: record.remainingQuantity as number,
+  });
+}
 
-  if (!hasAnyFeeInclusiveEvidenceField(evidence)) {
-    if (evidence.terminalStatus !== undefined) {
-      throw new Error("Legacy PositionGuard candidate evidence cannot declare a terminal lifecycle status.");
-    }
-    if (evidence.realizedPnlKrw !== null && !Number.isFinite(evidence.realizedPnlKrw)) {
-      throw new Error("PositionGuard candidate evidence realizedPnlKrw must be finite or null.");
-    }
-    if ((evidence.action === "REDUCE" || evidence.action === "EXIT") && evidence.realizedPnlKrw === null) {
-      throw new Error(`PositionGuard candidate evidence ${evidence.evidenceId} realizedPnlKrw is required for ${evidence.action}.`);
-    }
-    return "LEGACY";
+function validateStateSnapshot(state: PositionGuardCandidateState): void {
+  if (!Number.isInteger(state.currentEpisodeAddCount) || state.currentEpisodeAddCount < 0) {
+    throw new Error("PositionGuard candidate state currentEpisodeAddCount must be a non-negative integer.");
   }
+  if (!Number.isFinite(state.currentEpisodeInventoryQuantity) || state.currentEpisodeInventoryQuantity < 0) {
+    throw new Error("PositionGuard candidate state currentEpisodeInventoryQuantity must be finite and non-negative.");
+  }
+  if (!Number.isFinite(state.currentEpisodeCostBasisKrw) || state.currentEpisodeCostBasisKrw < 0) {
+    throw new Error("PositionGuard candidate state currentEpisodeCostBasisKrw must be finite and non-negative.");
+  }
+  if (!Number.isFinite(state.currentEpisodeRealizedPnlKrw)) {
+    throw new Error("PositionGuard candidate state currentEpisodeRealizedPnlKrw must be finite.");
+  }
+  if (!Number.isSafeInteger(state.stateVersion) || state.stateVersion < 0) {
+    throw new Error("PositionGuard candidate state stateVersion must be a non-negative safe integer.");
+  }
+  if (state.lastEntryPath !== null && !STRATEGY_ENTRY_PATHS.includes(state.lastEntryPath)) {
+    throw new Error("PositionGuard candidate state lastEntryPath is invalid.");
+  }
+  validateFullExitMetadata(state);
+  validateCursor(state);
 
-  if (
-    evidence.terminalStatus === undefined ||
-    evidence.executedQuantity === undefined ||
-    evidence.grossQuoteValueKrw === undefined ||
-    evidence.confirmedFeeKrw === undefined
-  ) {
-    throw new Error("Fee-inclusive PositionGuard candidate evidence must include terminal status, quantity, value, and confirmed fee.");
-  }
-  if (!Number.isFinite(evidence.executedQuantity) || evidence.executedQuantity < 0) {
-    throw new Error("PositionGuard candidate evidence executedQuantity must be finite and non-negative.");
-  }
-  if (!Number.isFinite(evidence.grossQuoteValueKrw) || evidence.grossQuoteValueKrw < 0) {
-    throw new Error("PositionGuard candidate evidence grossQuoteValueKrw must be finite and non-negative.");
-  }
-  if (!Number.isFinite(evidence.confirmedFeeKrw) || evidence.confirmedFeeKrw < 0) {
-    throw new Error("PositionGuard candidate evidence confirmedFeeKrw must be finite and non-negative.");
-  }
-  if (evidence.terminalStatus !== "FILLED" && evidence.terminalStatus !== "CANCELED") {
-    throw new Error("PositionGuard candidate evidence terminal lifecycle status is invalid.");
-  }
-  if (evidence.executedQuantity === 0) {
-    if (evidence.terminalStatus !== "CANCELED") {
-      throw new Error("Terminal no-fill PositionGuard candidate evidence must be CANCELED.");
+  if (state.currentEpisodeInventoryQuantity <= POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE) {
+    if (state.currentEpisodeInventoryQuantity !== 0) {
+      throw new Error("Flat PositionGuard candidate state must normalize inventory quantity to zero.");
     }
-    if (evidence.grossQuoteValueKrw !== 0 || evidence.confirmedFeeKrw !== 0) {
-      throw new Error("Terminal no-fill PositionGuard candidate evidence must have zero value and fee.");
+    if (
+      state.currentEpisodeCostBasisKrw !== 0 ||
+      state.currentEpisodeAddCount !== 0 ||
+      state.currentEpisodeRealizedPnlKrw !== 0
+    ) {
+      throw new Error("Flat PositionGuard candidate state must have zero cost basis, add count, and realized PnL.");
     }
-  } else {
-    if (evidence.grossQuoteValueKrw <= 0) {
-      throw new Error("PositionGuard candidate evidence must have a positive quote value for a non-zero fill.");
+    if (state.lastEvidenceAt !== null && state.lastFullExitAt === null) {
+      throw new Error("Flat PositionGuard candidate state with a cursor requires full-exit metadata.");
     }
-    if (!Number.isFinite(evidence.grossQuoteValueKrw / evidence.executedQuantity)) {
-      throw new Error("PositionGuard candidate evidence implied execution price must be finite.");
-    }
+  } else if (state.currentEpisodeCostBasisKrw <= 0 || state.lastEntryPath === null) {
+    throw new Error("Open PositionGuard candidate state requires positive cost basis and entry path.");
   }
-  return "FEE_INCLUSIVE";
 }
 
 function validateFullExitMetadata(state: PositionGuardCandidateState): void {
@@ -338,91 +305,102 @@ function validateFullExitMetadata(state: PositionGuardCandidateState): void {
   }
 }
 
-function validateEntryPath(state: PositionGuardCandidateState): void {
-  if (state.lastEntryPath !== null && !STRATEGY_ENTRY_PATHS.includes(state.lastEntryPath)) {
-    throw new Error("PositionGuard candidate state lastEntryPath is invalid.");
-  }
-}
-
 function validateCursor(state: PositionGuardCandidateState): void {
-  if (state.lastEvidenceAt === undefined || state.lastEvidenceId === undefined) {
-    throw new Error("PositionGuard candidate state cursor metadata must be present.");
+  const evidenceAt = state.lastEvidenceAt;
+  const evidenceId = state.lastEvidenceId;
+  const hasEvidenceAt = typeof evidenceAt === "string";
+  const hasEvidenceId = typeof evidenceId === "string";
+  if (evidenceAt !== null && !hasEvidenceAt) {
+    throw new Error("PositionGuard candidate state lastEvidenceAt must be a string or null.");
   }
-  if (state.lastEvidenceAt !== null) {
-    parsePositionGuardCandidateTimestamp(state.lastEvidenceAt, "state lastEvidenceAt");
-  }
-  if (
-    state.lastEvidenceId !== null &&
-    (typeof state.lastEvidenceId !== "string" || state.lastEvidenceId.trim() === "")
-  ) {
+  if (evidenceId !== null && (!hasEvidenceId || evidenceId.trim() === "")) {
     throw new Error("PositionGuard candidate state lastEvidenceId must be a non-empty string or null.");
   }
-  const hasEvidenceAt = typeof state.lastEvidenceAt === "string";
-  const hasEvidenceId = typeof state.lastEvidenceId === "string";
   if (hasEvidenceAt !== hasEvidenceId) {
     throw new Error("PositionGuard candidate state cursor metadata must be either both null or both non-null.");
   }
-  if (!hasEvidenceAt && !isPristineCandidateState(state)) {
-    throw new Error("PositionGuard candidate state may use a null cursor only when the state is empty.");
+  if (!hasEvidenceAt) {
+    if (!isPristineCandidateState(state)) {
+      throw new Error("PositionGuard candidate state may use a null cursor only when the state is empty.");
+    }
+    return;
+  }
+  parsePositionGuardCandidateTimestamp(evidenceAt, "state lastEvidenceAt");
+  if (state.stateVersion === 0) {
+    throw new Error("PositionGuard candidate state with a cursor must have a positive stateVersion.");
+  }
+  if (state.lastFullExitAt !== null &&
+    parsePositionGuardCandidateTimestamp(state.lastFullExitAt, "state lastFullExitAt") >
+      parsePositionGuardCandidateTimestamp(evidenceAt, "state lastEvidenceAt")) {
+    throw new Error("PositionGuard candidate state full-exit metadata cannot be after its chronology cursor.");
   }
 }
 
-function validateFeeInclusiveState(state: PositionGuardCandidateState): void {
-  if (!hasCompleteFeeInclusiveState(state)) {
-    throw new Error("PositionGuard candidate state inventory, cost basis, and stateVersion must be present together.");
+function validateExecutionEvidence(evidence: Readonly<PositionGuardCandidateExecutionEvidence>): void {
+  if (typeof evidence.evidenceId !== "string" || evidence.evidenceId.trim() === "") {
+    throw new Error("PositionGuard candidate evidenceId must be a non-empty string.");
   }
-  const inventory = state.currentEpisodeInventoryQuantity;
-  const costBasis = state.currentEpisodeCostBasisKrw;
-  const stateVersion = state.stateVersion;
-  if (!Number.isFinite(inventory) || inventory < 0) {
-    throw new Error("PositionGuard candidate state currentEpisodeInventoryQuantity must be finite and non-negative.");
+  parsePositionGuardCandidateTimestamp(evidence.executedAt, "evidence executedAt");
+  if (!EXECUTED_ACTIONS.includes(evidence.action)) {
+    throw new Error(`PositionGuard candidate evidence action ${String(evidence.action)} is invalid.`);
   }
-  if (!Number.isFinite(costBasis) || costBasis < 0) {
-    throw new Error("PositionGuard candidate state currentEpisodeCostBasisKrw must be finite and non-negative.");
+  if (!STRATEGY_ENTRY_PATHS.includes(evidence.entryPath)) {
+    throw new Error(`PositionGuard candidate evidence entryPath ${String(evidence.entryPath)} is invalid.`);
   }
-  if (!Number.isSafeInteger(stateVersion) || stateVersion < 0) {
-    throw new Error("PositionGuard candidate state stateVersion must be a non-negative safe integer.");
+  if (evidence.terminalStatus !== "FILLED" && evidence.terminalStatus !== "CANCELED") {
+    throw new Error("PositionGuard candidate evidence terminal lifecycle status is invalid.");
   }
-  if (inventory <= POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE && costBasis !== 0) {
-    throw new Error("Flat PositionGuard candidate state must have zero cost basis.");
+  for (const [field, value] of [
+    ["executedQuantity", evidence.executedQuantity],
+    ["grossQuoteValueKrw", evidence.grossQuoteValueKrw],
+    ["confirmedFeeKrw", evidence.confirmedFeeKrw],
+    ["remainingQuantity", evidence.remainingQuantity],
+  ] as const) {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new Error(`PositionGuard candidate evidence ${field} must be finite and non-negative.`);
+    }
   }
-  if (inventory > POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE && (costBasis <= 0 || state.lastEntryPath === null)) {
-    throw new Error("Open PositionGuard candidate state requires positive cost basis and entry path.");
+  if (evidence.executedQuantity === 0) {
+    if (evidence.terminalStatus !== "CANCELED") {
+      throw new Error("Terminal no-fill PositionGuard candidate evidence must be CANCELED.");
+    }
+    if (evidence.grossQuoteValueKrw !== 0 || evidence.confirmedFeeKrw !== 0) {
+      throw new Error("Terminal no-fill PositionGuard candidate evidence must have zero value and fee.");
+    }
+    return;
   }
-  if (state.lastEvidenceAt === null && stateVersion !== 0) {
-    throw new Error("Cursorless PositionGuard candidate state must have stateVersion 0.");
+  if (evidence.grossQuoteValueKrw <= 0) {
+    throw new Error("PositionGuard candidate evidence must have a positive quote value for a non-zero fill.");
   }
-  if (state.lastEvidenceAt !== null && stateVersion === 0) {
-    throw new Error("PositionGuard candidate state with a cursor must have a positive stateVersion.");
+  if (!Number.isFinite(evidence.grossQuoteValueKrw / evidence.executedQuantity)) {
+    throw new Error("PositionGuard candidate evidence implied execution price must be finite.");
   }
 }
 
 function assertNoFillEvidenceMatchesState(
   state: PositionGuardCandidateState,
-  evidence: PositionGuardCandidateExecutionEvidence,
+  evidence: Readonly<PositionGuardCandidateExecutionEvidence>,
 ): void {
-  assertResidualMatches(state.currentEpisodeInventoryQuantity!, evidence.remainingQuantity, evidence.evidenceId);
+  assertResidualMatches(state.currentEpisodeInventoryQuantity, evidence.remainingQuantity, evidence.evidenceId);
 }
 
 function assertNonZeroFillLifecycle(
   state: PositionGuardCandidateState,
-  evidence: PositionGuardCandidateExecutionEvidence,
+  evidence: Readonly<PositionGuardCandidateExecutionEvidence>,
 ): void {
-  const inventory = state.currentEpisodeInventoryQuantity!;
-  const executedQuantity = evidence.executedQuantity!;
   if (isBuyAction(evidence.action)) {
-    if (evidence.action === "ENTER" && inventory > POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE) {
+    if (evidence.action === "ENTER" && state.currentEpisodeInventoryQuantity !== 0) {
       throw new Error("PositionGuard candidate ENTER evidence requires a flat episode.");
     }
-    if (evidence.action === "ADD" && inventory <= POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE) {
+    if (evidence.action === "ADD" && state.currentEpisodeInventoryQuantity <= POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE) {
       throw new Error("PositionGuard candidate ADD evidence requires an open episode.");
     }
     return;
   }
-  if (inventory <= POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE) {
+  if (state.currentEpisodeInventoryQuantity <= POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE) {
     throw new Error("PositionGuard candidate sell evidence requires an open episode.");
   }
-  if (executedQuantity > inventory + POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE) {
+  if (evidence.executedQuantity > state.currentEpisodeInventoryQuantity + POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE) {
     throw new Error("PositionGuard candidate sell evidence exceeds episode inventory.");
   }
 }
@@ -435,22 +413,14 @@ function assertResidualMatches(expected: number, actual: number, evidenceId: str
 
 function assertEvidenceAfterStateCursor(
   state: PositionGuardCandidateState,
-  evidence: PositionGuardCandidateExecutionEvidence,
+  evidence: Readonly<PositionGuardCandidateExecutionEvidence>,
 ): void {
   if (state.lastEvidenceAt === null) return;
-  const lastEvidenceId = state.lastEvidenceId;
-  if (lastEvidenceId === null) {
-    throw new Error("PositionGuard candidate state cursor metadata is incomplete.");
-  }
-  if (evidence.evidenceId === lastEvidenceId) {
-    throw new Error(`Duplicate PositionGuard candidate evidenceId ${evidence.evidenceId} at the state cursor.`);
-  }
-
   const cursorEpoch = parsePositionGuardCandidateTimestamp(state.lastEvidenceAt, "state lastEvidenceAt");
   const evidenceEpoch = parsePositionGuardCandidateTimestamp(evidence.executedAt, "evidence executedAt");
   if (
     evidenceEpoch < cursorEpoch ||
-    (evidenceEpoch === cursorEpoch && evidence.evidenceId <= lastEvidenceId)
+    (evidenceEpoch === cursorEpoch && evidence.evidenceId <= state.lastEvidenceId!)
   ) {
     throw new Error(
       "PositionGuard candidate evidence must be ordered after the state chronology cursor by epoch nanoseconds and evidenceId.",
@@ -458,51 +428,61 @@ function assertEvidenceAfterStateCursor(
   }
 }
 
+function exactOwnDataRecord<Keys extends readonly string[]>(
+  value: unknown,
+  label: string,
+  keys: Keys,
+): Record<Keys[number], unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`PositionGuard candidate ${label} must be an object.`);
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error(`PositionGuard candidate ${label} must be a plain object with own data properties.`);
+  }
+  const names = Object.getOwnPropertyNames(value);
+  const symbols = Object.getOwnPropertySymbols(value);
+  if (symbols.length > 0) {
+    throw new Error(`PositionGuard candidate ${label} must not contain symbol keys.`);
+  }
+  if (names.length !== keys.length || names.some((name) => !keys.includes(name))) {
+    throw new Error(`PositionGuard candidate ${label} must contain exactly the required own data properties.`);
+  }
+  const record: Record<string, unknown> = {};
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !("value" in descriptor)) {
+      throw new Error(`PositionGuard candidate ${label} ${key} must be an own data property.`);
+    }
+    record[key] = descriptor.value;
+  }
+  return record as Record<Keys[number], unknown>;
+}
+
 function cloneState(state: PositionGuardCandidateState): PositionGuardCandidateState {
   return {
     currentEpisodeAddCount: state.currentEpisodeAddCount,
-    ...(state.currentEpisodeCostBasisKrw === undefined ? {} : { currentEpisodeCostBasisKrw: state.currentEpisodeCostBasisKrw }),
-    ...(state.currentEpisodeInventoryQuantity === undefined ? {} : { currentEpisodeInventoryQuantity: state.currentEpisodeInventoryQuantity }),
+    currentEpisodeCostBasisKrw: state.currentEpisodeCostBasisKrw,
+    currentEpisodeInventoryQuantity: state.currentEpisodeInventoryQuantity,
     currentEpisodeRealizedPnlKrw: state.currentEpisodeRealizedPnlKrw,
     lastFullExitAt: state.lastFullExitAt,
     lastFullExitRealizedPnlKrw: state.lastFullExitRealizedPnlKrw,
     lastEntryPath: state.lastEntryPath,
     lastEvidenceAt: state.lastEvidenceAt,
     lastEvidenceId: state.lastEvidenceId,
-    ...(state.stateVersion === undefined ? {} : { stateVersion: state.stateVersion }),
+    stateVersion: state.stateVersion,
   };
 }
 
 function isPristineCandidateState(state: PositionGuardCandidateState): boolean {
   return state.currentEpisodeAddCount === 0 &&
+    state.currentEpisodeCostBasisKrw === 0 &&
+    state.currentEpisodeInventoryQuantity === 0 &&
     state.currentEpisodeRealizedPnlKrw === 0 &&
     state.lastFullExitAt === null &&
     state.lastFullExitRealizedPnlKrw === null &&
     state.lastEntryPath === null &&
-    (state.currentEpisodeInventoryQuantity === undefined || state.currentEpisodeInventoryQuantity === 0) &&
-    (state.currentEpisodeCostBasisKrw === undefined || state.currentEpisodeCostBasisKrw === 0) &&
-    (state.stateVersion === undefined || state.stateVersion === 0);
-}
-
-function hasAnyFeeInclusiveStateField(state: PositionGuardCandidateState): boolean {
-  return state.currentEpisodeInventoryQuantity !== undefined ||
-    state.currentEpisodeCostBasisKrw !== undefined ||
-    state.stateVersion !== undefined;
-}
-
-function hasCompleteFeeInclusiveState(
-  state: PositionGuardCandidateState,
-): state is RequiredFeeInclusiveCandidateState {
-  return state.currentEpisodeInventoryQuantity !== undefined &&
-    state.currentEpisodeCostBasisKrw !== undefined &&
-    state.stateVersion !== undefined;
-}
-
-function hasAnyFeeInclusiveEvidenceField(evidence: PositionGuardCandidateExecutionEvidence): boolean {
-  return evidence.terminalStatus !== undefined ||
-    evidence.executedQuantity !== undefined ||
-    evidence.grossQuoteValueKrw !== undefined ||
-    evidence.confirmedFeeKrw !== undefined;
+    state.stateVersion === 0;
 }
 
 function isBuyAction(action: PositionGuardCandidateExecutionEvidence["action"]): boolean {
@@ -527,12 +507,3 @@ function daysInMonth(year: number, month: number): number {
   }
   return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }
-
-function roundLegacyMoney(value: number): number {
-  return Number(value.toFixed(6));
-}
-
-type RequiredFeeInclusiveCandidateState = PositionGuardCandidateState & Required<Pick<
-  PositionGuardCandidateState,
-  "currentEpisodeCostBasisKrw" | "currentEpisodeInventoryQuantity" | "stateVersion"
->>;

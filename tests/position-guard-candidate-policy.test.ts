@@ -455,14 +455,31 @@ function analysis(overrides: Partial<PositionGuardStructureAnalysis> = {}): Posi
 }
 
 function state(overrides: Partial<PositionGuardCandidateState> = {}): PositionGuardCandidateState {
-  return {
+  const result: PositionGuardCandidateState = {
     currentEpisodeAddCount: 0,
+    currentEpisodeCostBasisKrw: 0,
+    currentEpisodeInventoryQuantity: 0,
     currentEpisodeRealizedPnlKrw: 0,
     lastFullExitAt: null,
     lastFullExitRealizedPnlKrw: null,
     lastEntryPath: null,
-    lastEvidenceAt: "2026-01-01T00:00:00Z",
-    lastEvidenceId: "fixture-prior-evidence",
+    lastEvidenceAt: null,
+    lastEvidenceId: null,
+    stateVersion: 0,
     ...overrides,
   };
+  if (result.currentEpisodeAddCount > 0) {
+    result.currentEpisodeInventoryQuantity = result.currentEpisodeInventoryQuantity || 0.01;
+    result.currentEpisodeCostBasisKrw = result.currentEpisodeCostBasisKrw || 100;
+    result.lastEntryPath ??= "PULLBACK";
+    result.lastEvidenceAt ??= "2026-01-01T00:00:00Z";
+    result.lastEvidenceId ??= "fixture-open-evidence";
+    result.stateVersion ||= 1;
+  }
+  if (result.lastFullExitAt !== null) {
+    result.lastEvidenceAt ??= result.lastFullExitAt;
+    result.lastEvidenceId ??= "fixture-full-exit";
+    result.stateVersion ||= 1;
+  }
+  return result;
 }

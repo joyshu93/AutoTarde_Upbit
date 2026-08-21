@@ -153,14 +153,16 @@ test("candidate state accepts canceled terminal evidence with a fill", () => {
 });
 
 test("candidate state leaves terminal no-fill evidence as a complete no-op", () => {
-  const state = advancePositionGuardCandidateState(emptyState(), buyEvidence({
-    evidenceId: "enter",
-    executedAt: "2026-08-20T00:00:00Z",
-    executedQuantity: 1,
-    grossQuoteValueKrw: 100,
-    confirmedFeeKrw: 1,
-    remainingQuantity: 1,
-  }));
+  const state = {
+    ...emptyState(),
+    currentEpisodeCostBasisKrw: 101,
+    currentEpisodeInventoryQuantity: 1,
+    lastEntryPath: "PULLBACK" as const,
+    lastEvidenceAt: "2026-08-20T00:00:00Z",
+    lastEvidenceId: "enter",
+    stateVersion: 1,
+  };
+  const original = { ...state };
   const noFill = advancePositionGuardCandidateState(state, sellEvidence({
     evidenceId: "canceled-no-fill",
     executedAt: "2026-08-20T01:00:00Z",
@@ -171,9 +173,141 @@ test("candidate state leaves terminal no-fill evidence as a complete no-op", () 
     remainingQuantity: 1,
   }));
 
-  assert.strictEqual(noFill, state);
+  assert.deepEqual(state, original);
+  assert.notStrictEqual(noFill, state);
+  assert.deepEqual(noFill, state);
+  assert.equal(Object.isFrozen(noFill), true);
   assert.equal(noFill.stateVersion, 1);
   assert.equal(noFill.lastEvidenceId, "enter");
+});
+
+test("candidate state keeps a mutable no-fill input detached after caller mutation", () => {
+  const state = {
+    ...emptyState(),
+    currentEpisodeCostBasisKrw: 101,
+    currentEpisodeInventoryQuantity: 1,
+    lastEntryPath: "PULLBACK" as const,
+    lastEvidenceAt: "2026-08-20T00:00:00Z",
+    lastEvidenceId: "enter",
+    stateVersion: 1,
+  } as PositionGuardCandidateState;
+  const noFill = advancePositionGuardCandidateState(state, sellEvidence({
+    evidenceId: "canceled-no-fill",
+    executedAt: "2026-08-20T01:00:00Z",
+    terminalStatus: "CANCELED",
+    executedQuantity: 0,
+    grossQuoteValueKrw: 0,
+    confirmedFeeKrw: 0,
+    remainingQuantity: 1,
+  }));
+
+  state.currentEpisodeCostBasisKrw = 999;
+  assert.equal(noFill.currentEpisodeCostBasisKrw, 101);
+});
+
+test("candidate state rejects a dirty flat episode before a later ENTER can inherit it", () => {
+  const dirtyFlat = {
+    ...emptyState(),
+    currentEpisodeAddCount: 1,
+    currentEpisodeRealizedPnlKrw: 5,
+    lastEvidenceAt: "2026-08-20T00:00:00Z",
+    lastEvidenceId: "prior",
+    stateVersion: 1,
+  };
+
+  assert.throws(() => validatePositionGuardCandidateState(dirtyFlat), /flat|episode/i);
+  assert.throws(() => advancePositionGuardCandidateState(dirtyFlat, buyEvidence({
+    evidenceId: "enter",
+    executedAt: "2026-08-20T01:00:00Z",
+    executedQuantity: 1,
+    grossQuoteValueKrw: 100,
+    confirmedFeeKrw: 1,
+    remainingQuantity: 1,
+  })), /flat|episode/i);
+});
+
+test("candidate state rejects incoherent cursor and full-exit chronology", () => {
+  assert.throws(() => validatePositionGuardCandidateState({
+    ...emptyState(),
+    lastEvidenceAt: "2026-08-20T00:00:00Z",
+    lastEvidenceId: "cursor",
+    stateVersion: 1,
+  }), /full-exit|flat|cursor/i);
+  assert.throws(() => validatePositionGuardCandidateState({
+    ...emptyState(),
+    lastFullExitAt: "2026-08-20T01:00:00Z",
+    lastFullExitRealizedPnlKrw: 0,
+    lastEvidenceAt: "2026-08-20T00:00:00Z",
+    lastEvidenceId: "cursor",
+    stateVersion: 1,
+  }), /chronolog|full-exit|cursor/i);
+});
+
+test("candidate state and evidence require exact own data properties", () => {
+  const inheritedState = Object.create(emptyState()) as PositionGuardCandidateState;
+  const inheritedEvidence = Object.create(buyEvidence({
+    evidenceId: "inherited",
+    executedAt: "2026-08-20T00:00:00Z",
+    executedQuantity: 1,
+    grossQuoteValueKrw: 100,
+    confirmedFeeKrw: 1,
+    remainingQuantity: 1,
+  })) as PositionGuardCandidateExecutionEvidence;
+  const hiddenExtraEvidence = buyEvidence({
+    evidenceId: "hidden-extra",
+    executedAt: "2026-08-20T00:00:00Z",
+    executedQuantity: 1,
+    grossQuoteValueKrw: 100,
+    confirmedFeeKrw: 1,
+    remainingQuantity: 1,
+  });
+  Object.defineProperty(hiddenExtraEvidence, "hidden", { value: true });
+  const symbolExtraState = { ...emptyState(), [Symbol("extra")]: true };
+
+  assert.throws(() => validatePositionGuardCandidateState(inheritedState), /own|data property/i);
+  assert.throws(() => advancePositionGuardCandidateState(emptyState(), inheritedEvidence), /own|data property/i);
+  assert.throws(() => advancePositionGuardCandidateState(emptyState(), hiddenExtraEvidence), /extra|exact|own/i);
+  assert.throws(
+    () => validatePositionGuardCandidateState(symbolExtraState as PositionGuardCandidateState),
+    /symbol|extra|exact/i,
+  );
+});
+
+test("candidate evidence rejects accessors without reading mutable getter values", () => {
+  let getterCalls = 0;
+  const evidence = buyEvidence({
+    evidenceId: "getter",
+    executedAt: "2026-08-20T00:00:00Z",
+    executedQuantity: 1,
+    grossQuoteValueKrw: 100,
+    confirmedFeeKrw: 1,
+    remainingQuantity: 1,
+  });
+  Object.defineProperty(evidence, "grossQuoteValueKrw", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return getterCalls === 1 ? 100 : 10_000;
+    },
+  });
+
+  assert.throws(() => advancePositionGuardCandidateState(emptyState(), evidence), /data property|accessor/i);
+  assert.equal(getterCalls, 0);
+});
+
+test("candidate evidence cannot omit every fee-inclusive economic field", () => {
+  const missingEconomicFields = {
+    evidenceId: "missing-economic-fields",
+    executedAt: "2026-08-20T00:00:00Z",
+    action: "ENTER",
+    entryPath: "PULLBACK",
+    remainingQuantity: 1,
+  } as unknown as PositionGuardCandidateExecutionEvidence;
+
+  assert.throws(
+    () => advancePositionGuardCandidateState(emptyState(), missingEconomicFields),
+    /required own data properties|exactly/i,
+  );
 });
 
 test("candidate projection sorts a detached copy by epoch nanoseconds and evidence ID", () => {
@@ -342,20 +476,28 @@ function emptyState(): PositionGuardCandidateState {
   };
 }
 
+type EvidenceOverrides = Pick<
+  PositionGuardCandidateExecutionEvidence,
+  "evidenceId" | "executedAt" | "executedQuantity" | "grossQuoteValueKrw" | "confirmedFeeKrw" | "remainingQuantity"
+> & Partial<Omit<
+  PositionGuardCandidateExecutionEvidence,
+  "evidenceId" | "executedAt" | "executedQuantity" | "grossQuoteValueKrw" | "confirmedFeeKrw" | "remainingQuantity"
+>>;
+
 function buyEvidence(
-  overrides: Partial<PositionGuardCandidateExecutionEvidence> & Pick<PositionGuardCandidateExecutionEvidence, "evidenceId" | "executedAt" | "executedQuantity" | "grossQuoteValueKrw" | "confirmedFeeKrw" | "remainingQuantity">,
+  overrides: EvidenceOverrides,
 ): PositionGuardCandidateExecutionEvidence {
   return evidence({ ...overrides, action: overrides.action ?? "ENTER" });
 }
 
 function sellEvidence(
-  overrides: Partial<PositionGuardCandidateExecutionEvidence> & Pick<PositionGuardCandidateExecutionEvidence, "evidenceId" | "executedAt" | "executedQuantity" | "grossQuoteValueKrw" | "confirmedFeeKrw" | "remainingQuantity">,
+  overrides: EvidenceOverrides,
 ): PositionGuardCandidateExecutionEvidence {
   return evidence({ ...overrides, action: overrides.action ?? "EXIT" });
 }
 
 function evidence(
-  overrides: Partial<PositionGuardCandidateExecutionEvidence> & Pick<PositionGuardCandidateExecutionEvidence, "evidenceId" | "executedAt" | "executedQuantity" | "grossQuoteValueKrw" | "confirmedFeeKrw" | "remainingQuantity">,
+  overrides: EvidenceOverrides,
 ): PositionGuardCandidateExecutionEvidence {
   return {
     evidenceId: overrides.evidenceId,
@@ -363,9 +505,9 @@ function evidence(
     action: overrides.action ?? "ENTER",
     entryPath: overrides.entryPath ?? "PULLBACK",
     terminalStatus: overrides.terminalStatus ?? "FILLED",
-    ...(overrides.executedQuantity === undefined ? {} : { executedQuantity: overrides.executedQuantity }),
-    ...(overrides.grossQuoteValueKrw === undefined ? {} : { grossQuoteValueKrw: overrides.grossQuoteValueKrw }),
-    ...(overrides.confirmedFeeKrw === undefined ? {} : { confirmedFeeKrw: overrides.confirmedFeeKrw }),
+    executedQuantity: overrides.executedQuantity,
+    grossQuoteValueKrw: overrides.grossQuoteValueKrw,
+    confirmedFeeKrw: overrides.confirmedFeeKrw,
     remainingQuantity: overrides.remainingQuantity,
   };
 }
