@@ -1,0 +1,690 @@
+import assert from "node:assert/strict";
+
+import type { PositionGuardPilotDeploymentRecord } from "../src/domain/pilot-types.js";
+import type {
+  BalanceSnapshotRecord,
+  ExecutionStateRecord,
+  OrderEventRecord,
+  OrderRecord,
+  PositionSnapshotRecord,
+  ReconciliationRunRecord,
+} from "../src/domain/types.js";
+import {
+  PositionGuardPilotRecovery,
+  type PositionGuardPilotRefreshReceipt,
+} from "../src/app/position-guard-pilot-recovery.js";
+import {
+  candidateEvidenceMaterial,
+  type CandidateEvidenceRecord,
+  type CandidatePilotRecoveryFaultReason,
+  type CandidatePilotRepository,
+} from "../src/modules/db/pilot-interfaces.js";
+import { InMemoryCandidatePilotRepository } from
+  "../src/modules/db/repositories/in-memory-candidate-pilot-repository.js";
+import {
+  InMemoryExecutionRepository,
+  InMemoryOperatorStateStore,
+} from "../src/modules/db/repositories/in-memory-repositories.js";
+import { createEmptyPositionGuardCandidateState } from
+  "../src/modules/strategy/position-guard-candidate-state.js";
+import { test } from "./harness.js";
+
+const ACCOUNT_ID = "primary";
+const DEPLOYMENT_ID = "btc-pilot-deployment";
+const PILOT_ID = "BTC_COMBINED_CONSERVATIVE_PILOT_V1" as const;
+const POLICY_ID = "COMBINED_CONSERVATIVE" as const;
+const POLICY_VERSION = "PCS-2026-001.DEPLOYMENT_READINESS_V1" as const;
+const CREATED_AT = "2026-08-21T00:00:00.000Z";
+const ACTIVATED_AT = "2026-08-21T00:00:10.000Z";
+const EVIDENCE_AT = "2026-08-21T00:00:20.000Z";
+const SNAPSHOT_AT = "2026-08-21T00:00:30.000Z";
+const RECONCILIATION_COMPLETED_AT = "2026-08-21T00:00:31.000Z";
+const NOW = "2026-08-21T00:01:00.000Z";
+const FRESHNESS_THRESHOLD_MS = 60_000;
+
+test("fresh persisted flat PENDING_FLAT activation returns immutable READY ACTIVE provenance", async () => {
+  const fixture = await createFixture();
+
+  const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "READY");
+  if (result.status !== "READY") return;
+  assert.equal(result.verificationOnly, true);
+  assert.equal(result.phase, "ACTIVE");
+  assert.equal(result.deployment.phase, "ACTIVE");
+  assert.deepEqual(result.activation, {
+    activationAt: NOW,
+    activationEpochNs: BigInt(Date.parse(NOW)) * 1_000_000n,
+  });
+  assert.deepEqual(result.state, {
+    currentEpisodeAddCount: 0,
+    currentEpisodeCostBasisKrw: "0",
+    currentEpisodeInventoryQuantity: "0",
+    currentEpisodeRealizedPnlKrw: "0",
+    lastFullExitAt: null,
+    lastFullExitRealizedPnlKrw: null,
+    lastEntryPath: null,
+    lastEvidenceAt: null,
+    lastEvidenceId: null,
+    stateVersion: 0,
+  });
+  assert.equal(result.stateVersion, 0);
+  assert.deepEqual(result.refreshProvenance, fixture.receipt);
+  assert.equal(Object.isFrozen(result), true);
+  assert.equal(Object.isFrozen(result.deployment), true);
+  assert.equal(Object.isFrozen(result.activation), true);
+  assert.equal(Object.isFrozen(result.state), true);
+  assert.equal(Object.isFrozen(result.refreshProvenance), true);
+  assert.equal((await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "ACTIVE");
+  assert.equal((await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID))
+    .filter((event) => event.eventType === "PHASE_TRANSITION").length, 1);
+});
+
+test("non-flat PENDING_FLAT returns READY PENDING_FLAT without activation", async () => {
+  const fixture = await createFixture({ balanceFree: "0.25", positionQuantity: "0.25" });
+
+  const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "READY");
+  if (result.status !== "READY") return;
+  assert.equal(result.phase, "PENDING_FLAT");
+  assert.equal(result.activation, null);
+  assert.equal(result.state.currentEpisodeInventoryQuantity, "0");
+  assert.equal((await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "PENDING_FLAT");
+});
+
+test("ACTIVE recovery verifies activation chronology and exact replay state", async () => {
+  const fixture = await createFixture({
+    phase: "ACTIVE",
+    evidenceQuantity: "0.1",
+    balanceFree: "0.1",
+    positionQuantity: "0.1",
+  });
+
+  const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "READY");
+  if (result.status !== "READY") return;
+  assert.equal(result.phase, "ACTIVE");
+  assert.deepEqual(result.activation, {
+    activationAt: ACTIVATED_AT,
+    activationEpochNs: BigInt(Date.parse(ACTIVATED_AT)) * 1_000_000n,
+  });
+  assert.equal(result.state.currentEpisodeInventoryQuantity, "0.1");
+  assert.equal(result.state.stateVersion, 1);
+});
+
+test("ACTIVE recovery rejects activation audit chronology that was not pristine", async () => {
+  const fixture = await createFixture({
+    phase: "ACTIVE",
+    evidenceQuantity: "0.1",
+    balanceFree: "0.1",
+    positionQuantity: "0.1",
+  });
+  const auditEvents = await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  fixture.recovery = fixture.createRecovery(overrideCandidatePilots(fixture.candidatePilots, {
+    listAuditEvents: async () => auditEvents.map((event) =>
+      event.eventType === "PHASE_TRANSITION" ? { ...event, stateVersion: 1 } : event
+    ),
+  }));
+
+  await expectFault(fixture, "IDENTITY_MISMATCH");
+});
+
+test("receipt that does not match the persisted latest rows faults closed", async () => {
+  const fixture = await createFixture();
+  await fixture.repositories.saveBalanceSnapshot(balanceSnapshot({
+    id: "balance-newer",
+    capturedAt: "2026-08-21T00:00:40.000Z",
+  }));
+
+  await expectFault(fixture, "SNAPSHOT_PROVENANCE_INVALID");
+});
+
+test("stale, future, and malformed persisted refresh timestamps fault closed", async () => {
+  const scenarios = [
+    {
+      name: "stale",
+      snapshotAt: "2026-08-20T23:58:00.000Z",
+      completedAt: "2026-08-20T23:58:01.000Z",
+      reasonCode: "STALE_SNAPSHOT" as const,
+    },
+    {
+      name: "future",
+      snapshotAt: "2026-08-21T00:02:00.000Z",
+      completedAt: "2026-08-21T00:02:01.000Z",
+      reasonCode: "STALE_SNAPSHOT" as const,
+    },
+    {
+      name: "malformed",
+      snapshotAt: "2026-08-21 00:00:30",
+      completedAt: RECONCILIATION_COMPLETED_AT,
+      reasonCode: "SNAPSHOT_PROVENANCE_INVALID" as const,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const fixture = await createFixture({
+      snapshotAt: scenario.snapshotAt,
+      reconciliationCompletedAt: scenario.completedAt,
+    });
+    await expectFault(fixture, scenario.reasonCode, scenario.name);
+  }
+});
+
+test("missing configured deployment pauses only the target global execution state", async () => {
+  const fixture = await createFixture({ createDeployment: false });
+
+  const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "BLOCKED_FAULT");
+  if (result.status !== "BLOCKED_FAULT") return;
+  assert.equal(result.reasonCode, "IDENTITY_MISMATCH");
+  assert.equal(result.executableAuthority, false);
+  assert.equal("deployment" in result, false);
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal(await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID), null);
+  assert.equal((await fixture.operatorState.listTransitions(100))
+    .filter((transition) => transition.id === result.faultId).length, 1);
+});
+
+test("another account's deployment is not mutated and only the target global state pauses", async () => {
+  const fixture = await createFixture({ deploymentAccountId: "other-account" });
+
+  const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "BLOCKED_FAULT");
+  if (result.status !== "BLOCKED_FAULT") return;
+  assert.equal(result.reasonCode, "IDENTITY_MISMATCH");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "PENDING_FLAT");
+  assert.equal((await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID))
+    .filter((event) => event.eventType === "FAULT_PAUSED").length, 0);
+});
+
+test("established deployment policy identity mismatch atomically pauses pilot and global state", async () => {
+  const fixture = await createFixture();
+  const persisted = await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID);
+  assert.ok(persisted);
+  fixture.recovery = fixture.createRecovery(overrideCandidatePilots(fixture.candidatePilots, {
+    getDeployment: async () => ({ ...persisted, policyVersion: "WRONG_VERSION" as typeof POLICY_VERSION }),
+  }));
+
+  await expectFault(fixture, "IDENTITY_MISMATCH");
+});
+
+test("evidence hash, material version, and exact replay mismatches fault closed", async () => {
+  for (const scenario of ["hash", "material", "replay"] as const) {
+    const fixture = await createFixture({
+      phase: "ACTIVE",
+      evidenceQuantity: "0.1",
+      balanceFree: "0.1",
+      positionQuantity: "0.1",
+    });
+    const records = await fixture.candidatePilots.listEvidenceRecords(DEPLOYMENT_ID);
+    assert.equal(records.length, 1);
+    let corrupted: Readonly<CandidateEvidenceRecord>;
+    if (scenario === "hash") {
+      corrupted = { ...records[0]!, materialHash: "0".repeat(64) };
+    } else if (scenario === "material") {
+      corrupted = { ...records[0]!, materialVersion: "LEGACY_APPROXIMATE_V1" };
+    } else {
+      const evidence = {
+        ...records[0]!.evidence,
+        executedQuantity: "0.2",
+        remainingQuantity: "0.2",
+      };
+      const material = candidateEvidenceMaterial(DEPLOYMENT_ID, evidence);
+      corrupted = {
+        evidence: material.evidence,
+        materialHash: material.hash,
+        materialVersion: material.materialVersion,
+      };
+    }
+    fixture.recovery = fixture.createRecovery(overrideCandidatePilots(fixture.candidatePilots, {
+      listEvidenceRecords: async () => [corrupted],
+    }));
+
+    await expectFault(fixture, "REPLAY_MISMATCH", scenario);
+  }
+});
+
+test("unknown reconciliation issue codes and malformed summary JSON block by default", async () => {
+  for (const scenario of ["unknown", "malformed"] as const) {
+    const fixture = await createFixture();
+    await fixture.repositories.updateReconciliationRun(reconciliationRun({
+      summaryJson: scenario === "unknown"
+        ? reconciliationSummaryJson(["NEW_UNREVIEWED_CODE"])
+        : "{not-json",
+      status: "DRIFT_DETECTED",
+    }));
+
+    await expectFault(fixture, "BLOCKING_RECONCILIATION", scenario);
+  }
+});
+
+test("reviewed non-blocking reconciliation issue codes pass verification", async () => {
+  const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+  await fixture.repositories.updateReconciliationRun(reconciliationRun({
+    summaryJson: reconciliationSummaryJson(["ORDER_STATUS_RECONCILED", "ORDER_FILLS_BACKFILLED"]),
+    status: "DRIFT_DETECTED",
+  }));
+
+  const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "READY");
+  if (result.status === "READY") assert.equal(result.phase, "PENDING_FLAT");
+});
+
+test("active and reconciliation-required orders block account-wide recovery", async () => {
+  for (const status of ["OPEN", "RECONCILIATION_REQUIRED"] as const) {
+    const fixture = await createFixture();
+    await fixture.repositories.saveOrder(orderRecord({ status }));
+
+    await expectFault(
+      fixture,
+      status === "RECONCILIATION_REQUIRED" ? "UNCERTAIN_ORDER" : "ACTIVE_ORDER",
+      status,
+    );
+  }
+});
+
+test("FAILED and REJECTED orders without definitive lifecycle proof remain uncertain", async () => {
+  for (const status of ["FAILED", "REJECTED"] as const) {
+    const fixture = await createFixture();
+    await fixture.repositories.saveOrder(orderRecord({
+      status,
+      failureCode: status === "REJECTED" ? "EXCHANGE_ORDER_REJECTED" : "EXCHANGE_SUBMISSION_FAILED",
+    }));
+
+    await expectFault(fixture, "UNCERTAIN_ORDER", status);
+  }
+});
+
+test("definitive rejection and bounded absence lifecycle evidence are safe", async () => {
+  const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+  const rejected = orderRecord({ id: "order-rejected", status: "REJECTED", failureCode: "EXCHANGE_ORDER_REJECTED" });
+  const absent = orderRecord({
+    id: "order-absent",
+    status: "FAILED",
+    failureCode: "ORDER_SUBMISSION_ABSENCE_CONFIRMED",
+  });
+  await fixture.repositories.saveOrder(rejected);
+  await fixture.repositories.appendOrderEvent(orderEvent(rejected.id, "ORDER_REJECTED", "EXCHANGE"));
+  await fixture.repositories.saveOrder(absent);
+  await fixture.repositories.appendOrderEvent(
+    orderEvent(absent.id, "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED", "RECONCILIATION"),
+  );
+
+  const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "READY");
+});
+
+test("malformed or future lifecycle timestamps cannot prove definitive rejection", async () => {
+  for (const createdAt of ["2026-08-21 00:00:27", "2026-08-21T00:02:00.000Z"]) {
+    const fixture = await createFixture();
+    const rejected = orderRecord({ status: "REJECTED", failureCode: "EXCHANGE_ORDER_REJECTED" });
+    await fixture.repositories.saveOrder(rejected);
+    await fixture.repositories.appendOrderEvent({
+      ...orderEvent(rejected.id, "ORDER_REJECTED", "EXCHANGE"),
+      createdAt,
+    });
+
+    await expectFault(fixture, "UNCERTAIN_ORDER", createdAt);
+  }
+});
+
+test("balance, position, replay inventory, and malformed numeric mismatches fault closed", async () => {
+  const scenarios = [
+    { name: "balance-position", balanceFree: "0.2", positionQuantity: "0.1", evidenceQuantity: "0.1" },
+    { name: "replay-exchange", balanceFree: "0.2", positionQuantity: "0.2", evidenceQuantity: "0.1" },
+    { name: "negative", balanceFree: "-0.1", positionQuantity: "0.1", evidenceQuantity: "0.1" },
+    { name: "non-finite", balanceFree: "NaN", positionQuantity: "0.1", evidenceQuantity: "0.1" },
+  ];
+  for (const scenario of scenarios) {
+    const fixture = await createFixture({
+      phase: "ACTIVE",
+      evidenceQuantity: scenario.evidenceQuantity,
+      balanceFree: scenario.balanceFree,
+      positionQuantity: scenario.positionQuantity,
+    });
+    await expectFault(fixture, "INVENTORY_MISMATCH", scenario.name);
+  }
+});
+
+test("activation CAS conflict faults instead of accepting separately activated state", async () => {
+  const fixture = await createFixture();
+  fixture.recovery = fixture.createRecovery(overrideCandidatePilots(fixture.candidatePilots, {
+    activateDeployment: async () => null,
+  }));
+
+  await expectFault(fixture, "ACTIVATION_CAS_CONFLICT");
+});
+
+test("restart retry reuses the deterministic Task 9A1 recovery fault", async () => {
+  const fixture = await createFixture();
+  await fixture.repositories.saveBalanceSnapshot(balanceSnapshot({
+    id: "balance-newer",
+    capturedAt: "2026-08-21T00:00:40.000Z",
+  }));
+
+  const first = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+  const retry = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(first.status, "BLOCKED_FAULT");
+  assert.equal(retry.status, "BLOCKED_FAULT");
+  if (first.status !== "BLOCKED_FAULT" || retry.status !== "BLOCKED_FAULT") return;
+  assert.equal(first.faultId, retry.faultId);
+  assert.equal((await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID))
+    .filter((event) => event.id === first.faultId).length, 1);
+  assert.equal((await fixture.operatorState.listTransitions(100))
+    .filter((transition) => transition.id === first.faultId).length, 1);
+});
+
+test("successful recovery never resumes a pre-existing operator pause", async () => {
+  const fixture = await createFixture({ operatorStatus: "PAUSED" });
+  const beforeTransitions = await fixture.operatorState.listTransitions(100);
+
+  const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "READY");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await fixture.operatorState.getState()).pauseReason, "operator-maintenance");
+  assert.deepEqual(await fixture.operatorState.listTransitions(100), beforeTransitions);
+});
+
+interface FixtureOptions {
+  createDeployment?: boolean;
+  deploymentAccountId?: string;
+  phase?: "PENDING_FLAT" | "ACTIVE";
+  evidenceQuantity?: string;
+  balanceFree?: string;
+  balanceLocked?: string;
+  positionQuantity?: string;
+  snapshotAt?: string;
+  reconciliationCompletedAt?: string;
+  operatorStatus?: "RUNNING" | "PAUSED";
+}
+
+interface RecoveryFixture {
+  repositories: InMemoryExecutionRepository;
+  operatorState: InMemoryOperatorStateStore;
+  candidatePilots: InMemoryCandidatePilotRepository;
+  receipt: PositionGuardPilotRefreshReceipt;
+  recovery: PositionGuardPilotRecovery;
+  createRecovery(candidatePilots?: CandidatePilotRepository): PositionGuardPilotRecovery;
+}
+
+async function createFixture(options: FixtureOptions = {}): Promise<RecoveryFixture> {
+  const snapshotAt = options.snapshotAt ?? SNAPSHOT_AT;
+  const reconciliationCompletedAt = options.reconciliationCompletedAt ?? RECONCILIATION_COMPLETED_AT;
+  const operatorState = new InMemoryOperatorStateStore(initialExecutionState(options.operatorStatus ?? "RUNNING"));
+  const repositories = new InMemoryExecutionRepository(operatorState);
+  const candidatePilots = new InMemoryCandidatePilotRepository(operatorState);
+  if (options.createDeployment !== false) {
+    await candidatePilots.createDeploymentWithInitialState({
+      deployment: deploymentRecord({ exchangeAccountId: options.deploymentAccountId ?? ACCOUNT_ID }),
+      initialState: createEmptyPositionGuardCandidateState(),
+    });
+    if (options.phase === "ACTIVE") {
+      const activated = await candidatePilots.activateDeployment({
+        deploymentId: DEPLOYMENT_ID,
+        expectedPhase: "PENDING_FLAT",
+        expectedUpdatedAt: CREATED_AT,
+        activationAt: ACTIVATED_AT,
+        activationEpochNs: BigInt(Date.parse(ACTIVATED_AT)) * 1_000_000n,
+      });
+      assert.ok(activated);
+      if (options.evidenceQuantity !== undefined) {
+        await candidatePilots.advanceStateWithEvidence({
+          deploymentId: DEPLOYMENT_ID,
+          expectedStateVersion: 0,
+          evidence: {
+            evidenceId: "evidence-enter-1",
+            executedAt: EVIDENCE_AT,
+            action: "ENTER",
+            entryPath: "PULLBACK",
+            terminalStatus: "FILLED",
+            executedQuantity: options.evidenceQuantity,
+            grossQuoteValueKrw: "10000000",
+            confirmedFeeKrw: "5000",
+            remainingQuantity: options.evidenceQuantity,
+          },
+        });
+      }
+    }
+  }
+
+  await repositories.saveBalanceSnapshot(balanceSnapshot({
+    capturedAt: snapshotAt,
+    ...(options.balanceFree !== undefined ? { balanceFree: options.balanceFree } : {}),
+    ...(options.balanceLocked !== undefined ? { balanceLocked: options.balanceLocked } : {}),
+  }));
+  await repositories.savePositionSnapshot(positionSnapshot({
+    capturedAt: snapshotAt,
+    ...(options.positionQuantity !== undefined ? { quantity: options.positionQuantity } : {}),
+  }));
+  await repositories.saveReconciliationRun(reconciliationRun({
+    startedAt: snapshotAt,
+    completedAt: reconciliationCompletedAt,
+  }));
+
+  const receipt: PositionGuardPilotRefreshReceipt = {
+    exchangeAccountId: ACCOUNT_ID,
+    requestedAt: snapshotAt,
+    balanceSnapshotId: "balance-refresh",
+    balanceCapturedAt: snapshotAt,
+    positionSnapshotId: "position-refresh",
+    positionCapturedAt: snapshotAt,
+    reconciliationRunId: "reconciliation-refresh",
+    reconciliationStartedAt: snapshotAt,
+    reconciliationCompletedAt,
+    reconciliationSource: "SCHEDULER_PREFLIGHT",
+  };
+  const createRecovery = (pilotRepository: CandidatePilotRepository = candidatePilots) =>
+    new PositionGuardPilotRecovery({
+      exchangeAccountId: ACCOUNT_ID,
+      deploymentId: DEPLOYMENT_ID,
+      pilotId: PILOT_ID,
+      market: "KRW-BTC",
+      policyId: POLICY_ID,
+      policyVersion: POLICY_VERSION,
+      freshnessThresholdMs: FRESHNESS_THRESHOLD_MS,
+      clock: {
+        now: () => ({ occurredAt: NOW, occurredAtEpochMs: Date.parse(NOW) }),
+      },
+      repositories,
+      candidatePilots: pilotRepository,
+      operatorState,
+    });
+  return {
+    repositories,
+    operatorState,
+    candidatePilots,
+    receipt,
+    recovery: createRecovery(),
+    createRecovery,
+  };
+}
+
+async function expectFault(
+  fixture: RecoveryFixture,
+  reasonCode: CandidatePilotRecoveryFaultReason,
+  label?: string,
+): Promise<void> {
+  const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+  assert.equal(result.status, "BLOCKED_FAULT", label);
+  if (result.status !== "BLOCKED_FAULT") return;
+  assert.equal(result.reasonCode, reasonCode, label);
+  assert.equal(result.executableAuthority, false, label);
+  assert.equal("deployment" in result, false, label);
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED", label);
+  assert.equal((await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "PAUSED_FAULT", label);
+  assert.equal((await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID))
+    .filter((event) => event.id === result.faultId).length, 1, label);
+}
+
+function deploymentRecord(input: { exchangeAccountId: string }): PositionGuardPilotDeploymentRecord {
+  return {
+    id: DEPLOYMENT_ID,
+    exchangeAccountId: input.exchangeAccountId,
+    pilotId: PILOT_ID,
+    market: "KRW-BTC",
+    policyId: POLICY_ID,
+    policyVersion: POLICY_VERSION,
+    phase: "PENDING_FLAT",
+    activationAt: null,
+    activationEpochNs: null,
+    createdAt: CREATED_AT,
+    updatedAt: CREATED_AT,
+  };
+}
+
+function balanceSnapshot(input: {
+  id?: string;
+  capturedAt?: string;
+  balanceFree?: string;
+  balanceLocked?: string;
+} = {}): BalanceSnapshotRecord {
+  return {
+    id: input.id ?? "balance-refresh",
+    exchangeAccountId: ACCOUNT_ID,
+    capturedAt: input.capturedAt ?? SNAPSHOT_AT,
+    source: "RECONCILIATION",
+    totalKrwValue: null,
+    balancesJson: JSON.stringify([{
+      currency: "BTC",
+      balance: input.balanceFree ?? "0",
+      locked: input.balanceLocked ?? "0",
+      avgBuyPrice: "0",
+      unitCurrency: "KRW",
+    }]),
+  };
+}
+
+function positionSnapshot(input: { capturedAt?: string; quantity?: string } = {}): PositionSnapshotRecord {
+  const capturedAt = input.capturedAt ?? SNAPSHOT_AT;
+  return {
+    id: "position-refresh",
+    exchangeAccountId: ACCOUNT_ID,
+    capturedAt,
+    source: "RECONCILIATION",
+    positionsJson: JSON.stringify([{
+      asset: "BTC",
+      market: "KRW-BTC",
+      quantity: input.quantity ?? "0",
+      averageEntryPrice: null,
+      markPrice: null,
+      marketValue: null,
+      exposureRatio: null,
+      capturedAt,
+    }]),
+  };
+}
+
+function reconciliationRun(input: {
+  startedAt?: string;
+  completedAt?: string;
+  summaryJson?: string;
+  status?: ReconciliationRunRecord["status"];
+} = {}): ReconciliationRunRecord {
+  return {
+    id: "reconciliation-refresh",
+    exchangeAccountId: ACCOUNT_ID,
+    status: input.status ?? "SUCCESS",
+    startedAt: input.startedAt ?? SNAPSHOT_AT,
+    completedAt: input.completedAt ?? RECONCILIATION_COMPLETED_AT,
+    summaryJson: input.summaryJson ?? reconciliationSummaryJson([]),
+    errorMessage: null,
+  };
+}
+
+function reconciliationSummaryJson(issueCodes: string[]): string {
+  return JSON.stringify({
+    source: "SCHEDULER_PREFLIGHT",
+    status: issueCodes.length === 0 ? "SUCCESS" : "DRIFT_DETECTED",
+    issues: issueCodes.map((code) => ({ code, message: `fixture:${code}` })),
+    candidateCount: 0,
+    processedCount: 0,
+    deferredCount: 0,
+    maxOrderLookupsPerRun: 10,
+  });
+}
+
+function orderRecord(input: {
+  id?: string;
+  status: OrderRecord["status"];
+  failureCode?: string | null;
+}): OrderRecord {
+  const id = input.id ?? `order-${input.status.toLowerCase()}`;
+  return {
+    id,
+    strategyDecisionId: null,
+    exchangeAccountId: ACCOUNT_ID,
+    market: "KRW-ETH",
+    side: "bid",
+    ordType: "price",
+    volume: null,
+    price: "5000",
+    timeInForce: null,
+    smpType: null,
+    identifier: `${id}-identifier`,
+    idempotencyKey: `${id}-idempotency`,
+    origin: "STRATEGY",
+    requestedAt: "2026-08-21T00:00:25.000Z",
+    upbitUuid: null,
+    status: input.status,
+    executionMode: "LIVE",
+    exchangeResponseJson: null,
+    failureCode: input.failureCode ?? null,
+    failureMessage: null,
+    createdAt: "2026-08-21T00:00:25.000Z",
+    updatedAt: "2026-08-21T00:00:26.000Z",
+  };
+}
+
+function orderEvent(
+  orderId: string,
+  eventType: string,
+  eventSource: OrderEventRecord["eventSource"],
+): OrderEventRecord {
+  return {
+    id: `${orderId}:${eventType}`,
+    orderId,
+    eventType,
+    eventSource,
+    payloadJson: "{}",
+    createdAt: "2026-08-21T00:00:27.000Z",
+  };
+}
+
+function initialExecutionState(status: "RUNNING" | "PAUSED"): ExecutionStateRecord {
+  return {
+    id: `execution_state_${ACCOUNT_ID}`,
+    exchangeAccountId: ACCOUNT_ID,
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: status,
+    killSwitchActive: false,
+    pauseReason: status === "PAUSED" ? "operator-maintenance" : null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-08-20T23:59:59.000Z",
+  };
+}
+
+function overrideCandidatePilots(
+  base: CandidatePilotRepository,
+  overrides: Partial<CandidatePilotRepository>,
+): CandidatePilotRepository {
+  return new Proxy(base, {
+    get(target, property, receiver) {
+      if (Object.prototype.hasOwnProperty.call(overrides, property)) {
+        return Reflect.get(overrides, property, receiver);
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}

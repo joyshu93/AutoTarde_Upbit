@@ -70,6 +70,7 @@ await import("./position-guard-candidate-parity.test.js");
 await import("./position-guard-candidate-dependency-boundary.test.js");
 await import("./position-guard-policy-router.test.js");
 await import("./candidate-pilot-recovery-fault-persistence.test.js");
+await import("./position-guard-pilot-recovery.test.js");
 await import("./performance-calculator.test.js");
 await import("./performance-trade-matcher.test.js");
 await import("./performance-diagnostics.test.js");
