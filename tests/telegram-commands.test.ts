@@ -116,6 +116,9 @@ function createControlRouterFixture(
     async listTransitions() {
       return [];
     },
+    async pauseForFault() {
+      return currentState;
+    },
     async pause() {
       calls.pause += 1;
       currentState = transitions.pause ?? currentState;
@@ -4770,6 +4773,7 @@ test("telegram risk summary maps every rule code exhaustively in English", async
     ORDER_RECOVERY_REQUIRED: "Order recovery required",
     BALANCE_DRIFT_DETECTED: "Balance drift detected",
     POSITION_DRIFT_DETECTED: "Position drift detected",
+    POSITION_GUARD_PILOT_UNCERTAIN_ORDER: "Uncertain order submission",
   };
 
   let offset = 0;

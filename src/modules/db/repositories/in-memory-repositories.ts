@@ -32,6 +32,15 @@ import type {
   PersistUncertainSubmissionInput,
   TelegramInboundOffsetStore,
 } from "../interfaces.js";
+import {
+  recordsEqual,
+  validateAtomicCompletion,
+  validateExchangeSubmissionInput,
+  validateFaultPauseInput,
+  validateNewOrderUniqueness,
+  validateOrderIntentInput,
+  validateUncertainSubmissionInput,
+} from "./atomic-lifecycle-validation.js";
 
 const ACTIVE_ORDER_STATUSES: ReadonlySet<OrderLifecycleStatus> = new Set([
   "INTENT_CREATED",
@@ -41,12 +50,6 @@ const ACTIVE_ORDER_STATUSES: ReadonlySet<OrderLifecycleStatus> = new Set([
   "PARTIALLY_FILLED",
   "CANCEL_REQUESTED",
   "RECONCILIATION_REQUIRED",
-]);
-const EXCHANGE_SUBMISSION_STATUSES: ReadonlySet<OrderLifecycleStatus> = new Set([
-  "OPEN",
-  "PARTIALLY_FILLED",
-  "FILLED",
-  "REJECTED",
 ]);
 
 export class InMemoryExecutionRepository implements ExecutionRepository {
@@ -99,7 +102,7 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   }
 
   async persistOrderIntent(input: PersistOrderIntentInput): Promise<void> {
-    assertOrderIntentInput(input);
+    validateOrderIntentInput(input);
     const existingOrder = this.orders.find((candidate) => candidate.id === input.order.id);
     const existingEvent = this.orderEvents.find((candidate) => candidate.id === input.event.id);
 
@@ -112,6 +115,7 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     if (existingEvent) {
       throw new Error(`Conflicting duplicate order event ${input.event.id}.`);
     }
+    validateNewOrderUniqueness(this.orders, input.order);
 
     const nextOrders = [...this.orders, cloneRecord(input.order)];
     const nextOrderEvents = [...this.orderEvents, cloneRecord(input.event)];
@@ -120,7 +124,7 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   }
 
   async persistExchangeSubmission(input: PersistExchangeSubmissionInput): Promise<void> {
-    assertExchangeSubmissionInput(input);
+    validateExchangeSubmissionInput(input);
     const existingOrder = this.orders.find((candidate) => candidate.id === input.order.id);
     if (!existingOrder) {
       throw new Error(`Cannot persist exchange submission for missing order ${input.order.id}.`);
@@ -131,15 +135,20 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     const existingFills = input.fills.map((fill) => findStoredFill(this.fills, fill));
     input.fills.forEach((fill, index) => assertNoConflictingRecord(existingFills[index], fill, "fill"));
 
-    const isExactRetry =
-      recordsEqual(existingOrder, input.order) &&
-      Boolean(existingEvent && recordsEqual(existingEvent, input.event)) &&
-      existingFills.every((fill, index) => Boolean(fill && recordsEqual(fill, input.fills[index]!)));
-    if (isExactRetry) {
+    const completion = validateAtomicCompletion(
+      existingOrder,
+      input.order,
+      [
+        { present: Boolean(existingEvent), exact: Boolean(existingEvent && recordsEqual(existingEvent, input.event)) },
+        ...existingFills.map((fill, index) => ({
+          present: Boolean(fill),
+          exact: Boolean(fill && recordsEqual(fill, input.fills[index]!)),
+        })),
+      ],
+      "exchange submission",
+    );
+    if (completion === "RETRY") {
       return;
-    }
-    if (existingOrder.status !== "PERSISTED" && existingOrder.status !== "SUBMITTING") {
-      throw new Error(`Conflicting exchange submission for order ${input.order.id}.`);
     }
 
     const nextOrders = this.orders.map((candidate) =>
@@ -158,7 +167,7 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   }
 
   async persistUncertainSubmission(input: PersistUncertainSubmissionInput): Promise<void> {
-    assertUncertainSubmissionInput(input);
+    validateUncertainSubmissionInput(input);
     const existingOrder = this.orders.find((candidate) => candidate.id === input.order.id);
     if (!existingOrder) {
       throw new Error(`Cannot persist uncertain submission for missing order ${input.order.id}.`);
@@ -169,15 +178,17 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     assertNoConflictingRecord(existingEvent, input.event, "order event");
     assertNoConflictingRecord(existingRiskEvent, input.riskEvent, "risk event");
 
-    const isExactRetry =
-      recordsEqual(existingOrder, input.order) &&
-      Boolean(existingEvent && recordsEqual(existingEvent, input.event)) &&
-      Boolean(existingRiskEvent && recordsEqual(existingRiskEvent, input.riskEvent));
-    if (isExactRetry) {
+    const completion = validateAtomicCompletion(
+      existingOrder,
+      input.order,
+      [
+        { present: Boolean(existingEvent), exact: Boolean(existingEvent && recordsEqual(existingEvent, input.event)) },
+        { present: Boolean(existingRiskEvent), exact: Boolean(existingRiskEvent && recordsEqual(existingRiskEvent, input.riskEvent)) },
+      ],
+      "uncertain submission",
+    );
+    if (completion === "RETRY") {
       return;
-    }
-    if (existingOrder.status !== "PERSISTED" && existingOrder.status !== "SUBMITTING") {
-      throw new Error(`Conflicting uncertain submission for order ${input.order.id}.`);
     }
 
     const nextOrders = this.orders.map((candidate) =>
@@ -634,11 +645,12 @@ export class InMemoryOperatorStateStore implements OperatorStateStore {
     if (input.exchangeAccountId !== this.state.exchangeAccountId) {
       throw new Error(`Fault ${input.faultId} is for a different exchange account.`);
     }
+    validateFaultPauseInput(input, this.state);
     const reason = formatFaultPauseReason(input);
     const existing = this.transitions.find((transition) => transition.id === input.faultId);
     if (existing) {
       if (
-        String(existing.command) === "AUTOMATIC_PAUSE" &&
+        existing.command === "AUTOMATIC_PAUSE" &&
         existing.exchangeAccountId === input.exchangeAccountId &&
         existing.reason === reason &&
         (this.state.systemStatus === "PAUSED" || this.state.systemStatus === "KILL_SWITCHED")
@@ -649,18 +661,17 @@ export class InMemoryOperatorStateStore implements OperatorStateStore {
     }
 
     const previousState = { ...this.state };
+    const preservesKillSwitch = this.state.killSwitchActive || this.state.systemStatus === "KILL_SWITCHED";
     this.state = {
       ...this.state,
-      systemStatus: this.state.killSwitchActive || this.state.systemStatus === "KILL_SWITCHED"
-        ? "KILL_SWITCHED"
-        : "PAUSED",
-      pauseReason: reason,
+      systemStatus: preservesKillSwitch ? "KILL_SWITCHED" : "PAUSED",
+      pauseReason: preservesKillSwitch ? this.state.pauseReason : reason,
       updatedAt: input.occurredAt,
     };
     this.recordTransition(
       previousState,
       this.state,
-      "AUTOMATIC_PAUSE" as ExecutionStateTransitionRecord["command"],
+      "AUTOMATIC_PAUSE",
       reason,
       input.faultId,
     );
@@ -824,61 +835,6 @@ function aggregateAssetExposure(positions: PositionSnapshot[]): Record<Supported
   );
 }
 
-function assertOrderIntentInput(input: PersistOrderIntentInput): void {
-  if (input.order.status !== "PERSISTED") {
-    throw new Error("Order intent must have PERSISTED status.");
-  }
-  assertOrderEventLink(input.order, input.event);
-}
-
-function assertExchangeSubmissionInput(input: PersistExchangeSubmissionInput): void {
-  if (!EXCHANGE_SUBMISSION_STATUSES.has(input.order.status)) {
-    throw new Error(`Exchange submission has unsupported status ${input.order.status}.`);
-  }
-  assertOrderEventLink(input.order, input.event);
-  assertUniqueFills(input.fills);
-  for (const fill of input.fills) {
-    if (fill.orderId !== input.order.id || fill.market !== input.order.market || fill.side !== input.order.side) {
-      throw new Error(`Fill ${fill.id} does not belong to order ${input.order.id}.`);
-    }
-  }
-}
-
-function assertUniqueFills(fills: FillRecord[]): void {
-  const ids = new Set<string>();
-  const exchangeIdentities = new Set<string>();
-  for (const fill of fills) {
-    const exchangeIdentity = `${fill.orderId}\u0000${fill.exchangeFillId}`;
-    if (ids.has(fill.id) || exchangeIdentities.has(exchangeIdentity)) {
-      throw new Error(`Duplicate fill ${fill.id} in atomic exchange submission.`);
-    }
-    ids.add(fill.id);
-    exchangeIdentities.add(exchangeIdentity);
-  }
-}
-
-function assertUncertainSubmissionInput(input: PersistUncertainSubmissionInput): void {
-  if (input.order.status !== "RECONCILIATION_REQUIRED") {
-    throw new Error("Uncertain submission must have RECONCILIATION_REQUIRED status.");
-  }
-  if (input.riskEvent.level !== "BLOCK") {
-    throw new Error("Uncertain submission must record a BLOCK risk event.");
-  }
-  assertOrderEventLink(input.order, input.event);
-  if (
-    input.riskEvent.orderId !== input.order.id ||
-    input.riskEvent.exchangeAccountId !== input.order.exchangeAccountId
-  ) {
-    throw new Error(`Risk event ${input.riskEvent.id} does not belong to order ${input.order.id}.`);
-  }
-}
-
-function assertOrderEventLink(order: OrderRecord, event: OrderEventRecord): void {
-  if (event.orderId !== order.id) {
-    throw new Error(`Order event ${event.id} does not belong to order ${order.id}.`);
-  }
-}
-
 function assertSameAccount(existing: OrderRecord, next: OrderRecord): void {
   if (existing.exchangeAccountId !== next.exchangeAccountId) {
     throw new Error(`Order ${next.id} cannot change exchange account.`);
@@ -899,16 +855,6 @@ function findStoredFill(fills: FillRecord[], fill: FillRecord): FillRecord | und
   return fills.find(
     (candidate) => candidate.id === fill.id ||
       (candidate.orderId === fill.orderId && candidate.exchangeFillId === fill.exchangeFillId),
-  );
-}
-
-function recordsEqual<T extends object>(left: T, right: T): boolean {
-  const leftRecord = left as Record<string, unknown>;
-  const rightRecord = right as Record<string, unknown>;
-  const leftKeys = Object.keys(leftRecord);
-  const rightKeys = Object.keys(rightRecord);
-  return leftKeys.length === rightKeys.length && leftKeys.every(
-    (key) => Object.prototype.hasOwnProperty.call(rightRecord, key) && leftRecord[key] === rightRecord[key],
   );
 }
 

@@ -1267,6 +1267,9 @@ test("router applies control commands, blocks invalid arguments, and advertises 
         },
       ];
     },
+    async pauseForFault() {
+      return currentState;
+    },
     async pause(reason) {
       stateTransitions.push(`pause:${reason ?? "none"}`);
       currentState = createExecutionState({
@@ -2058,6 +2061,9 @@ function createOperatorStateStub(): OperatorStateStore {
         },
       ];
     },
+    async pauseForFault() {
+      return createExecutionState({ systemStatus: "PAUSED" });
+    },
     async pause(reason) {
       return createExecutionState({
         systemStatus: "PAUSED",
@@ -2129,6 +2135,9 @@ function createRepositoryStub(overrides: Partial<ExecutionRepository> = {}): Exe
       orders.push(record);
     },
     async updateOrder() {},
+    async persistOrderIntent() {},
+    async persistExchangeSubmission() {},
+    async persistUncertainSubmission() {},
     async findOrderByIdempotencyKey() {
       return null;
     },

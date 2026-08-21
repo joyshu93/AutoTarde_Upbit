@@ -132,6 +132,12 @@ const RISK_RULE_PRESENTATIONS: Readonly<Record<RiskRuleCode, LocalizedRule>> = {
     "Position drift detected",
     "The exchange position change was not fully explained by local fill history.",
   ),
+  POSITION_GUARD_PILOT_UNCERTAIN_ORDER: rule(
+    "주문 확인 필요",
+    "주문 전송 결과를 확정할 수 없어 조정 확인이 필요합니다.",
+    "Uncertain order submission",
+    "The order submission outcome is unknown and requires reconciliation.",
+  ),
 };
 
 export function formatRiskEventsPresentation(

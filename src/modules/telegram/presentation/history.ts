@@ -148,6 +148,7 @@ function describeTransitionCommand(
 ): string {
   const labels: Record<ExecutionStateTransitionRecord["command"], readonly [string, string]> = {
     BOOTSTRAP: ["초기 상태 저장", "bootstrap"],
+    AUTOMATIC_PAUSE: ["자동 장애 일시정지", "automatic fault pause"],
     "/pause": ["운영자 일시정지", "operator pause"],
     "/resume": ["운영자 재개", "operator resume"],
     "/killswitch": ["긴급 중지", "kill switch"],

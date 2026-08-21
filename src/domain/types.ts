@@ -92,7 +92,8 @@ export type RiskRuleCode =
   | "EXCHANGE_ORDER_TEST_FAILED"
   | "ORDER_RECOVERY_REQUIRED"
   | "BALANCE_DRIFT_DETECTED"
-  | "POSITION_DRIFT_DETECTED";
+  | "POSITION_DRIFT_DETECTED"
+  | "POSITION_GUARD_PILOT_UNCERTAIN_ORDER";
 
 export interface UserRecord {
   id: string;
@@ -138,6 +139,7 @@ export interface ExecutionStateSeed {
 
 export type ExecutionStateTransitionCommand =
   | "BOOTSTRAP"
+  | "AUTOMATIC_PAUSE"
   | "/pause"
   | "/resume"
   | "/killswitch"
