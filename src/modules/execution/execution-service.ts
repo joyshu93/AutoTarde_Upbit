@@ -51,7 +51,8 @@ export class ExecutionService {
       operatorState: OperatorStateStore;
       candidatePilots?: Pick<
         CandidatePilotRepository,
-        "getDeployment" | "getExactState" | "getExecutionBindingForOrder" | "pauseForRecoveryFault"
+        "getDeployment" | "getExactState" | "getExecutionBindingForOrder" |
+        "pauseForCandidateIntentFault"
       >;
       reporter?: OperatorNotificationReporter;
       now?: () => string;
@@ -861,14 +862,17 @@ export class ExecutionService {
     const provenanceJson = JSON.stringify(provenance);
     const faultId = `candidate-intent:${createHash("sha256").update(provenanceJson, "utf8").digest("hex")}`;
     try {
-      await candidatePilots.pauseForRecoveryFault({
+      await candidatePilots.pauseForCandidateIntentFault({
         deploymentId: input.authority.deploymentId,
         exchangeAccountId: input.authority.exchangeAccountId,
+        stage: input.stage,
+        strategyDecisionId: input.decision.id,
+        orderId: input.orderId,
+        bindingId: input.bindingId,
         faultId,
         reasonCode: input.stage === "PERSISTENCE" ? "ACTIVATION_CAS_CONFLICT" : "IDENTITY_MISMATCH",
         provenanceJson,
         occurredAt: input.occurredAt,
-        occurredAtPolicy: "ADVANCE_TO_PERSISTED_SUCCESSOR",
       });
     } catch (error) {
       throw new CandidateExecutionSafetyError(

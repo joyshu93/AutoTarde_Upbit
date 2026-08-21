@@ -73,7 +73,15 @@ export interface PauseCandidatePilotForRecoveryFaultInput {
   reasonCode: CandidatePilotRecoveryFaultReason;
   provenanceJson: string;
   occurredAt: string;
-  occurredAtPolicy?: "ADVANCE_TO_PERSISTED_SUCCESSOR";
+}
+
+export type CandidateIntentFaultStage = "DUPLICATE" | "DERIVATION" | "PERSISTENCE";
+
+export interface PauseCandidateIntentFaultInput extends PauseCandidatePilotForRecoveryFaultInput {
+  stage: CandidateIntentFaultStage;
+  strategyDecisionId: string;
+  orderId: string;
+  bindingId: string;
 }
 
 export interface PauseCandidatePilotForRecoveryFaultResult {
@@ -122,6 +130,9 @@ export interface CandidatePilotRepository {
   ): Promise<AdvanceCandidatePilotStateResult>;
   pauseForRecoveryFault(
     input: PauseCandidatePilotForRecoveryFaultInput,
+  ): Promise<PauseCandidatePilotForRecoveryFaultResult>;
+  pauseForCandidateIntentFault(
+    input: PauseCandidateIntentFaultInput,
   ): Promise<PauseCandidatePilotForRecoveryFaultResult>;
 }
 
@@ -338,17 +349,19 @@ export function candidateEvidenceMaterial(
 export function validateCandidatePilotRecoveryFaultInput(
   input: PauseCandidatePilotForRecoveryFaultInput,
 ): void {
+  exactOwnDataRecord(input, "candidate recovery fault input", [
+    "deploymentId",
+    "exchangeAccountId",
+    "faultId",
+    "reasonCode",
+    "provenanceJson",
+    "occurredAt",
+  ] as const);
   requireNonEmpty(input.deploymentId, "candidate recovery fault deploymentId");
   requireNonEmpty(input.exchangeAccountId, "candidate recovery fault exchangeAccountId");
   requireNonEmpty(input.faultId, "candidate recovery fault faultId");
   requireNonEmpty(input.reasonCode, "candidate recovery fault reasonCode");
   parsePositionGuardCandidateTimestamp(input.occurredAt, "candidate recovery fault occurredAt");
-  if (
-    input.occurredAtPolicy !== undefined &&
-    input.occurredAtPolicy !== "ADVANCE_TO_PERSISTED_SUCCESSOR"
-  ) {
-    throw new Error("Candidate recovery fault occurredAtPolicy is invalid.");
-  }
   let provenance: unknown;
   try {
     provenance = JSON.parse(input.provenanceJson) as unknown;
@@ -360,19 +373,139 @@ export function validateCandidatePilotRecoveryFaultInput(
   }
 }
 
-export function resolveCandidatePilotRecoveryFaultOccurrence(
-  input: PauseCandidatePilotForRecoveryFaultInput,
+const CANDIDATE_INTENT_FAULT_INPUT_KEYS = [
+  "deploymentId",
+  "exchangeAccountId",
+  "stage",
+  "strategyDecisionId",
+  "orderId",
+  "bindingId",
+  "faultId",
+  "reasonCode",
+  "provenanceJson",
+  "occurredAt",
+] as const;
+const CANDIDATE_INTENT_FAULT_PROVENANCE_KEYS = [
+  "schemaVersion",
+  "stage",
+  "deploymentId",
+  "exchangeAccountId",
+  "strategyDecisionId",
+  "orderId",
+  "bindingId",
+  "market",
+  "action",
+  "side",
+  "ordType",
+  "price",
+  "volume",
+  "expectedPhase",
+  "expectedDeploymentUpdatedAt",
+  "expectedStateVersion",
+] as const;
+const CANDIDATE_INTENT_FAULT_STAGES = ["DUPLICATE", "DERIVATION", "PERSISTENCE"] as const;
+
+export function validateCandidateIntentFaultInput(
+  input: PauseCandidateIntentFaultInput,
+): PauseCandidatePilotForRecoveryFaultInput {
+  exactOwnDataRecord(input, "candidate intent fault input", CANDIDATE_INTENT_FAULT_INPUT_KEYS);
+  requireNonEmpty(input.deploymentId, "candidate intent fault deploymentId");
+  requireNonEmpty(input.exchangeAccountId, "candidate intent fault exchangeAccountId");
+  requireNonEmpty(input.strategyDecisionId, "candidate intent fault strategyDecisionId");
+  requireNonEmpty(input.orderId, "candidate intent fault orderId");
+  requireNonEmpty(input.bindingId, "candidate intent fault bindingId");
+  requireNonEmpty(input.faultId, "candidate intent fault faultId");
+  if (!CANDIDATE_INTENT_FAULT_STAGES.includes(input.stage)) {
+    throw new Error("Candidate intent fault stage is invalid.");
+  }
+  const expectedReasonCode: CandidatePilotRecoveryFaultReason = input.stage === "PERSISTENCE"
+    ? "ACTIVATION_CAS_CONFLICT"
+    : "IDENTITY_MISMATCH";
+  if (input.reasonCode !== expectedReasonCode) {
+    throw new Error("Candidate intent fault reason does not match its stage.");
+  }
+  parsePositionGuardCandidateTimestamp(input.occurredAt, "candidate intent fault occurredAt");
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(input.provenanceJson) as unknown;
+  } catch {
+    throw new Error("Candidate intent fault provenanceJson must be valid JSON.");
+  }
+  const provenance = exactOwnDataRecord(
+    parsed,
+    "candidate intent fault provenance",
+    CANDIDATE_INTENT_FAULT_PROVENANCE_KEYS,
+  );
+  if (provenance.schemaVersion !== "CANDIDATE_INTENT_FAULT_V1") {
+    throw new Error("Candidate intent fault provenance schema is invalid.");
+  }
+  if (!CANDIDATE_INTENT_FAULT_STAGES.includes(provenance.stage as CandidateIntentFaultStage)) {
+    throw new Error("Candidate intent fault provenance stage is invalid.");
+  }
+  if (
+    provenance.stage !== input.stage ||
+    provenance.deploymentId !== input.deploymentId ||
+    provenance.exchangeAccountId !== input.exchangeAccountId ||
+    provenance.strategyDecisionId !== input.strategyDecisionId ||
+    provenance.orderId !== input.orderId ||
+    provenance.bindingId !== input.bindingId
+  ) {
+    throw new Error("Candidate intent fault provenance identity does not match the request.");
+  }
+  if (
+    provenance.market !== "KRW-BTC" ||
+    !EVIDENCE_ACTIONS.includes(provenance.action as typeof EVIDENCE_ACTIONS[number]) ||
+    (provenance.side !== "bid" && provenance.side !== "ask") ||
+    !["limit", "price", "market", "best"].includes(provenance.ordType as string) ||
+    (provenance.expectedPhase !== "ACTIVE" && provenance.expectedPhase !== "DRAINING") ||
+    !Number.isSafeInteger(provenance.expectedStateVersion) ||
+    (provenance.expectedStateVersion as number) < 0
+  ) {
+    throw new Error("Candidate intent fault provenance material is invalid.");
+  }
+  if (typeof provenance.expectedDeploymentUpdatedAt !== "string") {
+    throw new Error("Candidate intent fault expected deployment timestamp is invalid.");
+  }
+  parsePositionGuardCandidateTimestamp(
+    provenance.expectedDeploymentUpdatedAt,
+    "candidate intent fault expectedDeploymentUpdatedAt",
+  );
+  for (const [label, value] of [["price", provenance.price], ["volume", provenance.volume]] as const) {
+    if (value !== null) {
+      canonicalNonNegativeDecimal(value, `candidate intent fault ${label}`);
+    }
+  }
+  const expectedFaultId = `candidate-intent:${createHash("sha256")
+    .update(input.provenanceJson, "utf8")
+    .digest("hex")}`;
+  if (input.faultId !== expectedFaultId) {
+    throw new Error("Candidate intent fault ID does not match the deterministic provenance hash.");
+  }
+
+  return {
+    deploymentId: input.deploymentId,
+    exchangeAccountId: input.exchangeAccountId,
+    faultId: input.faultId,
+    reasonCode: input.reasonCode,
+    provenanceJson: input.provenanceJson,
+    occurredAt: input.occurredAt,
+  };
+}
+
+export function resolveCandidateIntentFaultOccurrence(
+  input: PauseCandidateIntentFaultInput,
   persistedChronology: readonly string[],
 ): PauseCandidatePilotForRecoveryFaultInput {
-  if (input.occurredAtPolicy !== "ADVANCE_TO_PERSISTED_SUCCESSOR") return input;
+  const fault = validateCandidateIntentFaultInput(input);
   const attemptedEpoch = parsePositionGuardCandidateTimestamp(
-    input.occurredAt,
-    "candidate recovery fault attempted occurredAt",
+    fault.occurredAt,
+    "candidate intent fault attempted occurredAt",
   );
   const latestPersistedEpoch = persistedChronology.reduce<bigint | null>((latest, timestamp) => {
     const epoch = parsePositionGuardCandidateTimestamp(
       timestamp,
-      "candidate recovery fault persisted chronology",
+      "candidate intent fault persisted chronology",
     );
     return latest === null || epoch > latest ? epoch : latest;
   }, null);
@@ -380,7 +513,7 @@ export function resolveCandidatePilotRecoveryFaultOccurrence(
     ? latestPersistedEpoch + 1n
     : attemptedEpoch;
   return {
-    ...input,
+    ...fault,
     occurredAt: formatCandidatePilotUtcNanoseconds(effectiveEpoch),
   };
 }
@@ -390,17 +523,17 @@ function formatCandidatePilotUtcNanoseconds(epochNanoseconds: bigint): string {
   const millisecondsPerSecond = 1_000n;
   const maximumDateMilliseconds = 8_640_000_000_000_000n;
   if (epochNanoseconds < 0n) {
-    throw new Error("Candidate recovery fault occurrence cannot precede the Unix epoch.");
+    throw new Error("Candidate intent fault occurrence cannot precede the Unix epoch.");
   }
   const wholeSeconds = epochNanoseconds / nanosecondsPerSecond;
   const fractionalNanoseconds = epochNanoseconds % nanosecondsPerSecond;
   const wholeMilliseconds = wholeSeconds * millisecondsPerSecond;
   if (wholeMilliseconds > maximumDateMilliseconds) {
-    throw new Error("Candidate recovery fault occurrence exceeds the supported UTC range.");
+    throw new Error("Candidate intent fault occurrence exceeds the supported UTC range.");
   }
   const iso = new Date(Number(wholeMilliseconds)).toISOString();
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000Z$/u.test(iso)) {
-    throw new Error("Candidate recovery fault occurrence exceeds the supported canonical UTC range.");
+    throw new Error("Candidate intent fault occurrence exceeds the supported canonical UTC range.");
   }
   return `${iso.slice(0, 19)}.${fractionalNanoseconds.toString().padStart(9, "0")}Z`;
 }

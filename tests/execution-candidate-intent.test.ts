@@ -541,7 +541,8 @@ function narrowCandidatePilots(
       const binding = await candidatePilots.getExecutionBindingForOrder(orderId);
       return binding && transformDuplicateBinding ? transformDuplicateBinding(binding) : binding;
     },
-    pauseForRecoveryFault: candidatePilots.pauseForRecoveryFault.bind(candidatePilots),
+    pauseForCandidateIntentFault:
+      candidatePilots.pauseForCandidateIntentFault.bind(candidatePilots),
   };
 }
 

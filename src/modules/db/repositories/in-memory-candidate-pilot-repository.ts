@@ -20,8 +20,9 @@ import {
   candidateEvidenceMaterial,
   buildCandidatePilotRecoveryFaultAuditEvent,
   candidatePilotRecoveryFaultReason,
-  resolveCandidatePilotRecoveryFaultOccurrence,
+  resolveCandidateIntentFaultOccurrence,
   validateCandidateExecutionBinding,
+  validateCandidateIntentFaultInput,
   validateCandidatePilotDeployment,
   validateCandidatePilotRecoveryFaultInput,
   type AdvanceCandidatePilotStateInput,
@@ -31,6 +32,7 @@ import {
   type CandidatePilotRepository,
   type CreateCandidatePilotDeploymentInput,
   type InMemoryAtomicFaultPauseStore,
+  type PauseCandidateIntentFaultInput,
   type PauseCandidatePilotForRecoveryFaultInput,
   type PauseCandidatePilotForRecoveryFaultResult,
 } from "../pilot-interfaces.js";
@@ -356,8 +358,22 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
     return this.serializeRecoveryFault(() => this.pauseForRecoveryFaultSerialized(input));
   }
 
+  async pauseForCandidateIntentFault(
+    input: PauseCandidateIntentFaultInput,
+  ): Promise<PauseCandidatePilotForRecoveryFaultResult> {
+    const candidateIntentInput = Object.freeze({ ...input });
+    const fault = validateCandidateIntentFaultInput(candidateIntentInput);
+    if (!this.atomicFaultPauseStore) {
+      throw new Error("In-memory candidate recovery faults require an atomic fault-pause store.");
+    }
+    return this.serializeRecoveryFault(
+      () => this.pauseForRecoveryFaultSerialized(fault, candidateIntentInput),
+    );
+  }
+
   private async pauseForRecoveryFaultSerialized(
     input: PauseCandidatePilotForRecoveryFaultInput,
+    candidateIntentInput: PauseCandidateIntentFaultInput | null = null,
   ): Promise<PauseCandidatePilotForRecoveryFaultResult> {
     if (!this.atomicFaultPauseStore) {
       throw new Error("In-memory candidate recovery faults require an atomic fault-pause store.");
@@ -386,12 +402,14 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
     const latestAuditEpoch = latestAudit === null
       ? null
       : parsePositionGuardCandidateTimestamp(latestAudit.createdAt, "candidate audit createdAt");
-    const effectiveInput = existingAudit && input.occurredAtPolicy === "ADVANCE_TO_PERSISTED_SUCCESSOR"
-      ? { ...input, occurredAt: existingAudit.createdAt }
-      : resolveCandidatePilotRecoveryFaultOccurrence(input, [
-          deployment.updatedAt,
-          ...(latestAudit === null ? [] : [latestAudit.createdAt]),
-        ]);
+    const effectiveInput = candidateIntentInput === null
+      ? input
+      : existingAudit
+        ? { ...input, occurredAt: existingAudit.createdAt }
+        : resolveCandidateIntentFaultOccurrence(candidateIntentInput, [
+            deployment.updatedAt,
+            ...(latestAudit === null ? [] : [latestAudit.createdAt]),
+          ]);
     const transitionAt = deriveFaultPauseTransitionAt(effectiveInput.occurredAt, executionState.updatedAt);
     if (existingAudit || existingTransition) {
       if (!existingAudit || !existingTransition || deployment.phase !== "PAUSED_FAULT" ||

@@ -26,8 +26,9 @@ import {
   candidateEvidenceMaterial,
   buildCandidatePilotRecoveryFaultAuditEvent,
   candidatePilotRecoveryFaultReason,
-  resolveCandidatePilotRecoveryFaultOccurrence,
+  resolveCandidateIntentFaultOccurrence,
   validateCandidateExecutionBinding,
+  validateCandidateIntentFaultInput,
   validateCandidatePilotDeployment,
   validateCandidatePilotRecoveryFaultInput,
   type AdvanceCandidatePilotStateInput,
@@ -36,6 +37,7 @@ import {
   type CandidateEvidenceRecord,
   type CandidatePilotRepository,
   type CreateCandidatePilotDeploymentInput,
+  type PauseCandidateIntentFaultInput,
   type PauseCandidatePilotForRecoveryFaultInput,
   type PauseCandidatePilotForRecoveryFaultResult,
 } from "../pilot-interfaces.js";
@@ -551,6 +553,21 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
     input: PauseCandidatePilotForRecoveryFaultInput,
   ): Promise<PauseCandidatePilotForRecoveryFaultResult> {
     validateCandidatePilotRecoveryFaultInput(input);
+    return this.pauseForRecoveryFaultAtomically(input, null);
+  }
+
+  async pauseForCandidateIntentFault(
+    input: PauseCandidateIntentFaultInput,
+  ): Promise<PauseCandidatePilotForRecoveryFaultResult> {
+    const candidateIntentInput = Object.freeze({ ...input });
+    const fault = validateCandidateIntentFaultInput(candidateIntentInput);
+    return this.pauseForRecoveryFaultAtomically(fault, candidateIntentInput);
+  }
+
+  private pauseForRecoveryFaultAtomically(
+    input: PauseCandidatePilotForRecoveryFaultInput,
+    candidateIntentInput: PauseCandidateIntentFaultInput | null,
+  ): PauseCandidatePilotForRecoveryFaultResult {
     const faultOccurrence = {
       exchangeAccountId: input.exchangeAccountId,
       faultId: input.faultId,
@@ -575,12 +592,14 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
       const executionState = selectExecutionState(this.db, input.exchangeAccountId);
       const existingAudit = existingAuditRow ? auditEventFromRow(existingAuditRow) : null;
       const latestAuditAt = selectLatestAuditTimestamp(this.db, input.deploymentId);
-      const effectiveInput = existingAudit && input.occurredAtPolicy === "ADVANCE_TO_PERSISTED_SUCCESSOR"
-        ? { ...input, occurredAt: existingAudit.createdAt }
-        : resolveCandidatePilotRecoveryFaultOccurrence(input, [
-            deployment.updatedAt,
-            ...(latestAuditAt === null ? [] : [latestAuditAt]),
-          ]);
+      const effectiveInput = candidateIntentInput === null
+        ? input
+        : existingAudit
+          ? { ...input, occurredAt: existingAudit.createdAt }
+          : resolveCandidateIntentFaultOccurrence(candidateIntentInput, [
+              deployment.updatedAt,
+              ...(latestAuditAt === null ? [] : [latestAuditAt]),
+            ]);
       const effectiveFaultOccurrence = {
         exchangeAccountId: effectiveInput.exchangeAccountId,
         faultId: effectiveInput.faultId,

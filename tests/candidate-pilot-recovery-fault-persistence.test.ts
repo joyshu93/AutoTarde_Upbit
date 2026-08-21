@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -7,6 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { ExecutionStateRecord } from "../src/domain/types.js";
 import type {
   CandidatePilotRepository,
+  PauseCandidateIntentFaultInput,
   PauseCandidatePilotForRecoveryFaultInput,
 } from "../src/modules/db/pilot-interfaces.js";
 import type { OperatorStateStore } from "../src/modules/db/interfaces.js";
@@ -31,6 +33,22 @@ const FACTORIES = [
   { name: "in-memory", create: createInMemoryFixture },
   { name: "sqlite", create: createSqliteFixture },
 ] as const;
+
+function assertOrdinaryFaultInputCannotSelectChronologyPolicy(): void {
+  const ordinaryInput: PauseCandidatePilotForRecoveryFaultInput = {
+    deploymentId: "compile-only-deployment",
+    exchangeAccountId: "primary",
+    faultId: "compile-only-fault",
+    reasonCode: "REPLAY_MISMATCH",
+    provenanceJson: "{}",
+    occurredAt: "2026-08-21T00:00:00.000Z",
+    // @ts-expect-error Candidate-intent timestamp advancement must not be part of the ordinary API.
+    occurredAtPolicy: "ADVANCE_TO_PERSISTED_SUCCESSOR",
+  };
+  void ordinaryInput;
+}
+
+void assertOrdinaryFaultInputCannotSelectChronologyPolicy;
 
 test("candidate recovery fault pause is atomic and idempotent in every repository", async () => {
   for (const factory of FACTORIES) {
@@ -208,11 +226,55 @@ test("candidate recovery fault rejects illegal phases and backdated chronology w
   }
 });
 
-test("candidate recovery fault advances canonically past latest audit only when explicitly requested", async () => {
+test("ordinary candidate recovery fault rejects the candidate-intent chronology policy as an extra key", async () => {
   for (const factory of FACTORIES) {
-    const fixture = await factory.create(`advance-chronology-${factory.name}`);
+    const fixture = await factory.create(`ordinary-extra-policy-${factory.name}`);
     try {
-      const deployment = await createDeployment(fixture, `deployment-advance-${factory.name}`);
+      const deployment = await createDeployment(
+        fixture,
+        `deployment-ordinary-extra-policy-${factory.name}`,
+      );
+      const ordinaryInput = recoveryFaultInput(
+        deployment.id,
+        addMilliseconds(deployment.updatedAt, 1),
+      );
+      const injectedInput = {
+        ...ordinaryInput,
+        occurredAtPolicy: "ADVANCE_TO_PERSISTED_SUCCESSOR",
+      } as unknown as PauseCandidatePilotForRecoveryFaultInput;
+
+      await assert.rejects(
+        () => fixture.candidatePilots.pauseForRecoveryFault(injectedInput),
+        /exactly own data properties|unexpected|extra|occurredAtPolicy/i,
+        factory.name,
+      );
+
+      assert.equal((await fixture.candidatePilots.getDeployment(deployment.id))?.phase, "PENDING_FLAT");
+      assert.equal((await fixture.operatorState.getState()).systemStatus, "RUNNING");
+      assert.equal((await fixture.candidatePilots.listAuditEvents(deployment.id))
+        .filter((event) => event.id === ordinaryInput.faultId).length, 0);
+      assert.equal((await fixture.operatorState.listTransitions(100))
+        .filter((transition) => transition.id === ordinaryInput.faultId).length, 0);
+    } finally {
+      await fixture.close();
+    }
+  }
+});
+
+test("candidate-intent fault advances exactly one nanosecond past latest chronology and retries idempotently", async () => {
+  for (const factory of FACTORIES) {
+    const fixture = await factory.create(`candidate-intent-chronology-${factory.name}`);
+    try {
+      const pending = await createDeployment(fixture, `deployment-candidate-intent-${factory.name}`);
+      const activationAt = addMilliseconds(pending.updatedAt, 5);
+      const deployment = await fixture.candidatePilots.activateDeployment({
+        deploymentId: pending.id,
+        expectedPhase: "PENDING_FLAT",
+        expectedUpdatedAt: pending.updatedAt,
+        activationAt,
+        activationEpochNs: parsePositionGuardCandidateTimestamp(activationAt, "activationAt"),
+      });
+      assert.ok(deployment);
       const latestAuditAt = addMilliseconds(deployment.updatedAt, 20);
       await fixture.candidatePilots.advanceStateWithEvidence({
         deploymentId: deployment.id,
@@ -230,22 +292,9 @@ test("candidate recovery fault advances canonically past latest audit only when 
         },
       });
       const attemptedAt = addMilliseconds(deployment.updatedAt, 10);
-      const strictInput = recoveryFaultInput(deployment.id, attemptedAt);
-
-      await assert.rejects(
-        () => fixture.candidatePilots.pauseForRecoveryFault(strictInput),
-        /chronology|precede/i,
-        `${factory.name}:strict`,
-      );
-      assert.equal((await fixture.candidatePilots.getDeployment(deployment.id))?.phase, "PENDING_FLAT");
-      assert.equal((await fixture.operatorState.getState()).systemStatus, "RUNNING");
-
-      const advancingInput = {
-        ...strictInput,
-        occurredAtPolicy: "ADVANCE_TO_PERSISTED_SUCCESSOR",
-      } as const;
-      const result = await fixture.candidatePilots.pauseForRecoveryFault(advancingInput);
-      const retry = await fixture.candidatePilots.pauseForRecoveryFault(advancingInput);
+      const input = candidateIntentFaultInput(deployment.id, deployment.updatedAt, attemptedAt);
+      const result = await fixture.candidatePilots.pauseForCandidateIntentFault(input);
+      const retry = await fixture.candidatePilots.pauseForCandidateIntentFault(input);
       assert.equal(result.duplicate, false, factory.name);
       assert.equal(retry.duplicate, true, factory.name);
       assert.equal(retry.auditEvent.createdAt, result.auditEvent.createdAt, factory.name);
@@ -259,6 +308,62 @@ test("candidate recovery fault advances canonically past latest audit only when 
       assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED", factory.name);
     } finally {
       await fixture.close();
+    }
+  }
+});
+
+test("candidate-intent fault rejects forged schema, stage, identity, and hash without mutation", async () => {
+  for (const factory of FACTORIES) {
+    for (const scenario of ["schema", "stage", "identity", "hash"] as const) {
+      const fixture = await factory.create(`candidate-intent-forged-${scenario}-${factory.name}`);
+      try {
+        const pending = await createDeployment(
+          fixture,
+          `deployment-candidate-intent-forged-${scenario}-${factory.name}`,
+        );
+        const activationAt = addMilliseconds(pending.updatedAt, 5);
+        const deployment = await fixture.candidatePilots.activateDeployment({
+          deploymentId: pending.id,
+          expectedPhase: "PENDING_FLAT",
+          expectedUpdatedAt: pending.updatedAt,
+          activationAt,
+          activationEpochNs: parsePositionGuardCandidateTimestamp(activationAt, "activationAt"),
+        });
+        assert.ok(deployment);
+        const valid = candidateIntentFaultInput(
+          deployment.id,
+          deployment.updatedAt,
+          addMilliseconds(deployment.updatedAt, 1),
+        );
+        const provenance = JSON.parse(valid.provenanceJson) as Record<string, unknown>;
+        if (scenario === "schema") provenance.schemaVersion = "FORGED_SCHEMA";
+        if (scenario === "stage") provenance.stage = "FINAL";
+        if (scenario === "identity") provenance.orderId = "forged-order";
+        const provenanceJson = JSON.stringify(provenance);
+        const forged = {
+          ...valid,
+          ...(scenario === "stage" ? { stage: "FINAL" } : {}),
+          provenanceJson,
+          faultId: scenario === "hash"
+            ? "candidate-intent:0000000000000000000000000000000000000000000000000000000000000000"
+            : candidateIntentFaultId(provenanceJson),
+        } as unknown as PauseCandidateIntentFaultInput;
+
+        await assert.rejects(
+          () => fixture.candidatePilots.pauseForCandidateIntentFault(forged),
+          /candidate.intent|schema|stage|identity|fault.*id|hash/i,
+          `${factory.name}:${scenario}`,
+        );
+
+        assert.equal((await fixture.candidatePilots.getDeployment(deployment.id))?.phase, "ACTIVE");
+        assert.equal((await fixture.operatorState.getState()).systemStatus, "RUNNING");
+        assert.equal((await fixture.candidatePilots.listAuditEvents(deployment.id))
+          .filter((event) => event.id === forged.faultId).length, 0);
+        assert.equal((await fixture.operatorState.listTransitions(100))
+          .filter((transition) => transition.id === forged.faultId).length, 0);
+      } finally {
+        await fixture.close();
+      }
     }
   }
 });
@@ -331,6 +436,48 @@ function recoveryFaultInput(
     provenanceJson: JSON.stringify({ source: "repository-contract" }),
     occurredAt,
   };
+}
+
+function candidateIntentFaultInput(
+  deploymentId: string,
+  expectedDeploymentUpdatedAt: string,
+  occurredAt: string,
+): PauseCandidateIntentFaultInput {
+  const stage = "DERIVATION" as const;
+  const provenanceJson = JSON.stringify({
+    schemaVersion: "CANDIDATE_INTENT_FAULT_V1",
+    stage,
+    deploymentId,
+    exchangeAccountId: "primary",
+    strategyDecisionId: "decision-1",
+    orderId: "order-1",
+    bindingId: "binding-1",
+    market: "KRW-BTC",
+    action: "ENTER",
+    side: "bid",
+    ordType: "price",
+    price: "6000",
+    volume: null,
+    expectedPhase: "ACTIVE",
+    expectedDeploymentUpdatedAt,
+    expectedStateVersion: 0,
+  });
+  return {
+    deploymentId,
+    exchangeAccountId: "primary",
+    stage,
+    strategyDecisionId: "decision-1",
+    orderId: "order-1",
+    bindingId: "binding-1",
+    faultId: candidateIntentFaultId(provenanceJson),
+    reasonCode: "IDENTITY_MISMATCH",
+    provenanceJson,
+    occurredAt,
+  };
+}
+
+function candidateIntentFaultId(provenanceJson: string): string {
+  return `candidate-intent:${createHash("sha256").update(provenanceJson, "utf8").digest("hex")}`;
 }
 
 function createInMemoryFixture(_label: string): Promise<FaultPauseFixture> {
