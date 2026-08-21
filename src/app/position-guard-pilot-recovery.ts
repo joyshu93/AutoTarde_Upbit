@@ -112,6 +112,11 @@ interface RecoveryFault extends Error {
   reasonCode: CandidatePilotRecoveryFaultReason;
 }
 
+interface PersistenceReadFault extends Error {
+  persistenceReadOperation: string;
+  persistenceReadFailureKind: "READ_ERROR" | "TYPE_ERROR" | "RANGE_ERROR";
+}
+
 const REVIEWED_NON_BLOCKING_RECONCILIATION_CODES = new Set([
   "ORDER_STATUS_RECONCILED",
   "ORDER_FILLS_BACKFILLED",
@@ -190,6 +195,8 @@ export class PositionGuardPilotRecovery {
       policyId: "COMBINED_CONSERVATIVE";
       policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1";
       freshnessThresholdMs: number;
+      minimumAbsenceObservations: number;
+      minimumAbsenceElapsedMs: number;
       clock: PositionGuardPilotRecoveryClock;
       repositories: RecoveryExecutionReads;
       candidatePilots: RecoveryCandidateRepository;
@@ -201,6 +208,13 @@ export class PositionGuardPilotRecovery {
     if (!Number.isSafeInteger(dependencies.freshnessThresholdMs) || dependencies.freshnessThresholdMs <= 0) {
       throw new Error("Candidate recovery freshnessThresholdMs must be a positive safe integer.");
     }
+    if (!Number.isSafeInteger(dependencies.minimumAbsenceObservations) ||
+      dependencies.minimumAbsenceObservations < 2) {
+      throw new Error("Candidate recovery minimumAbsenceObservations must be a safe integer of at least two.");
+    }
+    if (!Number.isSafeInteger(dependencies.minimumAbsenceElapsedMs) || dependencies.minimumAbsenceElapsedMs <= 0) {
+      throw new Error("Candidate recovery minimumAbsenceElapsedMs must be a positive safe integer.");
+    }
   }
 
   async verifyAndPrepareBtcRun(
@@ -208,18 +222,18 @@ export class PositionGuardPilotRecovery {
   ): Promise<PositionGuardPilotRecoveryResult> {
     const clock = this.readClock();
     const receipt = snapshotReceipt(refreshReceipt);
-    const readback = await this.readPersistedAccountEvidence();
-
-    if (!readback.deployment || readback.deployment.exchangeAccountId !== this.dependencies.exchangeAccountId) {
-      return this.blockForFault("IDENTITY_MISMATCH", receipt, readback, clock);
-    }
-
-    await this.readCandidateAuthority(readback);
-
-    const existingFault = await this.readExistingPersistedFault(readback);
-    if (existingFault) return existingFault;
+    const readback = emptyRecoveryReadback();
 
     try {
+      await this.readPersistedAccountEvidence(readback);
+      if (!hasEstablishedDeploymentIdentity(readback, this.dependencies)) {
+        return this.blockForFault("IDENTITY_MISMATCH", receipt, readback, clock);
+      }
+      await this.readCandidateAuthority(readback);
+
+      const existingFault = await this.readExistingPersistedFault(readback);
+      if (existingFault) return existingFault;
+
       const verified = this.verifyReadyAuthority(readback, receipt, clock.epochNanoseconds);
 
       if (readback.deployment.phase === "PENDING_FLAT") {
@@ -230,53 +244,75 @@ export class PositionGuardPilotRecovery {
       }
       return await this.confirmStableReady(readback, receipt, clock);
     } catch (error) {
+      if (isPersistenceReadFault(error)) {
+        return this.blockForReadFailure(error, receipt, readback, clock);
+      }
       const fault = asRecoveryFault(error);
       return this.blockForFault(fault.reasonCode, receipt, readback, clock);
     }
   }
 
-  private async readPersistedAccountEvidence(): Promise<RecoveryReadback> {
-    const [balanceSnapshot, positionSnapshot, reconciliationRuns, orders, deployment] = await Promise.all([
-      this.dependencies.repositories.getLatestBalanceSnapshot(this.dependencies.exchangeAccountId),
-      this.dependencies.repositories.getLatestPositionSnapshot(this.dependencies.exchangeAccountId),
-      this.dependencies.repositories.listReconciliationRuns(this.dependencies.exchangeAccountId, 1),
-      this.dependencies.repositories.listOrders(this.dependencies.exchangeAccountId),
-      this.dependencies.candidatePilots.getDeployment(this.dependencies.deploymentId),
-    ]);
-    const orderEvents = new Map<string, OrderEventRecord[]>();
-    const orderRecoveryObservations = new Map<string, OrderSubmissionRecoveryObservationRecord[]>();
-    await Promise.all(orders.map(async (order) => {
-      const events = await this.dependencies.repositories.listOrderEvents(order.id);
-      orderEvents.set(order.id, events);
+  private async readPersistedAccountEvidence(readback = emptyRecoveryReadback()): Promise<RecoveryReadback> {
+    readback.deployment = await this.readPersistence(
+      "candidatePilots.getDeployment",
+      () => this.dependencies.candidatePilots.getDeployment(this.dependencies.deploymentId),
+    );
+    readback.balanceSnapshot = await this.readPersistence(
+      "repositories.getLatestBalanceSnapshot",
+      () => this.dependencies.repositories.getLatestBalanceSnapshot(this.dependencies.exchangeAccountId),
+    );
+    readback.positionSnapshot = await this.readPersistence(
+      "repositories.getLatestPositionSnapshot",
+      () => this.dependencies.repositories.getLatestPositionSnapshot(this.dependencies.exchangeAccountId),
+    );
+    const reconciliationRuns = await this.readPersistence(
+      "repositories.listReconciliationRuns",
+      () => this.dependencies.repositories.listReconciliationRuns(this.dependencies.exchangeAccountId, 1),
+    );
+    readback.reconciliationRun = reconciliationRuns[0] ?? null;
+    readback.orders = await this.readPersistence(
+      "repositories.listOrders",
+      () => this.dependencies.repositories.listOrders(this.dependencies.exchangeAccountId),
+    );
+    for (const order of readback.orders) {
+      const events = await this.readPersistence(
+        "repositories.listOrderEvents",
+        () => this.dependencies.repositories.listOrderEvents(order.id),
+      );
+      readback.orderEvents.set(order.id, events);
       const listObservations = this.dependencies.repositories.listOrderSubmissionRecoveryObservations;
       const observations = listObservations
-        ? await listObservations.call(this.dependencies.repositories, order.id)
+        ? await this.readPersistence(
+            "repositories.listOrderSubmissionRecoveryObservations",
+            () => listObservations.call(this.dependencies.repositories, order.id),
+          )
         : [];
-      orderRecoveryObservations.set(order.id, observations);
-    }));
-    return {
-      balanceSnapshot,
-      positionSnapshot,
-      reconciliationRun: reconciliationRuns[0] ?? null,
-      orders,
-      deployment,
-      state: null,
-      evidenceRecords: [],
-      auditEvents: [],
-      orderEvents,
-      orderRecoveryObservations,
-    };
+      readback.orderRecoveryObservations.set(order.id, observations);
+    }
+    return readback;
   }
 
   private async readCandidateAuthority(readback: RecoveryReadback): Promise<void> {
-    const [state, evidenceRecords, auditEvents] = await Promise.all([
-      this.dependencies.candidatePilots.getExactState(this.dependencies.deploymentId),
-      this.dependencies.candidatePilots.listEvidenceRecords(this.dependencies.deploymentId),
-      this.dependencies.candidatePilots.listAuditEvents(this.dependencies.deploymentId),
-    ]);
-    readback.state = state;
-    readback.evidenceRecords = evidenceRecords;
-    readback.auditEvents = auditEvents;
+    readback.state = await this.readPersistence(
+      "candidatePilots.getExactState",
+      () => this.dependencies.candidatePilots.getExactState(this.dependencies.deploymentId),
+    );
+    readback.evidenceRecords = await this.readPersistence(
+      "candidatePilots.listEvidenceRecords",
+      () => this.dependencies.candidatePilots.listEvidenceRecords(this.dependencies.deploymentId),
+    );
+    readback.auditEvents = await this.readPersistence(
+      "candidatePilots.listAuditEvents",
+      () => this.dependencies.candidatePilots.listAuditEvents(this.dependencies.deploymentId),
+    );
+  }
+
+  private async readPersistence<T>(operation: string, read: () => Promise<T>): Promise<T> {
+    try {
+      return await read();
+    } catch (error) {
+      throw persistenceReadFault(operation, error);
+    }
   }
 
   private verifyReadyAuthority(
@@ -292,7 +328,7 @@ export class PositionGuardPilotRecovery {
     }
     this.verifyDeploymentIdentity(readback.deployment, nowEpochNanoseconds);
     this.verifyRefreshCorrelation(receipt, readback, nowEpochNanoseconds);
-    this.verifyReconciliation(receipt, readback.reconciliationRun);
+    this.verifyReconciliation(receipt, readback.reconciliationRun, nowEpochNanoseconds);
     this.verifyAuditAuthority(readback.deployment, readback.auditEvents, nowEpochNanoseconds);
     this.verifyOrders(readback, nowEpochNanoseconds);
     const state = this.verifyEvidenceAndState(readback, nowEpochNanoseconds);
@@ -429,6 +465,7 @@ export class PositionGuardPilotRecovery {
   private verifyReconciliation(
     receipt: Readonly<PositionGuardPilotRefreshReceipt>,
     run: ReconciliationRunRecord | null,
+    nowEpochNanoseconds: bigint,
   ): void {
     if (!run) throw recoveryFault("BLOCKING_RECONCILIATION", "Latest reconciliation is missing.");
     let summary: unknown;
@@ -454,7 +491,8 @@ export class PositionGuardPilotRecovery {
       !isNonNegativeSafeInteger(summary.maxOrderLookupsPerRun) ||
       summary.processedCount + summary.deferredCount !== summary.candidateCount ||
       summary.processedCount > summary.maxOrderLookupsPerRun ||
-      (summary.historyRecovery !== undefined && !isValidHistoryRecoverySummary(summary.historyRecovery))
+      (summary.historyRecovery !== undefined &&
+        !isValidHistoryRecoverySummary(summary.historyRecovery, run, nowEpochNanoseconds))
     ) {
       throw recoveryFault("BLOCKING_RECONCILIATION", "Reconciliation summary shape is invalid.");
     }
@@ -525,6 +563,7 @@ export class PositionGuardPilotRecovery {
       const events = readback.orderEvents.get(order.id) ?? [];
       const observations = readback.orderRecoveryObservations.get(order.id) ?? [];
       this.verifyOrderChronology(order, events, nowEpochNanoseconds);
+      verifyRecoveryObservations(order, observations, nowEpochNanoseconds);
       if (orderIds.has(order.id) || order.exchangeAccountId !== this.dependencies.exchangeAccountId) {
         throw recoveryFault("UNCERTAIN_ORDER", "Account-wide order read returned duplicate or mismatched provenance.");
       }
@@ -541,7 +580,16 @@ export class PositionGuardPilotRecovery {
           throw recoveryFault("UNCERTAIN_ORDER", "An order requires reconciliation.");
         case "FAILED":
         case "REJECTED":
-          if (!isDefinitivelyAbsentOrder(order, events, observations, nowEpochNanoseconds)) {
+          if (!isDefinitivelyAbsentOrder(
+            order,
+            events,
+            observations,
+            nowEpochNanoseconds,
+            {
+              minimumNotFoundObservations: this.dependencies.minimumAbsenceObservations,
+              minimumElapsedMs: this.dependencies.minimumAbsenceElapsedMs,
+            },
+          )) {
             throw recoveryFault("UNCERTAIN_ORDER", `Order ${order.id} lacks definitive no-order evidence.`);
           }
           break;
@@ -706,12 +754,24 @@ export class PositionGuardPilotRecovery {
     if (!activated) {
       return this.blockForFault("ACTIVATION_CAS_CONFLICT", receipt, readback, clock);
     }
-    const auditEvents = await this.dependencies.candidatePilots.listAuditEvents(this.dependencies.deploymentId);
     const activatedReadback = {
       ...readback,
       deployment: activated,
-      auditEvents,
+      auditEvents: [] as PositionGuardPilotAuditEventRecord[],
     };
+    let auditEvents: PositionGuardPilotAuditEventRecord[];
+    try {
+      auditEvents = await this.readPersistence(
+        "candidatePilots.listAuditEvents",
+        () => this.dependencies.candidatePilots.listAuditEvents(this.dependencies.deploymentId),
+      );
+      activatedReadback.auditEvents = auditEvents;
+    } catch (error) {
+      if (isPersistenceReadFault(error)) {
+        return this.blockForReadFailure(error, receipt, activatedReadback, clock);
+      }
+      throw error;
+    }
     try {
       this.verifyDeploymentIdentity(activated, clock.epochNanoseconds);
       this.verifyAuditAuthority(activated, auditEvents, clock.epochNanoseconds);
@@ -815,10 +875,10 @@ export class PositionGuardPilotRecovery {
     receipt: Readonly<PositionGuardPilotRefreshReceipt>,
     clock: { occurredAt: string; epochNanoseconds: bigint },
   ): Promise<PositionGuardPilotRecoveryResult> {
-    let latest = baseline;
+    const latest = emptyRecoveryReadback();
     try {
-      latest = await this.readPersistedAccountEvidence();
-      if (!latest.deployment || latest.deployment.exchangeAccountId !== this.dependencies.exchangeAccountId) {
+      await this.readPersistedAccountEvidence(latest);
+      if (!hasEstablishedDeploymentIdentity(latest, this.dependencies)) {
         throw recoveryFault("IDENTITY_MISMATCH", "Candidate deployment identity changed during recovery verification.");
       }
       await this.readCandidateAuthority(latest);
@@ -831,6 +891,10 @@ export class PositionGuardPilotRecovery {
       const verified = this.verifyReadyAuthority(latest, receipt, clock.epochNanoseconds);
       return this.ready(latest.deployment, verified.state, receipt);
     } catch (error) {
+      if (isPersistenceReadFault(error)) {
+        const faultAuthority = hasEstablishedDeploymentIdentity(latest, this.dependencies) ? latest : baseline;
+        return this.blockForReadFailure(error, receipt, faultAuthority, clock);
+      }
       const fault = asRecoveryFault(error);
       return this.blockForFault(fault.reasonCode, receipt, latest, clock);
     }
@@ -875,6 +939,33 @@ export class PositionGuardPilotRecovery {
       receipt,
       readback,
     });
+    return this.persistFault(reasonCode, provenanceJson, readback, clock);
+  }
+
+  private async blockForReadFailure(
+    fault: PersistenceReadFault,
+    receipt: Readonly<PositionGuardPilotRefreshReceipt>,
+    readback: RecoveryReadback,
+    clock: { occurredAt: string; epochNanoseconds: bigint },
+  ): Promise<PositionGuardPilotRecoveryResult> {
+    const reasonCode = "SNAPSHOT_PROVENANCE_INVALID" as const;
+    const provenanceJson = buildReadFailureProvenanceJson({
+      reasonCode,
+      operation: fault.persistenceReadOperation,
+      failureKind: fault.persistenceReadFailureKind,
+      configured: this.dependencies,
+      receipt,
+      deployment: hasEstablishedDeploymentIdentity(readback, this.dependencies) ? readback.deployment : null,
+    });
+    return this.persistFault(reasonCode, provenanceJson, readback, clock);
+  }
+
+  private async persistFault(
+    reasonCode: CandidatePilotRecoveryFaultReason,
+    provenanceJson: string,
+    readback: RecoveryReadback,
+    clock: { occurredAt: string; epochNanoseconds: bigint },
+  ): Promise<PositionGuardPilotRecoveryResult> {
     const faultId = `candidate-pilot-recovery:${createHash("sha256")
       .update(`${reasonCode}\n${provenanceJson}`, "utf8")
       .digest("hex")}`;
@@ -887,8 +978,7 @@ export class PositionGuardPilotRecovery {
       occurredAt: clock.occurredAt,
     };
 
-    const deploymentIdentityEstablished = readback.deployment !== null &&
-      readback.deployment.exchangeAccountId === this.dependencies.exchangeAccountId;
+    const deploymentIdentityEstablished = hasEstablishedDeploymentIdentity(readback, this.dependencies);
     if (deploymentIdentityEstablished) {
       const existing = readback.auditEvents.find((event) => event.id === faultId);
       if (existing) fault.occurredAt = existing.createdAt;
@@ -897,7 +987,12 @@ export class PositionGuardPilotRecovery {
         throw new Error("Candidate recovery fault pause did not persist the expected atomic authority.");
       }
     } else {
-      const existing = await this.dependencies.operatorState.getTransitionById(faultId);
+      let existing = null;
+      try {
+        existing = await this.dependencies.operatorState.getTransitionById(faultId);
+      } catch {
+        // The deterministic pause write remains safe and idempotent when its optional readback is unavailable.
+      }
       if (existing) fault.occurredAt = existing.createdAt;
       await this.dependencies.operatorState.pauseForFault({
         exchangeAccountId: fault.exchangeAccountId,
@@ -925,7 +1020,10 @@ export class PositionGuardPilotRecovery {
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id));
     const event = faultEvents[0];
     if (!event) throw new Error("Persisted PAUSED_FAULT deployment has no fault audit event.");
-    const transition = await this.dependencies.operatorState.getTransitionById(event.id);
+    const transition = await this.readPersistence(
+      "operatorState.getTransitionById",
+      () => this.dependencies.operatorState.getTransitionById(event.id),
+    );
     if (!transition || transition.command !== "AUTOMATIC_PAUSE") {
       throw new Error("Persisted candidate recovery fault has no matching global pause transition.");
     }
@@ -975,6 +1073,29 @@ function snapshotReceipt(value: PositionGuardPilotRefreshReceipt): Readonly<Posi
   });
 }
 
+function emptyRecoveryReadback(): RecoveryReadback {
+  return {
+    balanceSnapshot: null,
+    positionSnapshot: null,
+    reconciliationRun: null,
+    orders: [],
+    deployment: null,
+    state: null,
+    evidenceRecords: [],
+    auditEvents: [],
+    orderEvents: new Map(),
+    orderRecoveryObservations: new Map(),
+  };
+}
+
+function hasEstablishedDeploymentIdentity(
+  readback: RecoveryReadback,
+  configured: { deploymentId: string; exchangeAccountId: string },
+): readback is RecoveryReadback & { deployment: PositionGuardPilotDeploymentRecord } {
+  return readback.deployment?.id === configured.deploymentId &&
+    readback.deployment.exchangeAccountId === configured.exchangeAccountId;
+}
+
 function buildFaultProvenanceJson(input: {
   reasonCode: CandidatePilotRecoveryFaultReason;
   configured: {
@@ -1001,6 +1122,52 @@ function buildFaultProvenanceJson(input: {
     },
     refreshReceipt: input.receipt,
     persistedAuthority: persistedAuthorityMaterial(input.readback),
+  });
+}
+
+function buildReadFailureProvenanceJson(input: {
+  reasonCode: "SNAPSHOT_PROVENANCE_INVALID";
+  operation: string;
+  failureKind: PersistenceReadFault["persistenceReadFailureKind"];
+  configured: {
+    exchangeAccountId: string;
+    deploymentId: string;
+    pilotId: string;
+    market: string;
+    policyId: string;
+    policyVersion: string;
+  };
+  receipt: Readonly<PositionGuardPilotRefreshReceipt>;
+  deployment: PositionGuardPilotDeploymentRecord | null;
+}): string {
+  return canonicalJson({
+    schemaVersion: 1,
+    reasonCode: input.reasonCode,
+    faultKind: "PERSISTENCE_READ_FAILURE",
+    readOperation: input.operation,
+    readFailureKind: input.failureKind,
+    configuredIdentity: {
+      exchangeAccountId: input.configured.exchangeAccountId,
+      deploymentId: input.configured.deploymentId,
+      pilotId: input.configured.pilotId,
+      market: input.configured.market,
+      policyId: input.configured.policyId,
+      policyVersion: input.configured.policyVersion,
+    },
+    refreshReceipt: input.receipt,
+    establishedDeploymentIdentity: input.deployment ? {
+      id: input.deployment.id,
+      exchangeAccountId: input.deployment.exchangeAccountId,
+      pilotId: input.deployment.pilotId,
+      market: input.deployment.market,
+      policyId: input.deployment.policyId,
+      policyVersion: input.deployment.policyVersion,
+      phase: input.deployment.phase,
+      activationAt: input.deployment.activationAt,
+      activationEpochNs: input.deployment.activationEpochNs,
+      createdAt: input.deployment.createdAt,
+      updatedAt: input.deployment.updatedAt,
+    } : null,
   });
 }
 
@@ -1064,11 +1231,83 @@ function contentMaterial(value: string): { value: string; sha256: string } {
   };
 }
 
+function verifyRecoveryObservations(
+  order: OrderRecord,
+  observations: OrderSubmissionRecoveryObservationRecord[],
+  nowEpochNanoseconds: bigint,
+): void {
+  const requestedAt = parseTimestamp(order.requestedAt, "order requestedAt", "UNCERTAIN_ORDER");
+  const ids = new Set<string>();
+  for (const observation of observations) {
+    let observedAt: bigint;
+    let detail: unknown;
+    try {
+      observedAt = parseCandidateEvidenceTimestamp(observation.observedAt, "recovery observation observedAt");
+      const createdAt = parseCandidateEvidenceTimestamp(observation.createdAt, "recovery observation createdAt");
+      detail = JSON.parse(observation.detailJson) as unknown;
+      if (
+        !isNonEmptyString(observation.id) ||
+        ids.has(observation.id) ||
+        observation.orderId !== order.id ||
+        !["FOUND", "NOT_FOUND", "TRANSIENT_FAILURE"].includes(observation.outcome as string) ||
+        !Number.isSafeInteger(observation.observedAtEpochMs) ||
+        observation.observedAtEpochMs < 0 ||
+        Date.parse(observation.observedAt) !== observation.observedAtEpochMs ||
+        observation.createdAt !== observation.observedAt ||
+        createdAt !== observedAt ||
+        observedAt < requestedAt ||
+        observedAt > nowEpochNanoseconds ||
+        !isValidRecoveryObservationDetail(observation.outcome, detail)
+      ) {
+        throw new Error("Recovery observation authority is invalid.");
+      }
+    } catch {
+      throw recoveryFault("UNCERTAIN_ORDER", `Order ${order.id} has invalid recovery observation evidence.`);
+    }
+    ids.add(observation.id);
+  }
+}
+
+function isValidRecoveryObservationDetail(
+  outcome: OrderSubmissionRecoveryObservationRecord["outcome"],
+  detail: unknown,
+): boolean {
+  if (!isPlainRecord(detail)) return false;
+  if (outcome === "NOT_FOUND") {
+    return hasExactOwnKeys(detail, ["attemptedQueries"]) && isValidRecoveryQueries(detail.attemptedQueries);
+  }
+  if (outcome === "TRANSIENT_FAILURE") {
+    return hasExactOwnKeys(detail, ["attemptedQueries", "reason"]) &&
+      isValidRecoveryQueries(detail.attemptedQueries) && isNonEmptyString(detail.reason);
+  }
+  if (outcome === "FOUND") {
+    return hasExactOwnKeys(detail, ["query", "attemptedQueries", "uuid"]) &&
+      isValidRecoveryQuery(detail.query) &&
+      isValidRecoveryQueries(detail.attemptedQueries) &&
+      isNonEmptyString(detail.uuid) &&
+      (detail.attemptedQueries as unknown[]).some((query) => canonicalJson(query) === canonicalJson(detail.query));
+  }
+  return false;
+}
+
+function isValidRecoveryQueries(value: unknown): value is unknown[] {
+  if (!Array.isArray(value) || value.length === 0 || !value.every(isValidRecoveryQuery)) return false;
+  const canonical = value.map((query) => canonicalJson(query));
+  return new Set(canonical).size === canonical.length;
+}
+
+function isValidRecoveryQuery(value: unknown): boolean {
+  return isPlainRecord(value) &&
+    ((hasExactOwnKeys(value, ["uuid"]) && isNonEmptyString(value.uuid)) ||
+      (hasExactOwnKeys(value, ["identifier"]) && isNonEmptyString(value.identifier)));
+}
+
 function isDefinitivelyAbsentOrder(
   order: OrderRecord,
   events: OrderEventRecord[],
   observations: OrderSubmissionRecoveryObservationRecord[],
   nowEpochNanoseconds: bigint,
+  policy: { minimumNotFoundObservations: number; minimumElapsedMs: number },
 ): boolean {
   let requestedAt: bigint;
   try {
@@ -1076,6 +1315,7 @@ function isDefinitivelyAbsentOrder(
   } catch {
     return false;
   }
+  if (observations.some((observation) => observation.outcome === "FOUND")) return false;
   if (order.status === "REJECTED") {
     const rejectionEvents = events.filter((event) => event.eventType === "ORDER_REJECTED");
     if (
@@ -1092,7 +1332,7 @@ function isDefinitivelyAbsentOrder(
       const eventAt = parseCandidateEvidenceTimestamp(event.createdAt, "order rejection createdAt");
       const payload = JSON.parse(event.payloadJson) as unknown;
       const response = JSON.parse(order.exchangeResponseJson) as unknown;
-      return event.orderId === order.id &&
+      const validProof = event.orderId === order.id &&
         event.createdAt === order.updatedAt &&
         eventAt >= requestedAt &&
         eventAt <= nowEpochNanoseconds &&
@@ -1100,6 +1340,7 @@ function isDefinitivelyAbsentOrder(
         isDefinitiveRejectionPayload(payload) &&
         isDefinitiveRejectionPayload(response) &&
         canonicalJson(payload) === canonicalJson(response);
+      return validProof && !hasLaterContradictoryOrderEvidence(event, events);
     } catch {
       return false;
     }
@@ -1134,9 +1375,9 @@ function isDefinitivelyAbsentOrder(
       !isNonNegativeSafeInteger(payload.absenceObservationCount) ||
       !isNonNegativeSafeInteger(payload.elapsedMs) ||
       !isNonNegativeSafeInteger(payload.minimumNotFoundObservations) ||
-      payload.minimumNotFoundObservations < 2 ||
+      payload.minimumNotFoundObservations !== policy.minimumNotFoundObservations ||
       !isNonNegativeSafeInteger(payload.minimumElapsedMs) ||
-      payload.minimumElapsedMs <= 0
+      payload.minimumElapsedMs !== policy.minimumElapsedMs
     ) {
       return false;
     }
@@ -1176,13 +1417,50 @@ function isDefinitivelyAbsentOrder(
     const latest = ordered.at(-1);
     if (!first || !latest || latest.observedAt !== event.createdAt) return false;
     const elapsedMs = latest.observedAtEpochMs - first.observedAtEpochMs;
-    return observations.length === payload.absenceObservationCount &&
+    return !hasLaterContradictoryOrderEvidence(event, events) &&
+      observations.length === payload.absenceObservationCount &&
       elapsedMs === payload.elapsedMs &&
-      observations.length >= payload.minimumNotFoundObservations &&
-      elapsedMs >= payload.minimumElapsedMs;
+      observations.length >= policy.minimumNotFoundObservations &&
+      elapsedMs >= policy.minimumElapsedMs;
   } catch {
     return false;
   }
+}
+
+function hasLaterContradictoryOrderEvidence(
+  proof: OrderEventRecord,
+  events: OrderEventRecord[],
+): boolean {
+  const proofAt = Date.parse(proof.createdAt);
+  return events.some((event) => {
+    if (event.id === proof.id || Date.parse(event.createdAt) < proofAt) return false;
+    if (event.eventSource === "EXCHANGE") return true;
+    const eventType = event.eventType.toUpperCase();
+    if (
+      eventType.includes("SUBMITTED") ||
+      eventType.includes("ACCEPTED") ||
+      eventType.includes("FILL") ||
+      eventType.includes("CANCELED") ||
+      eventType.includes("TERMINAL") ||
+      eventType.includes("EXCHANGE_ORDER_RECOVERED")
+    ) {
+      return true;
+    }
+    try {
+      const payload = JSON.parse(event.payloadJson) as unknown;
+      return containsContradictoryOrderMaterial(payload);
+    } catch {
+      return true;
+    }
+  });
+}
+
+function containsContradictoryOrderMaterial(value: unknown): boolean {
+  if (!isPlainRecord(value)) return false;
+  if (value.accepted === true || isNonEmptyString(value.uuid) || isNonEmptyString(value.upbitUuid)) return true;
+  if (typeof value.fillCount === "number" && value.fillCount > 0) return true;
+  if (typeof value.executedVolume === "string" && value.executedVolume !== "0") return true;
+  return ["OPEN", "PARTIALLY_FILLED", "FILLED", "CANCELED"].includes(value.nextStatus as string);
 }
 
 function isDefinitiveRejectionPayload(value: unknown): boolean {
@@ -1206,7 +1484,11 @@ function isDefinitiveRejectionPayload(value: unknown): boolean {
   );
 }
 
-function isValidHistoryRecoverySummary(value: unknown): boolean {
+function isValidHistoryRecoverySummary(
+  value: unknown,
+  run: ReconciliationRunRecord,
+  nowEpochNanoseconds: bigint,
+): boolean {
   if (
     !isPlainRecord(value) ||
     !hasExactOwnKeys(value, [
@@ -1227,29 +1509,64 @@ function isValidHistoryRecoverySummary(value: unknown): boolean {
     !Number.isSafeInteger(value.closedOrderLookbackDays) ||
     (value.closedOrderLookbackDays as number) <= 0 ||
     !Number.isSafeInteger(value.stopBeforeDays) ||
-    (value.stopBeforeDays as number) <= 0 ||
+    (value.stopBeforeDays as number) < (value.closedOrderLookbackDays as number) ||
     !isStrictTimestamp(value.stopBeforeAt) ||
     !Number.isSafeInteger(value.retentionAssumptionDays) ||
-    (value.retentionAssumptionDays as number) <= 0 ||
+    (value.retentionAssumptionDays as number) < (value.closedOrderLookbackDays as number) ||
     !isStrictTimestamp(value.retentionBoundaryAt) ||
     (value.retentionStatus !== "WITHIN_ASSUMED_RETENTION" && value.retentionStatus !== "BEYOND_ASSUMED_RETENTION") ||
     (value.coverageStatus !== "IN_PROGRESS" && value.coverageStatus !== "COMPLETE") ||
-    (value.confidenceLevel !== "HIGH" && value.confidenceLevel !== "PARTIAL" && value.confidenceLevel !== "FAILED") ||
+    (value.confidenceLevel !== "HIGH" && value.confidenceLevel !== "PARTIAL") ||
     ![
       "ARCHIVE_COMPLETE",
       "ARCHIVE_IN_PROGRESS",
       "PAGE_LIMIT_REACHED",
       "BEYOND_ASSUMED_RETENTION",
-      "LOOKUP_FAILED",
     ].includes(value.confidenceReason as string) ||
-    (value.confidenceLevel === "FAILED" ? !isNonEmptyString(value.failureMessage) : value.failureMessage !== null) ||
+    value.failureMessage !== null ||
     !isNonNegativeSafeInteger(value.scannedSnapshotCount) ||
     !isNonNegativeSafeInteger(value.recoveredOrderCount) ||
-    !Array.isArray(value.markets)
+    !Array.isArray(value.markets) ||
+    value.markets.length !== 2
   ) {
     return false;
   }
+
+  const millisecondsPerDay = 86_400_000;
+  const startedAtMs = Date.parse(run.startedAt);
+  const lookbackMs = (value.closedOrderLookbackDays as number) * millisecondsPerDay;
+  const stopBeforeMs = (value.stopBeforeDays as number) * millisecondsPerDay;
+  const retentionMs = (value.retentionAssumptionDays as number) * millisecondsPerDay;
+  if (
+    !Number.isSafeInteger(startedAtMs) ||
+    !Number.isSafeInteger(lookbackMs) ||
+    !Number.isSafeInteger(stopBeforeMs) ||
+    !Number.isSafeInteger(retentionMs)
+  ) {
+    return false;
+  }
+  const recentStartAt = new Date(startedAtMs - lookbackMs).toISOString();
+  const expectedStopBeforeAt = new Date(startedAtMs - stopBeforeMs).toISOString();
+  const expectedRetentionBoundaryAt = new Date(startedAtMs - retentionMs).toISOString();
+  if (
+    value.stopBeforeAt !== expectedStopBeforeAt ||
+    value.retentionBoundaryAt !== expectedRetentionBoundaryAt ||
+    !timestampIsNotFuture(run.startedAt, nowEpochNanoseconds) ||
+    !timestampIsNotFuture(value.stopBeforeAt, nowEpochNanoseconds) ||
+    !timestampIsNotFuture(value.retentionBoundaryAt, nowEpochNanoseconds)
+  ) {
+    return false;
+  }
+
   const markets = new Set<string>();
+  const validatedMarkets: Array<{
+    archiveComplete: boolean;
+    retentionStatus: "WITHIN_ASSUMED_RETENTION" | "BEYOND_ASSUMED_RETENTION";
+    confidenceLevel: "HIGH" | "PARTIAL";
+    confidenceReason: "ARCHIVE_COMPLETE" | "ARCHIVE_IN_PROGRESS" | "PAGE_LIMIT_REACHED" |
+      "BEYOND_ASSUMED_RETENTION";
+    snapshotCount: number;
+  }> = [];
   for (const market of value.markets) {
     if (
       !isPlainRecord(market) ||
@@ -1298,9 +1615,104 @@ function isValidHistoryRecoverySummary(value: unknown): boolean {
     ) {
       return false;
     }
+
+    const timestamps = [
+      market.recentClosedWindowStartAt,
+      market.recentClosedWindowEndAt,
+      market.archivalWindowStartAt,
+      market.archivalWindowEndAt,
+      market.nextWindowEndAt,
+    ];
+    if (!timestamps.every((timestamp) => timestampIsNotFuture(timestamp, nowEpochNanoseconds))) return false;
+
+    const archivalStartMs = Date.parse(market.archivalWindowStartAt as string);
+    const archivalEndMs = Date.parse(market.archivalWindowEndAt as string);
+    const expectedArchivalStartMs = archivalEndMs <= Date.parse(expectedStopBeforeAt)
+      ? archivalEndMs
+      : Math.max(archivalEndMs - lookbackMs, Date.parse(expectedStopBeforeAt));
+    const expectedArchiveComplete = archivalStartMs <= Date.parse(expectedStopBeforeAt);
+    const expectedRetentionStatus =
+      archivalStartMs <= Date.parse(expectedRetentionBoundaryAt) ||
+        Date.parse(expectedStopBeforeAt) < Date.parse(expectedRetentionBoundaryAt)
+        ? "BEYOND_ASSUMED_RETENTION"
+        : "WITHIN_ASSUMED_RETENTION";
+    const pageLimitReached = market.openHistoryTruncated ||
+      market.recentClosedHistoryTruncated || market.archivalClosedHistoryTruncated;
+    const expectedConfidenceReason = pageLimitReached
+      ? "PAGE_LIMIT_REACHED"
+      : expectedRetentionStatus === "BEYOND_ASSUMED_RETENTION"
+        ? "BEYOND_ASSUMED_RETENTION"
+        : expectedArchiveComplete
+          ? "ARCHIVE_COMPLETE"
+          : "ARCHIVE_IN_PROGRESS";
+    const expectedConfidenceLevel = expectedArchiveComplete && !pageLimitReached &&
+        expectedRetentionStatus === "WITHIN_ASSUMED_RETENTION"
+      ? "HIGH"
+      : "PARTIAL";
+    const totalPages = (market.openPagesScanned as number) +
+      (market.recentClosedPagesScanned as number) + (market.archivalClosedPagesScanned as number);
+    if (
+      market.recentClosedWindowStartAt !== recentStartAt ||
+      market.recentClosedWindowEndAt !== run.startedAt ||
+      archivalStartMs > archivalEndMs ||
+      archivalEndMs > Date.parse(recentStartAt) ||
+      market.archivalWindowStartAt !== new Date(expectedArchivalStartMs).toISOString() ||
+      market.nextWindowEndAt !== market.archivalWindowStartAt ||
+      market.archiveComplete !== expectedArchiveComplete ||
+      market.retentionStatus !== expectedRetentionStatus ||
+      market.confidenceReason !== expectedConfidenceReason ||
+      market.confidenceLevel !== expectedConfidenceLevel ||
+      (market.openHistoryTruncated && market.openPagesScanned === 0) ||
+      (market.recentClosedHistoryTruncated && market.recentClosedPagesScanned === 0) ||
+      (market.archivalClosedHistoryTruncated && market.archivalClosedPagesScanned === 0) ||
+      !Number.isSafeInteger(totalPages) ||
+      (market.snapshotCount > 0 && totalPages === 0)
+    ) {
+      return false;
+    }
     markets.add(market.market);
+    validatedMarkets.push({
+      archiveComplete: expectedArchiveComplete,
+      retentionStatus: expectedRetentionStatus,
+      confidenceLevel: expectedConfidenceLevel,
+      confidenceReason: expectedConfidenceReason,
+      snapshotCount: market.snapshotCount as number,
+    });
   }
-  return true;
+
+  if (!markets.has("KRW-BTC") || !markets.has("KRW-ETH")) return false;
+  const expectedCoverage = validatedMarkets.every((market) => market.archiveComplete) ? "COMPLETE" : "IN_PROGRESS";
+  const expectedRetention = validatedMarkets.some((market) => market.retentionStatus === "BEYOND_ASSUMED_RETENTION")
+    ? "BEYOND_ASSUMED_RETENTION"
+    : "WITHIN_ASSUMED_RETENTION";
+  const expectedConfidence = validatedMarkets.every((market) => market.confidenceLevel === "HIGH")
+    ? "HIGH"
+    : "PARTIAL";
+  const expectedReason = validatedMarkets.some((market) => market.confidenceReason === "PAGE_LIMIT_REACHED")
+    ? "PAGE_LIMIT_REACHED"
+    : validatedMarkets.some((market) => market.confidenceReason === "BEYOND_ASSUMED_RETENTION")
+      ? "BEYOND_ASSUMED_RETENTION"
+      : validatedMarkets.some((market) => market.confidenceReason === "ARCHIVE_IN_PROGRESS")
+        ? "ARCHIVE_IN_PROGRESS"
+        : "ARCHIVE_COMPLETE";
+  const snapshotCount = validatedMarkets.reduce((total, market) => total + market.snapshotCount, 0);
+  return Number.isSafeInteger(snapshotCount) &&
+    value.coverageStatus === expectedCoverage &&
+    value.retentionStatus === expectedRetention &&
+    value.confidenceLevel === expectedConfidence &&
+    value.confidenceReason === expectedReason &&
+    (value.recoveredOrderCount as number) <= (value.scannedSnapshotCount as number) &&
+    (value.scannedSnapshotCount as number) <= snapshotCount &&
+    ((value.scannedSnapshotCount as number) > 0) === (snapshotCount > 0);
+}
+
+function timestampIsNotFuture(value: unknown, nowEpochNanoseconds: bigint): value is string {
+  if (!isStrictTimestamp(value)) return false;
+  try {
+    return parseCandidateEvidenceTimestamp(value, "history recovery timestamp") <= nowEpochNanoseconds;
+  } catch {
+    return false;
+  }
 }
 
 function parseExchangeDecimal(value: unknown, label: string): ExactDecimal {
@@ -1346,6 +1758,25 @@ function parseTimestamp(
 
 function recoveryFault(reasonCode: CandidatePilotRecoveryFaultReason, message: string): RecoveryFault {
   return Object.assign(new Error(message), { reasonCode });
+}
+
+function persistenceReadFault(operation: string, cause: unknown): PersistenceReadFault {
+  const persistenceReadFailureKind: PersistenceReadFault["persistenceReadFailureKind"] = cause instanceof TypeError
+    ? "TYPE_ERROR"
+    : cause instanceof RangeError
+      ? "RANGE_ERROR"
+      : "READ_ERROR";
+  return Object.assign(new Error(`Persistence read failed during ${operation}.`), {
+    persistenceReadOperation: operation,
+    persistenceReadFailureKind,
+  });
+}
+
+function isPersistenceReadFault(value: unknown): value is PersistenceReadFault {
+  return value instanceof Error &&
+    "persistenceReadOperation" in value && typeof value.persistenceReadOperation === "string" &&
+    "persistenceReadFailureKind" in value &&
+    ["READ_ERROR", "TYPE_ERROR", "RANGE_ERROR"].includes(value.persistenceReadFailureKind as string);
 }
 
 function asRecoveryFault(error: unknown): RecoveryFault {

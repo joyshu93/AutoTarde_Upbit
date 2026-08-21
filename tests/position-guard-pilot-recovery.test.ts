@@ -47,6 +47,8 @@ const SNAPSHOT_AT = "2026-08-21T00:00:30.000Z";
 const RECONCILIATION_COMPLETED_AT = "2026-08-21T00:00:31.000Z";
 const NOW = "2026-08-21T00:01:00.000Z";
 const FRESHNESS_THRESHOLD_MS = 60_000;
+const MINIMUM_ABSENCE_OBSERVATIONS = 2;
+const MINIMUM_ABSENCE_ELAPSED_MS = 10_000;
 const DEFINITIVE_REJECTION_PAYLOAD = Object.freeze({
   kind: "DEFINITIVE_REJECTION",
   status: 400,
@@ -55,10 +57,10 @@ const DEFINITIVE_REJECTION_PAYLOAD = Object.freeze({
   responseReceived: true,
 });
 const ABSENCE_PROOF_PAYLOAD = Object.freeze({
-  absenceObservationCount: 2,
-  elapsedMs: 10_000,
-  minimumNotFoundObservations: 2,
-  minimumElapsedMs: 10_000,
+  absenceObservationCount: MINIMUM_ABSENCE_OBSERVATIONS,
+  elapsedMs: MINIMUM_ABSENCE_ELAPSED_MS,
+  minimumNotFoundObservations: MINIMUM_ABSENCE_OBSERVATIONS,
+  minimumElapsedMs: MINIMUM_ABSENCE_ELAPSED_MS,
 });
 
 test("fresh persisted flat PENDING_FLAT activation returns immutable READY ACTIVE provenance", async () => {
@@ -273,6 +275,66 @@ test("future deployment, evidence, order, and audit timestamps all fault closed"
   }
 });
 
+test("every authoritative persistence read failure returns a sanitized durable BLOCKED_FAULT", async () => {
+  const operations = [
+    "getDeployment",
+    "getLatestBalanceSnapshot",
+    "getLatestPositionSnapshot",
+    "listReconciliationRuns",
+    "listOrders",
+    "listOrderEvents",
+    "listOrderSubmissionRecoveryObservations",
+    "getExactState",
+    "listEvidenceRecords",
+    "listAuditEvents",
+  ] as const;
+  const outcomes: string[] = [];
+  for (const operation of operations) {
+    const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+    if (operation === "listOrderEvents" || operation === "listOrderSubmissionRecoveryObservations") {
+      await fixture.repositories.saveOrder(orderRecord({ status: "FILLED" }));
+    }
+    const secret = `SUPER_SECRET_${operation}`;
+    const fail = async () => {
+      throw new Error(secret);
+    };
+    const candidatePilots = operation === "getDeployment" || operation === "getExactState" ||
+        operation === "listEvidenceRecords" || operation === "listAuditEvents"
+      ? overrideCandidatePilots(fixture.candidatePilots, { [operation]: fail })
+      : fixture.candidatePilots;
+    const repositories = operation !== "getDeployment" && operation !== "getExactState" &&
+        operation !== "listEvidenceRecords" && operation !== "listAuditEvents"
+      ? overrideExecutionRepositories(fixture.repositories, { [operation]: fail })
+      : fixture.repositories;
+    fixture.recovery = fixture.createRecovery(candidatePilots, repositories);
+
+    let result: Awaited<ReturnType<PositionGuardPilotRecovery["verifyAndPrepareBtcRun"]>>;
+    try {
+      result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+    } catch {
+      outcomes.push("THREW");
+      continue;
+    }
+    outcomes.push(result.status);
+    assert.equal(result.status, "BLOCKED_FAULT", operation);
+    if (result.status !== "BLOCKED_FAULT") continue;
+    assert.equal(result.reasonCode, "SNAPSHOT_PROVENANCE_INVALID", operation);
+    assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED", operation);
+    assert.equal(
+      (await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase,
+      operation === "getDeployment" ? "PENDING_FLAT" : "PAUSED_FAULT",
+      operation,
+    );
+    const persistedMaterial = JSON.stringify({
+      audits: await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID),
+      transitions: await fixture.operatorState.listTransitions(100),
+    });
+    assert.equal(persistedMaterial.includes(secret), false, operation);
+  }
+
+  assert.deepEqual(outcomes, operations.map(() => "BLOCKED_FAULT"));
+});
+
 test("missing configured deployment pauses only the target global execution state", async () => {
   const fixture = await createFixture({ createDeployment: false });
 
@@ -392,6 +454,46 @@ test("reconciliation requires a complete schema, allowlisted source, valid count
 
     await expectFault(fixture, "BLOCKING_RECONCILIATION", scenario);
   }
+});
+
+test("history recovery rejects failed, contradictory, future, impossible, and inconsistent progress", async () => {
+  const scenarios = ["failed", "future", "chronology", "counts", "aggregate-counts", "progress"] as const;
+  const outcomes: string[] = [];
+  for (const scenario of scenarios) {
+    const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+    const summary = JSON.parse(reconciliationSummaryJson([])) as Record<string, unknown>;
+    const history = validHistoryRecoverySummary();
+    if (scenario === "failed") {
+      history.confidenceLevel = "FAILED";
+      history.confidenceReason = "LOOKUP_FAILED";
+      history.failureMessage = "history lookup failed";
+    } else if (scenario === "future") {
+      history.markets[0]!.recentClosedWindowEndAt = "2026-08-21T00:02:00.000Z";
+    } else if (scenario === "chronology") {
+      history.markets[0]!.archivalWindowStartAt = "2026-08-15T00:00:30.000Z";
+    } else if (scenario === "counts") {
+      history.recoveredOrderCount = history.scannedSnapshotCount + 1;
+    } else if (scenario === "aggregate-counts") {
+      history.markets[0]!.snapshotCount = Number.MAX_SAFE_INTEGER;
+      history.markets[1]!.snapshotCount = Number.MAX_SAFE_INTEGER;
+    } else {
+      history.coverageStatus = "COMPLETE";
+      history.confidenceReason = "ARCHIVE_COMPLETE";
+    }
+    summary.historyRecovery = history;
+    await fixture.repositories.updateReconciliationRun(reconciliationRun({
+      summaryJson: JSON.stringify(summary),
+      status: "SUCCESS",
+    }));
+
+    const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+    outcomes.push(result.status);
+    if (result.status === "BLOCKED_FAULT") {
+      assert.equal(result.reasonCode, "BLOCKING_RECONCILIATION", scenario);
+    }
+  }
+
+  assert.deepEqual(outcomes, scenarios.map(() => "BLOCKED_FAULT"));
 });
 
 test("reviewed non-blocking reconciliation issue codes pass verification", async () => {
@@ -520,6 +622,92 @@ test("marker-shaped rejection and absence events cannot prove terminal safety", 
   }
 });
 
+test("terminal no-order proof is final, uncontradicted, and bound to explicit recovery policy", async () => {
+  const scenarios = ["later-submission", "found-observation", "policy-mismatch"] as const;
+  const outcomes: string[] = [];
+  for (const scenario of scenarios) {
+    const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+    if (scenario === "policy-mismatch") {
+      const absent = {
+        ...orderRecord({ status: "FAILED", failureCode: "ORDER_SUBMISSION_ABSENCE_CONFIRMED" }),
+        failureMessage: "Bounded identifier recovery confirmed persistent exchange absence.",
+        updatedAt: "2026-08-21T00:00:36.000Z",
+      };
+      await fixture.repositories.saveOrder(absent);
+      await fixture.repositories.saveOrderSubmissionRecoveryObservation(
+        recoveryObservation(absent.id, "policy-absence-1", "2026-08-21T00:00:26.000Z"),
+      );
+      await fixture.repositories.saveOrderSubmissionRecoveryObservation(
+        recoveryObservation(absent.id, "policy-absence-2", "2026-08-21T00:00:36.000Z"),
+      );
+      await fixture.repositories.appendOrderEvent({
+        ...orderEvent(absent.id, "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED", "RECONCILIATION"),
+        id: `identifier-recovery-absence-event:${absent.id}`,
+        payloadJson: JSON.stringify({
+          ...ABSENCE_PROOF_PAYLOAD,
+          minimumElapsedMs: 5_000,
+        }),
+        createdAt: absent.updatedAt,
+      });
+    } else {
+      const rejected = {
+        ...orderRecord({ status: "REJECTED", failureCode: "EXCHANGE_ORDER_REJECTED" }),
+        exchangeResponseJson: JSON.stringify(DEFINITIVE_REJECTION_PAYLOAD),
+        failureMessage: "Upbit definitively rejected the order submission.",
+        updatedAt: "2026-08-21T00:00:27.000Z",
+      };
+      await fixture.repositories.saveOrder(rejected);
+      await fixture.repositories.appendOrderEvent({
+        ...orderEvent(rejected.id, "ORDER_REJECTED", "EXCHANGE"),
+        payloadJson: JSON.stringify(DEFINITIVE_REJECTION_PAYLOAD),
+        createdAt: rejected.updatedAt,
+      });
+      if (scenario === "later-submission") {
+        await fixture.repositories.appendOrderEvent({
+          ...orderEvent(rejected.id, "ORDER_SUBMITTED", "EXCHANGE"),
+          id: `${rejected.id}:later-submission`,
+          payloadJson: JSON.stringify({ accepted: true, uuid: "later-upbit-uuid" }),
+          createdAt: "2026-08-21T00:00:28.000Z",
+        });
+      } else {
+        await fixture.repositories.saveOrderSubmissionRecoveryObservation({
+          ...recoveryObservation(rejected.id, "found-after-rejection", "2026-08-21T00:00:28.000Z"),
+          outcome: "FOUND",
+          detailJson: JSON.stringify({
+            query: { identifier: rejected.identifier },
+            attemptedQueries: [{ identifier: rejected.identifier }],
+            uuid: "found-upbit-uuid",
+          }),
+        });
+      }
+    }
+
+    const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+    outcomes.push(result.status);
+    if (result.status === "BLOCKED_FAULT") assert.equal(result.reasonCode, "UNCERTAIN_ORDER", scenario);
+  }
+
+  const constructorFixture = await createFixture();
+  let acceptedInvalidPolicies = 0;
+  for (const policy of [
+    { minimumAbsenceObservations: 1, minimumAbsenceElapsedMs: MINIMUM_ABSENCE_ELAPSED_MS },
+    { minimumAbsenceObservations: MINIMUM_ABSENCE_OBSERVATIONS, minimumAbsenceElapsedMs: 0 },
+    { minimumAbsenceObservations: MINIMUM_ABSENCE_OBSERVATIONS, minimumAbsenceElapsedMs: 1.5 },
+  ]) {
+    try {
+      constructorFixture.createRecovery(undefined, undefined, policy);
+      acceptedInvalidPolicies += 1;
+    } catch {
+      // Expected once the explicit bounded-absence policy is validated.
+    }
+  }
+
+  assert.deepEqual({ outcomes, acceptedInvalidPolicies }, {
+    outcomes: scenarios.map(() => "BLOCKED_FAULT"),
+    acceptedInvalidPolicies: 0,
+  });
+});
+
 test("malformed or future lifecycle timestamps cannot prove definitive rejection", async () => {
   for (const createdAt of ["2026-08-21 00:00:27", "2026-08-21T00:02:00.000Z"]) {
     const fixture = await createFixture();
@@ -532,6 +720,60 @@ test("malformed or future lifecycle timestamps cannot prove definitive rejection
 
     await expectFault(fixture, "UNCERTAIN_ORDER", createdAt);
   }
+});
+
+test("every order status rejects malformed, future, mismatched, or unknown recovery observations", async () => {
+  const scenarios = [
+    { name: "rejected-unknown-outcome", status: "REJECTED" as const },
+    { name: "filled-future", status: "FILLED" as const },
+    { name: "canceled-epoch-mismatch", status: "CANCELED" as const },
+    { name: "risk-rejected-identity", status: "RISK_REJECTED" as const },
+  ];
+  const outcomes: string[] = [];
+  for (const scenario of scenarios) {
+    const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+    let order = orderRecord({ status: scenario.status });
+    if (scenario.status === "REJECTED") {
+      order = {
+        ...order,
+        failureCode: "EXCHANGE_ORDER_REJECTED",
+        exchangeResponseJson: JSON.stringify(DEFINITIVE_REJECTION_PAYLOAD),
+        failureMessage: "Upbit definitively rejected the order submission.",
+        updatedAt: "2026-08-21T00:00:27.000Z",
+      };
+    }
+    await fixture.repositories.saveOrder(order);
+    if (scenario.status === "REJECTED") {
+      await fixture.repositories.appendOrderEvent({
+        ...orderEvent(order.id, "ORDER_REJECTED", "EXCHANGE"),
+        payloadJson: JSON.stringify(DEFINITIVE_REJECTION_PAYLOAD),
+        createdAt: order.updatedAt,
+      });
+    }
+    let observation = recoveryObservation(order.id, `${scenario.name}-observation`, "2026-08-21T00:00:28.000Z");
+    if (scenario.name === "rejected-unknown-outcome") {
+      observation = {
+        ...observation,
+        outcome: "UNKNOWN_OUTCOME" as OrderSubmissionRecoveryObservationRecord["outcome"],
+      };
+    } else if (scenario.name === "filled-future") {
+      observation = recoveryObservation(order.id, `${scenario.name}-observation`, "2026-08-21T00:02:00.000Z");
+    } else if (scenario.name === "canceled-epoch-mismatch") {
+      observation = { ...observation, observedAtEpochMs: observation.observedAtEpochMs + 1 };
+    } else {
+      observation = { ...observation, orderId: "different-order" };
+    }
+    const repositories = overrideExecutionRepositories(fixture.repositories, {
+      listOrderSubmissionRecoveryObservations: async () => [observation],
+    });
+    fixture.recovery = fixture.createRecovery(undefined, repositories);
+
+    const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+    outcomes.push(result.status);
+    if (result.status === "BLOCKED_FAULT") assert.equal(result.reasonCode, "UNCERTAIN_ORDER", scenario.name);
+  }
+
+  assert.deepEqual(outcomes, scenarios.map(() => "BLOCKED_FAULT"));
 });
 
 test("balance, position, replay inventory, and malformed numeric mismatches fault closed", async () => {
@@ -648,6 +890,8 @@ interface FixtureOptions {
   snapshotAt?: string;
   reconciliationCompletedAt?: string;
   operatorStatus?: "RUNNING" | "PAUSED";
+  minimumAbsenceObservations?: number;
+  minimumAbsenceElapsedMs?: number;
 }
 
 interface RecoveryFixture {
@@ -659,6 +903,10 @@ interface RecoveryFixture {
   createRecovery(
     candidatePilots?: CandidatePilotRepository,
     repositories?: ExecutionRepository,
+    absencePolicy?: {
+      minimumAbsenceObservations: number;
+      minimumAbsenceElapsedMs: number;
+    },
   ): PositionGuardPilotRecovery;
 }
 
@@ -731,8 +979,12 @@ async function createFixture(options: FixtureOptions = {}): Promise<RecoveryFixt
   const createRecovery = (
     pilotRepository: CandidatePilotRepository = candidatePilots,
     executionRepositories: ExecutionRepository = repositories,
-  ) =>
-    new PositionGuardPilotRecovery({
+    absencePolicy = {
+      minimumAbsenceObservations: options.minimumAbsenceObservations ?? MINIMUM_ABSENCE_OBSERVATIONS,
+      minimumAbsenceElapsedMs: options.minimumAbsenceElapsedMs ?? MINIMUM_ABSENCE_ELAPSED_MS,
+    },
+  ) => {
+    const dependencies = {
       exchangeAccountId: ACCOUNT_ID,
       deploymentId: DEPLOYMENT_ID,
       pilotId: PILOT_ID,
@@ -740,13 +992,17 @@ async function createFixture(options: FixtureOptions = {}): Promise<RecoveryFixt
       policyId: POLICY_ID,
       policyVersion: POLICY_VERSION,
       freshnessThresholdMs: FRESHNESS_THRESHOLD_MS,
+      minimumAbsenceObservations: absencePolicy.minimumAbsenceObservations,
+      minimumAbsenceElapsedMs: absencePolicy.minimumAbsenceElapsedMs,
       clock: {
         now: () => ({ occurredAt: NOW, occurredAtEpochMs: Date.parse(NOW) }),
       },
       repositories: executionRepositories,
       candidatePilots: pilotRepository,
       operatorState,
-    });
+    } as const;
+    return new PositionGuardPilotRecovery(dependencies);
+  };
   return {
     repositories,
     operatorState,
@@ -859,6 +1115,43 @@ function reconciliationSummaryJson(issueCodes: string[]): string {
     deferredCount: 0,
     maxOrderLookupsPerRun: 10,
   });
+}
+
+function validHistoryRecoverySummary() {
+  const marketProgress = (market: "KRW-BTC" | "KRW-ETH") => ({
+    market,
+    recentClosedWindowStartAt: "2026-08-14T00:00:30.000Z",
+    recentClosedWindowEndAt: SNAPSHOT_AT,
+    archivalWindowStartAt: "2026-08-07T00:00:30.000Z",
+    archivalWindowEndAt: "2026-08-14T00:00:30.000Z",
+    nextWindowEndAt: "2026-08-07T00:00:30.000Z",
+    archiveComplete: false,
+    retentionStatus: "WITHIN_ASSUMED_RETENTION",
+    confidenceLevel: "PARTIAL",
+    confidenceReason: "ARCHIVE_IN_PROGRESS",
+    openHistoryTruncated: false,
+    recentClosedHistoryTruncated: false,
+    archivalClosedHistoryTruncated: false,
+    openPagesScanned: 1,
+    recentClosedPagesScanned: 1,
+    archivalClosedPagesScanned: 1,
+    snapshotCount: 2,
+  });
+  return {
+    closedOrderLookbackDays: 7,
+    stopBeforeDays: 365,
+    stopBeforeAt: "2025-08-21T00:00:30.000Z",
+    retentionAssumptionDays: 365,
+    retentionBoundaryAt: "2025-08-21T00:00:30.000Z",
+    retentionStatus: "WITHIN_ASSUMED_RETENTION",
+    coverageStatus: "IN_PROGRESS",
+    confidenceLevel: "PARTIAL",
+    confidenceReason: "ARCHIVE_IN_PROGRESS",
+    failureMessage: null as string | null,
+    scannedSnapshotCount: 2,
+    recoveredOrderCount: 1,
+    markets: [marketProgress("KRW-BTC"), marketProgress("KRW-ETH")],
+  };
 }
 
 function orderRecord(input: {
