@@ -12,6 +12,13 @@ export type PositionGuardPolicySelection =
       liveOperatorConfirmed: true;
     }>;
 
+export type PositionGuardPilotPhase =
+  | "DISABLED"
+  | "PENDING_FLAT"
+  | "ACTIVE"
+  | "PAUSED_FAULT"
+  | "DRAINING";
+
 export type PositionGuardPilotAbandonmentRecord = Readonly<{
   authority: string;
   event: string;

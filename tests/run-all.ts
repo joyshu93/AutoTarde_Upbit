@@ -63,6 +63,7 @@ await import("./position-guard-candidate-state.test.js");
 await import("./position-guard-candidate-policy.test.js");
 await import("./position-guard-candidate-parity.test.js");
 await import("./position-guard-candidate-dependency-boundary.test.js");
+await import("./position-guard-policy-router.test.js");
 await import("./performance-calculator.test.js");
 await import("./performance-trade-matcher.test.js");
 await import("./performance-diagnostics.test.js");

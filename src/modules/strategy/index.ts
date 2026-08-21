@@ -6,5 +6,6 @@ export * from "./position-guard-backtest-frames.js";
 export * from "./position-guard-backtest-report.js";
 export * from "./position-guard-public-backtest.js";
 export * from "./position-guard-core.js";
+export * from "./position-guard-policy-router.js";
 export * from "./position-guard-runner.js";
 export * from "./position-guard-snapshot.js";
