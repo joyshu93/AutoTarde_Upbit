@@ -335,6 +335,57 @@ test("every authoritative persistence read failure returns a sanitized durable B
   assert.deepEqual(outcomes, operations.map(() => "BLOCKED_FAULT"));
 });
 
+test("initial and stable-reread deployment failures persist distinct faults for their pause authority", async () => {
+  const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+  let deploymentReadCount = 0;
+  const failingPilots = overrideCandidatePilots(fixture.candidatePilots, {
+    getDeployment: async (deploymentId) => {
+      deploymentReadCount += 1;
+      if (deploymentReadCount === 1 || deploymentReadCount === 3) {
+        throw new Error("same deployment read failure");
+      }
+      return fixture.candidatePilots.getDeployment(deploymentId);
+    },
+  });
+  const recovery = fixture.createRecovery(failingPilots);
+
+  const initialFailure = await recovery.verifyAndPrepareBtcRun(fixture.receipt);
+  assert.equal(initialFailure.status, "BLOCKED_FAULT");
+  if (initialFailure.status !== "BLOCKED_FAULT") return;
+  assert.equal((await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "PENDING_FLAT");
+
+  const stableRereadFailure = await recovery.verifyAndPrepareBtcRun(fixture.receipt);
+  assert.equal(stableRereadFailure.status, "BLOCKED_FAULT");
+  if (stableRereadFailure.status !== "BLOCKED_FAULT") return;
+  assert.notEqual(stableRereadFailure.faultId, initialFailure.faultId);
+  assert.equal((await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "PAUSED_FAULT");
+  assert.equal((await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID))
+    .filter((event) => event.id === stableRereadFailure.faultId).length, 1);
+  const transitions = await fixture.operatorState.listTransitions(100);
+  assert.equal(transitions.filter((transition) => transition.id === initialFailure.faultId).length, 1);
+  assert.equal(transitions.filter((transition) => transition.id === stableRereadFailure.faultId).length, 1);
+  const initialTransition = transitions.find((transition) => transition.id === initialFailure.faultId);
+  assert.ok(initialTransition);
+  assert.ok(initialTransition.reason);
+  const initialProvenance = JSON.parse(initialTransition.reason.slice(
+    initialTransition.reason.indexOf("provenance=") + "provenance=".length,
+  )) as Record<string, unknown>;
+  assert.equal(initialProvenance.faultKind, "PERSISTENCE_READ_FAILURE");
+  assert.equal(initialProvenance.readOperation, "candidatePilots.getDeployment");
+  assert.equal(initialProvenance.readStage, "INITIAL_DEPLOYMENT_READ");
+  assert.equal(initialProvenance.pauseAuthority, "GLOBAL_ONLY");
+
+  const stableAudit = (await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID))
+    .find((event) => event.id === stableRereadFailure.faultId);
+  assert.ok(stableAudit);
+  const stableAuditPayload = JSON.parse(stableAudit.payloadJson) as { provenanceJson: string };
+  const stableProvenance = JSON.parse(stableAuditPayload.provenanceJson) as Record<string, unknown>;
+  assert.equal(stableProvenance.faultKind, "PERSISTENCE_READ_FAILURE");
+  assert.equal(stableProvenance.readOperation, "candidatePilots.getDeployment");
+  assert.equal(stableProvenance.readStage, "STABLE_AUTHORITY_REREAD");
+  assert.equal(stableProvenance.pauseAuthority, "PILOT_AND_GLOBAL_ATOMIC");
+});
+
 test("read-failure restart reuses immutable fault identity and separates operation and error class", async () => {
   const restartFixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
   const failingPilots = overrideCandidatePilots(restartFixture.candidatePilots, {

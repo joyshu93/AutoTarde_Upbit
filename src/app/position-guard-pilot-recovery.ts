@@ -114,7 +114,24 @@ interface RecoveryFault extends Error {
 
 interface PersistenceReadFault extends Error {
   persistenceReadOperation: string;
+  persistenceReadStage: PersistenceReadStage;
+  persistenceReadPauseAuthority: PersistenceReadPauseAuthority;
   persistenceReadFailureClass: string;
+}
+
+type PersistenceReadStage =
+  | "INITIAL_DEPLOYMENT_READ"
+  | "INITIAL_AUTHORITY_READ"
+  | "POST_ACTIVATION_AUDIT_READ"
+  | "STABLE_AUTHORITY_REREAD"
+  | "EXISTING_FAULT_TRANSITION_READ";
+
+type PersistenceReadPauseAuthority = "GLOBAL_ONLY" | "PILOT_AND_GLOBAL_ATOMIC";
+
+interface PersistenceReadContext {
+  operation: string;
+  stage: PersistenceReadStage;
+  pauseAuthority: PersistenceReadPauseAuthority;
 }
 
 const REVIEWED_NON_BLOCKING_RECONCILIATION_CODES = new Set([
@@ -225,11 +242,11 @@ export class PositionGuardPilotRecovery {
     const readback = emptyRecoveryReadback();
 
     try {
-      await this.readPersistedAccountEvidence(readback);
+      await this.readPersistedAccountEvidence(readback, "INITIAL_AUTHORITY_READ");
       if (!hasEstablishedDeploymentIdentity(readback, this.dependencies)) {
         return this.blockForFault("IDENTITY_MISMATCH", receipt, readback, clock);
       }
-      await this.readCandidateAuthority(readback);
+      await this.readCandidateAuthority(readback, "INITIAL_AUTHORITY_READ");
 
       const existingFault = await this.readExistingPersistedFault(readback);
       if (existingFault) return existingFault;
@@ -252,38 +269,65 @@ export class PositionGuardPilotRecovery {
     }
   }
 
-  private async readPersistedAccountEvidence(readback = emptyRecoveryReadback()): Promise<RecoveryReadback> {
+  private async readPersistedAccountEvidence(
+    readback: RecoveryReadback,
+    stage: "INITIAL_AUTHORITY_READ" | "STABLE_AUTHORITY_REREAD",
+  ): Promise<RecoveryReadback> {
     readback.deployment = await this.readPersistence(
-      "candidatePilots.getDeployment",
+      {
+        operation: "candidatePilots.getDeployment",
+        stage: stage === "INITIAL_AUTHORITY_READ" ? "INITIAL_DEPLOYMENT_READ" : stage,
+        pauseAuthority: stage === "INITIAL_AUTHORITY_READ" ? "GLOBAL_ONLY" : "PILOT_AND_GLOBAL_ATOMIC",
+      },
       () => this.dependencies.candidatePilots.getDeployment(this.dependencies.deploymentId),
     );
+    const pauseAuthority = stage === "STABLE_AUTHORITY_REREAD" ||
+        hasEstablishedDeploymentIdentity(readback, this.dependencies)
+      ? "PILOT_AND_GLOBAL_ATOMIC"
+      : "GLOBAL_ONLY";
     readback.balanceSnapshot = await this.readPersistence(
-      "repositories.getLatestBalanceSnapshot",
+      {
+        operation: "repositories.getLatestBalanceSnapshot",
+        stage,
+        pauseAuthority,
+      },
       () => this.dependencies.repositories.getLatestBalanceSnapshot(this.dependencies.exchangeAccountId),
     );
     readback.positionSnapshot = await this.readPersistence(
-      "repositories.getLatestPositionSnapshot",
+      {
+        operation: "repositories.getLatestPositionSnapshot",
+        stage,
+        pauseAuthority,
+      },
       () => this.dependencies.repositories.getLatestPositionSnapshot(this.dependencies.exchangeAccountId),
     );
     const reconciliationRuns = await this.readPersistence(
-      "repositories.listReconciliationRuns",
+      {
+        operation: "repositories.listReconciliationRuns",
+        stage,
+        pauseAuthority,
+      },
       () => this.dependencies.repositories.listReconciliationRuns(this.dependencies.exchangeAccountId, 1),
     );
     readback.reconciliationRun = reconciliationRuns[0] ?? null;
     readback.orders = await this.readPersistence(
-      "repositories.listOrders",
+      { operation: "repositories.listOrders", stage, pauseAuthority },
       () => this.dependencies.repositories.listOrders(this.dependencies.exchangeAccountId),
     );
     for (const order of readback.orders) {
       const events = await this.readPersistence(
-        "repositories.listOrderEvents",
+        { operation: "repositories.listOrderEvents", stage, pauseAuthority },
         () => this.dependencies.repositories.listOrderEvents(order.id),
       );
       readback.orderEvents.set(order.id, events);
       const listObservations = this.dependencies.repositories.listOrderSubmissionRecoveryObservations;
       const observations = listObservations
         ? await this.readPersistence(
-            "repositories.listOrderSubmissionRecoveryObservations",
+            {
+              operation: "repositories.listOrderSubmissionRecoveryObservations",
+              stage,
+              pauseAuthority,
+            },
             () => listObservations.call(this.dependencies.repositories, order.id),
           )
         : [];
@@ -292,26 +336,29 @@ export class PositionGuardPilotRecovery {
     return readback;
   }
 
-  private async readCandidateAuthority(readback: RecoveryReadback): Promise<void> {
+  private async readCandidateAuthority(
+    readback: RecoveryReadback,
+    stage: "INITIAL_AUTHORITY_READ" | "STABLE_AUTHORITY_REREAD",
+  ): Promise<void> {
     readback.state = await this.readPersistence(
-      "candidatePilots.getExactState",
+      { operation: "candidatePilots.getExactState", stage, pauseAuthority: "PILOT_AND_GLOBAL_ATOMIC" },
       () => this.dependencies.candidatePilots.getExactState(this.dependencies.deploymentId),
     );
     readback.evidenceRecords = await this.readPersistence(
-      "candidatePilots.listEvidenceRecords",
+      { operation: "candidatePilots.listEvidenceRecords", stage, pauseAuthority: "PILOT_AND_GLOBAL_ATOMIC" },
       () => this.dependencies.candidatePilots.listEvidenceRecords(this.dependencies.deploymentId),
     );
     readback.auditEvents = await this.readPersistence(
-      "candidatePilots.listAuditEvents",
+      { operation: "candidatePilots.listAuditEvents", stage, pauseAuthority: "PILOT_AND_GLOBAL_ATOMIC" },
       () => this.dependencies.candidatePilots.listAuditEvents(this.dependencies.deploymentId),
     );
   }
 
-  private async readPersistence<T>(operation: string, read: () => Promise<T>): Promise<T> {
+  private async readPersistence<T>(context: PersistenceReadContext, read: () => Promise<T>): Promise<T> {
     try {
       return await read();
     } catch (error) {
-      throw persistenceReadFault(operation, error);
+      throw persistenceReadFault(context, error);
     }
   }
 
@@ -762,7 +809,11 @@ export class PositionGuardPilotRecovery {
     let auditEvents: PositionGuardPilotAuditEventRecord[];
     try {
       auditEvents = await this.readPersistence(
-        "candidatePilots.listAuditEvents",
+        {
+          operation: "candidatePilots.listAuditEvents",
+          stage: "POST_ACTIVATION_AUDIT_READ",
+          pauseAuthority: "PILOT_AND_GLOBAL_ATOMIC",
+        },
         () => this.dependencies.candidatePilots.listAuditEvents(this.dependencies.deploymentId),
       );
       activatedReadback.auditEvents = auditEvents;
@@ -877,11 +928,11 @@ export class PositionGuardPilotRecovery {
   ): Promise<PositionGuardPilotRecoveryResult> {
     const latest = emptyRecoveryReadback();
     try {
-      await this.readPersistedAccountEvidence(latest);
+      await this.readPersistedAccountEvidence(latest, "STABLE_AUTHORITY_REREAD");
       if (!hasEstablishedDeploymentIdentity(latest, this.dependencies)) {
         throw recoveryFault("IDENTITY_MISMATCH", "Candidate deployment identity changed during recovery verification.");
       }
-      await this.readCandidateAuthority(latest);
+      await this.readCandidateAuthority(latest, "STABLE_AUTHORITY_REREAD");
       if (canonicalAuthorityJson(latest) !== canonicalAuthorityJson(baseline)) {
         throw recoveryFault(
           "SNAPSHOT_PROVENANCE_INVALID",
@@ -952,6 +1003,8 @@ export class PositionGuardPilotRecovery {
     const provenanceJson = buildReadFailureProvenanceJson({
       reasonCode,
       operation: fault.persistenceReadOperation,
+      stage: fault.persistenceReadStage,
+      pauseAuthority: fault.persistenceReadPauseAuthority,
       failureClass: fault.persistenceReadFailureClass,
       configured: this.dependencies,
       receipt,
@@ -1024,7 +1077,11 @@ export class PositionGuardPilotRecovery {
     const event = faultEvents[0];
     if (!event) throw new Error("Persisted PAUSED_FAULT deployment has no fault audit event.");
     const transition = await this.readPersistence(
-      "operatorState.getTransitionById",
+      {
+        operation: "operatorState.getTransitionById",
+        stage: "EXISTING_FAULT_TRANSITION_READ",
+        pauseAuthority: "PILOT_AND_GLOBAL_ATOMIC",
+      },
       () => this.dependencies.operatorState.getTransitionById(event.id),
     );
     if (!transition || transition.command !== "AUTOMATIC_PAUSE") {
@@ -1131,6 +1188,8 @@ function buildFaultProvenanceJson(input: {
 function buildReadFailureProvenanceJson(input: {
   reasonCode: "SNAPSHOT_PROVENANCE_INVALID";
   operation: string;
+  stage: PersistenceReadStage;
+  pauseAuthority: PersistenceReadPauseAuthority;
   failureClass: string;
   configured: {
     exchangeAccountId: string;
@@ -1147,6 +1206,8 @@ function buildReadFailureProvenanceJson(input: {
     reasonCode: input.reasonCode,
     faultKind: "PERSISTENCE_READ_FAILURE",
     readOperation: input.operation,
+    readStage: input.stage,
+    pauseAuthority: input.pauseAuthority,
     readFailureClass: input.failureClass,
     configuredIdentity: {
       exchangeAccountId: input.configured.exchangeAccountId,
@@ -1769,10 +1830,12 @@ function recoveryFault(reasonCode: CandidatePilotRecoveryFaultReason, message: s
   return Object.assign(new Error(message), { reasonCode });
 }
 
-function persistenceReadFault(operation: string, cause: unknown): PersistenceReadFault {
+function persistenceReadFault(context: PersistenceReadContext, cause: unknown): PersistenceReadFault {
   const persistenceReadFailureClass = sanitizedReadFailureClass(cause);
-  return Object.assign(new Error(`Persistence read failed during ${operation}.`), {
-    persistenceReadOperation: operation,
+  return Object.assign(new Error(`Persistence read failed during ${context.operation}.`), {
+    persistenceReadOperation: context.operation,
+    persistenceReadStage: context.stage,
+    persistenceReadPauseAuthority: context.pauseAuthority,
     persistenceReadFailureClass,
   });
 }
@@ -1780,9 +1843,25 @@ function persistenceReadFault(operation: string, cause: unknown): PersistenceRea
 function isPersistenceReadFault(value: unknown): value is PersistenceReadFault {
   return value instanceof Error &&
     "persistenceReadOperation" in value && typeof value.persistenceReadOperation === "string" &&
+    "persistenceReadStage" in value && isPersistenceReadStage(value.persistenceReadStage) &&
+    "persistenceReadPauseAuthority" in value && isPersistenceReadPauseAuthority(value.persistenceReadPauseAuthority) &&
     "persistenceReadFailureClass" in value &&
     typeof value.persistenceReadFailureClass === "string" &&
     isSanitizedReadFailureClass(value.persistenceReadFailureClass);
+}
+
+function isPersistenceReadStage(value: unknown): value is PersistenceReadStage {
+  return typeof value === "string" && [
+    "INITIAL_DEPLOYMENT_READ",
+    "INITIAL_AUTHORITY_READ",
+    "POST_ACTIVATION_AUDIT_READ",
+    "STABLE_AUTHORITY_REREAD",
+    "EXISTING_FAULT_TRANSITION_READ",
+  ].includes(value);
+}
+
+function isPersistenceReadPauseAuthority(value: unknown): value is PersistenceReadPauseAuthority {
+  return value === "GLOBAL_ONLY" || value === "PILOT_AND_GLOBAL_ATOMIC";
 }
 
 function sanitizedReadFailureClass(cause: unknown): string {
