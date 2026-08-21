@@ -20,6 +20,7 @@ import {
   candidateEvidenceMaterial,
   buildCandidatePilotRecoveryFaultAuditEvent,
   candidatePilotRecoveryFaultReason,
+  resolveCandidatePilotRecoveryFaultOccurrence,
   validateCandidateExecutionBinding,
   validateCandidatePilotDeployment,
   validateCandidatePilotRecoveryFaultInput,
@@ -373,10 +374,28 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
       : (await this.atomicFaultPauseStore.listTransitions(Number.MAX_SAFE_INTEGER))
         .find((transition) => transition.id === input.faultId) ?? null;
     const executionState = await this.atomicFaultPauseStore.getState();
-    const transitionAt = deriveFaultPauseTransitionAt(input.occurredAt, executionState.updatedAt);
+    const latestAudit = (this.auditEvents.get(input.deploymentId) ?? []).reduce<
+      PositionGuardPilotAuditEventRecord | null
+    >((latest, event) => {
+      if (!latest) return event;
+      return parsePositionGuardCandidateTimestamp(event.createdAt, "candidate audit createdAt") >
+        parsePositionGuardCandidateTimestamp(latest.createdAt, "candidate audit createdAt")
+        ? event
+        : latest;
+    }, null);
+    const latestAuditEpoch = latestAudit === null
+      ? null
+      : parsePositionGuardCandidateTimestamp(latestAudit.createdAt, "candidate audit createdAt");
+    const effectiveInput = existingAudit && input.occurredAtPolicy === "ADVANCE_TO_PERSISTED_SUCCESSOR"
+      ? { ...input, occurredAt: existingAudit.createdAt }
+      : resolveCandidatePilotRecoveryFaultOccurrence(input, [
+          deployment.updatedAt,
+          ...(latestAudit === null ? [] : [latestAudit.createdAt]),
+        ]);
+    const transitionAt = deriveFaultPauseTransitionAt(effectiveInput.occurredAt, executionState.updatedAt);
     if (existingAudit || existingTransition) {
       if (!existingAudit || !existingTransition || deployment.phase !== "PAUSED_FAULT" ||
-        deployment.updatedAt !== input.occurredAt ||
+        deployment.updatedAt !== effectiveInput.occurredAt ||
         (executionState.systemStatus !== "PAUSED" && executionState.systemStatus !== "KILL_SWITCHED")) {
         throw new Error(`Conflicting partial candidate recovery fault ${input.faultId}.`);
       }
@@ -384,11 +403,11 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
         throw new Error(`Conflicting duplicate candidate recovery fault ${input.faultId}.`);
       }
       const expectedAudit = buildCandidatePilotRecoveryFaultAuditEvent({
-        fault: input,
+        fault: effectiveInput,
         fromPhase: existingAudit.fromPhase,
         stateVersion: state.stateVersion,
       });
-      const expectedReason = `faultId=${input.faultId}; reason=${candidatePilotRecoveryFaultReason(input)}`;
+      const expectedReason = `faultId=${input.faultId}; reason=${candidatePilotRecoveryFaultReason(effectiveInput)}`;
       if (!sameAuditEvent(existingAudit, expectedAudit) ||
         existingTransition.command !== "AUTOMATIC_PAUSE" ||
         existingTransition.exchangeAccountId !== input.exchangeAccountId ||
@@ -406,15 +425,8 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
       throw new Error(`Candidate recovery fault cannot pause phase ${deployment.phase}.`);
     }
     const occurredAtEpoch = parsePositionGuardCandidateTimestamp(
-      input.occurredAt,
+      effectiveInput.occurredAt,
       "candidate recovery fault occurredAt",
-    );
-    const latestAuditEpoch = (this.auditEvents.get(input.deploymentId) ?? []).reduce<bigint | null>(
-      (latest, event) => {
-        const epoch = parsePositionGuardCandidateTimestamp(event.createdAt, "candidate audit createdAt");
-        return latest === null || epoch > latest ? epoch : latest;
-      },
-      null,
     );
     if (
       occurredAtEpoch < parsePositionGuardCandidateTimestamp(deployment.updatedAt, "deployment updatedAt") ||
@@ -423,21 +435,21 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
       throw new Error("Candidate recovery fault cannot precede deployment chronology.");
     }
     const auditEvent = buildCandidatePilotRecoveryFaultAuditEvent({
-      fault: input,
+      fault: effectiveInput,
       fromPhase: deployment.phase,
       stateVersion: state.stateVersion,
     });
     const nextExecutionState = this.atomicFaultPauseStore.applyFaultPauseAtomically({
       exchangeAccountId: input.exchangeAccountId,
       faultId: input.faultId,
-      reason: candidatePilotRecoveryFaultReason(input),
-      occurredAt: input.occurredAt,
+      reason: candidatePilotRecoveryFaultReason(effectiveInput),
+      occurredAt: effectiveInput.occurredAt,
       transitionAt,
     });
     const pausedDeployment: PositionGuardPilotDeploymentRecord = {
       ...deployment,
       phase: "PAUSED_FAULT",
-      updatedAt: input.occurredAt,
+      updatedAt: effectiveInput.occurredAt,
     };
     this.deployments.set(input.deploymentId, pausedDeployment);
     this.auditEvents.set(input.deploymentId, [

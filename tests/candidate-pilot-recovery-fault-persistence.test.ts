@@ -16,7 +16,7 @@ import { InMemoryOperatorStateStore } from
   "../src/modules/db/repositories/in-memory-repositories.js";
 import { openSqliteDatabase } from "../src/modules/db/repositories/sqlite-database.js";
 import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
-import { createEmptyPositionGuardCandidateState } from
+import { createEmptyPositionGuardCandidateState, parsePositionGuardCandidateTimestamp } from
   "../src/modules/strategy/position-guard-candidate-state.js";
 import { test } from "./harness.js";
 
@@ -204,6 +204,61 @@ test("candidate recovery fault rejects illegal phases and backdated chronology w
       } finally {
         await fixture.close();
       }
+    }
+  }
+});
+
+test("candidate recovery fault advances canonically past latest audit only when explicitly requested", async () => {
+  for (const factory of FACTORIES) {
+    const fixture = await factory.create(`advance-chronology-${factory.name}`);
+    try {
+      const deployment = await createDeployment(fixture, `deployment-advance-${factory.name}`);
+      const latestAuditAt = addMilliseconds(deployment.updatedAt, 20);
+      await fixture.candidatePilots.advanceStateWithEvidence({
+        deploymentId: deployment.id,
+        expectedStateVersion: 0,
+        evidence: {
+          evidenceId: "future-audit",
+          executedAt: latestAuditAt,
+          action: "ENTER",
+          entryPath: "RECLAIM",
+          terminalStatus: "FILLED",
+          executedQuantity: "0.00001",
+          grossQuoteValueKrw: "1000",
+          confirmedFeeKrw: "0.5",
+          remainingQuantity: "0.00001",
+        },
+      });
+      const attemptedAt = addMilliseconds(deployment.updatedAt, 10);
+      const strictInput = recoveryFaultInput(deployment.id, attemptedAt);
+
+      await assert.rejects(
+        () => fixture.candidatePilots.pauseForRecoveryFault(strictInput),
+        /chronology|precede/i,
+        `${factory.name}:strict`,
+      );
+      assert.equal((await fixture.candidatePilots.getDeployment(deployment.id))?.phase, "PENDING_FLAT");
+      assert.equal((await fixture.operatorState.getState()).systemStatus, "RUNNING");
+
+      const advancingInput = {
+        ...strictInput,
+        occurredAtPolicy: "ADVANCE_TO_PERSISTED_SUCCESSOR",
+      } as const;
+      const result = await fixture.candidatePilots.pauseForRecoveryFault(advancingInput);
+      const retry = await fixture.candidatePilots.pauseForRecoveryFault(advancingInput);
+      assert.equal(result.duplicate, false, factory.name);
+      assert.equal(retry.duplicate, true, factory.name);
+      assert.equal(retry.auditEvent.createdAt, result.auditEvent.createdAt, factory.name);
+      assert.equal(result.deployment.phase, "PAUSED_FAULT", factory.name);
+      assert.match(result.auditEvent.createdAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{9}Z$/u);
+      assert.equal(
+        parsePositionGuardCandidateTimestamp(result.auditEvent.createdAt, "fault audit createdAt"),
+        parsePositionGuardCandidateTimestamp(latestAuditAt, "latest audit createdAt") + 1n,
+        factory.name,
+      );
+      assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED", factory.name);
+    } finally {
+      await fixture.close();
     }
   }
 });

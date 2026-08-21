@@ -3,6 +3,7 @@ import type {
   ExecutionStateRecord,
   ExecutionPolicy,
   FillRecord,
+  OrderEventRecord,
   RiskRuleCode,
   OrderRecord,
   RiskEventRecord,
@@ -13,6 +14,7 @@ import type {
 import { createId } from "../../shared/ids.js";
 import type { ExecutionRepository, OperatorStateStore } from "../db/interfaces.js";
 import type { AccountExecutionLeaseStore, CandidatePilotRepository } from "../db/pilot-interfaces.js";
+import { validateCandidateExecutionBinding } from "../db/pilot-interfaces.js";
 import { ExchangeOrderSubmissionError } from "../exchange/errors.js";
 import type { ExchangeAdapter, ExecutionExchangeAdapter, UpbitOrderChance } from "../exchange/interfaces.js";
 import { evaluateRiskGuards } from "../risk/guards.js";
@@ -26,6 +28,10 @@ import {
 } from "./candidate-execution-authority.js";
 import { createHash } from "node:crypto";
 
+import type {
+  CandidateExecutionBindingRecord,
+  PositionGuardPilotDeploymentRecord,
+} from "../../domain/pilot-types.js";
 import type {
   CandidateExecutionAuthority,
   SubmitOrderFromDecisionInput,
@@ -70,7 +76,33 @@ export class ExecutionService {
       input.exchangeAccountId,
       idempotencyKey,
     );
+    const candidateContext = await this.prepareCandidateContext(input, market);
     if (duplicate) {
+      if (candidateContext) {
+        let bindingId = `candidate-duplicate-binding:${duplicate.id}`;
+        try {
+          bindingId = await this.assertExactCandidateDuplicate({
+            authority: candidateContext.authority,
+            decision: candidateContext.decision,
+            duplicate,
+            idempotencyKey,
+          });
+        } catch (error) {
+          await this.pauseCandidateIntentFault({
+            authority: candidateContext.authority,
+            decision: candidateContext.decision,
+            input,
+            orderId: duplicate.id,
+            bindingId,
+            stage: "DUPLICATE",
+            occurredAt: candidateFaultOccurredAt(candidateContext.authority, attemptStartedAt),
+          });
+          throw new CandidateExecutionSafetyError(
+            "Candidate duplicate authority or binding is missing or mismatched; execution is paused.",
+            error,
+          );
+        }
+      }
       return {
         accepted: false,
         outcome: "DUPLICATE",
@@ -78,8 +110,6 @@ export class ExecutionService {
         reason: "Duplicate order intent already exists for the same idempotency key.",
       };
     }
-
-    const candidateContext = await this.prepareCandidateContext(input, market);
 
     const leaseOwnerToken = createId("account_execution_lease");
     let acquisitionWindow: { atEpochMs: number; expiresAtEpochMs: number };
@@ -378,7 +408,7 @@ export class ExecutionService {
           orderId,
           bindingId: bindingId!,
           stage: "DERIVATION",
-          occurredAt: candidateTimestamps.bindingCreatedAt,
+          occurredAt: candidateFaultOccurredAt(candidateContext.authority, candidateTimestamps.bindingCreatedAt),
         });
         throw new CandidateExecutionSafetyError(
           "Candidate order binding could not be derived safely; execution is paused.",
@@ -403,7 +433,7 @@ export class ExecutionService {
           orderId,
           bindingId: bindingId!,
           stage: "PERSISTENCE",
-          occurredAt: candidateTimestamps.bindingCreatedAt,
+          occurredAt: candidateFaultOccurredAt(candidateContext.authority, candidateTimestamps.bindingCreatedAt),
         });
         throw new CandidateExecutionSafetyError(
           "Candidate order intent could not be persisted atomically; execution is paused.",
@@ -761,13 +791,47 @@ export class ExecutionService {
     return { authority, decision };
   }
 
+  private async assertExactCandidateDuplicate(input: {
+    authority: CandidateExecutionAuthority;
+    decision: StrategyDecisionRecord;
+    duplicate: OrderRecord;
+    idempotencyKey: string;
+  }): Promise<string> {
+    const candidatePilots = this.dependencies.candidatePilots;
+    if (!candidatePilots) {
+      throw new Error("Candidate duplicate validation requires the candidate repository.");
+    }
+    const binding = await candidatePilots.getExecutionBindingForOrder(input.duplicate.id);
+    if (!binding) {
+      throw new Error("Candidate duplicate order has no persisted execution binding.");
+    }
+    validateCandidateExecutionBinding(binding);
+    const [deployment, exactState, events] = await Promise.all([
+      candidatePilots.getDeployment(input.authority.deploymentId),
+      candidatePilots.getExactState(input.authority.deploymentId),
+      this.dependencies.repositories.listOrderEvents(input.duplicate.id),
+    ]);
+    const persistedEvents = events.filter((event) => event.eventType === "ORDER_PERSISTED");
+    const persistedEvent = persistedEvents[0] ?? null;
+    if (
+      !deployment || !exactState || persistedEvents.length !== 1 || !persistedEvent ||
+      !matchesCandidateDuplicateOrder(input.duplicate, input.decision, input.idempotencyKey) ||
+      !matchesCandidateDuplicateBinding(binding, input.duplicate, input.decision, input.authority) ||
+      !matchesCandidateDuplicateDeployment(deployment, exactState.stateVersion, input.authority) ||
+      !matchesCandidateDuplicatePersistedEvent(persistedEvent, input.duplicate, input.decision)
+    ) {
+      throw new Error("Candidate duplicate order, binding, decision, deployment, or event does not match authority.");
+    }
+    return binding.id;
+  }
+
   private async pauseCandidateIntentFault(input: {
     authority: CandidateExecutionAuthority;
     decision: StrategyDecisionRecord;
     input: SubmitOrderFromDecisionInput;
     orderId: string;
     bindingId: string;
-    stage: "DERIVATION" | "PERSISTENCE";
+    stage: "DUPLICATE" | "DERIVATION" | "PERSISTENCE";
     occurredAt: string;
   }): Promise<void> {
     const candidatePilots = this.dependencies.candidatePilots;
@@ -801,9 +865,10 @@ export class ExecutionService {
         deploymentId: input.authority.deploymentId,
         exchangeAccountId: input.authority.exchangeAccountId,
         faultId,
-        reasonCode: input.stage === "DERIVATION" ? "IDENTITY_MISMATCH" : "ACTIVATION_CAS_CONFLICT",
+        reasonCode: input.stage === "PERSISTENCE" ? "ACTIVATION_CAS_CONFLICT" : "IDENTITY_MISMATCH",
         provenanceJson,
         occurredAt: input.occurredAt,
+        occurredAtPolicy: "ADVANCE_TO_PERSISTED_SUCCESSOR",
       });
     } catch (error) {
       throw new CandidateExecutionSafetyError(
@@ -1442,6 +1507,102 @@ function deriveRequestedNotionalKrw(
 
 function nullableNumberString(value: number | null): string | null {
   return value === null ? null : String(value);
+}
+
+function matchesCandidateDuplicateOrder(
+  order: OrderRecord,
+  decision: StrategyDecisionRecord,
+  idempotencyKey: string,
+): boolean {
+  return order.exchangeAccountId === decision.exchangeAccountId &&
+    order.strategyDecisionId === decision.id &&
+    order.market === decision.market &&
+    order.origin === "STRATEGY" &&
+    order.idempotencyKey === idempotencyKey &&
+    order.identifier.trim() !== "" &&
+    order.createdAt === order.requestedAt &&
+    ((decision.action === "ENTER" || decision.action === "ADD")
+      ? order.side === "bid" && order.ordType === "price" &&
+        order.price === decision.intendedNotionalKrw && order.volume === null
+      : order.side === "ask" && order.ordType === "market" &&
+        order.price === null && order.volume === decision.intendedQuantity) &&
+    order.timeInForce === null && order.smpType === null;
+}
+
+function matchesCandidateDuplicateBinding(
+  binding: CandidateExecutionBindingRecord,
+  order: OrderRecord,
+  decision: StrategyDecisionRecord,
+  authority: CandidateExecutionAuthority,
+): boolean {
+  let expectedRequestedAt: string;
+  try {
+    expectedRequestedAt = formatCanonicalUtcIsoNanoseconds(
+      parseCandidateEvidenceTimestamp(binding.createdAt, "candidate duplicate binding createdAt") + 1n,
+    );
+  } catch {
+    return false;
+  }
+  return binding.deploymentId === authority.deploymentId &&
+    binding.strategyDecisionId === decision.id &&
+    binding.orderId === order.id &&
+    binding.exchangeAccountId === authority.exchangeAccountId &&
+    binding.activationAt === authority.activationAt &&
+    binding.activationEpochNs === authority.activationEpochNs &&
+    binding.market === authority.market &&
+    binding.strategyKey === authority.strategyKey &&
+    binding.policyId === authority.policyId &&
+    binding.policyVersion === authority.policyVersion &&
+    binding.executionMode === order.executionMode &&
+    binding.ordType === order.ordType &&
+    binding.action === decision.action &&
+    binding.side === order.side &&
+    binding.intendedQuantity === decision.intendedQuantity &&
+    binding.intendedNotionalKrw === decision.intendedNotionalKrw &&
+    binding.boundPrice === order.price &&
+    binding.boundVolume === order.volume &&
+    binding.boundTimeInForce === order.timeInForce &&
+    binding.boundSmpType === order.smpType &&
+    order.requestedAt === expectedRequestedAt;
+}
+
+function matchesCandidateDuplicateDeployment(
+  deployment: PositionGuardPilotDeploymentRecord,
+  exactStateVersion: number,
+  authority: CandidateExecutionAuthority,
+): boolean {
+  return deployment.id === authority.deploymentId &&
+    deployment.exchangeAccountId === authority.exchangeAccountId &&
+    deployment.pilotId === authority.pilotId &&
+    deployment.market === authority.market &&
+    deployment.policyId === authority.policyId &&
+    deployment.policyVersion === authority.policyVersion &&
+    deployment.phase === authority.expectedPhase &&
+    deployment.updatedAt === authority.expectedDeploymentUpdatedAt &&
+    deployment.activationAt === authority.activationAt &&
+    deployment.activationEpochNs === authority.activationEpochNs &&
+    exactStateVersion === authority.expectedStateVersion;
+}
+
+function matchesCandidateDuplicatePersistedEvent(
+  event: OrderEventRecord,
+  order: OrderRecord,
+  decision: StrategyDecisionRecord,
+): boolean {
+  if (
+    event.orderId !== order.id || event.eventSource !== "LOCAL" ||
+    event.createdAt !== order.requestedAt
+  ) {
+    return false;
+  }
+  try {
+    const payload = JSON.parse(event.payloadJson) as unknown;
+    return typeof payload === "object" && payload !== null && !Array.isArray(payload) &&
+      (payload as { idempotencyKey?: unknown }).idempotencyKey === order.idempotencyKey &&
+      (payload as { decisionAction?: unknown }).decisionAction === decision.action;
+  } catch {
+    return false;
+  }
 }
 
 function candidateFaultOccurredAt(

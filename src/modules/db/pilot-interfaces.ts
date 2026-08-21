@@ -18,6 +18,10 @@ import {
   type PositionGuardCandidateState,
 } from "../strategy/position-guard-candidate-state.js";
 
+export function parseCandidatePilotTimestamp(value: string, label: string): bigint {
+  return parsePositionGuardCandidateTimestamp(value, label);
+}
+
 export interface CreateCandidatePilotDeploymentInput {
   deployment: PositionGuardPilotDeploymentRecord;
   initialState: PositionGuardCandidateState;
@@ -69,6 +73,7 @@ export interface PauseCandidatePilotForRecoveryFaultInput {
   reasonCode: CandidatePilotRecoveryFaultReason;
   provenanceJson: string;
   occurredAt: string;
+  occurredAtPolicy?: "ADVANCE_TO_PERSISTED_SUCCESSOR";
 }
 
 export interface PauseCandidatePilotForRecoveryFaultResult {
@@ -338,6 +343,12 @@ export function validateCandidatePilotRecoveryFaultInput(
   requireNonEmpty(input.faultId, "candidate recovery fault faultId");
   requireNonEmpty(input.reasonCode, "candidate recovery fault reasonCode");
   parsePositionGuardCandidateTimestamp(input.occurredAt, "candidate recovery fault occurredAt");
+  if (
+    input.occurredAtPolicy !== undefined &&
+    input.occurredAtPolicy !== "ADVANCE_TO_PERSISTED_SUCCESSOR"
+  ) {
+    throw new Error("Candidate recovery fault occurredAtPolicy is invalid.");
+  }
   let provenance: unknown;
   try {
     provenance = JSON.parse(input.provenanceJson) as unknown;
@@ -347,6 +358,51 @@ export function validateCandidatePilotRecoveryFaultInput(
   if (provenance === null || typeof provenance !== "object" || Array.isArray(provenance)) {
     throw new Error("Candidate recovery fault provenanceJson must contain an object.");
   }
+}
+
+export function resolveCandidatePilotRecoveryFaultOccurrence(
+  input: PauseCandidatePilotForRecoveryFaultInput,
+  persistedChronology: readonly string[],
+): PauseCandidatePilotForRecoveryFaultInput {
+  if (input.occurredAtPolicy !== "ADVANCE_TO_PERSISTED_SUCCESSOR") return input;
+  const attemptedEpoch = parsePositionGuardCandidateTimestamp(
+    input.occurredAt,
+    "candidate recovery fault attempted occurredAt",
+  );
+  const latestPersistedEpoch = persistedChronology.reduce<bigint | null>((latest, timestamp) => {
+    const epoch = parsePositionGuardCandidateTimestamp(
+      timestamp,
+      "candidate recovery fault persisted chronology",
+    );
+    return latest === null || epoch > latest ? epoch : latest;
+  }, null);
+  const effectiveEpoch = latestPersistedEpoch !== null && attemptedEpoch <= latestPersistedEpoch
+    ? latestPersistedEpoch + 1n
+    : attemptedEpoch;
+  return {
+    ...input,
+    occurredAt: formatCandidatePilotUtcNanoseconds(effectiveEpoch),
+  };
+}
+
+function formatCandidatePilotUtcNanoseconds(epochNanoseconds: bigint): string {
+  const nanosecondsPerSecond = 1_000_000_000n;
+  const millisecondsPerSecond = 1_000n;
+  const maximumDateMilliseconds = 8_640_000_000_000_000n;
+  if (epochNanoseconds < 0n) {
+    throw new Error("Candidate recovery fault occurrence cannot precede the Unix epoch.");
+  }
+  const wholeSeconds = epochNanoseconds / nanosecondsPerSecond;
+  const fractionalNanoseconds = epochNanoseconds % nanosecondsPerSecond;
+  const wholeMilliseconds = wholeSeconds * millisecondsPerSecond;
+  if (wholeMilliseconds > maximumDateMilliseconds) {
+    throw new Error("Candidate recovery fault occurrence exceeds the supported UTC range.");
+  }
+  const iso = new Date(Number(wholeMilliseconds)).toISOString();
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000Z$/u.test(iso)) {
+    throw new Error("Candidate recovery fault occurrence exceeds the supported canonical UTC range.");
+  }
+  return `${iso.slice(0, 19)}.${fractionalNanoseconds.toString().padStart(9, "0")}Z`;
 }
 
 export function candidatePilotRecoveryFaultReason(

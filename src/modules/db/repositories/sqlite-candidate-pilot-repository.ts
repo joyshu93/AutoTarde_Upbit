@@ -26,6 +26,7 @@ import {
   candidateEvidenceMaterial,
   buildCandidatePilotRecoveryFaultAuditEvent,
   candidatePilotRecoveryFaultReason,
+  resolveCandidatePilotRecoveryFaultOccurrence,
   validateCandidateExecutionBinding,
   validateCandidatePilotDeployment,
   validateCandidatePilotRecoveryFaultInput,
@@ -572,29 +573,42 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
       const existingAuditRow = selectAuditRowById(this.db, input.faultId);
       const existingTransitionRow = selectExecutionStateTransitionRow(this.db, input.faultId);
       const executionState = selectExecutionState(this.db, input.exchangeAccountId);
+      const existingAudit = existingAuditRow ? auditEventFromRow(existingAuditRow) : null;
+      const latestAuditAt = selectLatestAuditTimestamp(this.db, input.deploymentId);
+      const effectiveInput = existingAudit && input.occurredAtPolicy === "ADVANCE_TO_PERSISTED_SUCCESSOR"
+        ? { ...input, occurredAt: existingAudit.createdAt }
+        : resolveCandidatePilotRecoveryFaultOccurrence(input, [
+            deployment.updatedAt,
+            ...(latestAuditAt === null ? [] : [latestAuditAt]),
+          ]);
+      const effectiveFaultOccurrence = {
+        exchangeAccountId: effectiveInput.exchangeAccountId,
+        faultId: effectiveInput.faultId,
+        reason: candidatePilotRecoveryFaultReason(effectiveInput),
+        occurredAt: effectiveInput.occurredAt,
+      };
       const faultPause = {
-        ...faultOccurrence,
-        transitionAt: deriveFaultPauseTransitionAt(input.occurredAt, executionState.updatedAt),
+        ...effectiveFaultOccurrence,
+        transitionAt: deriveFaultPauseTransitionAt(effectiveInput.occurredAt, executionState.updatedAt),
       };
       validateFaultPauseInput(faultPause);
 
       if (existingAuditRow || existingTransitionRow) {
         if (
-          !existingAuditRow ||
+          !existingAudit ||
           !existingTransitionRow ||
           deployment.phase !== "PAUSED_FAULT" ||
-          deployment.updatedAt !== input.occurredAt ||
+          deployment.updatedAt !== effectiveInput.occurredAt ||
           (executionState.systemStatus !== "PAUSED" && executionState.systemStatus !== "KILL_SWITCHED")
         ) {
           throw new Error(`Conflicting partial candidate recovery fault ${input.faultId}.`);
         }
-        const existingAudit = auditEventFromRow(existingAuditRow);
         const existingTransition = executionStateTransitionFromRow(existingTransitionRow);
         if (existingAudit.fromPhase === null || !isFaultPausablePhase(existingAudit.fromPhase)) {
           throw new Error(`Conflicting duplicate candidate recovery fault ${input.faultId}.`);
         }
         const expectedAudit = buildCandidatePilotRecoveryFaultAuditEvent({
-          fault: input,
+          fault: effectiveInput,
           fromPhase: existingAudit.fromPhase,
           stateVersion: stateRow.state_version,
         });
@@ -616,10 +630,9 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
         throw new Error(`Candidate recovery fault cannot pause phase ${deployment.phase}.`);
       }
       const occurredAtEpoch = parsePositionGuardCandidateTimestamp(
-        input.occurredAt,
+        effectiveInput.occurredAt,
         "candidate recovery fault occurredAt",
       );
-      const latestAuditAt = selectLatestAuditTimestamp(this.db, input.deploymentId);
       if (
         occurredAtEpoch < parsePositionGuardCandidateTimestamp(deployment.updatedAt, "deployment updatedAt") ||
         (latestAuditAt !== null && occurredAtEpoch < parsePositionGuardCandidateTimestamp(
@@ -631,7 +644,7 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
       }
       const transitionAt = validateFaultPauseTimestamp(faultPause, executionState);
       const auditEvent = buildCandidatePilotRecoveryFaultAuditEvent({
-        fault: input,
+        fault: effectiveInput,
         fromPhase: deployment.phase,
         stateVersion: stateRow.state_version,
       });
@@ -650,7 +663,7 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
         SET phase = 'PAUSED_FAULT', updated_at = ?
         WHERE id = ? AND exchange_account_id = ? AND phase = ? AND updated_at = ?
       `).run(
-        input.occurredAt,
+        effectiveInput.occurredAt,
         input.deploymentId,
         input.exchangeAccountId,
         deployment.phase,

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 
+import type { CandidateExecutionBindingRecord } from "../src/domain/pilot-types.js";
 import type { ExecutionStateRecord, StrategyDecisionRecord } from "../src/domain/types.js";
 import type { CandidatePilotRepository } from "../src/modules/db/pilot-interfaces.js";
+import { candidateExecutionBindingMaterialHash } from "../src/modules/db/pilot-interfaces.js";
 import { InMemoryAccountExecutionLeaseStore } from
   "../src/modules/db/repositories/in-memory-account-execution-lease-store.js";
 import { InMemoryCandidatePilotRepository } from
@@ -31,6 +33,7 @@ import { test } from "./harness.js";
 const ATTEMPT_AT = "2026-08-21T00:00:00.000Z";
 const ACTIVATION_AT = "2026-08-20T23:59:59.000Z";
 const DEPLOYMENT_UPDATED_AT = "2026-08-20T23:59:59.000Z";
+const FUTURE_CHRONOLOGY_AT = "2026-08-21T01:00:00.000Z";
 
 test("candidate execution persists one atomic bound intent with exact successor timestamps", async () => {
   const fixture = await createFixture();
@@ -189,6 +192,126 @@ test("exact candidate duplicate reuses the existing intent without a second bind
   assert.equal(fixture.repositories.persistCandidateIntentCalls, 1);
   assert.equal(fixture.adapter.createOrderCalls, 1);
   assert.equal((await fixture.repositories.listOrders("primary")).length, 1);
+  assert.equal((await fixture.candidatePilots.getDeployment("deployment-1"))?.phase, "ACTIVE");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "RUNNING");
+});
+
+test("candidate duplicate with no execution binding atomically pauses instead of returning DUPLICATE", async () => {
+  const fixture = await createFixture();
+  const baselineInput = candidateInput();
+  delete baselineInput.candidateAuthority;
+  const first = await fixture.service.submitOrderFromDecision(baselineInput);
+
+  assert.equal(first.accepted, true);
+  await assert.rejects(
+    () => fixture.service.submitOrderFromDecision(candidateInput()),
+    CandidateExecutionSafetyError,
+  );
+
+  assert.equal(fixture.adapter.createOrderCalls, 1);
+  assert.equal(fixture.repositories.persistCandidateIntentCalls, 0);
+  assert.equal((await fixture.repositories.listOrders("primary")).length, 1);
+  assert.equal((await fixture.candidatePilots.getDeployment("deployment-1"))?.phase, "PAUSED_FAULT");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  const audit = (await fixture.candidatePilots.listAuditEvents("deployment-1")).at(-1);
+  const payload = JSON.parse(audit!.payloadJson) as { reasonCode: string };
+  assert.equal(payload.reasonCode, "IDENTITY_MISMATCH");
+});
+
+test("candidate duplicate with mismatched deployment binding atomically pauses", async () => {
+  const fixture = await createFixture({
+    transformDuplicateBinding: (binding) => rehashBinding({
+      ...binding,
+      deploymentId: "other-deployment",
+    }),
+  });
+  await fixture.service.submitOrderFromDecision(candidateInput());
+
+  await assert.rejects(
+    () => fixture.service.submitOrderFromDecision(candidateInput()),
+    CandidateExecutionSafetyError,
+  );
+
+  assert.equal(fixture.adapter.createOrderCalls, 1);
+  assert.equal(fixture.repositories.persistCandidateIntentCalls, 1);
+  assert.equal((await fixture.candidatePilots.getDeployment("deployment-1"))?.phase, "PAUSED_FAULT");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("candidate duplicate with mismatched bound order material atomically pauses", async () => {
+  const fixture = await createFixture({
+    transformDuplicateBinding: (binding) => rehashBinding({
+      ...binding,
+      boundPrice: "5999",
+    }),
+  });
+  await fixture.service.submitOrderFromDecision(candidateInput());
+
+  await assert.rejects(
+    () => fixture.service.submitOrderFromDecision(candidateInput()),
+    CandidateExecutionSafetyError,
+  );
+
+  assert.equal(fixture.adapter.createOrderCalls, 1);
+  assert.equal(fixture.repositories.persistCandidateIntentCalls, 1);
+  assert.equal((await fixture.candidatePilots.getDeployment("deployment-1"))?.phase, "PAUSED_FAULT");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("non-candidate duplicate preserves the existing DUPLICATE result without pausing", async () => {
+  const fixture = await createFixture();
+  const input = candidateInput();
+  delete input.candidateAuthority;
+
+  const first = await fixture.service.submitOrderFromDecision(input);
+  const second = await fixture.service.submitOrderFromDecision(input);
+
+  assert.equal(first.accepted, true);
+  assert.equal(second.outcome, "DUPLICATE");
+  assert.equal(fixture.adapter.createOrderCalls, 1);
+  assert.equal((await fixture.candidatePilots.getDeployment("deployment-1"))?.phase, "ACTIVE");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "RUNNING");
+});
+
+test("candidate derivation fault advances past authority deployment chronology under clock skew", async () => {
+  const fixture = await createFixture();
+  const baseAuthority = candidateAuthority();
+  if (baseAuthority.expectedPhase !== "ACTIVE") throw new Error("test authority must be ACTIVE");
+  const skewedAuthority: CandidateExecutionAuthority = {
+    ...baseAuthority,
+    expectedDeploymentUpdatedAt: FUTURE_CHRONOLOGY_AT,
+    routeReason: "CANDIDATE_EARLY_THESIS_FAILURE" as const,
+  };
+
+  await assert.rejects(
+    () => fixture.service.submitOrderFromDecision(candidateInput(skewedAuthority)),
+    CandidateExecutionSafetyError,
+  );
+
+  const audit = (await fixture.candidatePilots.listAuditEvents("deployment-1")).at(-1);
+  assert.equal((await fixture.candidatePilots.getDeployment("deployment-1"))?.phase, "PAUSED_FAULT");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  assert.ok(Date.parse(audit!.createdAt) >= Date.parse(FUTURE_CHRONOLOGY_AT));
+  assert.equal(fixture.adapter.createOrderCalls, 0);
+  assert.notEqual(await fixture.leases.getLease("primary"), null);
+});
+
+test("candidate persistence fault advances past latest audit chronology under clock skew", async () => {
+  const fixture = await createFixture({ failCandidatePersistence: true });
+  await appendFutureCandidateAudit(fixture.candidatePilots);
+  const authority = { ...candidateAuthority(), expectedStateVersion: 1 };
+
+  await assert.rejects(
+    () => fixture.service.submitOrderFromDecision(candidateInput(authority)),
+    CandidateExecutionSafetyError,
+  );
+
+  const audit = (await fixture.candidatePilots.listAuditEvents("deployment-1")).at(-1);
+  assert.equal((await fixture.candidatePilots.getDeployment("deployment-1"))?.phase, "PAUSED_FAULT");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  assert.ok(Date.parse(audit!.createdAt) >= Date.parse(FUTURE_CHRONOLOGY_AT));
+  assert.equal(fixture.adapter.createOrderCalls, 0);
+  assert.notEqual(await fixture.leases.getLease("primary"), null);
 });
 
 class RecordingExecutionRepository extends InMemoryExecutionRepository {
@@ -267,6 +390,7 @@ async function createFixture(options: {
   failCandidatePersistence?: boolean;
   saveDecision?: boolean;
   live?: boolean;
+  transformDuplicateBinding?: (binding: CandidateExecutionBindingRecord) => CandidateExecutionBindingRecord;
 } = {}) {
   const operatorState = new InMemoryOperatorStateStore(executionState(options.live ?? false));
   const candidatePilots = new InMemoryCandidatePilotRepository(operatorState);
@@ -291,7 +415,7 @@ async function createFixture(options: {
     now: () => ATTEMPT_AT,
     ...(options.includeCandidateDependency === false
       ? {}
-      : { candidatePilots: narrowCandidatePilots(candidatePilots) }),
+      : { candidatePilots: narrowCandidatePilots(candidatePilots, options.transformDuplicateBinding) }),
   };
   const service = new ExecutionService(dependencies);
 
@@ -406,13 +530,45 @@ function candidateInput(
   };
 }
 
-function narrowCandidatePilots(candidatePilots: CandidatePilotRepository) {
+function narrowCandidatePilots(
+  candidatePilots: CandidatePilotRepository,
+  transformDuplicateBinding?: (binding: CandidateExecutionBindingRecord) => CandidateExecutionBindingRecord,
+) {
   return {
     getDeployment: candidatePilots.getDeployment.bind(candidatePilots),
     getExactState: candidatePilots.getExactState.bind(candidatePilots),
-    getExecutionBindingForOrder: candidatePilots.getExecutionBindingForOrder.bind(candidatePilots),
+    getExecutionBindingForOrder: async (orderId: string) => {
+      const binding = await candidatePilots.getExecutionBindingForOrder(orderId);
+      return binding && transformDuplicateBinding ? transformDuplicateBinding(binding) : binding;
+    },
     pauseForRecoveryFault: candidatePilots.pauseForRecoveryFault.bind(candidatePilots),
   };
+}
+
+function rehashBinding(
+  binding: CandidateExecutionBindingRecord,
+): CandidateExecutionBindingRecord {
+  const next = { ...binding, orderMaterialHash: "" };
+  next.orderMaterialHash = candidateExecutionBindingMaterialHash(next);
+  return next;
+}
+
+async function appendFutureCandidateAudit(candidatePilots: CandidatePilotRepository): Promise<void> {
+  await candidatePilots.advanceStateWithEvidence({
+    deploymentId: "deployment-1",
+    expectedStateVersion: 0,
+    evidence: {
+      evidenceId: "future-chronology",
+      executedAt: FUTURE_CHRONOLOGY_AT,
+      action: "ENTER",
+      entryPath: "RECLAIM",
+      terminalStatus: "FILLED",
+      executedQuantity: "0.00001",
+      grossQuoteValueKrw: "1000",
+      confirmedFeeKrw: "0.5",
+      remainingQuantity: "0.00001",
+    },
+  });
 }
 
 function executionState(live: boolean): ExecutionStateRecord {

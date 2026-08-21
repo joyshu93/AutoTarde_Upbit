@@ -130,6 +130,10 @@ Every order intent requires:
 
 Idempotency is used to prevent duplicate active orders for the same decision and request fingerprint.
 
+Candidate idempotency retries are additionally evidence-bound. An existing fingerprint is reusable only when the existing order, immutable binding, persisted decision, first `ORDER_PERSISTED` event, deployment authority, and order material are exact matches. An unbound or mismatched candidate duplicate is a fail-closed recovery fault: no binding is projected, no order is transmitted, and pilot plus global execution are paused atomically. Ordinary non-candidate duplicate handling is unchanged.
+
+Candidate intent-fault timestamps are resolved by the candidate repository only when the execution service explicitly requests `ADVANCE_TO_PERSISTED_SUCCESSOR`. The repository preserves strict chronology for every ordinary caller, but for this narrow fault path it chooses the canonical attempted instant or, when persisted deployment/audit chronology is later, exactly its next nanosecond inside the same serialized pause transaction. The deterministic fault identity and immutable provenance remain based on the failed attempt rather than the adjusted persistence instant.
+
 ## Cancellation
 
 Cancellation must preserve lifecycle evidence:

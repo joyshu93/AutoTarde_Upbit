@@ -2,10 +2,10 @@ import type { CandidateExecutionBindingRecord } from "../../domain/pilot-types.j
 import type { OrderRecord, StrategyDecisionRecord } from "../../domain/types.js";
 import {
   candidateExecutionBindingMaterialHash,
+  parseCandidatePilotTimestamp,
   validateCandidateExecutionBinding,
 } from "../db/pilot-interfaces.js";
 import { validateCandidateBoundOrderIntent } from "../db/repositories/candidate-bound-order-validation.js";
-import { parsePositionGuardCandidateTimestamp } from "../strategy/position-guard-candidate-state.js";
 import type { CandidateExecutionAuthority } from "./interfaces.js";
 
 const AUTHORITY_KEYS = [
@@ -60,7 +60,7 @@ export function validateCandidateExecutionAuthority(value: unknown): CandidateEx
   if (typeof record.activationAt !== "string" || typeof record.activationEpochNs !== "bigint") {
     throw new Error("Candidate execution authority activation timestamp and epoch are invalid.");
   }
-  const activationEpochNs = parsePositionGuardCandidateTimestamp(
+  const activationEpochNs = parseCandidatePilotTimestamp(
     record.activationAt,
     "execution authority activationAt",
   );
@@ -70,7 +70,7 @@ export function validateCandidateExecutionAuthority(value: unknown): CandidateEx
   if (typeof record.expectedDeploymentUpdatedAt !== "string") {
     throw new Error("Candidate execution authority expected deployment updatedAt is invalid.");
   }
-  const deploymentUpdatedAt = parsePositionGuardCandidateTimestamp(
+  const deploymentUpdatedAt = parseCandidatePilotTimestamp(
     record.expectedDeploymentUpdatedAt,
     "execution authority expected deployment updatedAt",
   );
@@ -197,7 +197,7 @@ export function createCandidateExecutionAttemptTimestamps(input: {
   if (typeof record.bindingCreatedAt !== "string") {
     throw new Error("Candidate execution binding createdAt must be a timestamp string.");
   }
-  const bindingEpochNs = parsePositionGuardCandidateTimestamp(
+  const bindingEpochNs = parseCandidatePilotTimestamp(
     record.bindingCreatedAt,
     "execution binding createdAt",
   );

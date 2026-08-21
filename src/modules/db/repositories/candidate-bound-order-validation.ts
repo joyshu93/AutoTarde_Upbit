@@ -8,7 +8,7 @@ import type {
   StrategyDecisionRecord,
 } from "../../../domain/types.js";
 import { canonicalNonNegativeDecimal } from "../../execution/candidate-evidence-decimals.js";
-import { parsePositionGuardCandidateTimestamp } from "../../strategy/position-guard-candidate-state.js";
+import { parseCandidatePilotTimestamp } from "../pilot-interfaces.js";
 import type {
   PersistCandidateBoundOrderIntentInput,
   PersistCandidateBoundOrderIntentRequest,
@@ -74,7 +74,7 @@ export function validateCandidateBoundOrderIntent(
   if (value.expectedPhase !== "ACTIVE" && value.expectedPhase !== "DRAINING") {
     throw new Error("Candidate-bound order intent expected deployment phase is invalid.");
   }
-  parsePositionGuardCandidateTimestamp(
+  parseCandidatePilotTimestamp(
     value.expectedDeploymentUpdatedAt,
     "candidate-bound expected deployment updatedAt",
   );
@@ -156,15 +156,15 @@ function validateDecision(
   validateOptionalDecimal(decision.intendedQuantity, "decision intendedQuantity");
   validateOptionalDecimal(decision.intendedNotionalKrw, "decision intendedNotionalKrw");
   validateOptionalDecimal(decision.referencePrice, "decision referencePrice");
-  const decisionCreatedAt = parsePositionGuardCandidateTimestamp(
+  const decisionCreatedAt = parseCandidatePilotTimestamp(
     decision.createdAt,
     "candidate-bound decision createdAt",
   );
-  const bindingCreatedAt = parsePositionGuardCandidateTimestamp(
+  const bindingCreatedAt = parseCandidatePilotTimestamp(
     binding.createdAt,
     "candidate-bound binding createdAt",
   );
-  const requestedAt = parsePositionGuardCandidateTimestamp(
+  const requestedAt = parseCandidatePilotTimestamp(
     order.requestedAt,
     "candidate-bound order requestedAt",
   );
@@ -248,8 +248,8 @@ function validateImmutableRequest(
   ) {
     throw new Error("Candidate-bound order timestamps must share the immutable request instant.");
   }
-  const bindingCreatedAt = parsePositionGuardCandidateTimestamp(binding.createdAt, "binding createdAt");
-  const requestedAt = parsePositionGuardCandidateTimestamp(order.requestedAt, "order requestedAt");
+  const bindingCreatedAt = parseCandidatePilotTimestamp(binding.createdAt, "binding createdAt");
+  const requestedAt = parseCandidatePilotTimestamp(order.requestedAt, "order requestedAt");
   if (requestedAt !== bindingCreatedAt + 1n) {
     throw new Error("Candidate order requestedAt must be the exact nanosecond successor of binding createdAt.");
   }

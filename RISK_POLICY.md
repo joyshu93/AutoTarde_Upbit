@@ -45,6 +45,7 @@ If either condition is missing, the system must behave as non-live, and risk eva
 - every order intent requires an idempotency key
 - the system must reject duplicate active intents for the same fingerprint
 - duplicate suppression must not rely only on message cooldowns or human-readable summaries
+- a candidate retry may return `DUPLICATE` only when its persisted order, first event, decision, immutable execution binding, deployment authority, and order material match exactly. Missing or conflicting candidate evidence must atomically pause the pilot and global execution, transmit no order, and never create or attach a replacement binding. Non-candidate duplicate behavior is unchanged.
 
 ### Account Execution Lease
 
@@ -108,6 +109,7 @@ The execution path should validate orders through:
 - an `ORDER_SUBMISSION_ABSENCE_CONFIRMED` `FAILED` row is a completed recovery conclusion and must be excluded before the next run constructs or budgets exchange lookup candidates
 - terminal BTC candidate evidence may advance only from a persisted `STRATEGY` order with a valid persisted deployment binding and PositionGuard decision, terminal `FILLED` or `CANCELED` lifecycle, nonzero aggregate fills, and confirmed per-fill KRW fees on every fill. Exact decimal evidence is persisted atomically with candidate-state CAS and audit data; legacy, allocated, missing, or conflicting provenance faults and pauses instead of substituting values or retrying execution.
 - a candidate projection fault event is disposed only with its matching persisted automatic fault-pause transition. A restart must atomically repair standard or recovered-projection event-written/pause-missing states without changing immutable event time; the repair transition uses an explicit attempt time raised atomically to at least the current execution-state time. A terminal no-fill marker cannot suppress later durable fills, which require projection or an explicit fault. Malformed persisted deployment activation data must enter this fault path rather than aborting the sweep.
+- normal candidate recovery-fault persistence keeps strict caller-supplied chronology and rejects backdated timestamps. Candidate intent derivation, duplicate-validation, and atomic-persistence faults alone may explicitly request a repository-computed canonical occurrence time; inside the same serialized transaction the repository advances that time to exactly one nanosecond after the latest deployment or audit chronology when required, without changing deterministic fault provenance.
 - if post-send local persistence fails, retain the durable `SUBMITTING` order and lease, attempt an automatic pause, and fail the run rather than retrying transmission
 
 ## Operator Controls
