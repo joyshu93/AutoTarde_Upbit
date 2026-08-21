@@ -23,7 +23,10 @@ import type {
   SupportedMarket,
   TelegramInboundOffsetRecord,
 } from "../../../domain/types.js";
-import type { OrderSubmissionRecoveryObservationRecord } from "../../../domain/pilot-types.js";
+import type {
+  CandidateExecutionBindingRecord,
+  OrderSubmissionRecoveryObservationRecord,
+} from "../../../domain/pilot-types.js";
 import type {
   ExecutionRepository,
   FinalizeBoundedSubmissionAbsenceInput,
@@ -31,10 +34,14 @@ import type {
   PersistCandidateProjectionFaultInput,
   OperatorStateStore,
   PersistExchangeSubmissionInput,
+  InMemoryCandidateBoundOrderStore,
+  PersistCandidateBoundOrderIntentInput,
+  PersistCandidateBoundOrderIntentRequest,
   PersistOrderIntentInput,
   PersistUncertainSubmissionInput,
   TelegramInboundOffsetStore,
 } from "../interfaces.js";
+import { validateCandidateBoundOrderIntent } from "./candidate-bound-order-validation.js";
 import {
   recordsEqual,
   faultPauseTransitionMatchesOccurrence,
@@ -77,6 +84,7 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
 
   constructor(
     private readonly atomicFaultPauseStore?: Pick<InMemoryOperatorStateStore, "applyFaultPauseAtomically">,
+    private readonly candidateBoundOrderStore?: InMemoryCandidateBoundOrderStore,
   ) {}
 
   async saveStrategyDecision(record: StrategyDecisionRecord): Promise<void> {
@@ -136,6 +144,87 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
 
     const nextOrders = [...this.orders, cloneRecord(input.order)];
     const nextOrderEvents = [...this.orderEvents, cloneRecord(input.event)];
+    this.orders = nextOrders;
+    this.orderEvents = nextOrderEvents;
+  }
+
+  async persistCandidateBoundOrderIntent(input: PersistCandidateBoundOrderIntentRequest): Promise<void> {
+    validateCandidateBoundRequestShape(input);
+    if (!this.candidateBoundOrderStore) {
+      throw new Error("In-memory candidate-bound order store is required.");
+    }
+    const decision = this.strategyDecisions.find((candidate) => candidate.id === input.order.strategyDecisionId);
+    const prepared = this.candidateBoundOrderStore.prepareCandidateBoundOrderIntent(input.binding);
+    if (!decision) {
+      throw new Error(`Persisted candidate strategy decision ${input.order.strategyDecisionId ?? "none"} is missing.`);
+    }
+    if (!prepared.deployment || prepared.exactStateVersion === null) {
+      throw new Error(`Persisted candidate authority ${input.binding.deploymentId} is missing.`);
+    }
+    const aggregate: PersistCandidateBoundOrderIntentInput = {
+      order: input.order,
+      event: input.event,
+      binding: input.binding,
+      decision: cloneRecord(decision),
+      deployment: prepared.deployment,
+      exactStateVersion: prepared.exactStateVersion,
+      expectedPhase: input.expectedPhase,
+      expectedDeploymentUpdatedAt: input.expectedDeploymentUpdatedAt,
+      expectedStateVersion: input.expectedStateVersion,
+    };
+    validateCandidateBoundOrderIntent(aggregate);
+
+    const existingOrdersById = this.orders.filter((candidate) => candidate.id === input.order.id);
+    const existingEventsById = this.orderEvents.filter((candidate) => candidate.id === input.event.id);
+    const existingOrder = existingOrdersById[0] ?? null;
+    const existingEventById = existingEventsById[0] ?? null;
+    const existingOrderEvents = this.orderEvents.filter((candidate) => candidate.orderId === input.order.id);
+    const existingBindingByOrder = prepared.existingBindingByOrderId;
+    const existingBindingById = prepared.existingBindingById;
+
+    if (existingOrdersById.length > 1) {
+      throw new Error(`Conflicting duplicate candidate-bound order id ${input.order.id}.`);
+    }
+    if (existingEventsById.length > 1) {
+      throw new Error(`Conflicting duplicate candidate-bound order event id ${input.event.id}.`);
+    }
+    if (existingEventById && !recordsEqual(existingEventById, input.event)) {
+      throw new Error(`Conflicting candidate-bound order event ${input.event.id}.`);
+    }
+    if (existingBindingByOrder && !recordsEqual(existingBindingByOrder, input.binding)) {
+      throw new Error(`Conflicting candidate-bound binding for order ${input.order.id}.`);
+    }
+    if (existingBindingById && !recordsEqual(existingBindingById, input.binding)) {
+      throw new Error(`Conflicting candidate-bound binding id ${input.binding.id}.`);
+    }
+
+    const componentCount = Number(existingOrder !== null) +
+      Number(existingOrderEvents.length > 0 || existingEventById !== null) +
+      Number(existingBindingByOrder !== null || existingBindingById !== null);
+    if (componentCount > 0) {
+      if (
+        !existingOrder || !recordsEqual(existingOrder, input.order) ||
+        existingOrderEvents.length !== 1 || !recordsEqual(existingOrderEvents[0]!, input.event) ||
+        !existingEventById ||
+        !existingBindingByOrder || !existingBindingById ||
+        !recordsEqual(existingBindingByOrder, input.binding) ||
+        !recordsEqual(existingBindingById, input.binding)
+      ) {
+        throw new Error(`Dangling partial candidate-bound order intent ${input.order.id}.`);
+      }
+      prepared.commitBinding();
+      return;
+    }
+
+    validateNewOrderUniqueness(this.orders, input.order);
+    const nextOrders = [...this.orders, cloneRecord(input.order)];
+    const nextOrderEvents = [...this.orderEvents, cloneRecord(input.event)];
+    const bindingClone = cloneCandidateBinding(input.binding);
+    if (!recordsEqual(bindingClone, input.binding)) {
+      throw new Error("Candidate-bound binding clone changed material.");
+    }
+
+    prepared.commitBinding();
     this.orders = nextOrders;
     this.orderEvents = nextOrderEvents;
   }
@@ -959,6 +1048,39 @@ function findStoredFill(fills: FillRecord[], fill: FillRecord): FillRecord | und
 function cloneRecord<T extends object>(record: T): T {
   return { ...record };
 }
+
+function cloneCandidateBinding(record: CandidateExecutionBindingRecord): CandidateExecutionBindingRecord {
+  return { ...record };
+}
+
+const CANDIDATE_BOUND_REQUEST_KEYS = [
+  "order",
+  "event",
+  "binding",
+  "expectedPhase",
+  "expectedDeploymentUpdatedAt",
+  "expectedStateVersion",
+] as const;
+
+function validateCandidateBoundRequestShape(input: PersistCandidateBoundOrderIntentRequest): void {
+  if (typeof input !== "object" || input === null || Object.getPrototypeOf(input) !== Object.prototype) {
+    throw new Error("Candidate-bound order persistence request must be a plain object.");
+  }
+  const keys = Reflect.ownKeys(input);
+  if (
+    keys.length !== CANDIDATE_BOUND_REQUEST_KEYS.length ||
+    keys.some((key) => typeof key !== "string" || !CANDIDATE_BOUND_REQUEST_KEYS.includes(
+      key as (typeof CANDIDATE_BOUND_REQUEST_KEYS)[number],
+    )) ||
+    keys.some((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      return !descriptor || !("value" in descriptor) || descriptor.enumerable !== true;
+    })
+  ) {
+    throw new Error("Candidate-bound order persistence request must contain exactly own data properties.");
+  }
+}
+
 
 function formatFaultPauseReason(input: FaultPauseInput): string {
   return `faultId=${input.faultId}; reason=${input.reason}`;

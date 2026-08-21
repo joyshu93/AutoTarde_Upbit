@@ -47,6 +47,29 @@ export interface PersistCandidateBoundOrderIntentInput {
   expectedStateVersion: number;
 }
 
+export interface PersistCandidateBoundOrderIntentRequest {
+  order: OrderRecord;
+  event: OrderEventRecord;
+  binding: CandidateExecutionBindingRecord;
+  expectedPhase: "ACTIVE" | "DRAINING";
+  expectedDeploymentUpdatedAt: string;
+  expectedStateVersion: number;
+}
+
+export interface PreparedInMemoryCandidateBoundOrderIntent {
+  deployment: PositionGuardPilotDeploymentRecord | null;
+  exactStateVersion: number | null;
+  existingBindingByOrderId: CandidateExecutionBindingRecord | null;
+  existingBindingById: CandidateExecutionBindingRecord | null;
+  commitBinding(): void;
+}
+
+export interface InMemoryCandidateBoundOrderStore {
+  prepareCandidateBoundOrderIntent(
+    binding: CandidateExecutionBindingRecord,
+  ): PreparedInMemoryCandidateBoundOrderIntent;
+}
+
 export interface PersistExchangeSubmissionInput {
   order: OrderRecord;
   event: OrderEventRecord;

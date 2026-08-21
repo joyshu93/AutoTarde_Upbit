@@ -33,14 +33,18 @@ import {
   type PauseCandidatePilotForRecoveryFaultInput,
   type PauseCandidatePilotForRecoveryFaultResult,
 } from "../pilot-interfaces.js";
-import { deriveFaultPauseTransitionAt } from "./atomic-lifecycle-validation.js";
+import type {
+  InMemoryCandidateBoundOrderStore,
+  PreparedInMemoryCandidateBoundOrderIntent,
+} from "../interfaces.js";
+import { deriveFaultPauseTransitionAt, recordsEqual } from "./atomic-lifecycle-validation.js";
 
 interface StoredEvidence {
   record: Readonly<CandidateEvidenceRecord>;
   epochNanoseconds: bigint;
 }
 
-export class InMemoryCandidatePilotRepository implements CandidatePilotRepository {
+export class InMemoryCandidatePilotRepository implements CandidatePilotRepository, InMemoryCandidateBoundOrderStore {
   private readonly deployments = new Map<string, PositionGuardPilotDeploymentRecord>();
   private readonly exactStates = new Map<string, Readonly<ExactCandidateState>>();
   private readonly evidence = new Map<string, StoredEvidence[]>();
@@ -207,8 +211,66 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
       }
       return { ...existing };
     }
+    const existingById = [...this.bindingsByOrderId.values()]
+      .find((candidate) => candidate.id === binding.id);
+    if (existingById) {
+      throw new Error(`Conflicting candidate execution binding id ${binding.id}.`);
+    }
     this.bindingsByOrderId.set(binding.orderId, { ...binding });
     return { ...binding };
+  }
+
+  prepareCandidateBoundOrderIntent(
+    input: CandidateExecutionBindingRecord,
+  ): PreparedInMemoryCandidateBoundOrderIntent {
+    const binding = { ...validateCandidateExecutionBinding(input) };
+    const deployment = this.deployments.get(binding.deploymentId);
+    const exactState = this.exactStates.get(binding.deploymentId);
+    const existingByOrder = this.bindingsByOrderId.get(binding.orderId);
+    const existingById = [...this.bindingsByOrderId.values()]
+      .find((candidate) => candidate.id === binding.id);
+    const deploymentSnapshot = deployment ? { ...deployment } : null;
+    const exactStateSnapshot = exactState ? { ...exactState } : null;
+    const existingByOrderSnapshot = existingByOrder ? { ...existingByOrder } : null;
+    const existingByIdSnapshot = existingById ? { ...existingById } : null;
+    let used = false;
+
+    return {
+      deployment: deploymentSnapshot ? { ...deploymentSnapshot } : null,
+      exactStateVersion: exactStateSnapshot?.stateVersion ?? null,
+      existingBindingByOrderId: existingByOrderSnapshot ? { ...existingByOrderSnapshot } : null,
+      existingBindingById: existingByIdSnapshot ? { ...existingByIdSnapshot } : null,
+      commitBinding: () => {
+        if (used) {
+          throw new Error("Candidate-bound binding commit capability is single-use and was already used.");
+        }
+        used = true;
+        const currentDeployment = this.deployments.get(binding.deploymentId) ?? null;
+        const currentExactState = this.exactStates.get(binding.deploymentId) ?? null;
+        const currentByOrder = this.bindingsByOrderId.get(binding.orderId) ?? null;
+        const currentById = [...this.bindingsByOrderId.values()]
+          .find((candidate) => candidate.id === binding.id) ?? null;
+        if (
+          !optionalRecordsEqual(currentDeployment, deploymentSnapshot) ||
+          !optionalRecordsEqual(currentExactState, exactStateSnapshot) ||
+          !optionalBindingsEqual(currentByOrder, existingByOrderSnapshot) ||
+          !optionalBindingsEqual(currentById, existingByIdSnapshot)
+        ) {
+          throw new Error("Candidate-bound order authority changed before binding commit.");
+        }
+        if (currentByOrder || currentById) {
+          if (
+            !currentByOrder || !currentById ||
+            !sameBinding(currentByOrder, binding) ||
+            !sameBinding(currentById, binding)
+          ) {
+            throw new Error("Candidate-bound order binding conflicts with prepared authority.");
+          }
+          return;
+        }
+        this.bindingsByOrderId.set(binding.orderId, binding);
+      },
+    };
   }
 
   async getExecutionBindingForOrder(orderId: string): Promise<CandidateExecutionBindingRecord | null> {
@@ -499,6 +561,19 @@ function sameBinding(left: CandidateExecutionBindingRecord, right: CandidateExec
     left.materialVersion === right.materialVersion &&
     left.orderMaterialHash === right.orderMaterialHash &&
     left.createdAt === right.createdAt;
+}
+
+function optionalBindingsEqual(
+  left: CandidateExecutionBindingRecord | null,
+  right: CandidateExecutionBindingRecord | null,
+): boolean {
+  if (left === null || right === null) return left === right;
+  return sameBinding(left, right);
+}
+
+function optionalRecordsEqual<T extends object>(left: T | null, right: T | null): boolean {
+  if (left === null || right === null) return left === right;
+  return recordsEqual(left, right);
 }
 
 function compareSqliteBinaryText(left: string, right: string): number {
