@@ -21,6 +21,8 @@ import {
 } from "./candidate-pilot-repository-contract.test.js";
 import { verifyAccountExecutionLeaseContract } from "./account-execution-lease-contract.test.js";
 
+const MIGRATION_0018 = "0018_scope_candidate_evidence_identity_to_deployment.sql";
+
 test("sqlite candidate pilot repository satisfies the common contracts", async () => {
   await withFreshBundle("candidate-contract", async (bundle) => {
     await verifyCandidatePilotRepositoryContract(() => bundle.candidatePilots);
@@ -124,6 +126,139 @@ test("migration 0017 reserves exact values and preserves pre-0017 rows and deliv
     assertDatabaseIntegrity(handle.db);
   } finally {
     handle.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("migration 0018 upgrades a recorded original 0017 without losing pilot state", async () => {
+  const databasePath = await createTempDatabasePath("upgrade-original-0017");
+  await createAppliedOriginal0017Fixture(databasePath);
+
+  const handle = openSqliteDatabase(databasePath);
+  try {
+    const migration = handle.db.prepare(
+      "SELECT filename FROM _schema_migrations WHERE filename = ?",
+    ).get(MIGRATION_0018) as { filename: string } | undefined;
+    assert.equal(migration?.filename, MIGRATION_0018);
+    assertCompositeEvidenceIdentity(handle.db);
+
+    const existingEvidence = handle.db.prepare(`
+      SELECT id, deployment_id, material_hash
+      FROM strategy_candidate_execution_evidence
+      WHERE deployment_id = ? AND id = ?
+    `).get("original-0017-primary", "original-evidence") as {
+      id: string;
+      deployment_id: string;
+      material_hash: string;
+    } | undefined;
+    assert.equal(existingEvidence?.deployment_id, "original-0017-primary");
+    assert.equal(existingEvidence?.id, "original-evidence");
+    assert.equal(existingEvidence?.material_hash.length, 64);
+
+    const repository = new SqliteCandidatePilotRepository(handle.db);
+    const existingState = await repository.getState("original-0017-primary");
+    assert.equal(existingState?.stateVersion, 1);
+    assert.equal(existingState?.lastEvidenceId, "original-evidence");
+    assert.equal((await repository.getState("original-0017-secondary"))?.stateVersion, 0);
+
+    assert.throws(() => handle.db.prepare(`
+      UPDATE strategy_candidate_execution_evidence
+      SET id = id
+      WHERE deployment_id = ? AND id = ?
+    `).run("original-0017-primary", "original-evidence"), /append-only/i);
+    assert.throws(() => handle.db.prepare(`
+      DELETE FROM strategy_candidate_execution_evidence
+      WHERE deployment_id = ? AND id = ?
+    `).run("original-0017-primary", "original-evidence"), /append-only/i);
+
+    await repository.advanceStateWithEvidence(
+      advanceInput("original-0017-primary", "shared-after-upgrade", 1, {
+        action: "ADD",
+        executedAt: "2026-08-21T00:00:02.000Z",
+        remainingQuantity: 0.2,
+      }),
+    );
+    await repository.advanceStateWithEvidence(
+      advanceInput("original-0017-secondary", "shared-after-upgrade", 0),
+    );
+    const sharedRows = handle.db.prepare(`
+      SELECT deployment_id
+      FROM strategy_candidate_execution_evidence
+      WHERE id = ?
+      ORDER BY deployment_id ASC
+    `).all("shared-after-upgrade") as unknown as Array<{ deployment_id: string }>;
+    assert.deepEqual(
+      sharedRows.map((row) => row.deployment_id),
+      ["original-0017-primary", "original-0017-secondary"],
+    );
+    assertDatabaseIntegrity(handle.db);
+  } finally {
+    handle.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("migration 0018 remains valid after fresh current composite 0017", async () => {
+  await withFreshBundle("migration-0018-fresh", async (_bundle, _databasePath, db) => {
+    const migration = db.prepare(
+      "SELECT filename FROM _schema_migrations WHERE filename = ?",
+    ).get(MIGRATION_0018) as { filename: string } | undefined;
+    assert.equal(migration?.filename, MIGRATION_0018);
+    assertCompositeEvidenceIdentity(db);
+    assertDatabaseIntegrity(db);
+  });
+});
+
+test("migration 0018 rolls back its evidence and state rebuild atomically", async () => {
+  const databasePath = await createTempDatabasePath("rollback-0018");
+  await createAppliedOriginal0017Fixture(databasePath);
+
+  try {
+    const before = new DatabaseSync(databasePath);
+    before.exec("ALTER TABLE strategy_candidate_execution_evidence DROP COLUMN material_hash;");
+    before.close();
+
+    let unexpectedHandle: ReturnType<typeof openSqliteDatabase> | undefined;
+    try {
+      assert.throws(() => {
+        unexpectedHandle = openSqliteDatabase(databasePath);
+      }, /material_hash/i);
+    } finally {
+      unexpectedHandle?.close();
+    }
+
+    const after = new DatabaseSync(databasePath);
+    try {
+      const migration = after.prepare(
+        "SELECT filename FROM _schema_migrations WHERE filename = ?",
+      ).get(MIGRATION_0018);
+      const legacyTables = after.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name LIKE '%0018_legacy%'
+      `).all();
+      assert.equal(migration, undefined);
+      assert.deepEqual(legacyTables, []);
+      assertGlobalEvidenceIdentity(after);
+      assert.equal((after.prepare(`
+        SELECT COUNT(*) AS count
+        FROM strategy_candidate_execution_evidence
+        WHERE deployment_id = ? AND id = ?
+      `).get("original-0017-primary", "original-evidence") as { count: number }).count, 1);
+      assert.equal((after.prepare(`
+        SELECT COUNT(*) AS count
+        FROM strategy_candidate_states
+        WHERE deployment_id IN (?, ?)
+      `).get("original-0017-primary", "original-0017-secondary") as { count: number }).count, 2);
+      assert.throws(() => after.prepare(`
+        UPDATE strategy_candidate_execution_evidence
+        SET id = id
+        WHERE deployment_id = ? AND id = ?
+      `).run("original-0017-primary", "original-evidence"), /append-only/i);
+      assertDatabaseIntegrity(after);
+    } finally {
+      after.close();
+    }
+  } finally {
     await cleanupTempDatabase(databasePath);
   }
 });
@@ -366,7 +501,7 @@ async function createPre0017Fixture(databasePath: string): Promise<void> {
     `);
     const migrations = (await readdir(path.resolve(process.cwd(), "migrations")))
       .filter((filename) => filename.endsWith(".sql"))
-      .filter((filename) => filename !== "0017_add_btc_candidate_live_pilot.sql")
+      .filter((filename) => filename.slice(0, 4) < "0017")
       .sort((left, right) => left.localeCompare(right));
     const fixtureMigrations = new Set([
       "0001_initial.sql",
@@ -421,6 +556,51 @@ async function createPre0017Fixture(databasePath: string): Promise<void> {
   }
 }
 
+async function createAppliedOriginal0017Fixture(databasePath: string): Promise<void> {
+  await createPre0017Fixture(databasePath);
+  const current0017 = await readFile(
+    path.resolve(process.cwd(), "migrations", "0017_add_btc_candidate_live_pilot.sql"),
+    "utf8",
+  );
+  const original0017 = current0017
+    .replace(
+      /CREATE TABLE strategy_candidate_execution_evidence \(\r?\n  deployment_id TEXT NOT NULL,\r?\n  id TEXT NOT NULL,/u,
+      "CREATE TABLE strategy_candidate_execution_evidence (\n" +
+        "  id TEXT PRIMARY KEY,\n" +
+        "  deployment_id TEXT NOT NULL,",
+    )
+    .replace(
+      /  PRIMARY KEY \(deployment_id, id\)\r?\n\);/u,
+      "  UNIQUE (deployment_id, id)\n);",
+    );
+  assert.notEqual(original0017, current0017);
+
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.exec(original0017);
+    db.prepare(
+      "INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)",
+    ).run("0017_add_btc_candidate_live_pilot.sql", "2026-08-21T00:00:00.000Z");
+    insertSecondaryExchangeAccount(db);
+
+    const repository = new SqliteCandidatePilotRepository(db);
+    await repository.createDeploymentWithInitialState(
+      initialDeploymentInput("original-0017-primary", "primary"),
+    );
+    await repository.createDeploymentWithInitialState(
+      initialDeploymentInput("original-0017-secondary", "secondary"),
+    );
+    await repository.advanceStateWithEvidence(
+      advanceInput("original-0017-primary", "original-evidence", 0),
+    );
+
+    assertGlobalEvidenceIdentity(db);
+    assertDatabaseIntegrity(db);
+  } finally {
+    db.close();
+  }
+}
+
 function insertNotification(db: DatabaseSync, id: string, type: string): void {
   db.prepare(`
     INSERT INTO operator_notifications (
@@ -465,6 +645,22 @@ function assertCompositeEvidenceIdentity(db: DatabaseSync): void {
     [["deployment_id", "deployment_id"], ["last_evidence_id", "id"]],
   );
   assert.equal(new Set(evidenceReference.map((foreignKey) => foreignKey.id)).size, 1);
+
+  const replayIndex = db.prepare(
+    "PRAGMA index_info(idx_strategy_candidate_evidence_replay)",
+  ).all() as Array<{ seqno: number; name: string }>;
+  assert.deepEqual(
+    replayIndex.sort((left, right) => left.seqno - right.seqno).map((column) => column.name),
+    ["deployment_id", "executed_at_epoch_ns", "id"],
+  );
+}
+
+function assertGlobalEvidenceIdentity(db: DatabaseSync): void {
+  const columns = db.prepare(
+    "PRAGMA table_info(strategy_candidate_execution_evidence)",
+  ).all() as Array<{ name: string; pk: number }>;
+  assert.equal(columns.find((column) => column.name === "id")?.pk, 1);
+  assert.equal(columns.find((column) => column.name === "deployment_id")?.pk, 0);
 }
 
 function insertRisk(db: DatabaseSync, id: string, ruleCode: string): void {

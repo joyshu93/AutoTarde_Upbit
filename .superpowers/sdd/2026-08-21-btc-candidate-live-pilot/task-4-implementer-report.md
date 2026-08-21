@@ -208,3 +208,92 @@ Result: exit code 0 with no whitespace errors.
 - The shared material validator rejects `1969-12-31T23:59:59.999999999Z` before either repository enters its mutation path.
 - No operational resource, runtime wiring, external service, or live execution setting was touched. No subagents were used.
 - No unresolved fix-round concern remains.
+
+## Fix round 2/5
+
+### RED
+
+Tests and the original-applied-0017 fixture were added before creating migration 0018. Commands:
+
+```powershell
+npm.cmd run build
+node --input-type=module -e "await import('./dist/tests/db-candidate-pilot-persistence.test.js'); const { runRegisteredTests } = await import('./dist/tests/harness.js'); await runRegisteredTests();"
+node --input-type=module -e "await import('./dist/tests/db-sqlite-wiring.test.js'); const { runRegisteredTests } = await import('./dist/tests/harness.js'); await runRegisteredTests();"
+```
+
+Build result: exit code 0. Focused persistence result: exit code 1 with three expected failures:
+
+```text
+FAIL migration 0018 upgrades a recorded original 0017 without losing pilot state
+actual migration filename: undefined
+expected: 0018_scope_candidate_evidence_identity_to_deployment.sql
+FAIL migration 0018 remains valid after fresh current composite 0017
+actual migration filename: undefined
+expected: 0018_scope_candidate_evidence_identity_to_deployment.sql
+FAIL migration 0018 rolls back its evidence and state rebuild atomically
+AssertionError: Missing expected exception.
+Error: 3 test(s) failed.
+```
+
+Focused wiring result: exit code 1 with the expected missing-0018 registration failure:
+
+```text
+FAIL openSqliteDatabase applies the initial migrations and exposes the durable tables
+assert.ok(migrationRows.some(
+  (row) => row.filename === "0018_scope_candidate_evidence_identity_to_deployment.sql"
+))
+Error: 1 test(s) failed.
+```
+
+All earlier candidate repository, lease, 0017 upgrade/rollback, append-only, transaction, concurrency, and integrity tests remained green during RED. This confirms the defect is the filename-recorded original 0017 having no immutable follow-up migration path.
+
+### GREEN
+
+Added immutable follow-up migration `0018_scope_candidate_evidence_identity_to_deployment.sql`; the corrected composite schema remains in 0017. Migration 0018 rebuilds evidence and state in one `BEGIN IMMEDIATE`, copies every column, restores the composite `(deployment_id, id)` primary/foreign key, recreates the replay index, and recreates both append-only evidence triggers.
+
+Commands and results:
+
+```powershell
+npm.cmd run build
+```
+
+Result: exit code 0.
+
+```powershell
+node --input-type=module -e "await import('./dist/tests/db-candidate-pilot-persistence.test.js'); const { runRegisteredTests } = await import('./dist/tests/harness.js'); await runRegisteredTests();"
+```
+
+Result: exit code 0, 20/20 focused persistence tests passed.
+
+```powershell
+node --input-type=module -e "await import('./dist/tests/db-sqlite-wiring.test.js'); const { runRegisteredTests } = await import('./dist/tests/harness.js'); await runRegisteredTests();"
+```
+
+Result: exit code 0, 11/11 SQLite wiring tests passed.
+
+```powershell
+npm.cmd run typecheck
+```
+
+Result: exit code 0.
+
+```powershell
+npm.cmd run test
+```
+
+Result: exit code 0. The main harness passed all registered tests, including the three new 0018 cases; the separately spawned prospective batch reported `tests 102`, `pass 102`, `fail 0`.
+
+```powershell
+git diff --check
+```
+
+Result: exit code 0 with no whitespace errors.
+
+### Migration evidence
+
+- Original-applied path: a temporary fixture runs the original global-ID-PK form of 0017, records the 0017 filename, and persists one referenced evidence row plus two candidate-state rows. Opening through the normal runner applies 0018, preserves those rows and the state cursor, restores the composite key/FK, and permits the two deployments to persist the same new evidence ID independently.
+- Fresh path: a fresh database applies the corrected composite 0017 and then 0018; the composite key/FK, replay index, `foreign_key_check`, and `integrity_check` all remain valid.
+- Index and triggers: tests assert replay-index columns are exactly `(deployment_id, executed_at_epoch_ns, id)` and prove both evidence `UPDATE` and `DELETE` remain blocked after upgrading the original schema.
+- Atomic rollback: removing a required source column injects an 0018 copy failure. The runner leaves 0018 unapplied, restores the original global-PK evidence table, both state rows, the referenced evidence row, and the append-only trigger, leaves no `_0018_legacy` tables, and reports clean foreign-key and integrity checks.
+- No operational database, runtime resource, external service, or live execution path was touched. No subagents were used.
+- No unresolved fix-round concern remains.

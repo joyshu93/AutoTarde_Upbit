@@ -67,6 +67,9 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
     assert.ok(migrationRows.some((row) => row.filename === "0015_add_scheduler_startup_blocked_notification_type.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0016_add_pending_confirmation_strategy_decision_status.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0017_add_btc_candidate_live_pilot.sql"));
+    assert.ok(migrationRows.some(
+      (row) => row.filename === "0018_scope_candidate_evidence_identity_to_deployment.sql",
+    ));
 
     const foreignKeyViolations = handle.db.prepare("PRAGMA foreign_key_check").all();
     assert.deepEqual(foreignKeyViolations, []);
