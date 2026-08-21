@@ -458,7 +458,9 @@ This diagnostic was designed after an observed holdout outcome, so it is retrosp
 
 ## Prospective Component Shadow Protocol
 
-`PCS-2026-001` is publicly registered. Its immutable no-peek observation window is `[2026-08-23T08:00:00.000Z,2026-12-21T08:00:00.000Z)`, equivalent to 2026-08-23 17:00 KST through 2026-12-21 17:00 KST. Before `window.from` it is registered and awaiting observation; from `window.from` until `window.to`, reports remain `COLLECTING` and expose no outcome metrics. The registration does not require the trading runtime or LIVE scheduler to run.
+`PCS-2026-001` is publicly registered. Its immutable no-peek observation window is `[2026-08-23T08:00:00.000Z,2026-12-21T08:00:00.000Z)`, equivalent to 2026-08-23 17:00 KST through 2026-12-21 17:00 KST. Before `window.from` it is registered and awaiting observation; from `window.from` until `window.to`, reports remain `COLLECTING` and expose no outcome metrics. Registration does not grant deployment, `DRY_RUN`, scheduler, order, or `LIVE` authority.
+
+Candidate policy and state modules are pure, execution-disconnected, configuration-free, and have no runtime reachability. They exist only for post-closure deployment readiness; current percentage-based sizing and all execution guards are unchanged.
 
 The public authority chain is:
 
