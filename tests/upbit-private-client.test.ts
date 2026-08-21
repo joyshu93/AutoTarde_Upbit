@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 
+import { ExchangeOrderSubmissionError } from "../src/modules/exchange/errors.js";
 import { UpbitPrivateClient } from "../src/modules/exchange/upbit/private-client.js";
 import { test } from "./harness.js";
 
@@ -89,6 +90,24 @@ test("create-order treats a malformed 2xx response as uncertain", async () => {
   );
 });
 
+test("create-order wraps malformed optional trade data from a 2xx response as uncertain", async () => {
+  const client = createPrivateClient(async () => jsonResponse({ ...validOrderResponse(), trades: {} }));
+
+  await assert.rejects(
+    () => client.createOrder(orderRequest),
+    (error: unknown) => {
+      assertSubmissionError(error, {
+        kind: "UNCERTAIN",
+        status: 200,
+        exchangeCode: null,
+        exchangeName: null,
+        responseReceived: true,
+      });
+      return true;
+    },
+  );
+});
+
 test("create-order retains the duplicate identifier code for recovery lookup", async () => {
   const client = createPrivateClient(async () => upbitErrorResponse(400, "duplicate_identifier", "already exists"));
 
@@ -100,6 +119,110 @@ test("create-order retains the duplicate identifier code for recovery lookup", a
         status: 400,
         exchangeCode: "duplicate_identifier",
         exchangeName: "duplicate_identifier",
+        responseReceived: true,
+      });
+      return true;
+    },
+  );
+});
+
+test("create-order does not retain reflected configured credentials as exchange metadata", async () => {
+  const accessKey = "configured-access-key";
+  const secretKey = "configured-secret-key";
+  const client = createPrivateClientWithCredentials({
+    accessKey,
+    secretKey,
+    fetchImpl: async () => upbitErrorResponse(400, accessKey, "rejected", secretKey),
+  });
+
+  await assert.rejects(
+    () => client.createOrder(orderRequest),
+    (error: unknown) => {
+      const submissionError = assertSubmissionError(error, {
+        kind: "DEFINITIVE_REJECTION",
+        status: 400,
+        exchangeCode: null,
+        exchangeName: null,
+        responseReceived: true,
+      });
+      assert.doesNotMatch(submissionError.message, /configured-access-key|configured-secret-key/);
+      return true;
+    },
+  );
+});
+
+test("create-order does not retain token-shaped exchange metadata", async () => {
+  const tokenLikeValue = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvcGVyYXRvciJ9.signature";
+  const client = createPrivateClient(async () => upbitErrorResponse(400, tokenLikeValue, "rejected"));
+
+  await assert.rejects(
+    () => client.createOrder(orderRequest),
+    (error: unknown) => {
+      assertSubmissionError(error, {
+        kind: "DEFINITIVE_REJECTION",
+        status: 400,
+        exchangeCode: null,
+        exchangeName: null,
+        responseReceived: true,
+      });
+      return true;
+    },
+  );
+});
+
+test("create-order keeps redirect handling manual and classifies a 3xx response as uncertain", async () => {
+  let redirect: RequestRedirect | undefined;
+  const client = createPrivateClient(async (_input, init) => {
+    redirect = init?.redirect;
+    return upbitErrorResponse(302, "redirected", "redirect");
+  });
+
+  await assert.rejects(
+    () => client.createOrder(orderRequest),
+    (error: unknown) => {
+      assertSubmissionError(error, {
+        kind: "UNCERTAIN",
+        status: 302,
+        exchangeCode: "redirected",
+        exchangeName: "redirected",
+        responseReceived: true,
+      });
+      return true;
+    },
+  );
+
+  assert.equal(redirect, "manual");
+});
+
+test("create-order treats a 408 response as uncertain", async () => {
+  const client = createPrivateClient(async () => upbitErrorResponse(408, "request_timeout", "timeout"));
+
+  await assert.rejects(
+    () => client.createOrder(orderRequest),
+    (error: unknown) => {
+      assertSubmissionError(error, {
+        kind: "UNCERTAIN",
+        status: 408,
+        exchangeCode: "request_timeout",
+        exchangeName: "request_timeout",
+        responseReceived: true,
+      });
+      return true;
+    },
+  );
+});
+
+test("create-order treats a 429 response as uncertain", async () => {
+  const client = createPrivateClient(async () => upbitErrorResponse(429, "too_many_requests", "rate limited"));
+
+  await assert.rejects(
+    () => client.createOrder(orderRequest),
+    (error: unknown) => {
+      assertSubmissionError(error, {
+        kind: "UNCERTAIN",
+        status: 429,
+        exchangeCode: "too_many_requests",
+        exchangeName: "too_many_requests",
         responseReceived: true,
       });
       return true;
@@ -246,15 +369,23 @@ test("upbit private client lists closed orders with done/cancel defaults", async
 });
 
 function createPrivateClient(fetchImpl: typeof fetch): UpbitPrivateClient {
-  return new UpbitPrivateClient({
+  return createPrivateClientWithCredentials({
     accessKey: "access-key",
     secretKey: "secret-key",
     fetchImpl,
   });
 }
 
-function upbitErrorResponse(status: number, name: string, message: string): Response {
-  return new Response(JSON.stringify({ error: { name, message } }), {
+function createPrivateClientWithCredentials(options: {
+  accessKey: string;
+  secretKey: string;
+  fetchImpl: typeof fetch;
+}): UpbitPrivateClient {
+  return new UpbitPrivateClient(options);
+}
+
+function upbitErrorResponse(status: number, name: string, message: string, code?: string): Response {
+  return new Response(JSON.stringify({ error: { name, message, ...(code ? { code } : {}) } }), {
     status,
     headers: { "Content-Type": "application/json" },
   });
@@ -265,6 +396,24 @@ function jsonResponse(body: unknown): Response {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+function validOrderResponse(): Record<string, unknown> {
+  return {
+    uuid: "order-uuid",
+    identifier: "submission-identifier",
+    market: "KRW-BTC",
+    side: "bid",
+    ord_type: "limit",
+    state: "wait",
+    price: "100000000",
+    volume: "0.001",
+    remaining_volume: "0.001",
+    executed_volume: "0",
+    paid_fee: "0",
+    created_at: "2026-08-21T00:00:00.000Z",
+    trades: [],
+  };
 }
 
 function assertSubmissionError(
@@ -278,6 +427,7 @@ function assertSubmissionError(
   },
 ): Error {
   assert.ok(error instanceof Error);
+  assert.ok(error instanceof ExchangeOrderSubmissionError);
   assert.equal(error.name, "ExchangeOrderSubmissionError");
 
   const typedError = error as Error & {

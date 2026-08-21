@@ -149,7 +149,7 @@ export class UpbitPrivateClient implements ExchangeAdapter {
     }
 
     if (!response.ok) {
-      const exchangeError = await readUpbitErrorMetadata(response);
+      const exchangeError = await readUpbitErrorMetadata(response, this.credentials);
       throw new ExchangeOrderSubmissionError({
         kind: isDefinitiveOrderRejection(response.status) ? "DEFINITIVE_REJECTION" : "UNCERTAIN",
         status: response.status,
@@ -182,7 +182,17 @@ export class UpbitPrivateClient implements ExchangeAdapter {
       });
     }
 
-    return mapOrderResponse(orderResponse);
+    try {
+      return mapOrderResponse(orderResponse);
+    } catch {
+      throw new ExchangeOrderSubmissionError({
+        kind: "UNCERTAIN",
+        status: response.status,
+        exchangeCode: null,
+        exchangeName: null,
+        responseReceived: true,
+      });
+    }
   }
 
   async cancelOrder(query: { uuid?: string; identifier?: string }): Promise<CancelOrderResult> {
@@ -261,6 +271,7 @@ export class UpbitPrivateClient implements ExchangeAdapter {
 
     const requestInit: RequestInit = {
       method: options.method,
+      redirect: "manual",
       headers: {
         Accept: "application/json",
         Authorization: `Bearer ${token}`,
@@ -289,35 +300,62 @@ class UpbitPrivateRequestError extends Error {
   }
 }
 
-async function readUpbitErrorMetadata(response: Response): Promise<{ code: string | null; name: string | null }> {
+async function readUpbitErrorMetadata(
+  response: Response,
+  credentials: UpbitCredentials,
+): Promise<{ code: string | null; name: string | null }> {
   try {
-    return extractUpbitErrorMetadata(await response.json());
+    return extractUpbitErrorMetadata(await response.json(), credentials);
   } catch {
     return { code: null, name: null };
   }
 }
 
-function extractUpbitErrorMetadata(payload: unknown): { code: string | null; name: string | null } {
+function extractUpbitErrorMetadata(
+  payload: unknown,
+  credentials: UpbitCredentials,
+): { code: string | null; name: string | null } {
   if (!isRecord(payload)) {
     return { code: null, name: null };
   }
 
   const error = isRecord(payload.error) ? payload.error : payload;
-  const name = sanitizeExchangeIdentifier(error.name);
+  const name = sanitizeExchangeIdentifier(error.name, credentials);
 
   return {
-    code: sanitizeExchangeIdentifier(error.code) ?? name,
+    code: sanitizeExchangeIdentifier(error.code, credentials) ?? name,
     name,
   };
 }
 
-function sanitizeExchangeIdentifier(value: unknown): string | null {
+function sanitizeExchangeIdentifier(value: unknown, credentials: UpbitCredentials): string | null {
   if (typeof value !== "string") {
     return null;
   }
 
   const trimmed = value.trim();
-  return /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/.test(trimmed) ? trimmed : null;
+  if (!/^[A-Za-z][A-Za-z0-9._:-]{0,127}$/.test(trimmed)) {
+    return null;
+  }
+
+  if (containsConfiguredCredential(trimmed, credentials) || looksLikeToken(trimmed)) {
+    return null;
+  }
+
+  return trimmed;
+}
+
+function containsConfiguredCredential(value: string, credentials: UpbitCredentials): boolean {
+  return [credentials.accessKey, credentials.secretKey].some(
+    (credential) => credential.length > 0 && value.includes(credential),
+  );
+}
+
+function looksLikeToken(value: string): boolean {
+  return (
+    /^eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value) ||
+    /^[A-Za-z0-9_-]{32,}$/.test(value)
+  );
 }
 
 function isDefinitiveOrderRejection(status: number): boolean {
@@ -332,7 +370,27 @@ function isValidOrderSubmissionResponse(response: unknown): response is UpbitOrd
     (response.side === "bid" || response.side === "ask") &&
     (response.ord_type === "limit" || response.ord_type === "price" || response.ord_type === "market" || response.ord_type === "best") &&
     isNonEmptyString(response.state) &&
-    isNonEmptyString(response.created_at)
+    isNonEmptyString(response.created_at) &&
+    isOptionalStringOrNull(response.identifier) &&
+    isOptionalStringOrNull(response.price) &&
+    isOptionalStringOrNull(response.volume) &&
+    isOptionalStringOrNull(response.remaining_volume) &&
+    isOptionalStringOrNull(response.executed_volume) &&
+    isOptionalStringOrNull(response.paid_fee) &&
+    (response.trades === undefined || (Array.isArray(response.trades) && response.trades.every(isValidOrderTrade)))
+  );
+}
+
+function isValidOrderTrade(trade: unknown): boolean {
+  return (
+    isRecord(trade) &&
+    isOptionalStringOrNull(trade.uuid) &&
+    (trade.side === undefined || trade.side === null || trade.side === "bid" || trade.side === "ask") &&
+    isNonEmptyString(trade.price) &&
+    isNonEmptyString(trade.volume) &&
+    isOptionalStringOrNull(trade.funds) &&
+    isOptionalStringOrNull(trade.fee) &&
+    isOptionalStringOrNull(trade.created_at)
   );
 }
 
@@ -342,6 +400,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function isOptionalStringOrNull(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === "string";
 }
 
 function buildHistoryQuery(
