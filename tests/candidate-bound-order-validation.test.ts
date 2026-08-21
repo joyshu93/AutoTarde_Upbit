@@ -195,6 +195,24 @@ test("candidate-bound order validator compares mixed-offset timestamps by epoch 
   assert.doesNotThrow(() => validateCandidateBoundOrderIntent(input));
 });
 
+test("candidate-bound order validator rejects decisions created after binding and request", () => {
+  const input = validInput({
+    decisionCreatedAt: "2026-08-21T00:00:00.000000002Z",
+  });
+
+  assert.throws(() => validateCandidateBoundOrderIntent(input), /decision.*binding.*chronology/i);
+});
+
+test("candidate-bound order validator allows decision equality at binding across timezone offsets", () => {
+  const input = validInput({
+    bindingCreatedAt: "2026-08-21T09:00:00+09:00",
+    decisionCreatedAt: "2026-08-21T00:00:00Z",
+    requestedAt: "2026-08-21T00:00:00.000000001Z",
+  });
+
+  assert.doesNotThrow(() => validateCandidateBoundOrderIntent(input));
+});
+
 test("candidate-bound order validator rejects malformed negative and unsafe state versions", () => {
   for (const value of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN, Number.POSITIVE_INFINITY]) {
     const expected = validInput();
@@ -257,6 +275,7 @@ test("candidate-bound order validator requires immutable request timestamps and 
 interface FixtureOptions {
   action?: "ENTER" | "ADD" | "REDUCE" | "EXIT";
   bindingCreatedAt?: string;
+  decisionCreatedAt?: string;
   phase?: "ACTIVE" | "DRAINING";
   requestedAt?: string;
 }
@@ -345,7 +364,7 @@ function validInput(options: FixtureOptions = {}): PersistCandidateBoundOrderInt
       intendedNotionalKrw,
       intendedQuantity,
       referencePrice: "100000000",
-      createdAt: "2026-08-20T23:59:59.500Z",
+      createdAt: options.decisionCreatedAt ?? "2026-08-20T23:59:59.500Z",
     },
     deployment: {
       id: "deployment-1",

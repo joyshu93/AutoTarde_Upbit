@@ -140,7 +140,21 @@ function validateDecision(
   validateOptionalDecimal(decision.intendedQuantity, "decision intendedQuantity");
   validateOptionalDecimal(decision.intendedNotionalKrw, "decision intendedNotionalKrw");
   validateOptionalDecimal(decision.referencePrice, "decision referencePrice");
-  parsePositionGuardCandidateTimestamp(decision.createdAt, "candidate-bound decision createdAt");
+  const decisionCreatedAt = parsePositionGuardCandidateTimestamp(
+    decision.createdAt,
+    "candidate-bound decision createdAt",
+  );
+  const bindingCreatedAt = parsePositionGuardCandidateTimestamp(
+    binding.createdAt,
+    "candidate-bound binding createdAt",
+  );
+  const requestedAt = parsePositionGuardCandidateTimestamp(
+    order.requestedAt,
+    "candidate-bound order requestedAt",
+  );
+  if (decisionCreatedAt > bindingCreatedAt || bindingCreatedAt >= requestedAt) {
+    throw new Error("Candidate decision and binding chronology must satisfy decision <= binding < request.");
+  }
 
   const expectedSide = decision.action === "ENTER" || decision.action === "ADD" ? "bid" : "ask";
   if (order.side !== expectedSide || binding.side !== expectedSide) {
