@@ -15,7 +15,9 @@ import {
   initialDeploymentInput,
   verifyCandidatePilotRepositoryContract,
   verifyCandidatePilotIdentityValidation,
+  verifyDeploymentScopedEvidenceIdentityContract,
   verifyMixedOffsetReplayContract,
+  verifyPreEpochEvidenceRejectionContract,
 } from "./candidate-pilot-repository-contract.test.js";
 import { verifyAccountExecutionLeaseContract } from "./account-execution-lease-contract.test.js";
 
@@ -28,6 +30,21 @@ test("sqlite candidate pilot repository satisfies the common contracts", async (
   });
   await withFreshBundle("candidate-identity", async (bundle) => {
     await verifyCandidatePilotIdentityValidation(() => bundle.candidatePilots);
+  });
+});
+
+test("sqlite candidate evidence identity is scoped to its deployment", async () => {
+  await withFreshBundle("candidate-scoped-evidence", async (bundle, _databasePath, db) => {
+    insertSecondaryExchangeAccount(db);
+    await verifyDeploymentScopedEvidenceIdentityContract(() => bundle.candidatePilots);
+    assertDatabaseIntegrity(db);
+  });
+});
+
+test("sqlite candidate pilot rejects pre-epoch evidence without mutation", async () => {
+  await withFreshBundle("candidate-pre-epoch", async (bundle, _databasePath, db) => {
+    await verifyPreEpochEvidenceRejectionContract(() => bundle.candidatePilots);
+    assertDatabaseIntegrity(db);
   });
 });
 
@@ -103,6 +120,7 @@ test("migration 0017 reserves exact values and preserves pre-0017 rows and deliv
       "SELECT filename FROM _schema_migrations WHERE filename = ?",
     ).get("0017_add_btc_candidate_live_pilot.sql") as { filename: string } | undefined;
     assert.equal(migration?.filename, "0017_add_btc_candidate_live_pilot.sql");
+    assertCompositeEvidenceIdentity(handle.db);
     assertDatabaseIntegrity(handle.db);
   } finally {
     handle.close();
@@ -414,6 +432,39 @@ function insertNotification(db: DatabaseSync, id: string, type: string): void {
     id, "primary", "TELEGRAM", type, "WARN", "title", "message", "{}", "PENDING", 0,
     null, null, null, null, null, "2026-08-21T00:00:00Z", null, null,
   );
+}
+
+function insertSecondaryExchangeAccount(db: DatabaseSync): void {
+  db.prepare(`
+    INSERT INTO exchange_accounts (
+      id, user_id, exchange, venue_type, account_label, access_key_ref, secret_key_ref,
+      quote_currency, is_primary, created_at, updated_at
+    )
+    SELECT ?, user_id, exchange, venue_type, ?, access_key_ref, secret_key_ref,
+      quote_currency, 0, created_at, updated_at
+    FROM exchange_accounts
+    WHERE id = ?
+  `).run("secondary", "secondary", "primary");
+}
+
+function assertCompositeEvidenceIdentity(db: DatabaseSync): void {
+  const columns = db.prepare(
+    "PRAGMA table_info(strategy_candidate_execution_evidence)",
+  ).all() as Array<{ name: string; pk: number }>;
+  assert.equal(columns.find((column) => column.name === "deployment_id")?.pk, 1);
+  assert.equal(columns.find((column) => column.name === "id")?.pk, 2);
+
+  const foreignKeys = db.prepare(
+    "PRAGMA foreign_key_list(strategy_candidate_states)",
+  ).all() as Array<{ id: number; seq: number; table: string; from: string; to: string }>;
+  const evidenceReference = foreignKeys
+    .filter((foreignKey) => foreignKey.table === "strategy_candidate_execution_evidence")
+    .sort((left, right) => left.seq - right.seq);
+  assert.deepEqual(
+    evidenceReference.map((foreignKey) => [foreignKey.from, foreignKey.to]),
+    [["deployment_id", "deployment_id"], ["last_evidence_id", "id"]],
+  );
+  assert.equal(new Set(evidenceReference.map((foreignKey) => foreignKey.id)).size, 1);
 }
 
 function insertRisk(db: DatabaseSync, id: string, ruleCode: string): void {

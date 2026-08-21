@@ -18,11 +18,12 @@ export type CandidatePilotRepositoryFactory = () =>
 
 export function initialDeploymentInput(
   id = "deployment-contract",
+  exchangeAccountId = "primary",
 ): CreateCandidatePilotDeploymentInput {
   return {
     deployment: {
       id,
-      exchangeAccountId: "primary",
+      exchangeAccountId,
       pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
       market: "KRW-BTC",
       policyId: "COMBINED_CONSERVATIVE",
@@ -147,12 +148,12 @@ export async function verifyMixedOffsetReplayContract(
   );
 
   await repository.advanceStateWithEvidence(
-    advanceInput(deployment.id, "evidence-a", 0, {
+    advanceInput(deployment.id, "evidence-first", 0, {
       executedAt: "2026-08-21T09:00:00+09:00",
     }),
   );
   await repository.advanceStateWithEvidence(
-    advanceInput(deployment.id, "evidence-b", 1, {
+    advanceInput(deployment.id, "B", 1, {
       action: "ADD",
       executedAt: "2026-08-21T00:00:00.000000001Z",
       executedQuantity: 0.05,
@@ -162,7 +163,7 @@ export async function verifyMixedOffsetReplayContract(
     }),
   );
   await repository.advanceStateWithEvidence(
-    advanceInput(deployment.id, "evidence-c", 2, {
+    advanceInput(deployment.id, "a", 2, {
       action: "ADD",
       executedAt: "2026-08-21T00:00:00.000000001Z",
       executedQuantity: 0.05,
@@ -175,14 +176,67 @@ export async function verifyMixedOffsetReplayContract(
   const evidence = await repository.listEvidenceAfter(deployment.id, null);
   assert.deepEqual(
     evidence.map((item) => item.evidenceId),
-    ["evidence-a", "evidence-b", "evidence-c"],
+    ["evidence-first", "B", "a"],
   );
   assert.deepEqual(
-    (await repository.listEvidenceAfter(deployment.id, "evidence-a"))
+    (await repository.listEvidenceAfter(deployment.id, "B"))
       .map((item) => item.evidenceId),
-    ["evidence-b", "evidence-c"],
+    ["a"],
   );
   assert.equal((await repository.getState(deployment.id))?.stateVersion, 3);
+}
+
+export async function verifyDeploymentScopedEvidenceIdentityContract(
+  create: CandidatePilotRepositoryFactory,
+): Promise<void> {
+  const repository = await create();
+  const first = await repository.createDeploymentWithInitialState(
+    initialDeploymentInput("deployment-scoped-first", "primary"),
+  );
+  const second = await repository.createDeploymentWithInitialState(
+    initialDeploymentInput("deployment-scoped-second", "secondary"),
+  );
+
+  await repository.advanceStateWithEvidence(advanceInput(first.id, "shared-evidence", 0));
+  await repository.advanceStateWithEvidence(advanceInput(second.id, "shared-evidence", 0));
+
+  assert.deepEqual(
+    (await repository.listEvidenceAfter(first.id, null)).map((item) => item.evidenceId),
+    ["shared-evidence"],
+  );
+  assert.deepEqual(
+    (await repository.listEvidenceAfter(second.id, null)).map((item) => item.evidenceId),
+    ["shared-evidence"],
+  );
+  assert.equal((await repository.getState(first.id))?.stateVersion, 1);
+  assert.equal((await repository.getState(second.id))?.stateVersion, 1);
+  await assert.rejects(
+    () => repository.advanceStateWithEvidence(
+      advanceInput(first.id, "shared-evidence", 0, { confirmedFeeKrw: 5_001 }),
+    ),
+    /conflicting duplicate/i,
+  );
+}
+
+export async function verifyPreEpochEvidenceRejectionContract(
+  create: CandidatePilotRepositoryFactory,
+): Promise<void> {
+  const repository = await create();
+  const deployment = await repository.createDeploymentWithInitialState(
+    initialDeploymentInput("deployment-pre-epoch"),
+  );
+
+  await assert.rejects(
+    () => repository.advanceStateWithEvidence(
+      advanceInput(deployment.id, "pre-epoch", 0, {
+        executedAt: "1969-12-31T23:59:59.999999999Z",
+      }),
+    ),
+    /before the Unix epoch/i,
+  );
+  assert.equal((await repository.getState(deployment.id))?.stateVersion, 0);
+  assert.deepEqual(await repository.listEvidenceAfter(deployment.id, null), []);
+  assert.equal((await repository.listAuditEvents(deployment.id)).length, 1);
 }
 
 export async function verifyCandidatePilotIdentityValidation(
@@ -219,6 +273,16 @@ test("in-memory candidate pilot repository satisfies the common contract", async
 
 test("in-memory candidate pilot replay orders mixed offsets by epoch nanosecond and id", async () => {
   await verifyMixedOffsetReplayContract(() => new InMemoryCandidatePilotRepository());
+});
+
+test("in-memory candidate evidence identity is scoped to its deployment", async () => {
+  await verifyDeploymentScopedEvidenceIdentityContract(
+    () => new InMemoryCandidatePilotRepository(),
+  );
+});
+
+test("in-memory candidate pilot rejects pre-epoch evidence without mutation", async () => {
+  await verifyPreEpochEvidenceRejectionContract(() => new InMemoryCandidatePilotRepository());
 });
 
 test("in-memory candidate pilot repository rejects forged persisted identity", async () => {

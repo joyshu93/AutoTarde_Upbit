@@ -222,8 +222,8 @@ CREATE TABLE strategy_pilot_deployments (
 );
 
 CREATE TABLE strategy_candidate_execution_evidence (
-  id TEXT PRIMARY KEY,
   deployment_id TEXT NOT NULL,
+  id TEXT NOT NULL,
   executed_at TEXT NOT NULL,
   executed_at_epoch_ns INTEGER NOT NULL CHECK (executed_at_epoch_ns >= 0),
   action TEXT NOT NULL CHECK (action IN ('ENTER', 'ADD', 'REDUCE', 'EXIT')),
@@ -236,7 +236,7 @@ CREATE TABLE strategy_candidate_execution_evidence (
   material_hash TEXT NOT NULL CHECK (length(material_hash) = 64),
   created_at TEXT NOT NULL,
   FOREIGN KEY (deployment_id) REFERENCES strategy_pilot_deployments(id) ON DELETE RESTRICT,
-  UNIQUE (deployment_id, id)
+  PRIMARY KEY (deployment_id, id)
 );
 
 CREATE TABLE strategy_candidate_states (

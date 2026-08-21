@@ -179,6 +179,9 @@ export function candidateEvidenceMaterial(
     snapshot.executedAt,
     "evidence executedAt",
   );
+  if (epochNanoseconds < 0n) {
+    throw new Error("Candidate evidence executedAt cannot be before the Unix epoch.");
+  }
   const canonical = JSON.stringify({
     schemaVersion: 1,
     deploymentId,

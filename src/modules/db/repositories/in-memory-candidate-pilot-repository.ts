@@ -1,3 +1,5 @@
+import { Buffer } from "node:buffer";
+
 import type {
   PositionGuardPilotAuditEventRecord,
   PositionGuardPilotDeploymentRecord,
@@ -194,5 +196,12 @@ function cloneState(state: PositionGuardCandidateState): PositionGuardCandidateS
 function compareEvidence(left: StoredEvidence, right: StoredEvidence): number {
   if (left.epochNanoseconds < right.epochNanoseconds) return -1;
   if (left.epochNanoseconds > right.epochNanoseconds) return 1;
-  return left.evidence.evidenceId.localeCompare(right.evidence.evidenceId);
+  return compareSqliteBinaryText(left.evidence.evidenceId, right.evidence.evidenceId);
+}
+
+function compareSqliteBinaryText(left: string, right: string): number {
+  return Buffer.compare(
+    Buffer.from(left, "utf8"),
+    Buffer.from(right, "utf8"),
+  );
 }

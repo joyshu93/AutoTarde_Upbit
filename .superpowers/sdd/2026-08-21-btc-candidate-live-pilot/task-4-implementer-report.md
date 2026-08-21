@@ -129,3 +129,82 @@ On Windows, the first full-suite attempt exposed an existing byte-level bundle c
 - Confirmed `src/domain/types.ts` is unchanged and no runtime activation or external side-effect path was added.
 - Root product/runtime documentation is unchanged because this task introduces no runtime behavior; later integration/documentation tasks own operator-visible behavior.
 - No unresolved Task 4 code concern remains. The only environment note is the existing Windows CRLF checkout behavior for the generated prospective validator; canonical regeneration produced no Git diff and the full suite passed.
+
+## Fix round 1/5
+
+### RED
+
+Tests were added before production changes for all three reviewer findings. The focused commands were:
+
+```powershell
+npm.cmd run build
+node --input-type=module -e "await import('./dist/tests/db-candidate-pilot-persistence.test.js'); const { runRegisteredTests } = await import('./dist/tests/harness.js'); await runRegisteredTests();"
+```
+
+Build result: exit code 0. Focused test result: exit code 1 with five expected failures:
+
+```text
+FAIL in-memory candidate pilot replay orders mixed offsets by epoch nanosecond and id
+actual: ['evidence-first', 'a', 'B']; expected: ['evidence-first', 'B', 'a']
+FAIL in-memory candidate pilot rejects pre-epoch evidence without mutation
+AssertionError: Missing expected rejection.
+FAIL sqlite candidate evidence identity is scoped to its deployment
+Error: UNIQUE constraint failed: strategy_candidate_execution_evidence.id
+FAIL sqlite candidate pilot rejects pre-epoch evidence without mutation
+Error: CHECK constraint failed: executed_at_epoch_ns >= 0
+FAIL migration 0017 reserves exact values and preserves pre-0017 rows and delivery foreign keys
+AssertionError: deployment_id primary-key position 0 !== 1
+Error: 5 test(s) failed.
+```
+
+The in-memory deployment-scoped identity contract already passed, confirming the uniqueness defect was isolated to the SQLite schema. The existing SQLite mixed-offset contract passed, confirming the ordering defect was isolated to the locale-sensitive in-memory tie-break.
+
+### GREEN
+
+The minimal fix uses UTF-8 bytewise comparison for the in-memory evidence-ID tie-break, rejects negative epoch nanoseconds in shared evidence material validation, and changes the evidence primary key to `(deployment_id, id)` while preserving the state table's composite reference.
+
+Commands and results after the fix and comparator naming refactor:
+
+```powershell
+npm.cmd run build
+```
+
+Result: exit code 0.
+
+```powershell
+node --input-type=module -e "await import('./dist/tests/db-candidate-pilot-persistence.test.js'); const { runRegisteredTests } = await import('./dist/tests/harness.js'); await runRegisteredTests();"
+```
+
+Result: exit code 0, 17/17 focused persistence tests passed. The run includes both backends' `B` then `a` binary replay and cursor behavior, deployment-scoped shared evidence IDs with same-deployment conflict rejection, pre-epoch rejection with unchanged state/evidence/audit, a fresh database, pre-0017 upgrade, composite PK/FK assertions, rollback injection, empty `PRAGMA foreign_key_check`, and `PRAGMA integrity_check = ok`.
+
+```powershell
+node --input-type=module -e "await import('./dist/tests/db-sqlite-wiring.test.js'); const { runRegisteredTests } = await import('./dist/tests/harness.js'); await runRegisteredTests();"
+```
+
+Result: exit code 0, 11/11 SQLite wiring and migration tests passed.
+
+```powershell
+npm.cmd run typecheck
+```
+
+Result: exit code 0.
+
+```powershell
+npm.cmd run test
+```
+
+Result: exit code 0. The main harness passed all registered tests, including all 17 Task 4 persistence tests; the separately spawned prospective batch reported `tests 102`, `pass 102`, `fail 0`.
+
+```powershell
+git diff --check
+```
+
+Result: exit code 0 with no whitespace errors.
+
+### Fix-round self-review
+
+- SQLite and in-memory replay now share epoch-nanosecond ordering followed by explicit UTF-8/BINARY evidence-ID ordering; no locale-sensitive comparator remains in the persistence path.
+- Evidence IDs can repeat across deployments but remain unique and conflict-checked within one deployment. Candidate-state cursor integrity remains a two-column foreign key to the same deployment and evidence ID.
+- The shared material validator rejects `1969-12-31T23:59:59.999999999Z` before either repository enters its mutation path.
+- No operational resource, runtime wiring, external service, or live execution setting was touched. No subagents were used.
+- No unresolved fix-round concern remains.
