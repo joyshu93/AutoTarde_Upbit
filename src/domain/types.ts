@@ -262,9 +262,18 @@ export interface FillRecord {
   volume: string;
   feeCurrency: string | null;
   feeAmount: string | null;
+  feeProvenance?: FillFeeProvenance;
   filledAt: string;
   rawPayloadJson: string;
 }
+
+export type FillFeeProvenance =
+  | "EXCHANGE_FILL_CONFIRMED"
+  | "ORDER_LEVEL_UNALLOCATED"
+  | "ORDER_LEVEL_ALLOCATED"
+  | "MISSING"
+  | "LEGACY_UNVERIFIED"
+  | "SIMULATED";
 
 export interface ReconciliationRunRecord {
   id: string;

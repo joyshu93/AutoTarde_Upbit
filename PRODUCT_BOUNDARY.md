@@ -149,7 +149,7 @@ The optional prospective registration preview is a non-binding local calculation
 
 The registered window is the fixed 120-day `[2026-08-23T08:00:00.000Z,2026-12-21T08:00:00.000Z)` no-peek period. Before `to`, the only valid evaluation state is `COLLECTING`; after the boundary the result may be `REGISTRATION_INVALID`, `REJECTED`, `INSUFFICIENT`, or `SUPPORTS_CONTINUED_SHADOW` according to the frozen evidence policy. None of these statuses authorizes strategy changes, deployment, DRY_RUN/LIVE execution, or order transmission.
 
-Candidate policy and state modules remain pure, execution-disconnected, and configuration-free. The deployment-scoped terminal-evidence projector is the sole runtime exception: reconciliation may use it only after durable eligible BTC terminal evidence exists, and it has no send, resume, or lease-release authority. Current percentage-based sizing and all execution guards are unchanged.
+Candidate policy and state modules remain pure, execution-disconnected, and configuration-free. The deployment-scoped terminal-evidence projector is the sole runtime exception: reconciliation may use it only after durable eligible BTC terminal evidence exists, and it has no send, resume, or lease-release authority. It accepts only a bound order/decision/deployment provenance match, exact persisted decimal evidence, and individually confirmed fill fees; legacy, allocated, missing, or invalid fee evidence faults and blocks advancement. Current percentage-based sizing and all execution guards are unchanged.
 
 ## Design Consequences
 - every order must have an explicit lifecycle record

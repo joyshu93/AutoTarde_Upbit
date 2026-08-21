@@ -143,6 +143,12 @@ export function validateFaultPauseTimestamp(input: FaultPauseInput, current: Exe
   }
 }
 
+export function normalizeFillFeeProvenance(record: FillRecord): FillRecord {
+  return record.feeProvenance === undefined
+    ? { ...record, feeProvenance: "LEGACY_UNVERIFIED" }
+    : record;
+}
+
 export function recordsEqual<T extends object>(left: T, right: T): boolean {
   const leftRecord = left as Record<string, unknown>;
   const rightRecord = right as Record<string, unknown>;

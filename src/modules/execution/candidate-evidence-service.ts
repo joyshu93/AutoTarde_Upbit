@@ -1,13 +1,26 @@
 import type {
+  CandidateExecutionBindingRecord,
+} from "../../domain/pilot-types.js";
+import type {
   FillRecord,
   OrderRecord,
   StrategyDecisionRecord,
 } from "../../domain/types.js";
 import type { ExecutionRepository, OperatorStateStore } from "../db/interfaces.js";
-import type { CandidatePilotRepository } from "../db/pilot-interfaces.js";
+import type { CandidateEvidenceRecord, CandidatePilotRepository } from "../db/pilot-interfaces.js";
+import {
+  addExactDecimals,
+  canonicalNonNegativeDecimal,
+  compareExactDecimals,
+  compareDeterministicIdentifiers,
+  deriveExactRemainingQuantity,
+  formatExactDecimal,
+  multiplyExactDecimals,
+  parseCanonicalNonNegativeDecimal,
+  projectExactCandidateState,
+} from "./candidate-evidence-decimals.js";
 import {
   parsePositionGuardCandidateTimestamp,
-  type PositionGuardCandidateDecimal,
   type PositionGuardCandidateExecutionEvidence,
 } from "../strategy/position-guard-candidate-state.js";
 import { POSITION_GUARD_STRATEGY_KEY, type StrategyEntryPath } from "../strategy/position-guard-core.js";
@@ -57,17 +70,20 @@ export class CandidateExecutionEvidenceService {
       return { outcome: "NOT_TERMINAL", orderId, detail: `Order lifecycle ${order.status} is not terminal.` };
     }
 
-    const deployment = await this.dependencies.pilotRepository.getDeploymentForExchangeAccount(
-      order.exchangeAccountId,
-    );
+    const deployment = await this.dependencies.pilotRepository.getDeploymentForExchangeAccount(order.exchangeAccountId);
     if (!deployment || (deployment.phase !== "ACTIVE" && deployment.phase !== "DRAINING")) {
       return { outcome: "NO_ACTIVE_DEPLOYMENT", orderId, detail: "No active candidate deployment is persisted." };
     }
-    if (deployment.market !== order.market) {
-      return this.fault(order, "DEPLOYMENT_MARKET_MISMATCH", "Candidate deployment market does not match terminal order market.");
-    }
 
     try {
+      const binding = await this.dependencies.pilotRepository.getExecutionBindingForOrder(order.id);
+      if (!binding) {
+        throw new CandidateEvidenceFault(
+          "CANDIDATE_EXECUTION_BINDING_MISSING",
+          "Terminal candidate order has no persisted deployment binding.",
+        );
+      }
+      const decision = await this.getVerifiedDecision(order, deployment, binding);
       const fills = await this.dependencies.repositories.listFills(order.id);
       if (fills.length === 0) {
         if (await this.hasTerminalNoFillMarker(order)) {
@@ -77,56 +93,71 @@ export class CandidateExecutionEvidenceService {
             detail: "Terminal no-fill cancellation was already recorded.",
           };
         }
-        const decision = await this.getVerifiedDecision(order);
         return this.recordTerminalNoFill(order, decision);
       }
 
-      const decision = await this.getVerifiedDecision(order);
       const aggregate = aggregateTerminalFills(order, decision, fills);
-      if (aggregate.executedQuantity.coefficient === 0n) {
-        return { outcome: "TERMINAL_NO_FILL", orderId, detail: "Terminal order has zero aggregate fills." };
-      }
-
-      const state = await this.dependencies.pilotRepository.getState(deployment.id);
-      if (!state) {
-        throw new CandidateEvidenceFault("CANDIDATE_STATE_MISSING", "Candidate deployment state is missing.");
-      }
       const evidenceId = `terminal-order:${order.id}`;
-      const existing = (await this.dependencies.pilotRepository.listEvidenceAfter(deployment.id, null))
-        .find((evidence) => evidence.evidenceId === evidenceId);
+      const exactState = await this.dependencies.pilotRepository.getExactState(deployment.id);
+      if (!exactState) {
+        throw new CandidateEvidenceFault(
+          "CANDIDATE_STATE_LEGACY_APPROXIMATE",
+          "Candidate state has no authoritative exact decimal representation.",
+        );
+      }
+      const records = await this.dependencies.pilotRepository.listEvidenceRecords(deployment.id);
+      if (records.some((record) => record.materialVersion !== "EXACT_V2")) {
+        throw new CandidateEvidenceFault(
+          "LEGACY_CANDIDATE_EVIDENCE",
+          "Candidate deployment contains legacy approximate evidence and cannot advance.",
+        );
+      }
+      const evidenceEpoch = parseTimestamp(aggregate.executedAt, "terminal fill executedAt");
+      const stateBeforeEvidence = projectExactCandidateState(
+        records
+          .filter((record) => isBeforeEvidence(record, evidenceEpoch, evidenceId))
+          .map((record) => record.evidence),
+      );
+      const remainingQuantity = deriveExactRemainingQuantity({
+        currentQuantity: stateBeforeEvidence.currentEpisodeInventoryQuantity,
+        action: decision.action,
+        executedQuantity: aggregate.executedQuantity,
+      });
+      const existing = await this.dependencies.pilotRepository.getEvidenceRecord(deployment.id, evidenceId);
       if (existing) {
+        if (existing.materialVersion !== "EXACT_V2") {
+          throw new CandidateEvidenceFault(
+            "LEGACY_CANDIDATE_EVIDENCE",
+            "Terminal order identity is occupied by legacy approximate candidate evidence.",
+          );
+        }
         assertMatchingExistingEvidence(existing, {
           evidenceId,
-          executedAt: order.updatedAt,
+          executedAt: aggregate.executedAt,
           action: decision.action,
           entryPath: decision.entryPath,
           terminalStatus: order.status,
-          executedQuantity: formatDecimal(aggregate.executedQuantity),
-          grossQuoteValueKrw: formatDecimal(aggregate.grossQuoteValueKrw),
-          confirmedFeeKrw: formatDecimal(aggregate.confirmedFeeKrw),
+          executedQuantity: aggregate.executedQuantity,
+          grossQuoteValueKrw: aggregate.grossQuoteValueKrw,
+          confirmedFeeKrw: aggregate.confirmedFeeKrw,
+          remainingQuantity,
         });
         return { outcome: "DUPLICATE", orderId, detail: "Terminal order evidence was already projected." };
       }
-
-      const remainingQuantity = deriveRemainingQuantity(
-        state.currentEpisodeInventoryQuantity,
-        decision.action,
-        aggregate.executedQuantity,
-      );
       const evidence: PositionGuardCandidateExecutionEvidence = {
         evidenceId,
-        executedAt: order.updatedAt,
+        executedAt: aggregate.executedAt,
         action: decision.action,
         entryPath: decision.entryPath,
         terminalStatus: order.status,
-        executedQuantity: formatDecimal(aggregate.executedQuantity),
-        grossQuoteValueKrw: formatDecimal(aggregate.grossQuoteValueKrw),
-        confirmedFeeKrw: formatDecimal(aggregate.confirmedFeeKrw),
-        remainingQuantity: formatDecimal(remainingQuantity),
+        executedQuantity: aggregate.executedQuantity,
+        grossQuoteValueKrw: aggregate.grossQuoteValueKrw,
+        confirmedFeeKrw: aggregate.confirmedFeeKrw,
+        remainingQuantity,
       };
       const advanced = await this.dependencies.pilotRepository.advanceStateWithEvidence({
         deploymentId: deployment.id,
-        expectedStateVersion: state.stateVersion,
+        expectedStateVersion: exactState.stateVersion,
         evidence,
       });
       return {
@@ -147,38 +178,62 @@ export class CandidateExecutionEvidenceService {
     }
   }
 
-  private async getVerifiedDecision(order: OrderRecord): Promise<VerifiedDecision> {
+  private async getVerifiedDecision(
+    order: OrderRecord,
+    deployment: Awaited<ReturnType<CandidatePilotRepository["getDeployment"]>> & {},
+    binding: CandidateExecutionBindingRecord,
+  ): Promise<VerifiedDecision> {
     if (!order.strategyDecisionId) {
       throw new CandidateEvidenceFault("STRATEGY_DECISION_MISSING", "Terminal strategy order has no decision reference.");
     }
-    if (!this.dependencies.repositories.getStrategyDecisionById) {
-      throw new CandidateEvidenceFault("STRATEGY_DECISION_LOOKUP_UNAVAILABLE", "Strategy decision lookup is unavailable.");
-    }
-    const decision = await this.dependencies.repositories.getStrategyDecisionById(order.strategyDecisionId);
+    const decision = await this.dependencies.repositories.getStrategyDecisionById?.(order.strategyDecisionId);
     if (!decision) {
       throw new CandidateEvidenceFault("STRATEGY_DECISION_MISSING", "Terminal strategy order references no persisted decision.");
+    }
+    if (
+      binding.deploymentId !== deployment.id ||
+      binding.strategyDecisionId !== decision.id ||
+      binding.orderId !== order.id ||
+      binding.exchangeAccountId !== order.exchangeAccountId ||
+      binding.market !== order.market ||
+      binding.strategyKey !== POSITION_GUARD_STRATEGY_KEY ||
+      binding.policyId !== deployment.policyId ||
+      binding.policyVersion !== deployment.policyVersion ||
+      binding.executionMode !== order.executionMode ||
+      binding.ordType !== order.ordType
+    ) {
+      throw new CandidateEvidenceFault("CANDIDATE_EXECUTION_BINDING_INVALID", "Persisted order binding does not match deployment provenance.");
     }
     if (
       decision.exchangeAccountId !== order.exchangeAccountId ||
       decision.strategyKey !== POSITION_GUARD_STRATEGY_KEY ||
       decision.market !== order.market ||
       decision.status !== "READY" ||
-      !isCandidateAction(decision.action)
+      !isCandidateAction(decision.action) ||
+      binding.action !== decision.action
     ) {
       throw new CandidateEvidenceFault("STRATEGY_DECISION_INVALID", "Persisted strategy decision is invalid for candidate evidence.");
     }
     const expectedSide = decision.action === "ENTER" || decision.action === "ADD" ? "bid" : "ask";
-    if (order.side !== expectedSide) {
-      throw new CandidateEvidenceFault("ORDER_SIDE_ACTION_MISMATCH", "Order side does not match the persisted decision action.");
+    if (order.side !== expectedSide || binding.side !== expectedSide) {
+      throw new CandidateEvidenceFault("ORDER_SIDE_ACTION_MISMATCH", "Order side does not match persisted candidate action.");
+    }
+    assertSameOptionalExactDecimal(binding.intendedQuantity, decision.intendedQuantity, "intended quantity");
+    assertSameOptionalExactDecimal(binding.intendedNotionalKrw, decision.intendedNotionalKrw, "intended notional");
+    if (binding.intendedQuantity !== null && order.volume !== binding.intendedQuantity) {
+      throw new CandidateEvidenceFault("ORDER_QUANTITY_INVALID", "Order volume does not match its bound intended quantity.");
+    }
+    if (order.ordType === "price" && binding.intendedNotionalKrw !== null && order.price !== binding.intendedNotionalKrw) {
+      throw new CandidateEvidenceFault("ORDER_QUANTITY_INVALID", "Price order budget does not match its bound intended notional.");
     }
     const decisionAt = parseTimestamp(decision.createdAt, "strategy decision createdAt");
     const requestedAt = parseTimestamp(order.requestedAt, "order requestedAt");
-    const updatedAt = parseTimestamp(order.updatedAt, "order updatedAt");
-    if (decisionAt > requestedAt || requestedAt > updatedAt) {
-      throw new CandidateEvidenceFault("ORDER_TIMESTAMP_INVALID", "Decision and order timestamps are inconsistent.");
+    const activationAt = binding.activationEpochNs;
+    if (decisionAt > requestedAt || requestedAt < activationAt) {
+      throw new CandidateEvidenceFault("ORDER_TIMESTAMP_INVALID", "Decision, activation, and order timestamps are inconsistent.");
     }
     const basis = parseDecisionBasis(decision);
-    return { action: decision.action, entryPath: basis.entryPath, decision, decisionAt, requestedAt, updatedAt };
+    return { action: decision.action, entryPath: basis.entryPath, decision, requestedAt };
   }
 
   private async fault(
@@ -186,8 +241,8 @@ export class CandidateExecutionEvidenceService {
     code: string,
     message: string,
   ): Promise<CandidateEvidenceProjectionResult> {
-    const { occurredAt } = this.dependencies.clock.now();
-    parseTimestamp(occurredAt, "candidate evidence fault occurredAt");
+    const now = this.dependencies.clock.now();
+    validateClock(now);
     const eventId = `candidate-evidence-fault:${order.id}:${code}`;
     const existingEvents = await this.dependencies.repositories.listOrderEvents(order.id);
     if (!existingEvents.some((event) => event.id === eventId)) {
@@ -197,14 +252,14 @@ export class CandidateExecutionEvidenceService {
         eventType: "CANDIDATE_EVIDENCE_PROJECTION_FAILED",
         eventSource: "RECONCILIATION",
         payloadJson: JSON.stringify({ code, message }),
-        createdAt: occurredAt,
+        createdAt: now.occurredAt,
       });
     }
     await this.dependencies.operatorState.pauseForFault({
       exchangeAccountId: order.exchangeAccountId,
       faultId: eventId,
       reason: `${code}: ${message}`,
-      occurredAt,
+      occurredAt: now.occurredAt,
     });
     return { outcome: "FAULT", orderId: order.id, detail: `${code}: ${message}` };
   }
@@ -216,14 +271,10 @@ export class CandidateExecutionEvidenceService {
     const eventId = `candidate-evidence-no-fill:${order.id}`;
     const existingEvents = await this.dependencies.repositories.listOrderEvents(order.id);
     if (existingEvents.some((event) => event.id === eventId)) {
-      return {
-        outcome: "DUPLICATE",
-        orderId: order.id,
-        detail: "Terminal no-fill cancellation was already recorded.",
-      };
+      return { outcome: "DUPLICATE", orderId: order.id, detail: "Terminal no-fill cancellation was already recorded." };
     }
-    const { occurredAt } = this.dependencies.clock.now();
-    parseTimestamp(occurredAt, "candidate no-fill occurredAt");
+    const now = this.dependencies.clock.now();
+    validateClock(now);
     await this.dependencies.repositories.appendOrderEvent({
       id: eventId,
       orderId: order.id,
@@ -234,7 +285,7 @@ export class CandidateExecutionEvidenceService {
         entryPath: decision.entryPath,
         terminalStatus: order.status,
       }),
-      createdAt: occurredAt,
+      createdAt: now.occurredAt,
     });
     return {
       outcome: "TERMINAL_NO_FILL",
@@ -245,8 +296,7 @@ export class CandidateExecutionEvidenceService {
 
   private async hasTerminalNoFillMarker(order: OrderRecord): Promise<boolean> {
     const eventId = `candidate-evidence-no-fill:${order.id}`;
-    const existingEvents = await this.dependencies.repositories.listOrderEvents(order.id);
-    return existingEvents.some((event) => event.id === eventId);
+    return (await this.dependencies.repositories.listOrderEvents(order.id)).some((event) => event.id === eventId);
   }
 }
 
@@ -256,14 +306,14 @@ interface VerifiedDecision {
   action: CandidateAction;
   entryPath: StrategyEntryPath;
   decision: StrategyDecisionRecord;
-  decisionAt: bigint;
   requestedAt: bigint;
-  updatedAt: bigint;
 }
 
-interface ExactDecimal {
-  coefficient: bigint;
-  scale: number;
+interface TerminalFillAggregate {
+  executedAt: string;
+  executedQuantity: string;
+  grossQuoteValueKrw: string;
+  confirmedFeeKrw: string;
 }
 
 class CandidateEvidenceFault extends Error {
@@ -276,46 +326,63 @@ function aggregateTerminalFills(
   order: OrderRecord,
   decision: VerifiedDecision,
   fills: FillRecord[],
-): {
-  executedQuantity: ExactDecimal;
-  grossQuoteValueKrw: ExactDecimal;
-  confirmedFeeKrw: ExactDecimal;
-} {
-  let executedQuantity = zeroDecimal();
-  let grossQuoteValueKrw = zeroDecimal();
-  let confirmedFeeKrw = zeroDecimal();
-  for (const fill of fills) {
+): TerminalFillAggregate {
+  let executedQuantity = parseCanonicalNonNegativeDecimal("0", "aggregate executed quantity");
+  let grossQuoteValueKrw = parseCanonicalNonNegativeDecimal("0", "aggregate gross quote value");
+  let confirmedFeeKrw = parseCanonicalNonNegativeDecimal("0", "aggregate confirmed fee");
+  const ordered = fills.map((fill) => ({
+    fill,
+    epochNanoseconds: parseTimestamp(fill.filledAt, "fill filledAt"),
+  })).sort((left, right) => {
+    if (left.epochNanoseconds < right.epochNanoseconds) return -1;
+    if (left.epochNanoseconds > right.epochNanoseconds) return 1;
+    return compareDeterministicIdentifiers(left.fill.id, right.fill.id);
+  });
+  for (const { fill, epochNanoseconds } of ordered) {
     if (fill.orderId !== order.id || fill.market !== order.market || fill.side !== order.side) {
       throw new CandidateEvidenceFault("FILL_ORDER_MISMATCH", "Persisted fill does not match terminal order identity.");
     }
-    const filledAt = parseTimestamp(fill.filledAt, "fill filledAt");
-    if (filledAt < decision.requestedAt || filledAt > decision.updatedAt) {
-      throw new CandidateEvidenceFault("FILL_TIMESTAMP_INVALID", "Persisted fill timestamp is outside the terminal order lifecycle.");
+    if (epochNanoseconds < decision.requestedAt) {
+      throw new CandidateEvidenceFault("FILL_TIMESTAMP_INVALID", "Persisted fill precedes the terminal order request.");
     }
-    if (fill.feeCurrency !== "KRW" || fill.feeAmount === null) {
-      throw new CandidateEvidenceFault("MISSING_FEE_EVIDENCE", "Every terminal fill requires confirmed KRW fee evidence.");
+    if (fill.feeCurrency !== "KRW" || fill.feeAmount === null || fill.feeProvenance !== "EXCHANGE_FILL_CONFIRMED") {
+      throw new CandidateEvidenceFault(
+        "UNVERIFIED_FEE_PROVENANCE",
+        "Every terminal fill requires a confirmed per-fill KRW fee source.",
+      );
     }
-    const volume = parsePositiveDecimal(fill.volume, "fill volume");
-    const price = parsePositiveDecimal(fill.price, "fill price");
-    const fee = parseNonNegativeDecimal(fill.feeAmount, "fill feeAmount");
-    executedQuantity = addDecimals(executedQuantity, volume);
-    grossQuoteValueKrw = addDecimals(grossQuoteValueKrw, multiplyDecimals(price, volume));
-    confirmedFeeKrw = addDecimals(confirmedFeeKrw, fee);
+    const volume = parseCanonicalNonNegativeDecimal(fill.volume, "fill volume");
+    const price = parseCanonicalNonNegativeDecimal(fill.price, "fill price");
+    const fee = parseCanonicalNonNegativeDecimal(fill.feeAmount, "fill feeAmount");
+    if (volume.coefficient === 0n || price.coefficient === 0n) {
+      throw new CandidateEvidenceFault("DECIMAL_INVALID", "Terminal fill volume and price must be positive.");
+    }
+    executedQuantity = addExactDecimals(executedQuantity, volume);
+    grossQuoteValueKrw = addExactDecimals(grossQuoteValueKrw, multiplyExactDecimals(price, volume));
+    confirmedFeeKrw = addExactDecimals(confirmedFeeKrw, fee);
   }
-
+  if (executedQuantity.coefficient === 0n) {
+    throw new CandidateEvidenceFault("TERMINAL_FILL_ZERO", "Terminal order contains only zero fills.");
+  }
   if (order.volume !== null) {
-    const requestedQuantity = parsePositiveDecimal(order.volume, "order volume");
-    if (compareDecimals(executedQuantity, requestedQuantity) > 0) {
+    const requestedQuantity = parseCanonicalNonNegativeDecimal(order.volume, "order volume");
+    if (compareExactDecimals(executedQuantity, requestedQuantity) > 0) {
       throw new CandidateEvidenceFault("ORDER_QUANTITY_INVALID", "Terminal fills exceed persisted order quantity.");
     }
   }
   if (order.side === "bid" && order.ordType === "price") {
-    const quoteBudget = parsePositiveDecimal(order.price ?? "", "order price");
-    if (compareDecimals(grossQuoteValueKrw, quoteBudget) > 0) {
+    const quoteBudget = parseCanonicalNonNegativeDecimal(order.price ?? "", "order price");
+    if (compareExactDecimals(grossQuoteValueKrw, quoteBudget) > 0) {
       throw new CandidateEvidenceFault("ORDER_QUANTITY_INVALID", "Terminal bid fills exceed persisted quote budget.");
     }
   }
-  return { executedQuantity, grossQuoteValueKrw, confirmedFeeKrw };
+  const latest = ordered.at(-1)!;
+  return {
+    executedAt: latest.fill.filledAt,
+    executedQuantity: formatExactDecimal(executedQuantity),
+    grossQuoteValueKrw: formatExactDecimal(grossQuoteValueKrw),
+    confirmedFeeKrw: formatExactDecimal(confirmedFeeKrw),
+  };
 }
 
 function parseDecisionBasis(decision: StrategyDecisionRecord): { entryPath: StrategyEntryPath } {
@@ -332,50 +399,46 @@ function parseDecisionBasis(decision: StrategyDecisionRecord): { entryPath: Stra
   const strategyDecision = asRecord(record.strategyDecision);
   const engineDecision = asRecord(record.engineDecision);
   const entryPath = engineDecision?.entryPath;
-  if (
-    strategyDecision?.market !== decision.market ||
-    strategyDecision.action !== decision.action ||
-    !isEntryPath(entryPath)
-  ) {
+  if (strategyDecision?.market !== decision.market || strategyDecision.action !== decision.action || !isEntryPath(entryPath)) {
     throw new CandidateEvidenceFault("STRATEGY_DECISION_INVALID", "Strategy decision basis does not match persisted decision provenance.");
   }
   return { entryPath };
 }
 
 function assertMatchingExistingEvidence(
-  existing: Readonly<PositionGuardCandidateExecutionEvidence>,
-  expected: Omit<PositionGuardCandidateExecutionEvidence, "remainingQuantity" | "executedQuantity" | "grossQuoteValueKrw" | "confirmedFeeKrw"> & {
-    executedQuantity: PositionGuardCandidateDecimal;
-    grossQuoteValueKrw: PositionGuardCandidateDecimal;
-    confirmedFeeKrw: PositionGuardCandidateDecimal;
-  },
+  existing: Readonly<CandidateEvidenceRecord>,
+  expected: PositionGuardCandidateExecutionEvidence,
 ): void {
+  const evidence = existing.evidence;
   if (
-    existing.executedAt !== expected.executedAt ||
-    existing.action !== expected.action ||
-    existing.entryPath !== expected.entryPath ||
-    existing.terminalStatus !== expected.terminalStatus ||
-    decimalText(existing.executedQuantity) !== decimalText(expected.executedQuantity) ||
-    decimalText(existing.grossQuoteValueKrw) !== decimalText(expected.grossQuoteValueKrw) ||
-    decimalText(existing.confirmedFeeKrw) !== decimalText(expected.confirmedFeeKrw)
+    evidence.executedAt !== expected.executedAt ||
+    evidence.action !== expected.action ||
+    evidence.entryPath !== expected.entryPath ||
+    evidence.terminalStatus !== expected.terminalStatus ||
+    evidence.executedQuantity !== expected.executedQuantity ||
+    evidence.grossQuoteValueKrw !== expected.grossQuoteValueKrw ||
+    evidence.confirmedFeeKrw !== expected.confirmedFeeKrw ||
+    evidence.remainingQuantity !== expected.remainingQuantity
   ) {
     throw new CandidateEvidenceFault("CONFLICTING_TERMINAL_EVIDENCE", "Persisted candidate evidence conflicts with terminal order evidence.");
   }
 }
 
-function deriveRemainingQuantity(
-  currentQuantity: number,
-  action: CandidateAction,
-  executedQuantity: ExactDecimal,
-): ExactDecimal {
-  const current = parseNonNegativeDecimal(String(currentQuantity), "candidate state inventory quantity");
-  if (action === "ENTER" || action === "ADD") {
-    return addDecimals(current, executedQuantity);
+function isBeforeEvidence(record: Readonly<CandidateEvidenceRecord>, epoch: bigint, evidenceId: string): boolean {
+  const recordEpoch = parseTimestamp(record.evidence.executedAt, "persisted candidate evidence executedAt");
+  return recordEpoch < epoch || (recordEpoch === epoch && record.evidence.evidenceId < evidenceId);
+}
+
+function assertSameOptionalExactDecimal(left: string | null, right: string | null, label: string): void {
+  if (left === null || right === null) {
+    if (left !== right) {
+      throw new CandidateEvidenceFault("CANDIDATE_EXECUTION_BINDING_INVALID", `Binding ${label} does not match strategy decision.`);
+    }
+    return;
   }
-  if (compareDecimals(executedQuantity, current) > 0) {
-    throw new CandidateEvidenceFault("ORDER_QUANTITY_INVALID", "Terminal sell evidence exceeds candidate inventory.");
+  if (canonicalNonNegativeDecimal(left, `binding ${label}`) !== canonicalNonNegativeDecimal(right, `decision ${label}`)) {
+    throw new CandidateEvidenceFault("CANDIDATE_EXECUTION_BINDING_INVALID", `Binding ${label} does not match strategy decision.`);
   }
-  return subtractDecimals(current, executedQuantity);
 }
 
 function isCandidateAction(value: StrategyDecisionRecord["action"]): value is CandidateAction {
@@ -403,78 +466,8 @@ function parseTimestamp(value: string, label: string): bigint {
   }
 }
 
-function parsePositiveDecimal(value: string, label: string): ExactDecimal {
-  const parsed = parseNonNegativeDecimal(value, label);
-  if (parsed.coefficient === 0n) {
-    throw new CandidateEvidenceFault("DECIMAL_INVALID", `${label} must be positive.`);
+function validateClock(value: ReturnType<CandidateEvidenceClock["now"]>): void {
+  if (!Number.isSafeInteger(value.occurredAtEpochMs) || value.occurredAtEpochMs < 0 || Date.parse(value.occurredAt) !== value.occurredAtEpochMs) {
+    throw new Error("Candidate evidence clock must provide matching persisted ISO and epoch-millisecond values.");
   }
-  return parsed;
-}
-
-function parseNonNegativeDecimal(value: string, label: string): ExactDecimal {
-  if (!/^(?:0|[1-9]\d*)(?:\.\d+)?$/u.test(value)) {
-    throw new CandidateEvidenceFault("DECIMAL_INVALID", `${label} must be a non-negative decimal string.`);
-  }
-  const [whole, fractional = ""] = value.split(".");
-  const coefficient = BigInt(`${whole}${fractional}`);
-  return normalizeDecimal({ coefficient, scale: fractional.length });
-}
-
-function zeroDecimal(): ExactDecimal {
-  return { coefficient: 0n, scale: 0 };
-}
-
-function normalizeDecimal(value: ExactDecimal): ExactDecimal {
-  let coefficient = value.coefficient;
-  let scale = value.scale;
-  while (scale > 0 && coefficient % 10n === 0n) {
-    coefficient /= 10n;
-    scale -= 1;
-  }
-  return { coefficient, scale };
-}
-
-function addDecimals(left: ExactDecimal, right: ExactDecimal): ExactDecimal {
-  const scale = Math.max(left.scale, right.scale);
-  return normalizeDecimal({
-    coefficient:
-      left.coefficient * 10n ** BigInt(scale - left.scale) +
-      right.coefficient * 10n ** BigInt(scale - right.scale),
-    scale,
-  });
-}
-
-function subtractDecimals(left: ExactDecimal, right: ExactDecimal): ExactDecimal {
-  const scale = Math.max(left.scale, right.scale);
-  return normalizeDecimal({
-    coefficient:
-      left.coefficient * 10n ** BigInt(scale - left.scale) -
-      right.coefficient * 10n ** BigInt(scale - right.scale),
-    scale,
-  });
-}
-
-function multiplyDecimals(left: ExactDecimal, right: ExactDecimal): ExactDecimal {
-  return normalizeDecimal({
-    coefficient: left.coefficient * right.coefficient,
-    scale: left.scale + right.scale,
-  });
-}
-
-function compareDecimals(left: ExactDecimal, right: ExactDecimal): number {
-  const scale = Math.max(left.scale, right.scale);
-  const leftCoefficient = left.coefficient * 10n ** BigInt(scale - left.scale);
-  const rightCoefficient = right.coefficient * 10n ** BigInt(scale - right.scale);
-  return leftCoefficient < rightCoefficient ? -1 : leftCoefficient > rightCoefficient ? 1 : 0;
-}
-
-function formatDecimal(value: ExactDecimal): string {
-  const digits = value.coefficient.toString();
-  if (value.scale === 0) return digits;
-  const padded = digits.padStart(value.scale + 1, "0");
-  return `${padded.slice(0, -value.scale)}.${padded.slice(-value.scale)}`;
-}
-
-function decimalText(value: PositionGuardCandidateDecimal): string {
-  return typeof value === "string" ? value : String(value);
 }

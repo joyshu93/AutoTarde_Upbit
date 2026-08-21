@@ -2,12 +2,16 @@ import { createHash } from "node:crypto";
 
 import type {
   AccountExecutionLeaseRecord,
+  CandidateExecutionBindingRecord,
   PositionGuardPilotAuditEventRecord,
   PositionGuardPilotDeploymentRecord,
 } from "../../domain/pilot-types.js";
 import {
+  canonicalNonNegativeDecimal,
+  type ExactCandidateState,
+} from "../execution/candidate-evidence-decimals.js";
+import {
   parsePositionGuardCandidateTimestamp,
-  type PositionGuardCandidateDecimal,
   type PositionGuardCandidateExecutionEvidence,
   type PositionGuardCandidateState,
 } from "../strategy/position-guard-candidate-state.js";
@@ -29,6 +33,14 @@ export interface AdvanceCandidatePilotStateResult {
   duplicate: boolean;
 }
 
+export type CandidateMaterialVersion = "LEGACY_APPROXIMATE_V1" | "EXACT_V2";
+
+export interface CandidateEvidenceRecord {
+  evidence: Readonly<PositionGuardCandidateExecutionEvidence>;
+  materialHash: string;
+  materialVersion: CandidateMaterialVersion;
+}
+
 export interface CandidatePilotRepository {
   createDeploymentWithInitialState(
     input: CreateCandidatePilotDeploymentInput,
@@ -38,11 +50,21 @@ export interface CandidatePilotRepository {
     exchangeAccountId: string,
   ): Promise<PositionGuardPilotDeploymentRecord | null>;
   getState(deploymentId: string): Promise<Readonly<PositionGuardCandidateState> | null>;
+  getExactState(deploymentId: string): Promise<Readonly<ExactCandidateState> | null>;
   listEvidenceAfter(
     deploymentId: string,
     afterEvidenceId: string | null,
   ): Promise<Array<Readonly<PositionGuardCandidateExecutionEvidence>>>;
+  listEvidenceRecords(
+    deploymentId: string,
+  ): Promise<Array<Readonly<CandidateEvidenceRecord>>>;
+  getEvidenceRecord(
+    deploymentId: string,
+    evidenceId: string,
+  ): Promise<Readonly<CandidateEvidenceRecord> | null>;
   listAuditEvents(deploymentId: string): Promise<PositionGuardPilotAuditEventRecord[]>;
+  createExecutionBinding(input: CandidateExecutionBindingRecord): Promise<CandidateExecutionBindingRecord>;
+  getExecutionBindingForOrder(orderId: string): Promise<CandidateExecutionBindingRecord | null>;
   advanceStateWithEvidence(
     input: AdvanceCandidatePilotStateInput,
   ): Promise<AdvanceCandidatePilotStateResult>;
@@ -91,6 +113,26 @@ const EVIDENCE_KEYS = [
   "grossQuoteValueKrw",
   "confirmedFeeKrw",
   "remainingQuantity",
+] as const;
+const BINDING_KEYS = [
+  "id",
+  "deploymentId",
+  "strategyDecisionId",
+  "orderId",
+  "exchangeAccountId",
+  "activationAt",
+  "activationEpochNs",
+  "market",
+  "strategyKey",
+  "policyId",
+  "policyVersion",
+  "executionMode",
+  "ordType",
+  "action",
+  "side",
+  "intendedQuantity",
+  "intendedNotionalKrw",
+  "createdAt",
 ] as const;
 const PILOT_PHASES = ["DISABLED", "PENDING_FLAT", "ACTIVE", "PAUSED_FAULT", "DRAINING"] as const;
 const EVIDENCE_ACTIONS = ["ENTER", "ADD", "REDUCE", "EXIT"] as const;
@@ -141,7 +183,12 @@ export function validateCandidatePilotDeployment(
 export function candidateEvidenceMaterial(
   deploymentId: string,
   evidence: PositionGuardCandidateExecutionEvidence,
-): { hash: string; epochNanoseconds: bigint; evidence: PositionGuardCandidateExecutionEvidence } {
+): {
+  hash: string;
+  epochNanoseconds: bigint;
+  evidence: PositionGuardCandidateExecutionEvidence;
+  materialVersion: "EXACT_V2";
+} {
   requireNonEmpty(deploymentId, "deploymentId");
   const record = exactOwnDataRecord(evidence, "candidate execution evidence", EVIDENCE_KEYS);
   const snapshot: PositionGuardCandidateExecutionEvidence = {
@@ -186,7 +233,8 @@ export function candidateEvidenceMaterial(
     throw new Error("Candidate evidence executedAt cannot be before the Unix epoch.");
   }
   const canonical = JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
+    materialVersion: "EXACT_V2",
     deploymentId,
     evidenceId: snapshot.evidenceId,
     executedAt: snapshot.executedAt,
@@ -203,7 +251,67 @@ export function candidateEvidenceMaterial(
     hash: createHash("sha256").update(canonical, "utf8").digest("hex"),
     epochNanoseconds,
     evidence: snapshot,
+    materialVersion: "EXACT_V2",
   };
+}
+
+export function validateCandidateExecutionBinding(
+  value: CandidateExecutionBindingRecord,
+): CandidateExecutionBindingRecord {
+  const record = exactOwnDataRecord(value, "candidate execution binding", BINDING_KEYS);
+  const binding = {
+    id: record.id,
+    deploymentId: record.deploymentId,
+    strategyDecisionId: record.strategyDecisionId,
+    orderId: record.orderId,
+    exchangeAccountId: record.exchangeAccountId,
+    activationAt: record.activationAt,
+    activationEpochNs: record.activationEpochNs,
+    market: record.market,
+    strategyKey: record.strategyKey,
+    policyId: record.policyId,
+    policyVersion: record.policyVersion,
+    executionMode: record.executionMode,
+    ordType: record.ordType,
+    action: record.action,
+    side: record.side,
+    intendedQuantity: record.intendedQuantity,
+    intendedNotionalKrw: record.intendedNotionalKrw,
+    createdAt: record.createdAt,
+  } as CandidateExecutionBindingRecord;
+  for (const field of [
+    binding.id,
+    binding.deploymentId,
+    binding.strategyDecisionId,
+    binding.orderId,
+    binding.exchangeAccountId,
+  ]) {
+    requireNonEmpty(field, "candidate execution binding identity");
+  }
+  if (
+    binding.market !== "KRW-BTC" ||
+    binding.strategyKey !== "position_guard.paper_core.v1" ||
+    binding.policyId !== "COMBINED_CONSERVATIVE" ||
+    binding.policyVersion !== "PCS-2026-001.DEPLOYMENT_READINESS_V1" ||
+    !["DRY_RUN", "LIVE"].includes(binding.executionMode) ||
+    !["limit", "price", "market", "best"].includes(binding.ordType) ||
+    !EVIDENCE_ACTIONS.includes(binding.action) ||
+    !["bid", "ask"].includes(binding.side)
+  ) {
+    throw new Error("Candidate execution binding has an invalid persisted provenance identity.");
+  }
+  const activationEpochNs = parsePositionGuardCandidateTimestamp(binding.activationAt, "binding activationAt");
+  if (activationEpochNs < 0n || activationEpochNs !== binding.activationEpochNs) {
+    throw new Error("Candidate execution binding activation epoch does not match its timestamp.");
+  }
+  parsePositionGuardCandidateTimestamp(binding.createdAt, "binding createdAt");
+  if (binding.intendedQuantity !== null) {
+    canonicalNonNegativeDecimal(binding.intendedQuantity, "binding intendedQuantity");
+  }
+  if (binding.intendedNotionalKrw !== null) {
+    canonicalNonNegativeDecimal(binding.intendedNotionalKrw, "binding intendedNotionalKrw");
+  }
+  return binding;
 }
 
 export function validateLeaseWindow(
@@ -220,31 +328,8 @@ export function validateLeaseWindow(
   }
 }
 
-function canonicalNonNegativeDecimal(value: unknown, label: string): PositionGuardCandidateDecimal {
-  if (typeof value === "number") {
-    if (!Number.isFinite(value) || value < 0) {
-      throw new Error(`Candidate evidence ${label} must be finite and non-negative.`);
-    }
-    return canonicalDecimalText(String(Object.is(value, -0) ? 0 : value));
-  }
-  if (typeof value !== "string") {
-    throw new Error(`Candidate evidence ${label} must be finite and non-negative.`);
-  }
-  return canonicalDecimalText(value);
-}
-
-function canonicalDecimalText(value: string): string {
-  if (!/^(?:0|[1-9]\d*)(?:\.\d+)?$/u.test(value)) {
-    throw new Error("Candidate evidence decimal values must be non-negative decimal strings.");
-  }
-  const [whole, fractional] = value.split(".");
-  const canonicalWhole = whole!.replace(/^0+(?=\d)/u, "");
-  const canonicalFractional = fractional?.replace(/0+$/u, "") ?? "";
-  return canonicalFractional === "" ? canonicalWhole : `${canonicalWhole}.${canonicalFractional}`;
-}
-
-function isZeroDecimal(value: PositionGuardCandidateDecimal): boolean {
-  return value === 0 || value === "0";
+function isZeroDecimal(value: unknown): boolean {
+  return value === "0";
 }
 
 function requireNonEmpty(value: string, label: string): void {

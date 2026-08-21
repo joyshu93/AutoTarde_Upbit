@@ -48,6 +48,7 @@ import type {
 } from "../types.js";
 import type {
   ExecutionRepository,
+  FinalizeBoundedSubmissionAbsenceInput,
   FaultPauseInput,
   OperatorStateStore,
   PersistExchangeSubmissionInput,
@@ -64,6 +65,7 @@ import { SqliteCandidatePilotRepository } from "./sqlite-candidate-pilot-reposit
 import { withImmediateTransaction } from "./sqlite-transaction.js";
 import {
   recordsEqual,
+  normalizeFillFeeProvenance,
   validateExchangeSubmissionInput,
   validateExchangeSubmissionCompletion,
   validateFaultPauseInput,
@@ -258,36 +260,40 @@ export class SqliteExecutionRepository implements ExecutionRepository {
 
   async persistExchangeSubmission(input: PersistExchangeSubmissionInput): Promise<void> {
     withImmediateTransaction(this.db, () => {
-      validateExchangeSubmissionInput(input);
-      const existingOrder = this.getOrderById(input.order.id);
+      const normalizedInput = {
+        ...input,
+        fills: input.fills.map(normalizeFillFeeProvenance),
+      };
+      validateExchangeSubmissionInput(normalizedInput);
+      const existingOrder = this.getOrderById(normalizedInput.order.id);
       if (!existingOrder) {
-        throw new Error(`Cannot persist exchange submission for missing order ${input.order.id}.`);
+        throw new Error(`Cannot persist exchange submission for missing order ${normalizedInput.order.id}.`);
       }
-      assertSameAccount(existingOrder, input.order);
-      const existingEvent = this.getOrderEventById(input.event.id);
-      assertNoConflictingRecord(existingEvent, input.event, "order event");
-      if (input.terminalEvent) {
-        const existingTerminalEvent = this.getOrderEventById(input.terminalEvent.id);
-        assertNoConflictingRecord(existingTerminalEvent, input.terminalEvent, "terminal order event");
+      assertSameAccount(existingOrder, normalizedInput.order);
+      const existingEvent = this.getOrderEventById(normalizedInput.event.id);
+      assertNoConflictingRecord(existingEvent, normalizedInput.event, "order event");
+      if (normalizedInput.terminalEvent) {
+        const existingTerminalEvent = this.getOrderEventById(normalizedInput.terminalEvent.id);
+        assertNoConflictingRecord(existingTerminalEvent, normalizedInput.terminalEvent, "terminal order event");
       }
-      const existingFills = input.fills.map((fill) => this.getFillByIdentity(fill));
-      input.fills.forEach((fill, index) => assertNoConflictingRecord(existingFills[index] ?? null, fill, "fill"));
+      const existingFills = normalizedInput.fills.map((fill) => this.getFillByIdentity(fill));
+      normalizedInput.fills.forEach((fill, index) => assertNoConflictingRecord(existingFills[index] ?? null, fill, "fill"));
 
       const completion = validateExchangeSubmissionCompletion(
         existingOrder,
-        input.order,
-        input,
-        this.getOrderEventsForOrder(input.order.id),
-        this.getFillsForOrder(input.order.id),
+        normalizedInput.order,
+        normalizedInput,
+        this.getOrderEventsForOrder(normalizedInput.order.id),
+        this.getFillsForOrder(normalizedInput.order.id),
       );
       if (completion === "RETRY") {
         return;
       }
 
-      this.upsertOrder(input.order);
-      this.insertOrderEvent(input.event);
-      if (input.terminalEvent) this.insertOrderEvent(input.terminalEvent);
-      input.fills.forEach((fill) => this.upsertFill(fill));
+      this.upsertOrder(normalizedInput.order);
+      this.insertOrderEvent(normalizedInput.event);
+      if (normalizedInput.terminalEvent) this.insertOrderEvent(normalizedInput.terminalEvent);
+      normalizedInput.fills.forEach((fill) => this.upsertFill(fill));
     });
   }
 
@@ -405,15 +411,15 @@ export class SqliteExecutionRepository implements ExecutionRepository {
   }
 
   async saveFill(record: FillRecord): Promise<void> {
-    this.upsertFill(record);
+    this.upsertFill(normalizeFillFeeProvenance(record));
   }
 
   private upsertFill(record: FillRecord): void {
     this.db.prepare(`
       INSERT INTO fills (
         id, order_id, exchange_fill_id, market, side, price, volume,
-        fee_currency, fee_amount, filled_at, raw_payload_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        fee_currency, fee_amount, fee_provenance, filled_at, raw_payload_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(order_id, exchange_fill_id) DO UPDATE SET
         market = excluded.market,
         side = excluded.side,
@@ -421,6 +427,7 @@ export class SqliteExecutionRepository implements ExecutionRepository {
         volume = excluded.volume,
         fee_currency = excluded.fee_currency,
         fee_amount = excluded.fee_amount,
+        fee_provenance = excluded.fee_provenance,
         filled_at = excluded.filled_at,
         raw_payload_json = excluded.raw_payload_json
     `).run(
@@ -433,6 +440,7 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       record.volume,
       record.feeCurrency,
       record.feeAmount,
+      record.feeProvenance ?? "LEGACY_UNVERIFIED",
       record.filledAt,
       record.rawPayloadJson,
     );
@@ -1160,6 +1168,92 @@ export class SqliteExecutionRepository implements ExecutionRepository {
     return rows.map(mapOrderSubmissionRecoveryObservationRow);
   }
 
+  async finalizeBoundedSubmissionAbsence(
+    input: FinalizeBoundedSubmissionAbsenceInput,
+  ): Promise<boolean> {
+    return withImmediateTransaction(this.db, () => {
+      const currentOrder = this.getOrderById(input.orderId);
+      if (
+        !currentOrder ||
+        currentOrder.status !== input.expectedStatus ||
+        currentOrder.updatedAt !== input.expectedUpdatedAt
+      ) {
+        return false;
+      }
+      if (input.event.orderId !== currentOrder.id || input.faultPause.exchangeAccountId !== currentOrder.exchangeAccountId) {
+        throw new Error("Bounded absence finalization provenance does not match the expected order.");
+      }
+      if (this.getOrderEventById(input.event.id)) {
+        throw new Error(`Conflicting bounded absence event ${input.event.id}.`);
+      }
+      validateFaultPauseInput(input.faultPause);
+      const stateRow = this.db.prepare(`
+        SELECT * FROM execution_state WHERE exchange_account_id = ? LIMIT 1
+      `).get(currentOrder.exchangeAccountId) as SqliteExecutionStateRow | undefined;
+      if (!stateRow) {
+        throw new Error(`Execution state is missing for exchange account ${currentOrder.exchangeAccountId}.`);
+      }
+      const currentState = mapExecutionStateRow(stateRow);
+      validateFaultPauseTimestamp(input.faultPause, currentState);
+      const orderUpdate = this.db.prepare(`
+        UPDATE orders
+        SET status = 'FAILED', failure_code = ?, failure_message = ?, updated_at = ?
+        WHERE id = ? AND status = ? AND updated_at = ?
+      `).run(
+        input.failureCode,
+        input.failureMessage,
+        input.failedAt,
+        input.orderId,
+        input.expectedStatus,
+        input.expectedUpdatedAt,
+      );
+      if (orderUpdate.changes !== 1) {
+        return false;
+      }
+      this.insertOrderEvent(input.event);
+      const reason = formatFaultPauseReason(input.faultPause);
+      const preservesKillSwitch = currentState.killSwitchActive || currentState.systemStatus === "KILL_SWITCHED";
+      const nextState: ExecutionStateRecord = {
+        ...currentState,
+        systemStatus: preservesKillSwitch ? "KILL_SWITCHED" : "PAUSED",
+        pauseReason: preservesKillSwitch ? currentState.pauseReason : reason,
+        updatedAt: input.faultPause.occurredAt,
+      };
+      this.db.prepare(`
+        UPDATE execution_state
+        SET execution_mode = ?, live_execution_gate = ?, system_status = ?, kill_switch_active = ?,
+            pause_reason = ?, degraded_reason = ?, degraded_at = ?, updated_at = ?
+        WHERE exchange_account_id = ?
+      `).run(
+        nextState.executionMode,
+        nextState.liveExecutionGate,
+        nextState.systemStatus,
+        toSqliteBoolean(nextState.killSwitchActive),
+        nextState.pauseReason,
+        nextState.degradedReason,
+        nextState.degradedAt,
+        nextState.updatedAt,
+        nextState.exchangeAccountId,
+      );
+      recordExecutionStateTransition(this.db, {
+        id: input.faultPause.faultId,
+        exchangeAccountId: currentOrder.exchangeAccountId,
+        command: "AUTOMATIC_PAUSE",
+        fromExecutionMode: currentState.executionMode,
+        toExecutionMode: nextState.executionMode,
+        fromLiveExecutionGate: currentState.liveExecutionGate,
+        toLiveExecutionGate: nextState.liveExecutionGate,
+        fromSystemStatus: currentState.systemStatus,
+        toSystemStatus: nextState.systemStatus,
+        fromKillSwitchActive: currentState.killSwitchActive,
+        toKillSwitchActive: nextState.killSwitchActive,
+        reason,
+        createdAt: input.faultPause.occurredAt,
+      });
+      return true;
+    });
+  }
+
   private getRiskEventById(id: string): RiskEventRecord | null {
     const row = this.db.prepare("SELECT * FROM risk_events WHERE id = ? LIMIT 1").get(id) as SqliteRiskEventRow | undefined;
     return row ? mapRiskEventRow(row) : null;
@@ -1739,6 +1833,7 @@ function mapFillRow(row: SqliteFillRow): FillRecord {
     volume: row.volume,
     feeCurrency: row.fee_currency,
     feeAmount: row.fee_amount,
+    feeProvenance: row.fee_provenance,
     filledAt: row.filled_at,
     rawPayloadJson: row.raw_payload_json,
   };

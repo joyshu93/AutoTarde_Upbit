@@ -11,6 +11,10 @@ import type {
 } from "../src/modules/db/pilot-interfaces.js";
 import { InMemoryCandidatePilotRepository } from
   "../src/modules/db/repositories/in-memory-candidate-pilot-repository.js";
+import {
+  EXACT_CANDIDATE_QUANTITY_TOLERANCE,
+  deriveExactRemainingQuantity,
+} from "../src/modules/execution/candidate-evidence-decimals.js";
 import { test } from "./harness.js";
 
 export type CandidatePilotRepositoryFactory = () =>
@@ -46,10 +50,10 @@ export function candidateEvidence(
     action: "ENTER",
     entryPath: "RECLAIM",
     terminalStatus: "FILLED",
-    executedQuantity: 0.1,
-    grossQuoteValueKrw: 10_000_000,
-    confirmedFeeKrw: 5_000,
-    remainingQuantity: 0.1,
+    executedQuantity: "0.1",
+    grossQuoteValueKrw: "10000000",
+    confirmedFeeKrw: "5000",
+    remainingQuantity: "0.1",
     ...overrides,
   };
 }
@@ -78,10 +82,10 @@ export async function verifyCandidatePilotRepositoryContract(
     advanceInput(deployment.id, "e1", 0),
   );
   const duplicateEvidence: PositionGuardCandidateExecutionEvidence = {
-    remainingQuantity: 0.1,
-    confirmedFeeKrw: 5_000,
-    grossQuoteValueKrw: 10_000_000,
-    executedQuantity: 0.1,
+    remainingQuantity: "0.1",
+    confirmedFeeKrw: "5000",
+    grossQuoteValueKrw: "10000000",
+    executedQuantity: "0.1",
     terminalStatus: "FILLED",
     entryPath: "RECLAIM",
     action: "ENTER",
@@ -102,7 +106,13 @@ export async function verifyCandidatePilotRepositoryContract(
 
   await assert.rejects(
     () => repository.advanceStateWithEvidence(
-      advanceInput(deployment.id, "e1", 0, { confirmedFeeKrw: 5_001 }),
+      advanceInput(deployment.id, "e1", 0, { confirmedFeeKrw: "5001" }),
+    ),
+    /conflicting duplicate/i,
+  );
+  await assert.rejects(
+    () => repository.advanceStateWithEvidence(
+      advanceInput(deployment.id, "e1", 0, { remainingQuantity: "0" }),
     ),
     /conflicting duplicate/i,
   );
@@ -111,7 +121,7 @@ export async function verifyCandidatePilotRepositoryContract(
       advanceInput(deployment.id, "e2", 0, {
         action: "ADD",
         executedAt: "2026-08-21T00:00:02.000Z",
-        remainingQuantity: 0.2,
+        remainingQuantity: "0.2",
       }),
     ),
     /state version/i,
@@ -121,11 +131,36 @@ export async function verifyCandidatePilotRepositoryContract(
   assert.equal((await repository.listEvidenceAfter(deployment.id, null)).length, 1);
   assert.equal((await repository.listAuditEvents(deployment.id)).length, 2);
 
+  await repository.advanceStateWithEvidence(
+    advanceInput(deployment.id, "exact-add", 1, {
+      action: "ADD",
+      executedAt: "2026-08-21T00:00:01.000000001Z",
+      executedQuantity: "0.1",
+      grossQuoteValueKrw: "10000000",
+      confirmedFeeKrw: "0",
+      remainingQuantity: "0.2",
+    }),
+  );
+  await repository.advanceStateWithEvidence(
+    advanceInput(deployment.id, "exact-reduce", 2, {
+      action: "REDUCE",
+      executedAt: "2026-08-21T00:00:02.000000001Z",
+      executedQuantity: "0.1",
+      grossQuoteValueKrw: "10000000",
+      confirmedFeeKrw: "0",
+      remainingQuantity: "0.1",
+    }),
+  );
+  assert.equal(
+    (await repository.getEvidenceRecord(deployment.id, "exact-reduce"))?.evidence.remainingQuantity,
+    "0.1",
+  );
+
   const forgedEvidence = {
     ...candidateEvidence("e2", {
       action: "ADD",
       executedAt: "2026-08-21T00:00:02.000Z",
-      remainingQuantity: 0.2,
+      remainingQuantity: "0.2",
     }),
     unexpected: true,
   } as PositionGuardCandidateExecutionEvidence;
@@ -156,20 +191,20 @@ export async function verifyMixedOffsetReplayContract(
     advanceInput(deployment.id, "B", 1, {
       action: "ADD",
       executedAt: "2026-08-21T00:00:00.000000001Z",
-      executedQuantity: 0.05,
-      grossQuoteValueKrw: 5_000_000,
-      confirmedFeeKrw: 2_500,
-      remainingQuantity: 0.15,
+      executedQuantity: "0.05",
+      grossQuoteValueKrw: "5000000",
+      confirmedFeeKrw: "2500",
+      remainingQuantity: "0.15",
     }),
   );
   await repository.advanceStateWithEvidence(
     advanceInput(deployment.id, "a", 2, {
       action: "ADD",
       executedAt: "2026-08-21T00:00:00.000000001Z",
-      executedQuantity: 0.05,
-      grossQuoteValueKrw: 5_000_000,
-      confirmedFeeKrw: 2_500,
-      remainingQuantity: 0.2,
+      executedQuantity: "0.05",
+      grossQuoteValueKrw: "5000000",
+      confirmedFeeKrw: "2500",
+      remainingQuantity: "0.2",
     }),
   );
 
@@ -212,7 +247,7 @@ export async function verifyDeploymentScopedEvidenceIdentityContract(
   assert.equal((await repository.getState(second.id))?.stateVersion, 1);
   await assert.rejects(
     () => repository.advanceStateWithEvidence(
-      advanceInput(first.id, "shared-evidence", 0, { confirmedFeeKrw: 5_001 }),
+      advanceInput(first.id, "shared-evidence", 0, { confirmedFeeKrw: "5001" }),
     ),
     /conflicting duplicate/i,
   );
@@ -287,4 +322,13 @@ test("in-memory candidate pilot rejects pre-epoch evidence without mutation", as
 
 test("in-memory candidate pilot repository rejects forged persisted identity", async () => {
   await verifyCandidatePilotIdentityValidation(() => new InMemoryCandidatePilotRepository());
+});
+
+test("exact candidate residuals use the canonical persisted quantity tolerance", () => {
+  assert.equal(EXACT_CANDIDATE_QUANTITY_TOLERANCE, "0.000000000001");
+  assert.equal(deriveExactRemainingQuantity({
+    currentQuantity: "1.0000000000001",
+    action: "EXIT",
+    executedQuantity: "1",
+  }), "0");
 });

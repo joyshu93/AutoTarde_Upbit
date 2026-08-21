@@ -2,6 +2,7 @@ import type {
   ExecutionRiskLimits,
   ExecutionStateRecord,
   ExecutionPolicy,
+  FillRecord,
   RiskRuleCode,
   OrderRecord,
   RiskEventRecord,
@@ -390,7 +391,7 @@ export class ExecutionService {
         updatedAt: submittedAt,
       };
 
-      const fills = exchangeOrder.fills.map((fill) => ({
+      const fills: FillRecord[] = exchangeOrder.fills.map((fill): FillRecord => ({
           id: createId("fill"),
           orderId: order.id,
           exchangeFillId: fill.tradeUuid ?? createId("exchange_fill"),
@@ -400,6 +401,7 @@ export class ExecutionService {
           volume: fill.volume,
           feeCurrency: "KRW",
           feeAmount: fill.fee,
+          feeProvenance: fill.fee === null ? "MISSING" : "EXCHANGE_FILL_CONFIRMED",
           filledAt: fill.createdAt ?? updatedOrder.updatedAt,
           rawPayloadJson: JSON.stringify(fill.raw),
         }));
@@ -1101,7 +1103,7 @@ function createDryRunSyntheticFill(input: {
   requestedNotionalKrw: number | null;
   filledAt: string;
   exchangeOrderRaw: unknown;
-}) {
+}): FillRecord | null {
   const price =
     input.ordType === "price" || input.price === null
       ? String(input.referencePrice)
@@ -1122,6 +1124,7 @@ function createDryRunSyntheticFill(input: {
     volume,
     feeCurrency: "KRW",
     feeAmount: "0",
+    feeProvenance: "SIMULATED",
     filledAt: input.filledAt,
     rawPayloadJson: JSON.stringify({
       mode: "DRY_RUN",

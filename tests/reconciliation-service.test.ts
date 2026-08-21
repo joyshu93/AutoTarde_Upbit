@@ -231,7 +231,7 @@ test("reconciliation projects persisted terminal order evidence after fill backf
   assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
 });
 
-test("reconciliation service falls back to order paid fee when Upbit trade fill omits fee", async () => {
+test("reconciliation service preserves an unallocated order fee when an Upbit trade fill omits fee", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = new InMemoryOperatorStateStore({
     id: "state-paid-fee-fallback",
@@ -317,7 +317,8 @@ test("reconciliation service falls back to order paid fee when Upbit trade fill 
 
   assert.equal(fills.length, 1);
   assert.equal(fills[0]?.feeCurrency, "KRW");
-  assert.equal(fills[0]?.feeAmount, "16.94148533");
+  assert.equal(fills[0]?.feeAmount, null);
+  assert.equal(fills[0]?.feeProvenance, "ORDER_LEVEL_UNALLOCATED");
 });
 
 test("reconciliation service treats filled Upbit price bids with canceled dust as filled", async () => {
@@ -412,7 +413,8 @@ test("reconciliation service treats filled Upbit price bids with canceled dust a
   assert.equal(orders[0]?.status, "FILLED");
   assert.equal(activeOrders.length, 0);
   assert.equal(fills.length, 1);
-  assert.equal(fills[0]?.feeAmount, "9.034586325");
+  assert.equal(fills[0]?.feeAmount, null);
+  assert.equal(fills[0]?.feeProvenance, "ORDER_LEVEL_UNALLOCATED");
 });
 
 test("reconciliation service rechecks stored canceled price bids with fill evidence", async () => {
@@ -515,7 +517,8 @@ test("reconciliation service rechecks stored canceled price bids with fill evide
   );
   assert.equal(orders[0]?.status, "FILLED");
   assert.equal(fills.length, 1);
-  assert.equal(fills[0]?.feeAmount, "9.034586325");
+  assert.equal(fills[0]?.feeAmount, null);
+  assert.equal(fills[0]?.feeProvenance, "ORDER_LEVEL_UNALLOCATED");
 });
 
 test("reconciliation service repairs local dry-run orders without querying Upbit", async () => {
@@ -1316,6 +1319,9 @@ test("reconciliation service rechecks failed terminal orders with exchange refer
         };
       },
     },
+    recoveryClock: {
+      now: () => ({ observedAt: "2026-04-20T00:00:01.000Z", observedAtEpochMs: 1_776_643_201_000 }),
+    },
   });
 
   const summary = await service.run("primary");
@@ -1323,21 +1329,12 @@ test("reconciliation service rechecks failed terminal orders with exchange refer
 
   assert.equal(summary.status, "DRIFT_DETECTED");
   assert.equal(summary.source, "DIRECT_RUN");
-  assert.deepEqual(summary.issues, [
-    {
-      code: "TERMINAL_ORDER_RECHECKED",
-      message: "Terminal order order-4 was rechecked against exchange state done.",
-    },
-    {
-      code: "ORDER_STATUS_RECONCILED",
-      message: "Order order-4 reconciled from FAILED to FILLED using exchange state done.",
-    },
-  ]);
+  assert.deepEqual(summary.issues.map((issue) => issue.code), ["ORDER_IDENTIFIER_RECOVERED"]);
   assert.equal(orders[0]?.status, "FILLED");
   assert.match(orders[0]?.exchangeResponseJson ?? "", /"state":"done"/);
 });
 
-test("reconciliation service treats absent FAILED exchange orders as confirmed terminal absence", async () => {
+test("reconciliation service keeps the first absent FAILED lookup uncertain", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = new InMemoryOperatorStateStore({
     id: "state-5",
@@ -1384,6 +1381,9 @@ test("reconciliation service treats absent FAILED exchange orders as confirmed t
         return null;
       },
     },
+    recoveryClock: {
+      now: () => ({ observedAt: "2026-04-20T00:00:01.000Z", observedAtEpochMs: 1_776_643_201_000 }),
+    },
   });
 
   const summary = await service.run("primary");
@@ -1391,14 +1391,9 @@ test("reconciliation service treats absent FAILED exchange orders as confirmed t
   const riskEvents = await repositories.listRiskEvents("primary");
 
   assert.equal(summary.status, "DRIFT_DETECTED");
-  assert.deepEqual(summary.issues, [
-    {
-      code: "TERMINAL_ORDER_CONFIRMED_ABSENT",
-      message: "Terminal order order-5 was confirmed absent on exchange during reconciliation.",
-    },
-  ]);
+  assert.deepEqual(summary.issues.map((issue) => issue.code), ["ORDER_IDENTIFIER_RECOVERY_UNCERTAIN"]);
   assert.equal(orders[0]?.status, "FAILED");
-  assert.equal(orders[0]?.failureCode, "TERMINAL_ORDER_CONFIRMED_ABSENT");
+  assert.equal(orders[0]?.failureCode, "EXCHANGE_SUBMISSION_FAILED");
   assert.equal(riskEvents.length, 0);
 });
 
@@ -1646,6 +1641,124 @@ test("first identifier recovery absence remains uncertain without resuming or se
   assert.deepEqual(observations.map((observation) => observation.outcome), ["NOT_FOUND"]);
 });
 
+test("immediate persisted terminal strategy orders are swept without consuming exchange lookup budget", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = pausedUncertainSubmissionState();
+  const order = uncertainSubmissionOrder({
+    id: "immediate-terminal-order",
+    status: "FILLED",
+    upbitUuid: null,
+    updatedAt: "2026-08-21T00:00:10.000Z",
+  });
+  await repositories.saveOrder(order);
+  await repositories.saveFill({
+    id: "immediate-terminal-fill",
+    orderId: order.id,
+    exchangeFillId: "immediate-terminal-fill",
+    market: "KRW-BTC",
+    side: "bid",
+    price: "100000000",
+    volume: "0.1",
+    feeCurrency: "KRW",
+    feeAmount: "500",
+    filledAt: "2026-08-21T00:00:02.000000001Z",
+    rawPayloadJson: "{}",
+  });
+  const projected: string[] = [];
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    maxOrderLookupsPerRun: 0,
+    candidateEvidenceService: {
+      async processTerminalOrder(orderId) {
+        projected.push(orderId);
+        return { outcome: "ADVANCED", orderId, detail: "projected" };
+      },
+    },
+  });
+
+  await reconciliation.run("primary");
+
+  assert.deepEqual(projected, [order.id]);
+});
+
+test("terminal sweep orders persisted fill instants before order update time with deterministic order IDs", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = pausedUncertainSubmissionState();
+  const orders = [
+    uncertainSubmissionOrder({ id: "terminal-z", status: "FILLED", updatedAt: "2026-08-21T00:00:00.000Z" }),
+    uncertainSubmissionOrder({ id: "terminal-a", status: "CANCELED", updatedAt: "2026-08-21T23:59:59.000Z" }),
+    uncertainSubmissionOrder({ id: "terminal-later", status: "FILLED", updatedAt: "2026-08-20T00:00:00.000Z" }),
+  ];
+  for (const order of orders) {
+    await repositories.saveOrder(order);
+  }
+  for (const [orderId, filledAt] of [
+    ["terminal-z", "2026-08-21T00:00:03.000000001Z"],
+    ["terminal-a", "2026-08-21T00:00:03.000000001Z"],
+    ["terminal-later", "2026-08-21T00:00:04.000000001Z"],
+  ] as const) {
+    await repositories.saveFill({
+      id: `fill-${orderId}`,
+      orderId,
+      exchangeFillId: `fill-${orderId}`,
+      market: "KRW-BTC",
+      side: "bid",
+      price: "100000000",
+      volume: "0.1",
+      feeCurrency: "KRW",
+      feeAmount: "500",
+      feeProvenance: "EXCHANGE_FILL_CONFIRMED",
+      filledAt,
+      rawPayloadJson: "{}",
+    });
+  }
+  const projected: string[] = [];
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    maxOrderLookupsPerRun: 0,
+    maxTerminalCandidateProjectionsPerRun: 2,
+    candidateEvidenceService: {
+      async processTerminalOrder(orderId) {
+        projected.push(orderId);
+        return { outcome: "ADVANCED", orderId, detail: "projected" };
+      },
+    },
+  });
+
+  await reconciliation.run("primary");
+
+  assert.deepEqual(projected, ["terminal-a", "terminal-z"]);
+});
+
+test("FAILED and REJECTED potentially-dispatched orders keep first null lookup uncertain", async () => {
+  for (const status of ["FAILED", "REJECTED"] as const) {
+    const repositories = new InMemoryExecutionRepository();
+    const operatorState = pausedUncertainSubmissionState();
+    const order = uncertainSubmissionOrder({
+      id: `terminal-${status.toLowerCase()}-absence`,
+      status,
+      failureCode: "SUBMISSION_RESPONSE_UNCERTAIN",
+    });
+    await repositories.saveOrder(order);
+    const reconciliation = new ReconciliationService({
+      repositories,
+      operatorState,
+      orderReader: { async getOrder() { return null; } },
+      identifierRecovery: { minimumNotFoundObservations: 2, minimumElapsedMs: 60_000 },
+      recoveryClock: {
+        now: () => ({ observedAt: "2026-08-21T00:00:01.000Z", observedAtEpochMs: 1_787_270_401_000 }),
+      },
+    });
+
+    const result = await reconciliation.recoverOrderByIdentifier(order);
+
+    assert.equal(result.outcome, "STILL_UNCERTAIN");
+    assert.equal((await repositories.findOrderByReference("primary", order.id))?.status, status);
+  }
+});
+
 test("submission recovery uses a persisted UUID before identifier fallback and never resumes", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = pausedUncertainSubmissionState();
@@ -1711,8 +1824,64 @@ test("submission recovery uses a persisted UUID before identifier fallback and n
   assert.deepEqual(observations.map((observation) => observation.outcome), ["FOUND"]);
 });
 
-test("bounded persisted identifier absence reaches a terminal fault only after count and elapsed time", async () => {
+test("recovered terminal projection failures persist a fault marker and pause execution", async () => {
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-recovered-projection-failure",
+    exchangeAccountId: "primary",
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-08-21T00:00:00.000Z",
+  });
   const repositories = new InMemoryExecutionRepository();
+  const order = uncertainSubmissionOrder({ id: "recovered-projection-failure-order" });
+  await repositories.saveOrder(order);
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    candidateEvidenceService: {
+      async processTerminalOrder(orderId) {
+        return { outcome: "FAULT", orderId, detail: "candidate binding could not be verified" };
+      },
+    },
+    orderReader: {
+      async getOrder() {
+        return {
+          uuid: "recovered-projection-failure-uuid",
+          identifier: order.identifier,
+          market: "KRW-BTC",
+          side: "bid",
+          ordType: "price",
+          state: "done",
+          price: "10000000",
+          volume: null,
+          remainingVolume: "0",
+          executedVolume: "0.1",
+          paidFee: "500",
+          createdAt: "2026-08-21T00:00:00.000Z",
+          fills: [],
+          raw: { state: "done" },
+        };
+      },
+    },
+    recoveryClock: {
+      now: () => ({ observedAt: "2026-08-21T00:00:01.000Z", observedAtEpochMs: 1_787_270_401_000 }),
+    },
+  });
+
+  const result = await reconciliation.recoverOrderByIdentifier(order);
+  const events = await repositories.listOrderEvents(order.id);
+
+  assert.equal(result.outcome, "RECOVERED_BUT_PROJECTION_FAILED");
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal(events.filter((event) => event.id === `candidate-evidence-recovery-fault:${order.id}`).length, 1);
+});
+
+test("bounded persisted identifier absence reaches a terminal fault only after count and elapsed time", async () => {
   const operatorState = new InMemoryOperatorStateStore({
     id: "state-bounded-absence",
     exchangeAccountId: "primary",
@@ -1725,6 +1894,7 @@ test("bounded persisted identifier absence reaches a terminal fault only after c
     degradedAt: null,
     updatedAt: "2026-08-21T00:00:00.000Z",
   });
+  const repositories = new InMemoryExecutionRepository(operatorState);
   const order = uncertainSubmissionOrder({ id: "bounded-absence-order" });
   await repositories.saveOrder(order);
   let now = {
@@ -1757,6 +1927,103 @@ test("bounded persisted identifier absence reaches a terminal fault only after c
   assert.equal(persistedOrder?.failureCode, "ORDER_SUBMISSION_ABSENCE_CONFIRMED");
   assert.deepEqual(observations.map((observation) => observation.outcome), ["NOT_FOUND", "NOT_FOUND"]);
   assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("bounded absence keeps count and elapsed thresholds independently uncertain across restart", async () => {
+  for (const policy of [
+    { minimumNotFoundObservations: 3, minimumElapsedMs: 60_000 },
+    { minimumNotFoundObservations: 2, minimumElapsedMs: 120_000 },
+  ]) {
+    const operatorState = new InMemoryOperatorStateStore({
+      id: `state-independent-bound-${policy.minimumNotFoundObservations}-${policy.minimumElapsedMs}`,
+      exchangeAccountId: "primary",
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-08-21T00:00:00.000Z",
+    });
+    const repositories = new InMemoryExecutionRepository(operatorState);
+    const order = uncertainSubmissionOrder({ id: `independent-bound-${policy.minimumNotFoundObservations}-${policy.minimumElapsedMs}` });
+    await repositories.saveOrder(order);
+    let now = { observedAt: "2026-08-21T00:00:01.000Z", observedAtEpochMs: 1_787_270_401_000 };
+    const firstService = new ReconciliationService({
+      repositories,
+      operatorState,
+      orderReader: { async getOrder() { return null; } },
+      identifierRecovery: policy,
+      recoveryClock: { now: () => now },
+    });
+    const first = await firstService.recoverOrderByIdentifier(order);
+    now = { observedAt: "2026-08-21T00:01:01.000Z", observedAtEpochMs: 1_787_270_461_000 };
+    const restartedService = new ReconciliationService({
+      repositories,
+      operatorState,
+      orderReader: { async getOrder() { return null; } },
+      identifierRecovery: policy,
+      recoveryClock: { now: () => now },
+    });
+    const second = await restartedService.recoverOrderByIdentifier(order);
+
+    assert.equal(first.outcome, "STILL_UNCERTAIN");
+    assert.equal(second.outcome, "STILL_UNCERTAIN");
+    assert.equal((await repositories.findOrderByReference("primary", order.id))?.status, "RECONCILIATION_REQUIRED");
+    assert.equal((await operatorState.getState()).systemStatus, "RUNNING");
+  }
+});
+
+test("bounded absence finalization loses its compare-and-set to a concurrent recovered order", async () => {
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-absence-cas-loss",
+    exchangeAccountId: "primary",
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-08-21T00:00:00.000Z",
+  });
+  const repositories = new InMemoryExecutionRepository(operatorState);
+  const order = uncertainSubmissionOrder({ id: "absence-cas-loss-order" });
+  await repositories.saveOrder(order);
+  let now = { observedAt: "2026-08-21T00:00:01.000Z", observedAtEpochMs: 1_787_270_401_000 };
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: { async getOrder() { return null; } },
+    identifierRecovery: { minimumNotFoundObservations: 2, minimumElapsedMs: 60_000 },
+    recoveryClock: { now: () => now },
+  });
+
+  await reconciliation.recoverOrderByIdentifier(order);
+  const finalizer = repositories.finalizeBoundedSubmissionAbsence.bind(repositories);
+  repositories.finalizeBoundedSubmissionAbsence = async (input) => {
+    await repositories.updateOrder({
+      ...(await repositories.findOrderByReference("primary", order.id))!,
+      status: "FILLED",
+      failureCode: null,
+      failureMessage: null,
+      updatedAt: "2026-08-21T00:01:01.000Z",
+    });
+    return finalizer(input);
+  };
+  now = { observedAt: "2026-08-21T00:01:01.000Z", observedAtEpochMs: 1_787_270_461_000 };
+
+  const result = await reconciliation.recoverOrderByIdentifier(order);
+
+  assert.equal(result.outcome, "STILL_UNCERTAIN");
+  assert.equal((await repositories.findOrderByReference("primary", order.id))?.status, "FILLED");
+  assert.equal((await operatorState.getState()).systemStatus, "RUNNING");
+  assert.equal(
+    (await repositories.listOrderEvents(order.id))
+      .filter((event) => event.eventType === "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED").length,
+    0,
+  );
 });
 
 test("transient identifier lookup failures never count toward bounded absence", async () => {

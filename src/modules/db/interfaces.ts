@@ -51,6 +51,17 @@ export interface FaultPauseInput {
   occurredAt: string;
 }
 
+export interface FinalizeBoundedSubmissionAbsenceInput {
+  orderId: string;
+  expectedStatus: Extract<OrderRecord["status"], "SUBMITTING" | "RECONCILIATION_REQUIRED" | "FAILED" | "REJECTED">;
+  expectedUpdatedAt: string;
+  failedAt: string;
+  failureCode: "ORDER_SUBMISSION_ABSENCE_CONFIRMED";
+  failureMessage: string;
+  event: OrderEventRecord;
+  faultPause: FaultPauseInput;
+}
+
 export interface ExecutionRepository {
   saveStrategyDecision(record: StrategyDecisionRecord): Promise<void>;
   getLatestStrategyDecision(
@@ -78,6 +89,9 @@ export interface ExecutionRepository {
   listOrderSubmissionRecoveryObservations?(
     orderId: string,
   ): Promise<OrderSubmissionRecoveryObservationRecord[]>;
+  finalizeBoundedSubmissionAbsence?(
+    input: FinalizeBoundedSubmissionAbsenceInput,
+  ): Promise<boolean>;
   saveBalanceSnapshot(record: BalanceSnapshotRecord): Promise<void>;
   getLatestBalanceSnapshot(exchangeAccountId: string): Promise<BalanceSnapshotRecord | null>;
   savePositionSnapshot(record: PositionSnapshotRecord): Promise<void>;

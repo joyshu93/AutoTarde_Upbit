@@ -68,6 +68,27 @@ export interface OrderSubmissionRecoveryObservationRecord {
   createdAt: string;
 }
 
+export interface CandidateExecutionBindingRecord {
+  id: string;
+  deploymentId: string;
+  strategyDecisionId: string;
+  orderId: string;
+  exchangeAccountId: string;
+  activationAt: string;
+  activationEpochNs: bigint;
+  market: "KRW-BTC";
+  strategyKey: "position_guard.paper_core.v1";
+  policyId: "COMBINED_CONSERVATIVE";
+  policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1";
+  executionMode: "DRY_RUN" | "LIVE";
+  ordType: "limit" | "price" | "market" | "best";
+  action: "ENTER" | "ADD" | "REDUCE" | "EXIT";
+  side: "bid" | "ask";
+  intendedQuantity: string | null;
+  intendedNotionalKrw: string | null;
+  createdAt: string;
+}
+
 export type PositionGuardPilotAbandonmentRecord = Readonly<{
   authority: string;
   event: string;

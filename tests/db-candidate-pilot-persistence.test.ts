@@ -23,6 +23,7 @@ import { verifyAccountExecutionLeaseContract } from "./account-execution-lease-c
 
 const MIGRATION_0018 = "0018_scope_candidate_evidence_identity_to_deployment.sql";
 const MIGRATION_0019 = "0019_store_candidate_evidence_decimals_as_text.sql";
+const MIGRATION_0020 = "0020_add_candidate_execution_bindings.sql";
 
 test("sqlite candidate pilot repository satisfies the common contracts", async () => {
   await withFreshBundle("candidate-contract", async (bundle) => {
@@ -36,7 +37,7 @@ test("sqlite candidate pilot repository satisfies the common contracts", async (
   });
 });
 
-test("migration 0019 stores canonical candidate evidence decimals as exact text", async () => {
+test("migration 0019 preserves legacy mirrors and writes authoritative canonical decimals separately", async () => {
   await withFreshBundle("candidate-exact-decimals", async (bundle, _databasePath, db) => {
     const deployment = await bundle.candidatePilots.createDeploymentWithInitialState(
       initialDeploymentInput("candidate-exact-decimals"),
@@ -57,30 +58,187 @@ test("migration 0019 stores canonical candidate evidence decimals as exact text"
       SELECT
         typeof(executed_quantity) AS executed_quantity_type,
         executed_quantity,
-        gross_quote_value_krw,
-        confirmed_fee_krw,
-        remaining_quantity
+        material_version,
+        typeof(executed_quantity_exact) AS executed_quantity_exact_type,
+        executed_quantity_exact,
+        gross_quote_value_krw_exact,
+        confirmed_fee_krw_exact,
+        remaining_quantity_exact
       FROM strategy_candidate_execution_evidence
       WHERE deployment_id = ? AND id = ?
     `).get(deployment.id, "exact-decimal-evidence") as {
       executed_quantity_type: string;
       executed_quantity: string;
-      gross_quote_value_krw: string;
-      confirmed_fee_krw: string;
-      remaining_quantity: string;
+      material_version: string;
+      executed_quantity_exact_type: string;
+      executed_quantity_exact: string;
+      gross_quote_value_krw_exact: string;
+      confirmed_fee_krw_exact: string;
+      remaining_quantity_exact: string;
     } | undefined;
 
     assert.equal(migration?.filename, MIGRATION_0019);
-    assert.equal(evidence?.executed_quantity_type, "text");
-    assert.equal(evidence?.executed_quantity, "0.123456789123456789");
-    assert.equal(evidence?.gross_quote_value_krw, "12345678.987654321");
-    assert.equal(evidence?.confirmed_fee_krw, "1234.567890123");
-    assert.equal(evidence?.remaining_quantity, "0.123456789123456789");
+    assert.equal(evidence?.executed_quantity_type, "real");
+    assert.equal(evidence?.material_version, "EXACT_V2");
+    assert.equal(evidence?.executed_quantity_exact_type, "text");
+    assert.equal(evidence?.executed_quantity_exact, "0.123456789123456789");
+    assert.equal(evidence?.gross_quote_value_krw_exact, "12345678.987654321");
+    assert.equal(evidence?.confirmed_fee_krw_exact, "1234.567890123");
+    assert.equal(evidence?.remaining_quantity_exact, "0.123456789123456789");
     assertDatabaseIntegrity(db);
   });
 });
 
-test("migration 0019 upgrades existing candidate evidence without losing state", async () => {
+test("fresh migration list applies 0019 before candidate execution bindings", async () => {
+  await withFreshBundle("migration-list-0019-0020", async (_bundle, _databasePath, db) => {
+    const filenames = (db.prepare(
+      "SELECT filename FROM _schema_migrations ORDER BY filename ASC",
+    ).all() as Array<{ filename: string }>).map((row) => row.filename);
+
+    assert.ok(filenames.includes(MIGRATION_0019));
+    assert.ok(filenames.includes(MIGRATION_0020));
+    assert.ok(filenames.indexOf(MIGRATION_0019) < filenames.indexOf(MIGRATION_0020));
+    assertDatabaseIntegrity(db);
+  });
+});
+
+test("migration 0019 rolls back every added compatibility column when a required table is unavailable", async () => {
+  const databasePath = await createTempDatabasePath("rollback-0019");
+  await createAppliedOriginal0017Fixture(databasePath);
+  const before = new DatabaseSync(databasePath);
+  try {
+    before.exec(await readFile(path.resolve(process.cwd(), "migrations", MIGRATION_0018), "utf8"));
+    before.prepare("INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)")
+      .run(MIGRATION_0018, "2026-08-21T00:00:00.000Z");
+    before.exec("DROP TABLE fills;");
+  } finally {
+    before.close();
+  }
+
+  try {
+    assert.throws(() => openSqliteDatabase(databasePath), /fills/i);
+    const after = new DatabaseSync(databasePath);
+    try {
+      const migration = after.prepare(
+        "SELECT filename FROM _schema_migrations WHERE filename = ?",
+      ).get(MIGRATION_0019);
+      const evidenceColumns = after.prepare(
+        "PRAGMA table_info(strategy_candidate_execution_evidence)",
+      ).all() as Array<{ name: string }>;
+      const stateColumns = after.prepare(
+        "PRAGMA table_info(strategy_candidate_states)",
+      ).all() as Array<{ name: string }>;
+
+      assert.equal(migration, undefined);
+      assert.equal(evidenceColumns.some((column) => column.name === "material_version"), false);
+      assert.equal(stateColumns.some((column) => column.name === "material_version"), false);
+    } finally {
+      after.close();
+    }
+  } finally {
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("migration 0019 preserves legacy REAL evidence as explicitly approximate without changing its hash", async () => {
+  const databasePath = await createTempDatabasePath("legacy-approximate-0019");
+  await createAppliedOriginal0017Fixture(databasePath);
+
+  const before = new DatabaseSync(databasePath);
+  try {
+    before.exec(await readFile(path.resolve(process.cwd(), "migrations", MIGRATION_0018), "utf8"));
+    before.prepare("INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)")
+      .run(MIGRATION_0018, "2026-08-21T00:00:00.000Z");
+    before.prepare(`
+      INSERT INTO strategy_candidate_execution_evidence (
+        deployment_id, id, executed_at, executed_at_epoch_ns, action, entry_path,
+        terminal_status, executed_quantity, gross_quote_value_krw, confirmed_fee_krw,
+        remaining_quantity, material_hash, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "original-0017-primary",
+      "legacy-exponent",
+      "2026-08-21T00:00:01.000000001Z",
+      1_787_270_401_000_000_001n,
+      "ENTER",
+      "PULLBACK",
+      "FILLED",
+      1e-20,
+      123456789.123456789,
+      0.000000000000000001,
+      1e-20,
+      "a".repeat(64),
+      "2026-08-21T00:00:01.000000001Z",
+    );
+  } finally {
+    before.close();
+  }
+
+  const handle = openSqliteDatabase(databasePath);
+  try {
+    const legacy = handle.db.prepare(`
+      SELECT material_hash, material_version, executed_quantity_exact
+      FROM strategy_candidate_execution_evidence
+      WHERE deployment_id = ? AND id = ?
+    `).get("original-0017-primary", "legacy-exponent") as {
+      material_hash: string;
+      material_version: string;
+      executed_quantity_exact: string | null;
+    } | undefined;
+
+    assert.equal(legacy?.material_hash, "a".repeat(64));
+    assert.equal(legacy?.material_version, "LEGACY_APPROXIMATE_V1");
+    assert.equal(legacy?.executed_quantity_exact, null);
+    assert.equal(await new SqliteCandidatePilotRepository(handle.db).getExactState("original-0017-primary"), null);
+  } finally {
+    handle.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("recorded unsafe 0019 databases gain only legacy provenance columns without rewriting hashes", async () => {
+  const databasePath = await createTempDatabasePath("recorded-unsafe-0019");
+  await createAppliedOriginal0017Fixture(databasePath);
+
+  const before = new DatabaseSync(databasePath);
+  try {
+    before.exec(await readFile(path.resolve(process.cwd(), "migrations", MIGRATION_0018), "utf8"));
+    before.prepare("INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)")
+      .run(MIGRATION_0018, "2026-08-21T00:00:00.000Z");
+    before.prepare("INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)")
+      .run(MIGRATION_0019, "2026-08-21T00:00:00.000Z");
+  } finally {
+    before.close();
+  }
+
+  const handle = openSqliteDatabase(databasePath);
+  try {
+    const evidence = handle.db.prepare(`
+      SELECT material_hash, material_version, executed_quantity_exact
+      FROM strategy_candidate_execution_evidence
+      WHERE deployment_id = ? AND id = ?
+    `).get("original-0017-primary", "original-evidence") as {
+      material_hash: string;
+      material_version: string;
+      executed_quantity_exact: string | null;
+    } | undefined;
+    const migration = handle.db.prepare(
+      "SELECT filename FROM _schema_migrations WHERE filename = ?",
+    ).get(MIGRATION_0020) as { filename: string } | undefined;
+
+    assert.equal(evidence?.material_hash, "c".repeat(64));
+    assert.equal(evidence?.material_version, "LEGACY_APPROXIMATE_V1");
+    assert.equal(evidence?.executed_quantity_exact, null);
+    assert.equal(migration?.filename, MIGRATION_0020);
+    assert.equal(await new SqliteCandidatePilotRepository(handle.db).getExactState("original-0017-primary"), null);
+    assertDatabaseIntegrity(handle.db);
+  } finally {
+    handle.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("migration 0019 marks pre-existing state as legacy and refuses exact advancement", async () => {
   const databasePath = await createTempDatabasePath("upgrade-0019");
   await createAppliedOriginal0017Fixture(databasePath);
 
@@ -90,17 +248,6 @@ test("migration 0019 upgrades existing candidate evidence without losing state",
     before.prepare(
       "INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)",
     ).run(MIGRATION_0018, "2026-08-21T00:00:00.000Z");
-    const repository = new SqliteCandidatePilotRepository(before);
-    await repository.advanceStateWithEvidence(
-      advanceInput("original-0017-primary", "pre-0019-evidence", 1, {
-        action: "ADD",
-        executedAt: "2026-08-21T00:00:02.000Z",
-        executedQuantity: 0.1,
-        grossQuoteValueKrw: 10_000_000,
-        confirmedFeeKrw: 5_000,
-        remainingQuantity: 0.2,
-      }),
-    );
   } finally {
     before.close();
   }
@@ -111,19 +258,27 @@ test("migration 0019 upgrades existing candidate evidence without losing state",
       "SELECT filename FROM _schema_migrations WHERE filename = ?",
     ).get(MIGRATION_0019) as { filename: string } | undefined;
     const evidence = handle.db.prepare(`
-      SELECT typeof(executed_quantity) AS value_type, executed_quantity
+      SELECT typeof(executed_quantity) AS value_type, material_version, executed_quantity_exact
       FROM strategy_candidate_execution_evidence
       WHERE deployment_id = ? AND id = ?
-    `).get("original-0017-primary", "pre-0019-evidence") as {
+    `).get("original-0017-primary", "original-evidence") as {
       value_type: string;
-      executed_quantity: string;
+      material_version: string;
+      executed_quantity_exact: string | null;
     } | undefined;
     const repository = new SqliteCandidatePilotRepository(handle.db);
 
     assert.equal(migration?.filename, MIGRATION_0019);
-    assert.equal(evidence?.value_type, "text");
-    assert.equal(evidence?.executed_quantity, "0.1");
-    assert.equal((await repository.getState("original-0017-primary"))?.stateVersion, 2);
+    assert.equal(evidence?.value_type, "real");
+    assert.equal(evidence?.material_version, "LEGACY_APPROXIMATE_V1");
+    assert.equal(evidence?.executed_quantity_exact, null);
+    assert.equal((await repository.getState("original-0017-primary"))?.stateVersion, 1);
+    await assert.rejects(
+      () => repository.advanceStateWithEvidence(
+        advanceInput("original-0017-primary", "post-0019-evidence", 1),
+      ),
+      /LEGACY_APPROXIMATE_V1/i,
+    );
     assertDatabaseIntegrity(handle.db);
   } finally {
     handle.close();
@@ -267,25 +422,11 @@ test("migration 0018 upgrades a recorded original 0017 without losing pilot stat
       WHERE deployment_id = ? AND id = ?
     `).run("original-0017-primary", "original-evidence"), /append-only/i);
 
-    await repository.advanceStateWithEvidence(
-      advanceInput("original-0017-primary", "shared-after-upgrade", 1, {
-        action: "ADD",
-        executedAt: "2026-08-21T00:00:02.000Z",
-        remainingQuantity: 0.2,
-      }),
-    );
-    await repository.advanceStateWithEvidence(
-      advanceInput("original-0017-secondary", "shared-after-upgrade", 0),
-    );
-    const sharedRows = handle.db.prepare(`
-      SELECT deployment_id
-      FROM strategy_candidate_execution_evidence
-      WHERE id = ?
-      ORDER BY deployment_id ASC
-    `).all("shared-after-upgrade") as unknown as Array<{ deployment_id: string }>;
-    assert.deepEqual(
-      sharedRows.map((row) => row.deployment_id),
-      ["original-0017-primary", "original-0017-secondary"],
+    await assert.rejects(
+      () => repository.advanceStateWithEvidence(
+        advanceInput("original-0017-primary", "shared-after-upgrade", 1),
+      ),
+      /LEGACY_APPROXIMATE_V1/i,
     );
     assertDatabaseIntegrity(handle.db);
   } finally {
@@ -453,6 +594,51 @@ test("candidate evidence insert, state CAS, and audit roll back as one transacti
     assert.equal((await bundle.candidatePilots.getState(deployment.id))?.stateVersion, 0);
     assert.deepEqual(await bundle.candidatePilots.listEvidenceAfter(deployment.id, null), []);
     assert.equal((await bundle.candidatePilots.listAuditEvents(deployment.id)).length, 1);
+    assertDatabaseIntegrity(db);
+  });
+});
+
+test("sqlite bounded absence finalization atomically fails the order, records evidence, and pauses", async () => {
+  await withFreshBundle("sqlite-bounded-absence", async (bundle, _databasePath, db) => {
+    insertOrder(db, "sqlite-bounded-absence-order", "RECONCILIATION_REQUIRED");
+    const order = await bundle.repositories.findOrderByReference("primary", "sqlite-bounded-absence-order");
+    const state = await bundle.operatorState.getState();
+    const finalizer = bundle.repositories.finalizeBoundedSubmissionAbsence;
+    assert.ok(order);
+    assert.ok(finalizer);
+    const input = {
+      orderId: order.id,
+      expectedStatus: "RECONCILIATION_REQUIRED" as const,
+      expectedUpdatedAt: order.updatedAt,
+      failedAt: state.updatedAt,
+      failureCode: "ORDER_SUBMISSION_ABSENCE_CONFIRMED" as const,
+      failureMessage: "bounded absence test",
+      event: {
+        id: "sqlite-bounded-absence-event",
+        orderId: order.id,
+        eventType: "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED",
+        eventSource: "RECONCILIATION" as const,
+        payloadJson: "{}",
+        createdAt: state.updatedAt,
+      },
+      faultPause: {
+        exchangeAccountId: "primary",
+        faultId: "sqlite-bounded-absence-fault",
+        reason: "bounded absence test",
+        occurredAt: state.updatedAt,
+      },
+    };
+
+    assert.equal(await finalizer.call(bundle.repositories, input), true);
+    assert.equal((await bundle.repositories.findOrderByReference("primary", order.id))?.status, "FAILED");
+    assert.equal((await bundle.repositories.listOrderEvents(order.id)).filter(
+      (event) => event.id === input.event.id,
+    ).length, 1);
+    assert.equal((await bundle.operatorState.getState()).systemStatus, "PAUSED");
+    assert.equal((await bundle.operatorState.listTransitions()).filter(
+      (transition) => transition.id === input.faultPause.faultId,
+    ).length, 1);
+    assert.equal(await finalizer.call(bundle.repositories, input), false);
     assertDatabaseIntegrity(db);
   });
 });
@@ -679,15 +865,70 @@ async function createAppliedOriginal0017Fixture(databasePath: string): Promise<v
     ).run("0017_add_btc_candidate_live_pilot.sql", "2026-08-21T00:00:00.000Z");
     insertSecondaryExchangeAccount(db);
 
-    const repository = new SqliteCandidatePilotRepository(db);
-    await repository.createDeploymentWithInitialState(
-      initialDeploymentInput("original-0017-primary", "primary"),
+    for (const deployment of [
+      initialDeploymentInput("original-0017-primary", "primary").deployment,
+      initialDeploymentInput("original-0017-secondary", "secondary").deployment,
+    ]) {
+      db.prepare(`
+        INSERT INTO strategy_pilot_deployments (
+          id, exchange_account_id, pilot_id, market, policy_id, policy_version,
+          phase, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        deployment.id,
+        deployment.exchangeAccountId,
+        deployment.pilotId,
+        deployment.market,
+        deployment.policyId,
+        deployment.policyVersion,
+        deployment.phase,
+        deployment.createdAt,
+        deployment.updatedAt,
+      );
+    }
+    db.prepare(`
+      INSERT INTO strategy_candidate_execution_evidence (
+        id, deployment_id, executed_at, executed_at_epoch_ns, action, entry_path,
+        terminal_status, executed_quantity, gross_quote_value_krw, confirmed_fee_krw,
+        remaining_quantity, material_hash, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "original-evidence",
+      "original-0017-primary",
+      "2026-08-21T00:00:01.000Z",
+      1_787_270_401_000_000_000n,
+      "ENTER",
+      "RECLAIM",
+      "FILLED",
+      0.1,
+      10_000_000,
+      5_000,
+      0.1,
+      "c".repeat(64),
+      "2026-08-21T00:00:01.000Z",
     );
-    await repository.createDeploymentWithInitialState(
-      initialDeploymentInput("original-0017-secondary", "secondary"),
+    db.prepare(`
+      INSERT INTO strategy_candidate_states (
+        deployment_id, current_episode_add_count, current_episode_cost_basis_krw,
+        current_episode_inventory_quantity, current_episode_realized_pnl_krw,
+        last_full_exit_at, last_full_exit_realized_pnl_krw, last_entry_path,
+        last_evidence_at, last_evidence_id, state_version, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "original-0017-primary", 0, 10_005_000, 0.1, 0,
+      null, null, "RECLAIM", "2026-08-21T00:00:01.000Z", "original-evidence", 1,
+      "2026-08-21T00:00:01.000Z",
     );
-    await repository.advanceStateWithEvidence(
-      advanceInput("original-0017-primary", "original-evidence", 0),
+    db.prepare(`
+      INSERT INTO strategy_candidate_states (
+        deployment_id, current_episode_add_count, current_episode_cost_basis_krw,
+        current_episode_inventory_quantity, current_episode_realized_pnl_krw,
+        last_full_exit_at, last_full_exit_realized_pnl_krw, last_entry_path,
+        last_evidence_at, last_evidence_id, state_version, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "original-0017-secondary", 0, 0, 0, 0,
+      null, null, null, null, null, 0, "2026-08-21T00:00:00.000Z",
     );
 
     assertGlobalEvidenceIdentity(db);

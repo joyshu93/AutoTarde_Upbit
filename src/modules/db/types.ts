@@ -145,6 +145,7 @@ export interface SqliteFillRow {
   volume: string;
   fee_currency: string | null;
   fee_amount: string | null;
+  fee_provenance: "EXCHANGE_FILL_CONFIRMED" | "ORDER_LEVEL_UNALLOCATED" | "ORDER_LEVEL_ALLOCATED" | "MISSING" | "LEGACY_UNVERIFIED" | "SIMULATED";
   filled_at: string;
   raw_payload_json: string;
 }

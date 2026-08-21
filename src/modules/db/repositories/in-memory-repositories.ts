@@ -26,6 +26,7 @@ import type {
 import type { OrderSubmissionRecoveryObservationRecord } from "../../../domain/pilot-types.js";
 import type {
   ExecutionRepository,
+  FinalizeBoundedSubmissionAbsenceInput,
   FaultPauseInput,
   OperatorStateStore,
   PersistExchangeSubmissionInput,
@@ -35,6 +36,7 @@ import type {
 } from "../interfaces.js";
 import {
   recordsEqual,
+  normalizeFillFeeProvenance,
   validateExchangeSubmissionInput,
   validateFaultPauseInput,
   validateFaultPauseTimestamp,
@@ -70,6 +72,10 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   private readonly operatorNotifications: OperatorNotificationRecord[] = [];
   private readonly operatorNotificationDeliveryAttempts: OperatorNotificationDeliveryAttemptRecord[] = [];
   private readonly operatorNotificationDeliveryRuns: OperatorNotificationDeliveryRunRecord[] = [];
+
+  constructor(
+    private readonly atomicFaultPauseStore?: Pick<InMemoryOperatorStateStore, "applyFaultPauseAtomically">,
+  ) {}
 
   async saveStrategyDecision(record: StrategyDecisionRecord): Promise<void> {
     this.strategyDecisions.push(record);
@@ -133,41 +139,45 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   }
 
   async persistExchangeSubmission(input: PersistExchangeSubmissionInput): Promise<void> {
-    validateExchangeSubmissionInput(input);
-    const existingOrder = this.orders.find((candidate) => candidate.id === input.order.id);
+    const normalizedInput = {
+      ...input,
+      fills: input.fills.map(normalizeFillFeeProvenance),
+    };
+    validateExchangeSubmissionInput(normalizedInput);
+    const existingOrder = this.orders.find((candidate) => candidate.id === normalizedInput.order.id);
     if (!existingOrder) {
-      throw new Error(`Cannot persist exchange submission for missing order ${input.order.id}.`);
+      throw new Error(`Cannot persist exchange submission for missing order ${normalizedInput.order.id}.`);
     }
-    assertSameAccount(existingOrder, input.order);
-    const existingEvent = this.orderEvents.find((candidate) => candidate.id === input.event.id);
-    assertNoConflictingRecord(existingEvent, input.event, "order event");
-    if (input.terminalEvent) {
-      const existingTerminalEvent = this.orderEvents.find((candidate) => candidate.id === input.terminalEvent!.id);
-      assertNoConflictingRecord(existingTerminalEvent, input.terminalEvent, "terminal order event");
+    assertSameAccount(existingOrder, normalizedInput.order);
+    const existingEvent = this.orderEvents.find((candidate) => candidate.id === normalizedInput.event.id);
+    assertNoConflictingRecord(existingEvent, normalizedInput.event, "order event");
+    if (normalizedInput.terminalEvent) {
+      const existingTerminalEvent = this.orderEvents.find((candidate) => candidate.id === normalizedInput.terminalEvent!.id);
+      assertNoConflictingRecord(existingTerminalEvent, normalizedInput.terminalEvent, "terminal order event");
     }
-    const existingFills = input.fills.map((fill) => findStoredFill(this.fills, fill));
-    input.fills.forEach((fill, index) => assertNoConflictingRecord(existingFills[index], fill, "fill"));
+    const existingFills = normalizedInput.fills.map((fill) => findStoredFill(this.fills, fill));
+    normalizedInput.fills.forEach((fill, index) => assertNoConflictingRecord(existingFills[index], fill, "fill"));
 
     const completion = validateExchangeSubmissionCompletion(
       existingOrder,
-      input.order,
-      input,
-      this.orderEvents.filter((candidate) => candidate.orderId === input.order.id),
-      this.fills.filter((candidate) => candidate.orderId === input.order.id),
+      normalizedInput.order,
+      normalizedInput,
+      this.orderEvents.filter((candidate) => candidate.orderId === normalizedInput.order.id),
+      this.fills.filter((candidate) => candidate.orderId === normalizedInput.order.id),
     );
     if (completion === "RETRY") {
       return;
     }
 
     const nextOrders = this.orders.map((candidate) =>
-      candidate.id === input.order.id ? cloneRecord(input.order) : candidate,
+      candidate.id === normalizedInput.order.id ? cloneRecord(normalizedInput.order) : candidate,
     );
     const nextOrderEvents = [
       ...this.orderEvents,
-      cloneRecord(input.event),
-      ...(input.terminalEvent ? [cloneRecord(input.terminalEvent)] : []),
+      cloneRecord(normalizedInput.event),
+      ...(normalizedInput.terminalEvent ? [cloneRecord(normalizedInput.terminalEvent)] : []),
     ];
-    const nextFills = [...this.fills, ...input.fills.map(cloneRecord)];
+    const nextFills = [...this.fills, ...normalizedInput.fills.map(cloneRecord)];
     this.orders = nextOrders;
     this.orderEvents = nextOrderEvents;
     this.fills = nextFills;
@@ -259,15 +269,16 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   }
 
   async saveFill(record: FillRecord): Promise<void> {
+    const normalizedRecord = normalizeFillFeeProvenance(record);
     const index = this.fills.findIndex(
-      (candidate) => candidate.orderId === record.orderId && candidate.exchangeFillId === record.exchangeFillId,
+      (candidate) => candidate.orderId === normalizedRecord.orderId && candidate.exchangeFillId === normalizedRecord.exchangeFillId,
     );
     if (index === -1) {
-      this.fills.push(cloneRecord(record));
+      this.fills.push(cloneRecord(normalizedRecord));
       return;
     }
 
-    this.fills[index] = cloneRecord(record);
+    this.fills[index] = cloneRecord(normalizedRecord);
   }
 
   async listFills(orderId?: string): Promise<FillRecord[]> {
@@ -295,6 +306,33 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       .filter((candidate) => candidate.orderId === orderId)
       .sort((left, right) => left.observedAtEpochMs - right.observedAtEpochMs || left.id.localeCompare(right.id))
       .map(cloneRecord);
+  }
+
+  async finalizeBoundedSubmissionAbsence(
+    input: FinalizeBoundedSubmissionAbsenceInput,
+  ): Promise<boolean> {
+    const current = this.orders.find((order) => order.id === input.orderId);
+    if (!current || current.status !== input.expectedStatus || current.updatedAt !== input.expectedUpdatedAt) {
+      return false;
+    }
+    if (!this.atomicFaultPauseStore) {
+      throw new Error("In-memory bounded absence finalization requires an atomic fault-pause store.");
+    }
+    if (input.event.orderId !== input.orderId || this.orderEvents.some((event) => event.id === input.event.id)) {
+      throw new Error("Bounded absence finalization event is invalid or conflicts with persisted evidence.");
+    }
+    const nextOrder: OrderRecord = {
+      ...current,
+      status: "FAILED",
+      failureCode: input.failureCode,
+      failureMessage: input.failureMessage,
+      updatedAt: input.failedAt,
+    };
+    // Both local collections change only after the pause plan has validated synchronously.
+    this.atomicFaultPauseStore.applyFaultPauseAtomically(input.faultPause);
+    this.orders = this.orders.map((order) => order.id === input.orderId ? cloneRecord(nextOrder) : order);
+    this.orderEvents = [...this.orderEvents, cloneRecord(input.event)];
+    return true;
   }
 
   async saveBalanceSnapshot(record: BalanceSnapshotRecord): Promise<void> {
@@ -662,6 +700,10 @@ export class InMemoryOperatorStateStore implements OperatorStateStore {
   }
 
   async pauseForFault(input: FaultPauseInput): Promise<ExecutionStateRecord> {
+    return this.applyFaultPauseAtomically(input);
+  }
+
+  applyFaultPauseAtomically(input: FaultPauseInput): ExecutionStateRecord {
     validateFaultPauseInput(input);
     if (input.exchangeAccountId !== this.state.exchangeAccountId) {
       throw new Error(`Fault ${input.faultId} is for a different exchange account.`);
@@ -676,7 +718,7 @@ export class InMemoryOperatorStateStore implements OperatorStateStore {
         existing.createdAt === input.occurredAt &&
         (this.state.systemStatus === "PAUSED" || this.state.systemStatus === "KILL_SWITCHED")
       ) {
-        return this.getState();
+        return { ...this.state };
       }
       throw new Error(`Conflicting duplicate automatic pause ${input.faultId}.`);
     }
@@ -697,7 +739,7 @@ export class InMemoryOperatorStateStore implements OperatorStateStore {
       reason,
       input.faultId,
     );
-    return this.getState();
+    return { ...this.state };
   }
 
   async pause(reason?: string): Promise<ExecutionStateRecord> {

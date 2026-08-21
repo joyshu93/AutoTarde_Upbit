@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 
+import type { FillRecord } from "../src/domain/types.js";
 import { CandidateExecutionEvidenceService } from "../src/modules/execution/candidate-evidence-service.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { InMemoryCandidatePilotRepository } from "../src/modules/db/repositories/in-memory-candidate-pilot-repository.js";
+import { TerminalCandidateProjectionSweep } from "../src/modules/reconciliation/terminal-candidate-sweep.js";
 import { createEmptyPositionGuardCandidateState } from "../src/modules/strategy/position-guard-candidate-state.js";
 import { test } from "./harness.js";
 
@@ -75,6 +77,12 @@ test("partial fills aggregate once per terminal order and canceled-with-fill adv
     createdAt: "2026-08-21T00:00:02.000Z",
     updatedAt: "2026-08-21T00:00:05.000Z",
   });
+  await pilotRepository.createExecutionBinding(candidateBinding({
+    deploymentId: deployment.id,
+    strategyDecisionId: "decision-1",
+    orderId: "order-1",
+    intendedNotionalKrw: "25000000",
+  }));
   await repositories.saveFill(fill("fill-1", "0.1", "2026-08-21T00:00:03.000Z", "500"));
   await repositories.saveFill(fill("fill-2", "0.15", "2026-08-21T00:00:04.000Z", "750"));
 
@@ -86,7 +94,7 @@ test("partial fills aggregate once per terminal order and canceled-with-fill adv
     clock: {
       now: () => ({
         occurredAt: "2026-08-21T00:00:06.000Z",
-        occurredAtEpochMs: 1_777_000_006_000,
+        occurredAtEpochMs: 1_787_270_406_000,
       }),
     },
   });
@@ -100,7 +108,7 @@ test("partial fills aggregate once per terminal order and canceled-with-fill adv
     clock: {
       now: () => ({
         occurredAt: "2026-08-21T00:00:07.000Z",
-        occurredAtEpochMs: 1_777_000_007_000,
+        occurredAtEpochMs: 1_787_270_407_000,
       }),
     },
   });
@@ -127,7 +135,7 @@ test("terminal no-fill cancellation is an explicit candidate evidence no-op", as
     clock: {
       now: () => ({
         occurredAt: "2026-08-21T00:00:07.000Z",
-        occurredAtEpochMs: 1_777_000_007_000,
+        occurredAtEpochMs: 1_787_270_407_000,
       }),
     },
   });
@@ -150,7 +158,7 @@ test("missing fill fee evidence faults without advancing candidate state", async
   const events = await fixture.repositories.listOrderEvents("order-1");
 
   assert.equal(result.outcome, "FAULT");
-  assert.match(result.detail, /MISSING_FEE_EVIDENCE/);
+  assert.match(result.detail, /UNVERIFIED_FEE_PROVENANCE/);
   assert.equal((await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null)).length, 0);
   assert.equal((await fixture.pilotRepository.getState(fixture.deploymentId))?.stateVersion, 0);
   assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
@@ -199,14 +207,114 @@ test("candidate evidence rejects fills that exceed the persisted bid quote budge
   assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
 });
 
+test("terminal candidate evidence uses the latest persisted fill instant rather than order update time", async () => {
+  const fixture = await createCandidateFixture({
+    fills: [
+      fill("chronology-first", "0.05", "2026-08-21T00:00:03.000000001Z", "500"),
+      fill("chronology-last", "0.05", "2026-08-21T00:00:04.000000009Z", "500"),
+    ],
+  });
+
+  const result = await fixture.service.processTerminalOrder("order-1");
+  const evidence = await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null);
+
+  assert.equal(result.outcome, "ADVANCED", result.detail);
+  assert.equal(evidence[0]?.executedAt, "2026-08-21T00:00:04.000000009Z");
+});
+
+test("terminal sweep projects persisted FILLED and CANCELED-with-fill orders exactly once after restart", async () => {
+  for (const terminalStatus of ["FILLED", "CANCELED"] as const) {
+    const fixture = await createCandidateFixture({
+      terminalStatus,
+      fills: [fill(`swept-${terminalStatus}`, "0.1", "2026-08-21T00:00:03.000000001Z", "500")],
+    });
+    const firstSweep = new TerminalCandidateProjectionSweep({
+      repositories: fixture.repositories,
+      projector: fixture.createService(),
+      maximumPerRun: 1,
+    });
+    const restartSweep = new TerminalCandidateProjectionSweep({
+      repositories: fixture.repositories,
+      projector: fixture.createService(),
+      maximumPerRun: 1,
+    });
+
+    const first = await firstSweep.run("primary");
+    const restarted = await restartSweep.run("primary");
+
+    assert.equal(first.processedCount, 1);
+    assert.equal(restarted.processedCount, 1);
+    assert.equal((await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null)).length, 1);
+    assert.equal((await fixture.pilotRepository.getState(fixture.deploymentId))?.stateVersion, 1);
+    assert.equal((await fixture.pilotRepository.listAuditEvents(fixture.deploymentId)).length, 2);
+  }
+});
+
+test("unbound terminal candidate evidence faults instead of attaching to the current deployment", async () => {
+  const fixture = await createCandidateFixture({
+    fills: [fill("unbound-fill", "0.1", "2026-08-21T00:00:03.000Z", "500")],
+    bound: false,
+  });
+
+  const result = await fixture.service.processTerminalOrder("order-1");
+
+  assert.equal(result.outcome, "FAULT");
+  assert.match(result.detail, /BINDING/i);
+  assert.equal((await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null)).length, 0);
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("bound execution mode must match the persisted terminal order", async () => {
+  const fixture = await createCandidateFixture({
+    bound: false,
+    fills: [fill("mode-mismatch-fill", "0.1", "2026-08-21T00:00:03.000Z", "500")],
+  });
+  await fixture.pilotRepository.createExecutionBinding({
+    ...candidateBinding({
+      deploymentId: fixture.deploymentId,
+      strategyDecisionId: "fixture-decision",
+      orderId: "order-1",
+      intendedNotionalKrw: "10000000",
+    }),
+    executionMode: "DRY_RUN",
+  });
+
+  const result = await fixture.service.processTerminalOrder("order-1");
+
+  assert.equal(result.outcome, "FAULT");
+  assert.match(result.detail, /BINDING_INVALID/i);
+  assert.equal((await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null)).length, 0);
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("legacy and inferred fill fees never count as confirmed candidate fee evidence", async () => {
+  for (const feeProvenance of ["ORDER_LEVEL_ALLOCATED", "LEGACY_UNVERIFIED"] as const) {
+    const fixture = await createCandidateFixture({
+      fills: [{
+        ...fill(`${feeProvenance}-fee`, "0.1", "2026-08-21T00:00:03.000Z", "500"),
+        feeProvenance,
+      }],
+    });
+
+    const result = await fixture.service.processTerminalOrder("order-1");
+
+    assert.equal(result.outcome, "FAULT");
+    assert.match(result.detail, /FEE.*PROVENANCE|UNVERIFIED_FEE/i);
+    assert.equal((await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null)).length, 0);
+  }
+});
+
 async function createCandidateFixture(input: {
-  fills: ReturnType<typeof fill>[];
+  fills: FillRecord[];
+  bound?: boolean;
+  terminalStatus?: "FILLED" | "CANCELED";
 }): Promise<{
   repositories: InMemoryExecutionRepository;
   pilotRepository: InMemoryCandidatePilotRepository;
   operatorState: InMemoryOperatorStateStore;
   deploymentId: string;
   service: CandidateExecutionEvidenceService;
+  createService: () => CandidateExecutionEvidenceService;
 }> {
   const repositories = new InMemoryExecutionRepository();
   const pilotRepository = new InMemoryCandidatePilotRepository();
@@ -268,7 +376,7 @@ async function createCandidateFixture(input: {
     origin: "STRATEGY",
     requestedAt: "2026-08-21T00:00:02.000Z",
     upbitUuid: "candidate-fixture-uuid",
-    status: "CANCELED",
+    status: input.terminalStatus ?? "CANCELED",
     executionMode: "LIVE",
     exchangeResponseJson: null,
     failureCode: null,
@@ -276,27 +384,38 @@ async function createCandidateFixture(input: {
     createdAt: "2026-08-21T00:00:02.000Z",
     updatedAt: "2026-08-21T00:00:05.000Z",
   });
+  if (input.bound !== false) {
+    await pilotRepository.createExecutionBinding(candidateBinding({
+      deploymentId: deployment.id,
+      strategyDecisionId: "fixture-decision",
+      orderId: "order-1",
+      intendedNotionalKrw: "10000000",
+    }));
+  }
   for (const candidateFill of input.fills) {
     await repositories.saveFill(candidateFill);
   }
+
+  const createService = () => new CandidateExecutionEvidenceService({
+    exchangeAccountId: "primary",
+    repositories,
+    pilotRepository,
+    operatorState,
+    clock: {
+      now: () => ({
+        occurredAt: "2026-08-21T00:00:06.000Z",
+        occurredAtEpochMs: 1_787_270_406_000,
+      }),
+    },
+  });
 
   return {
     repositories,
     pilotRepository,
     operatorState,
     deploymentId: deployment.id,
-    service: new CandidateExecutionEvidenceService({
-      exchangeAccountId: "primary",
-      repositories,
-      pilotRepository,
-      operatorState,
-      clock: {
-        now: () => ({
-          occurredAt: "2026-08-21T00:00:06.000Z",
-          occurredAtEpochMs: 1_777_000_006_000,
-        }),
-      },
-    }),
+    service: createService(),
+    createService,
   };
 }
 
@@ -305,7 +424,7 @@ function fill(
   volume: string,
   filledAt: string,
   feeAmount: string | null,
-) {
+): FillRecord {
   return {
     id,
     orderId: "order-1",
@@ -316,7 +435,36 @@ function fill(
     volume,
     feeCurrency: "KRW",
     feeAmount,
+    feeProvenance: "EXCHANGE_FILL_CONFIRMED",
     filledAt,
     rawPayloadJson: "{}",
+  };
+}
+
+function candidateBinding(input: {
+  deploymentId: string;
+  strategyDecisionId: string;
+  orderId: string;
+  intendedNotionalKrw: string;
+}) {
+  return {
+    id: `binding:${input.orderId}`,
+    deploymentId: input.deploymentId,
+    strategyDecisionId: input.strategyDecisionId,
+    orderId: input.orderId,
+    exchangeAccountId: "primary",
+    activationAt: "2026-08-21T00:00:00.000Z",
+    activationEpochNs: 1_787_270_400_000_000_000n,
+    market: "KRW-BTC" as const,
+    strategyKey: "position_guard.paper_core.v1" as const,
+    policyId: "COMBINED_CONSERVATIVE" as const,
+    policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1" as const,
+    executionMode: "LIVE" as const,
+    ordType: "price" as const,
+    action: "ENTER" as const,
+    side: "bid" as const,
+    intendedQuantity: null,
+    intendedNotionalKrw: input.intendedNotionalKrw,
+    createdAt: "2026-08-21T00:00:02.000Z",
   };
 }

@@ -75,6 +75,9 @@ function applyMigrations(db: DatabaseSync, migrationsDir: string): void {
   for (const filename of filenames) {
     const applied = appliedStatement.get(filename) as { filename: string } | undefined;
     if (applied) {
+      if (filename === "0019_store_candidate_evidence_decimals_as_text.sql") {
+        repairMigration0019(db);
+      }
       continue;
     }
 
@@ -175,6 +178,57 @@ function repairMigration0009(db: DatabaseSync): void {
   `);
 }
 
+function repairMigration0019(db: DatabaseSync): void {
+  db.exec("BEGIN IMMEDIATE;");
+  try {
+    if (tableExists(db, "strategy_candidate_execution_evidence")) {
+      ensureCandidatePilotColumn(
+        db,
+        "strategy_candidate_execution_evidence",
+        "material_version",
+        "TEXT NOT NULL DEFAULT 'LEGACY_APPROXIMATE_V1' " +
+          "CHECK (material_version IN ('LEGACY_APPROXIMATE_V1', 'EXACT_V2'))",
+      );
+      ensureCandidatePilotColumn(db, "strategy_candidate_execution_evidence", "executed_quantity_exact", "TEXT");
+      ensureCandidatePilotColumn(db, "strategy_candidate_execution_evidence", "gross_quote_value_krw_exact", "TEXT");
+      ensureCandidatePilotColumn(db, "strategy_candidate_execution_evidence", "confirmed_fee_krw_exact", "TEXT");
+      ensureCandidatePilotColumn(db, "strategy_candidate_execution_evidence", "remaining_quantity_exact", "TEXT");
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_strategy_candidate_evidence_material_version
+          ON strategy_candidate_execution_evidence(deployment_id, material_version, executed_at_epoch_ns, id);
+      `);
+    }
+    if (tableExists(db, "strategy_candidate_states")) {
+      ensureCandidatePilotColumn(
+        db,
+        "strategy_candidate_states",
+        "material_version",
+        "TEXT NOT NULL DEFAULT 'LEGACY_APPROXIMATE_V1' " +
+          "CHECK (material_version IN ('LEGACY_APPROXIMATE_V1', 'EXACT_V2'))",
+      );
+      ensureCandidatePilotColumn(db, "strategy_candidate_states", "current_episode_cost_basis_krw_exact", "TEXT");
+      ensureCandidatePilotColumn(db, "strategy_candidate_states", "current_episode_inventory_quantity_exact", "TEXT");
+      ensureCandidatePilotColumn(db, "strategy_candidate_states", "current_episode_realized_pnl_krw_exact", "TEXT");
+      ensureCandidatePilotColumn(db, "strategy_candidate_states", "last_full_exit_realized_pnl_krw_exact", "TEXT");
+    }
+    if (tableExists(db, "fills")) {
+      ensureCandidatePilotColumn(
+        db,
+        "fills",
+        "fee_provenance",
+        "TEXT NOT NULL DEFAULT 'LEGACY_UNVERIFIED' " +
+          "CHECK (fee_provenance IN (" +
+          "'EXCHANGE_FILL_CONFIRMED', 'ORDER_LEVEL_UNALLOCATED', 'ORDER_LEVEL_ALLOCATED', " +
+          "'MISSING', 'LEGACY_UNVERIFIED', 'SIMULATED'))",
+      );
+    }
+    db.exec("COMMIT;");
+  } catch (error) {
+    if (db.isTransaction) db.exec("ROLLBACK;");
+    throw error;
+  }
+}
+
 function ensureExecutionStateColumn(
   db: DatabaseSync,
   columnName: "degraded_reason" | "degraded_at",
@@ -203,6 +257,17 @@ function ensureOperatorNotificationColumn(
   }
 
   db.exec(`ALTER TABLE operator_notifications ADD COLUMN ${columnName} ${columnType};`);
+}
+
+function ensureCandidatePilotColumn(
+  db: DatabaseSync,
+  tableName: "strategy_candidate_execution_evidence" | "strategy_candidate_states" | "fills",
+  columnName: string,
+  columnType: string,
+): void {
+  if (!tableHasColumn(db, tableName, columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnType};`);
+  }
 }
 
 function rebuildExecutionStateTransitions(db: DatabaseSync): void {
