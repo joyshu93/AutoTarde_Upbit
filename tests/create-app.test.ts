@@ -189,6 +189,7 @@ function createConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     telegramDeliveryBaseBackoffMs: 15_000,
     telegramDeliveryMaxBackoffMs: 300_000,
     telegramDeliveryLeaseMs: 30_000,
+    accountExecutionLeaseMs: 30_000,
     telegramInboundPollingEnabled: false,
     telegramInboundPollIntervalMs: 2_000,
     telegramInboundPollTimeoutSeconds: 25,

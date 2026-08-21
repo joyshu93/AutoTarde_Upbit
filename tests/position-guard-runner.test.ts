@@ -4,6 +4,7 @@ import type { ExecutionStateRecord, StrategyDecision } from "../src/domain/types
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { ExecutionService } from "../src/modules/execution/execution-service.js";
 import { DryRunExchangeAdapter, type ExchangeAdapter } from "../src/modules/exchange/interfaces.js";
+import { InMemoryAccountExecutionLeaseStore } from "../src/modules/db/repositories/in-memory-account-execution-lease-store.js";
 import type {
   UpbitCandleSnapshot,
   UpbitGetDayCandlesRequest,
@@ -386,6 +387,8 @@ function createExecutionService(
     exchangeAdapter,
     validationAdapter: exchangeAdapter,
     repositories,
+    accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
+    accountExecutionLeaseMs: 30_000,
     operatorState: new InMemoryOperatorStateStore(createExecutionState()),
     now: () => "2026-04-20T01:05:10.000Z",
   });

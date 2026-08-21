@@ -27,6 +27,7 @@ export interface AppConfig {
   telegramDeliveryBaseBackoffMs: number;
   telegramDeliveryMaxBackoffMs: number;
   telegramDeliveryLeaseMs: number;
+  accountExecutionLeaseMs: number;
   telegramInboundPollingEnabled: boolean;
   telegramInboundPollIntervalMs: number;
   telegramInboundPollTimeoutSeconds: number;
@@ -54,6 +55,7 @@ const DEFAULT_TELEGRAM_DELIVERY_MAX_ATTEMPTS = 5;
 const DEFAULT_TELEGRAM_DELIVERY_BASE_BACKOFF_MS = 15_000;
 const DEFAULT_TELEGRAM_DELIVERY_MAX_BACKOFF_MS = 300_000;
 const DEFAULT_TELEGRAM_DELIVERY_LEASE_MS = 30_000;
+const DEFAULT_ACCOUNT_EXECUTION_LEASE_MS = 30_000;
 const DEFAULT_TELEGRAM_INBOUND_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_TELEGRAM_INBOUND_POLL_TIMEOUT_SECONDS = 25;
 const DEFAULT_TELEGRAM_INBOUND_POLL_LIMIT = 10;
@@ -103,6 +105,10 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     telegramDeliveryLeaseMs: parseNumber(
       env.TELEGRAM_DELIVERY_LEASE_MS,
       DEFAULT_TELEGRAM_DELIVERY_LEASE_MS,
+    ),
+    accountExecutionLeaseMs: parsePositiveSafeInteger(
+      env.ACCOUNT_EXECUTION_LEASE_MS,
+      DEFAULT_ACCOUNT_EXECUTION_LEASE_MS,
     ),
     telegramInboundPollingEnabled: parseBoolean(env.ENABLE_TELEGRAM_INBOUND_POLLING),
     telegramInboundPollIntervalMs: parsePositiveNumber(
@@ -187,6 +193,11 @@ function parseNumber(input: string | undefined, fallback: number): number {
 function parsePositiveNumber(input: string | undefined, fallback: number): number {
   const parsed = Number(input);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parsePositiveSafeInteger(input: string | undefined, fallback: number): number {
+  const parsed = Number(input);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function listDeprecatedIgnoredEnvVars(env: NodeJS.ProcessEnv): readonly string[] {

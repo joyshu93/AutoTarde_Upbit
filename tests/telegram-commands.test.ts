@@ -4774,6 +4774,7 @@ test("telegram risk summary maps every rule code exhaustively in English", async
     BALANCE_DRIFT_DETECTED: "Balance drift detected",
     POSITION_DRIFT_DETECTED: "Position drift detected",
     POSITION_GUARD_PILOT_UNCERTAIN_ORDER: "Uncertain order submission",
+    ACCOUNT_EXECUTION_LEASE_BLOCKED: "Account execution lease blocked",
   };
 
   let offset = 0;

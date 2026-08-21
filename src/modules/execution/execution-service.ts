@@ -10,6 +10,8 @@ import type {
 } from "../../domain/types.js";
 import { createId } from "../../shared/ids.js";
 import type { ExecutionRepository, OperatorStateStore } from "../db/interfaces.js";
+import type { AccountExecutionLeaseStore } from "../db/pilot-interfaces.js";
+import { ExchangeOrderSubmissionError } from "../exchange/errors.js";
 import type { ExchangeAdapter, UpbitOrderChance } from "../exchange/interfaces.js";
 import { evaluateRiskGuards } from "../risk/guards.js";
 import type { OperatorNotificationReporter } from "../telegram/reporter.js";
@@ -23,6 +25,8 @@ export class ExecutionService {
       exchangeAdapter: ExchangeAdapter;
       validationAdapter?: Pick<ExchangeAdapter, "getOrderChance" | "testOrder">;
       repositories: ExecutionRepository;
+      accountExecutionLeases: AccountExecutionLeaseStore;
+      accountExecutionLeaseMs: number;
       operatorState: OperatorStateStore;
       reporter?: OperatorNotificationReporter;
       now?: () => string;
@@ -50,10 +54,52 @@ export class ExecutionService {
     if (duplicate) {
       return {
         accepted: false,
+        outcome: "DUPLICATE",
         order: duplicate,
         reason: "Duplicate order intent already exists for the same idempotency key.",
       };
     }
+
+    const leaseOwnerToken = createId("account_execution_lease");
+    const requestedAtEpochMs = Date.parse(requestedAt);
+    if (!Number.isSafeInteger(requestedAtEpochMs) || requestedAtEpochMs < 0) {
+      throw new Error("Execution submission requires a valid current timestamp for account lease acquisition.");
+    }
+    const lease = await this.dependencies.accountExecutionLeases.acquireLease({
+      exchangeAccountId: input.exchangeAccountId,
+      ownerToken: leaseOwnerToken,
+      purpose: "ORDER_SUBMISSION",
+      acquiredAtEpochMs: requestedAtEpochMs,
+      expiresAtEpochMs: requestedAtEpochMs + this.dependencies.accountExecutionLeaseMs,
+    });
+
+    if (!lease) {
+      const message = "Account execution lease is unavailable; order submission is blocked pending recovery.";
+      await this.dependencies.repositories.saveRiskEvent(
+        createRiskEvent(
+          input.exchangeAccountId,
+          input.strategyDecisionId,
+          "ACCOUNT_EXECUTION_LEASE_BLOCKED",
+          message,
+          { idempotencyKey, market, requestedAt },
+        ),
+      );
+      await this.pauseForFault({
+        exchangeAccountId: input.exchangeAccountId,
+        faultId: `account-execution-lease:${idempotencyKey}`,
+        reason: message,
+        occurredAt: requestedAt,
+      });
+      return {
+        accepted: false,
+        outcome: "LEASE_BLOCKED",
+        order: null,
+        reason: message,
+      };
+    }
+
+    let releaseLease = true;
+    try {
 
     const state = await this.dependencies.operatorState.getState();
     const policy = composeExecutionPolicy(state, this.dependencies.riskLimits);
@@ -121,6 +167,7 @@ export class ExecutionService {
 
       return {
         accepted: false,
+        outcome: "REJECTED",
         order: null,
         reason: risk.triggeredRules.map((rule) => rule.message).join("; "),
       };
@@ -169,6 +216,7 @@ export class ExecutionService {
 
       return {
         accepted: false,
+        outcome: "REJECTED",
         order: null,
         reason: preTradeValidation.message,
       };
@@ -199,18 +247,27 @@ export class ExecutionService {
       updatedAt: requestedAt,
     };
 
-    await this.dependencies.repositories.saveOrder(order);
-    await this.dependencies.repositories.appendOrderEvent({
-      id: createId("order_event"),
-      orderId: order.id,
-      eventType: "ORDER_PERSISTED",
-      eventSource: "LOCAL",
-      payloadJson: JSON.stringify({
-        idempotencyKey,
-        decisionAction: decision.action,
-      }),
-      createdAt: requestedAt,
+    await this.dependencies.repositories.persistOrderIntent({
+      order,
+      event: {
+        id: createId("order_event"),
+        orderId: order.id,
+        eventType: "ORDER_PERSISTED",
+        eventSource: "LOCAL",
+        payloadJson: JSON.stringify({
+          idempotencyKey,
+          decisionAction: decision.action,
+        }),
+        createdAt: requestedAt,
+      },
     });
+
+    const submittingOrder: OrderRecord = {
+      ...order,
+      status: "SUBMITTING",
+      updatedAt: requestedAt,
+    };
+    await this.dependencies.repositories.updateOrder(submittingOrder);
 
     try {
       const exchangeOrder = await this.dependencies.exchangeAdapter.createOrder({
@@ -224,28 +281,16 @@ export class ExecutionService {
         smpType: null,
       });
 
-      const submittedAt = new Date().toISOString();
-      const updatedOrder: OrderRecord = {
-        ...order,
+      const submittedAt = this.currentTimestamp();
+      let updatedOrder: OrderRecord = {
+        ...submittingOrder,
         upbitUuid: exchangeOrder.uuid,
         status: mapExchangeOrderStatus(exchangeOrder.state, exchangeOrder.executedVolume, exchangeOrder.ordType, exchangeOrder.side),
         exchangeResponseJson: JSON.stringify(exchangeOrder.raw),
         updatedAt: submittedAt,
       };
 
-      await this.dependencies.repositories.updateOrder(updatedOrder);
-      await this.dependencies.repositories.appendOrderEvent({
-        id: createId("order_event"),
-        orderId: order.id,
-        eventType: "ORDER_SUBMITTED",
-        eventSource: "EXCHANGE",
-        payloadJson: JSON.stringify(exchangeOrder.raw),
-        createdAt: updatedOrder.updatedAt,
-      });
-
-      let savedFillCount = 0;
-      for (const fill of exchangeOrder.fills) {
-        await this.dependencies.repositories.saveFill({
+      const fills = exchangeOrder.fills.map((fill) => ({
           id: createId("fill"),
           orderId: order.id,
           exchangeFillId: fill.tradeUuid ?? createId("exchange_fill"),
@@ -257,12 +302,10 @@ export class ExecutionService {
           feeAmount: fill.fee,
           filledAt: fill.createdAt ?? updatedOrder.updatedAt,
           rawPayloadJson: JSON.stringify(fill.raw),
-        });
-        savedFillCount += 1;
-      }
+        }));
 
       if (state.executionMode === "DRY_RUN") {
-        const settledAt = new Date().toISOString();
+        const settledAt = this.currentTimestamp();
         const syntheticFill = createDryRunSyntheticFill({
           orderId: order.id,
           market,
@@ -276,86 +319,234 @@ export class ExecutionService {
           exchangeOrderRaw: exchangeOrder.raw,
         });
 
-        if (savedFillCount === 0 && syntheticFill) {
-          await this.dependencies.repositories.saveFill(syntheticFill);
-          savedFillCount += 1;
+        if (fills.length === 0 && syntheticFill) {
+          fills.push(syntheticFill);
         }
 
-        const settledOrder: OrderRecord = {
+        if (fills.length === 0) {
+          releaseLease = false;
+          await this.throwPostSendPersistenceFailure({
+            order: submittingOrder,
+            exchangeAccountId: input.exchangeAccountId,
+            occurredAt: settledAt,
+            reason: "Dry-run submission could not produce terminal fill evidence.",
+          });
+        }
+
+        updatedOrder = {
           ...updatedOrder,
           status: "FILLED",
           updatedAt: settledAt,
         };
-
-        await this.dependencies.repositories.updateOrder(settledOrder);
-        await this.dependencies.repositories.appendOrderEvent({
-          id: createId("order_event"),
-          orderId: order.id,
-          eventType: "ORDER_FILLED",
-          eventSource: "LOCAL",
-          payloadJson: JSON.stringify({
-            mode: "DRY_RUN",
-            settlement: "SIMULATED_IMMEDIATE_FILL",
-            syntheticFillCreated: Boolean(syntheticFill && savedFillCount > 0),
-            fillCount: savedFillCount,
-          }),
-          createdAt: settledAt,
-        });
-
-        return {
-          accepted: true,
-          order: settledOrder,
-          reason: null,
-        };
       }
+
+      releaseLease = false;
+      try {
+        await this.dependencies.repositories.persistExchangeSubmission({
+          order: updatedOrder,
+          event: {
+            id: createId("order_event"),
+            orderId: order.id,
+            eventType: "ORDER_SUBMITTED",
+            eventSource: "EXCHANGE",
+            payloadJson: JSON.stringify(exchangeOrder.raw),
+            createdAt: updatedOrder.updatedAt,
+          },
+          fills,
+        });
+      } catch {
+        await this.throwPostSendPersistenceFailure({
+          order: submittingOrder,
+          exchangeAccountId: input.exchangeAccountId,
+          occurredAt: this.currentTimestamp(),
+          reason: "Exchange submission response could not be persisted atomically.",
+        });
+      }
+
+      if (state.executionMode === "DRY_RUN") {
+        try {
+          await this.dependencies.repositories.appendOrderEvent({
+            id: createId("order_event"),
+            orderId: order.id,
+            eventType: "ORDER_FILLED",
+            eventSource: "LOCAL",
+            payloadJson: JSON.stringify({
+              mode: "DRY_RUN",
+              settlement: "SIMULATED_IMMEDIATE_FILL",
+              fillCount: fills.length,
+            }),
+            createdAt: updatedOrder.updatedAt,
+          });
+        } catch {
+          // The atomic FILLED order, fill, and exchange event already make resend unsafe.
+          await this.safeReport({
+            exchangeAccountId: input.exchangeAccountId,
+            notificationType: "ORDER_SUBMISSION_FAILED",
+            severity: "ERROR",
+            title: "Dry-run fill event persistence failed",
+            message: "The simulated fill is terminal, but its supplemental local event was not persisted.",
+            payload: { orderId: order.id, identifier: order.identifier },
+          });
+        }
+      }
+
+      releaseLease = isTerminalOrderStatus(updatedOrder.status);
 
       return {
         accepted: true,
+        outcome: state.executionMode === "DRY_RUN" ? "SIMULATED_FILLED" : "SUBMITTED",
         order: updatedOrder,
         reason: null,
       };
     } catch (error) {
-      const failedOrder: OrderRecord = {
-        ...order,
-        status: "FAILED",
-        failureCode: "EXCHANGE_SUBMISSION_FAILED",
-        failureMessage: error instanceof Error ? error.message : "Unknown exchange submission failure.",
-        updatedAt: new Date().toISOString(),
+      if (error instanceof PostSendPersistenceSafetyError) {
+        throw error;
+      }
+      const submissionError = describeSubmissionError(error);
+      const definitiveRejection =
+        error instanceof ExchangeOrderSubmissionError &&
+        error.kind === "DEFINITIVE_REJECTION" &&
+        !isDuplicateIdentifierError(error);
+
+      if (definitiveRejection) {
+        const rejectedOrder: OrderRecord = {
+          ...submittingOrder,
+          status: "REJECTED",
+          failureCode: "EXCHANGE_ORDER_REJECTED",
+          failureMessage: submissionError.message,
+          exchangeResponseJson: JSON.stringify(submissionError.metadata),
+          updatedAt: this.currentTimestamp(),
+        };
+        releaseLease = false;
+        try {
+          await this.dependencies.repositories.persistExchangeSubmission({
+            order: rejectedOrder,
+            event: {
+              id: createId("order_event"),
+              orderId: order.id,
+              eventType: "ORDER_REJECTED",
+              eventSource: "EXCHANGE",
+              payloadJson: JSON.stringify(submissionError.metadata),
+              createdAt: rejectedOrder.updatedAt,
+            },
+            fills: [],
+          });
+        } catch {
+          await this.throwPostSendPersistenceFailure({
+            order: submittingOrder,
+            exchangeAccountId: input.exchangeAccountId,
+            occurredAt: this.currentTimestamp(),
+            reason: "Definitive exchange rejection could not be persisted atomically.",
+          });
+        }
+        releaseLease = true;
+        await this.safeReport({
+          exchangeAccountId: input.exchangeAccountId,
+          notificationType: "ORDER_REJECTED",
+          severity: "WARN",
+          title: "Order rejected by exchange",
+          message: submissionError.message,
+          payload: {
+            orderId: rejectedOrder.id,
+            identifier: rejectedOrder.identifier,
+            ...submissionError.metadata,
+          },
+        });
+        return {
+          accepted: false,
+          outcome: "REJECTED",
+          order: rejectedOrder,
+          reason: submissionError.message,
+        };
+      }
+
+      const uncertainOrder: OrderRecord = {
+        ...submittingOrder,
+        status: "RECONCILIATION_REQUIRED",
+        failureCode: "RECONCILIATION_REQUIRED",
+        failureMessage: submissionError.message,
+        exchangeResponseJson: JSON.stringify(submissionError.metadata),
+        updatedAt: this.currentTimestamp(),
       };
-
-      await this.dependencies.repositories.updateOrder(failedOrder);
-      await this.dependencies.repositories.appendOrderEvent({
-        id: createId("order_event"),
-        orderId: order.id,
-        eventType: "ORDER_SUBMISSION_FAILED",
-        eventSource: "LOCAL",
-        payloadJson: JSON.stringify({
-          message: failedOrder.failureMessage,
-        }),
-        createdAt: failedOrder.updatedAt,
-      });
-      await this.safeReport({
+      releaseLease = false;
+      try {
+        await this.dependencies.repositories.persistUncertainSubmission({
+          order: uncertainOrder,
+          event: {
+            id: createId("order_event"),
+            orderId: order.id,
+            eventType: "RECONCILIATION_RECOVERY_REQUIRED",
+            eventSource: "LOCAL",
+            payloadJson: JSON.stringify(submissionError.metadata),
+            createdAt: uncertainOrder.updatedAt,
+          },
+          riskEvent: createRiskEvent(
+            input.exchangeAccountId,
+            input.strategyDecisionId,
+            "POSITION_GUARD_PILOT_UNCERTAIN_ORDER",
+            submissionError.message,
+            submissionError.metadata,
+            order.id,
+          ),
+        });
+      } catch {
+        await this.throwPostSendPersistenceFailure({
+          order: submittingOrder,
+          exchangeAccountId: input.exchangeAccountId,
+          occurredAt: this.currentTimestamp(),
+          reason: "Uncertain exchange submission could not be persisted atomically.",
+        });
+      }
+      await this.pauseForFault({
         exchangeAccountId: input.exchangeAccountId,
-        notificationType: "ORDER_SUBMISSION_FAILED",
-        severity: "ERROR",
-        title: "Order submission failed",
-        message: failedOrder.failureMessage ?? "Unknown exchange submission failure.",
-        payload: {
-          orderId: failedOrder.id,
-          strategyDecisionId: failedOrder.strategyDecisionId,
-          market: failedOrder.market,
-          side: failedOrder.side,
-          ordType: failedOrder.ordType,
-          identifier: failedOrder.identifier,
-        },
+        faultId: `uncertain-order:${order.id}`,
+        reason: submissionError.message,
+        occurredAt: uncertainOrder.updatedAt,
       });
-
       return {
         accepted: false,
-        order: failedOrder,
-        reason: failedOrder.failureMessage,
+        outcome: "RECONCILIATION_REQUIRED",
+        order: uncertainOrder,
+        reason: submissionError.message,
       };
     }
+    } finally {
+      if (releaseLease) {
+        await this.dependencies.accountExecutionLeases.releaseLease(input.exchangeAccountId, leaseOwnerToken);
+      }
+    }
+  }
+
+  private currentTimestamp(): string {
+    return this.dependencies.now?.() ?? new Date().toISOString();
+  }
+
+  private async pauseForFault(input: {
+    exchangeAccountId: string;
+    faultId: string;
+    reason: string;
+    occurredAt: string;
+  }): Promise<void> {
+    try {
+      await this.dependencies.operatorState.pauseForFault(input);
+    } catch {
+      // Fault pausing is attempted without obscuring the durable lifecycle evidence.
+    }
+  }
+
+  private async throwPostSendPersistenceFailure(input: {
+    order: OrderRecord;
+    exchangeAccountId: string;
+    occurredAt: string;
+    reason: string;
+  }): Promise<never> {
+    await this.pauseForFault({
+      exchangeAccountId: input.exchangeAccountId,
+      faultId: `post-send-persistence:${input.order.id}`,
+      reason: input.reason,
+      occurredAt: input.occurredAt,
+    });
+    throw new PostSendPersistenceSafetyError(input.reason);
   }
 
   private async runExchangePreTradeValidation(input: {
@@ -586,6 +777,58 @@ function hasExecutedVolume(executedVolume: string | null): boolean {
   return Boolean(executedVolume && Number(executedVolume) > 0);
 }
 
+function isTerminalOrderStatus(status: OrderRecord["status"]): boolean {
+  return status === "FILLED" || status === "CANCELED" || status === "REJECTED";
+}
+
+function isDuplicateIdentifierError(error: ExchangeOrderSubmissionError): boolean {
+  return [error.exchangeCode, error.exchangeName].some(
+    (value) => value?.trim().toLowerCase() === "duplicate_identifier",
+  );
+}
+
+function describeSubmissionError(error: unknown): {
+  message: string;
+  metadata: {
+    kind: "DEFINITIVE_REJECTION" | "UNCERTAIN";
+    status: number | null;
+    exchangeCode: string | null;
+    exchangeName: string | null;
+    responseReceived: boolean;
+  };
+} {
+  if (error instanceof ExchangeOrderSubmissionError) {
+    return {
+      message: error.message,
+      metadata: {
+        kind: error.kind,
+        status: error.status,
+        exchangeCode: error.exchangeCode,
+        exchangeName: error.exchangeName,
+        responseReceived: error.responseReceived,
+      },
+    };
+  }
+
+  return {
+    message: "Order submission outcome is uncertain and requires reconciliation.",
+    metadata: {
+      kind: "UNCERTAIN",
+      status: null,
+      exchangeCode: null,
+      exchangeName: null,
+      responseReceived: false,
+    },
+  };
+}
+
+class PostSendPersistenceSafetyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PostSendPersistenceSafetyError";
+  }
+}
+
 function createDryRunSyntheticFill(input: {
   orderId: string;
   market: OrderRecord["market"];
@@ -647,12 +890,13 @@ function createRiskEvent(
   ruleCode: RiskEventRecord["ruleCode"],
   message: string,
   payload: Record<string, unknown> = {},
+  orderId: string | null = null,
 ): RiskEventRecord {
   return {
     id: createId("risk_event"),
     exchangeAccountId,
     strategyDecisionId,
-    orderId: null,
+    orderId,
     level: "BLOCK",
     ruleCode,
     message,

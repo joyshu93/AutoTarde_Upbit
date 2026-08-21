@@ -97,14 +97,20 @@ Exchange-backed fill windows used for portfolio drift explanation compare parsed
 The intended live path is:
 
 1. create intent
-2. risk approve
-3. persist
-4. submit to Upbit
-5. store exchange UUID and raw response
-6. ingest order-state changes and fills
-7. reconcile until terminal state is consistent
+2. reject an existing idempotency match
+3. acquire the account-scoped execution lease before validation or persistence
+4. risk approve and run Upbit order-chance and order-test validation
+5. atomically persist `PERSISTED` plus `ORDER_PERSISTED`
+6. transition the durable order to `SUBMITTING`
+7. call the exchange adapter exactly once
+8. atomically store accepted, definitive rejection, or uncertain-submission evidence
+9. reconcile until terminal state is consistent
+
+`ACCOUNT_EXECUTION_LEASE_MS` is a positive explicit setting with a `30000` default. Safe pre-send exits and definitive terminal outcomes release the lease. Uncertain, active, and post-send persistence-failure outcomes retain it. A lease conflict creates no order row or exchange send, persists `ACCOUNT_EXECUTION_LEASE_BLOCKED`, and attempts an automatic pause.
 
 The real Upbit order-create adapter distinguishes a clear exchange rejection from an outcome that needs recovery. Only a clear `4xx` creation rejection is definitive; timeouts, disconnects, redirects, `5xx` responses, malformed successful responses (including optional fields), mapping failures, and other dispatched-request failures remain uncertain. Typed submission failures retain only HTTP status, sanitized exchange code/name, and whether a response was received. They never retain request credentials, JWTs, access keys, secret keys, token-shaped/reflected metadata, or raw error responses. Private requests use manual redirect handling so a `3xx` response remains observable. A confirmed authenticated order lookup `404` remains an absent (`null`) lookup result.
+
+`duplicate_identifier` is reconciliation-required rather than a simple rejection because identifier recovery must establish whether the matching exchange order is locally represented before any later send. The system never retries `createOrder` merely because the original response was lost.
 
 The live send path is selected only when mode, live gate, and credentials are explicitly configured.
 Upbit `price` market buys may return exchange state `cancel` after a successful fill when only dust-sized KRW or fee lock remains. In that specific filled `bid`/`price` case, the local lifecycle records the order as `FILLED` and preserves the raw exchange `cancel` payload plus fill and fee evidence. Ordinary canceled orders without this filled market-buy pattern remain `CANCELED`.

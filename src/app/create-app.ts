@@ -76,7 +76,7 @@ export function createApp(
     liveExecutionGate: config.liveExecutionGate,
     killSwitchActive: config.globalKillSwitch,
   });
-  const { repositories, operatorState } = persistence;
+  const { repositories, operatorState, accountExecutionLeases } = persistence;
 
   const strategy = new DeterministicStubStrategy();
   const liveExchangeClient = new UpbitPrivateClient({
@@ -126,6 +126,8 @@ export function createApp(
     exchangeAdapter: executionExchangeAdapter,
     validationAdapter: syncExchangeAdapter,
     repositories,
+    accountExecutionLeases,
+    accountExecutionLeaseMs: config.accountExecutionLeaseMs,
     operatorState,
     reporter,
   });

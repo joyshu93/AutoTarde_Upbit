@@ -4,6 +4,7 @@ import type { ExecutionStateRecord } from "../src/domain/types.js";
 import { ExecutionService } from "../src/modules/execution/execution-service.js";
 import type { SubmissionOutcome, SubmitOrderFromDecisionResult } from "../src/modules/execution/interfaces.js";
 import { DryRunExchangeAdapter, type ExchangeAdapter } from "../src/modules/exchange/interfaces.js";
+import { InMemoryAccountExecutionLeaseStore } from "../src/modules/db/repositories/in-memory-account-execution-lease-store.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { DurableTelegramReporter, type OperatorNotificationReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
@@ -41,6 +42,8 @@ function createExecutionService(overrides?: {
     },
     exchangeAdapter: overrides?.exchangeAdapter ?? new DryRunExchangeAdapter(),
     repositories,
+    accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
+    accountExecutionLeaseMs: 30_000,
     operatorState,
     now: () => "2026-04-20T00:00:20.000Z",
     ...(overrides?.validationAdapter ? { validationAdapter: overrides.validationAdapter } : {}),
@@ -52,7 +55,7 @@ function createExecutionService(overrides?: {
   return { service, repositories };
 }
 
-test("submission outcomes retain compatibility with existing execution results", () => {
+test("submission outcomes require an explicit discriminant", () => {
   const outcomes: SubmissionOutcome[] = [
     "SUBMITTED",
     "SIMULATED_FILLED",
@@ -61,14 +64,38 @@ test("submission outcomes retain compatibility with existing execution results",
     "LEASE_BLOCKED",
     "RECONCILIATION_REQUIRED",
   ];
-  const existingResult: SubmitOrderFromDecisionResult = {
+  const result: SubmitOrderFromDecisionResult = {
     accepted: true,
-    order: null,
+    outcome: "SIMULATED_FILLED",
+    order: {
+      id: "order-1",
+      strategyDecisionId: null,
+      exchangeAccountId: "primary",
+      market: "KRW-BTC",
+      side: "bid",
+      ordType: "limit",
+      volume: "0.001",
+      price: "100000000",
+      timeInForce: null,
+      smpType: null,
+      identifier: "identifier-1",
+      idempotencyKey: "idempotency-1",
+      origin: "STRATEGY",
+      requestedAt: "2026-04-20T00:00:00.000Z",
+      upbitUuid: null,
+      status: "FILLED",
+      executionMode: "DRY_RUN",
+      exchangeResponseJson: null,
+      failureCode: null,
+      failureMessage: null,
+      createdAt: "2026-04-20T00:00:00.000Z",
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    },
     reason: null,
   };
 
   assert.equal(outcomes.length, 6);
-  assert.equal(existingResult.outcome, undefined);
+  assert.equal(result.outcome, "SIMULATED_FILLED");
 });
 
 test("execution service persists a dry-run order and blocks duplicate idempotent submissions", async () => {
@@ -542,6 +569,8 @@ test("execution service queues an operator notification when an order is rejecte
     exchangeAdapter,
     validationAdapter: exchangeAdapter,
     repositories,
+    accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
+    accountExecutionLeaseMs: 30_000,
     operatorState,
     reporter,
     now: () => "2026-04-20T00:00:20.000Z",
@@ -818,6 +847,8 @@ test("execution service records order mode from persisted operator state", async
     },
     exchangeAdapter: new DryRunExchangeAdapter(),
     repositories,
+    accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
+    accountExecutionLeaseMs: 30_000,
     operatorState,
     now: () => "2026-04-20T00:00:20.000Z",
   });

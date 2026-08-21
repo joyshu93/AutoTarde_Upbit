@@ -138,6 +138,12 @@ const RISK_RULE_PRESENTATIONS: Readonly<Record<RiskRuleCode, LocalizedRule>> = {
     "Uncertain order submission",
     "The order submission outcome is unknown and requires reconciliation.",
   ),
+  ACCOUNT_EXECUTION_LEASE_BLOCKED: rule(
+    "계정 실행 잠금 차단",
+    "다른 실행 시도 또는 미해결 주문이 계정 실행 잠금을 점유하고 있습니다.",
+    "Account execution lease blocked",
+    "Another execution attempt or unresolved order owns the account execution lease.",
+  ),
 };
 
 export function formatRiskEventsPresentation(

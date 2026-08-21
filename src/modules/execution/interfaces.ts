@@ -21,9 +21,34 @@ export interface SubmitOrderFromDecisionInput {
   market?: SupportedMarket;
 }
 
-export interface SubmitOrderFromDecisionResult {
-  accepted: boolean;
-  order: OrderRecord | null;
-  reason: string | null;
-  outcome?: SubmissionOutcome;
-}
+export type SubmitOrderFromDecisionResult =
+  | {
+      accepted: true;
+      outcome: "SUBMITTED" | "SIMULATED_FILLED";
+      order: OrderRecord;
+      reason: null;
+    }
+  | {
+      accepted: false;
+      outcome: "DUPLICATE";
+      order: OrderRecord;
+      reason: string;
+    }
+  | {
+      accepted: false;
+      outcome: "LEASE_BLOCKED";
+      order: null;
+      reason: string;
+    }
+  | {
+      accepted: false;
+      outcome: "RECONCILIATION_REQUIRED";
+      order: OrderRecord;
+      reason: string;
+    }
+  | {
+      accepted: false;
+      outcome: "REJECTED";
+      order: OrderRecord | null;
+      reason: string;
+    };

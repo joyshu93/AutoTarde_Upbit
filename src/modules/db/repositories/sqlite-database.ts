@@ -324,7 +324,9 @@ function rebuildRiskEvents(db: DatabaseSync): void {
           'EXCHANGE_ORDER_TEST_FAILED',
           'ORDER_RECOVERY_REQUIRED',
           'BALANCE_DRIFT_DETECTED',
-          'POSITION_DRIFT_DETECTED'
+          'POSITION_DRIFT_DETECTED',
+          'POSITION_GUARD_PILOT_UNCERTAIN_ORDER',
+          'ACCOUNT_EXECUTION_LEASE_BLOCKED'
         )
       ),
       message TEXT NOT NULL,

@@ -46,6 +46,13 @@ If either condition is missing, the system must behave as non-live, and risk eva
 - the system must reject duplicate active intents for the same fingerprint
 - duplicate suppression must not rely only on message cooldowns or human-readable summaries
 
+### Account Execution Lease
+
+- every executable decision must acquire the account-scoped database lease after idempotency duplicate detection and before execution, risk, exchange-validation, or order-persistence work
+- `ACCOUNT_EXECUTION_LEASE_MS` must be a positive explicit configuration value; its default is `30000`
+- lease conflict or ambiguity must create no order row, make no exchange create-order call, persist `ACCOUNT_EXECUTION_LEASE_BLOCKED` evidence, and attempt an automatic pause
+- safe pre-send exits and definitive terminal outcomes release the lease; active, uncertain, or post-send persistence-failure outcomes retain it for recovery
+
 ### Stale Price Guard
 
 - orders require a recent price snapshot
@@ -94,6 +101,8 @@ The execution path should validate orders through:
 - reconciliation must not query Upbit for local `DRY_RUN` adapter artifacts such as `dryrun_*` UUIDs; those records must be repaired locally and remain visibly simulated
 - simulated `DRY_RUN` fills must not be used as exchange-balance explanations in portfolio drift detection
 - partial fills, cancel requests, rejects, and unresolved states must remain queryable
+- a typed or untyped exception from `createOrder` is uncertain unless it is a clear definitive exchange rejection; `duplicate_identifier` remains `RECONCILIATION_REQUIRED` so recovery can query by identifier without resending
+- if post-send local persistence fails, retain the durable `SUBMITTING` order and lease, attempt an automatic pause, and fail the run rather than retrying transmission
 
 ## Operator Controls
 

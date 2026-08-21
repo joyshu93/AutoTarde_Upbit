@@ -338,12 +338,12 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 8. If multiple configured market timers become due together, queue their scheduled strategy cycles for the exchange account instead of letting the account-scoped runner lock skip one market.
 9. If a `LIVE` scheduled tick submits an order, record remaining ticks from the same one-second scheduler batch as `SKIPPED` and defer them to the next interval.
 10. Build a deterministic strategy decision, either from an explicit operator `/run BTC|ETH` request or the disabled-by-default scheduler.
-11. Convert the decision into an order intent with an idempotency key.
-12. Run risk guards.
-13. Run exchange pre-trade validation through `orders/chance` and `orders/test`.
-14. Persist the order record and append an order event.
-15. Call the exchange adapter.
-16. Persist the updated order state.
+11. Convert the decision into an order intent with an idempotency key and reject an existing match.
+12. Acquire the explicit-duration account execution lease before execution, risk, validation, or persistence work.
+13. Run risk guards and exchange pre-trade validation through `orders/chance` and `orders/test`.
+14. Atomically persist `PERSISTED` plus `ORDER_PERSISTED`, then transition to `SUBMITTING`.
+15. Call the exchange adapter exactly once.
+16. Atomically persist accepted, definitive rejection, or reconciliation-required evidence; retain the lease on active, uncertain, and post-send persistence-failure outcomes.
 17. Persist operator_notifications for significant operator-facing outcomes.
 18. Kick best-effort Telegram delivery without letting network delivery alter execution outcomes.
 19. If another delivery kick arrives while the inline worker is in flight, record a follow-up request and run one more delivery pass after the current pass finishes.

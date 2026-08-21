@@ -14,6 +14,7 @@ test("loadAppConfig defaults to DRY_RUN with live gate disabled", () => {
   assert.equal(config.telegramDeliveryBaseBackoffMs, 15_000);
   assert.equal(config.telegramDeliveryMaxBackoffMs, 300_000);
   assert.equal(config.telegramDeliveryLeaseMs, 30_000);
+  assert.equal(config.accountExecutionLeaseMs, 30_000);
   assert.equal(config.telegramInboundPollingEnabled, false);
   assert.equal(config.telegramInboundPollIntervalMs, 2_000);
   assert.equal(config.telegramInboundPollTimeoutSeconds, 25);
@@ -62,6 +63,7 @@ test("loadAppConfig allows LIVE only when explicitly requested", () => {
     TELEGRAM_DELIVERY_BASE_BACKOFF_MS: "20000",
     TELEGRAM_DELIVERY_MAX_BACKOFF_MS: "600000",
     TELEGRAM_DELIVERY_LEASE_MS: "45000",
+    ACCOUNT_EXECUTION_LEASE_MS: "45000",
     ENABLE_TELEGRAM_INBOUND_POLLING: "true",
     TELEGRAM_INBOUND_POLL_INTERVAL_MS: "3000",
     TELEGRAM_INBOUND_POLL_TIMEOUT_SECONDS: "20",
@@ -83,6 +85,7 @@ test("loadAppConfig allows LIVE only when explicitly requested", () => {
   assert.equal(config.telegramDeliveryBaseBackoffMs, 20_000);
   assert.equal(config.telegramDeliveryMaxBackoffMs, 600_000);
   assert.equal(config.telegramDeliveryLeaseMs, 45_000);
+  assert.equal(config.accountExecutionLeaseMs, 45_000);
   assert.equal(config.telegramInboundPollingEnabled, true);
   assert.equal(config.telegramInboundPollIntervalMs, 3_000);
   assert.equal(config.telegramInboundPollTimeoutSeconds, 20);
@@ -107,4 +110,13 @@ test("loadAppConfig accepts an explicit sqlite database path override", () => {
   assert.equal(config.databasePath, "./var/test-wiring.sqlite");
   assert.equal(config.reconciliationMaxOrderLookupsPerRun, 4);
   assert.equal(config.reconciliationHistoryMaxPagesPerMarket, 6);
+});
+
+test("loadAppConfig requires a positive account execution lease duration", () => {
+  assert.equal(loadAppConfig({ ACCOUNT_EXECUTION_LEASE_MS: "0" }).accountExecutionLeaseMs, 30_000);
+  assert.equal(loadAppConfig({ ACCOUNT_EXECUTION_LEASE_MS: "-1" }).accountExecutionLeaseMs, 30_000);
+  assert.equal(loadAppConfig({ ACCOUNT_EXECUTION_LEASE_MS: "1.5" }).accountExecutionLeaseMs, 30_000);
+  assert.equal(loadAppConfig({ ACCOUNT_EXECUTION_LEASE_MS: "9007199254740992" }).accountExecutionLeaseMs, 30_000);
+  assert.equal(loadAppConfig({ ACCOUNT_EXECUTION_LEASE_MS: "not-a-number" }).accountExecutionLeaseMs, 30_000);
+  assert.equal(loadAppConfig({ ACCOUNT_EXECUTION_LEASE_MS: "12000" }).accountExecutionLeaseMs, 12_000);
 });
