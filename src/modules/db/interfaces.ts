@@ -24,11 +24,27 @@ import type {
   SupportedMarket,
   TelegramInboundOffsetRecord,
 } from "../../domain/types.js";
-import type { OrderSubmissionRecoveryObservationRecord } from "../../domain/pilot-types.js";
+import type {
+  CandidateExecutionBindingRecord,
+  OrderSubmissionRecoveryObservationRecord,
+  PositionGuardPilotDeploymentRecord,
+} from "../../domain/pilot-types.js";
 
 export interface PersistOrderIntentInput {
   order: OrderRecord;
   event: OrderEventRecord;
+}
+
+export interface PersistCandidateBoundOrderIntentInput {
+  order: OrderRecord;
+  event: OrderEventRecord;
+  binding: CandidateExecutionBindingRecord;
+  decision: StrategyDecisionRecord;
+  deployment: PositionGuardPilotDeploymentRecord;
+  exactStateVersion: number;
+  expectedPhase: "ACTIVE" | "DRAINING";
+  expectedDeploymentUpdatedAt: string;
+  expectedStateVersion: number;
 }
 
 export interface PersistExchangeSubmissionInput {
