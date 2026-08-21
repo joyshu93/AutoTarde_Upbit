@@ -114,7 +114,7 @@ interface RecoveryFault extends Error {
 
 interface PersistenceReadFault extends Error {
   persistenceReadOperation: string;
-  persistenceReadFailureKind: "READ_ERROR" | "TYPE_ERROR" | "RANGE_ERROR";
+  persistenceReadFailureClass: string;
 }
 
 const REVIEWED_NON_BLOCKING_RECONCILIATION_CODES = new Set([
@@ -952,10 +952,9 @@ export class PositionGuardPilotRecovery {
     const provenanceJson = buildReadFailureProvenanceJson({
       reasonCode,
       operation: fault.persistenceReadOperation,
-      failureKind: fault.persistenceReadFailureKind,
+      failureClass: fault.persistenceReadFailureClass,
       configured: this.dependencies,
       receipt,
-      deployment: hasEstablishedDeploymentIdentity(readback, this.dependencies) ? readback.deployment : null,
     });
     return this.persistFault(reasonCode, provenanceJson, readback, clock);
   }
@@ -981,7 +980,11 @@ export class PositionGuardPilotRecovery {
     const deploymentIdentityEstablished = hasEstablishedDeploymentIdentity(readback, this.dependencies);
     if (deploymentIdentityEstablished) {
       const existing = readback.auditEvents.find((event) => event.id === faultId);
-      if (existing) fault.occurredAt = existing.createdAt;
+      if (existing) {
+        fault.occurredAt = existing.createdAt;
+      } else if (readback.deployment.phase === "PAUSED_FAULT") {
+        fault.occurredAt = readback.deployment.updatedAt;
+      }
       const persisted = await this.dependencies.candidatePilots.pauseForRecoveryFault(fault);
       if (persisted.auditEvent.id !== faultId || persisted.deployment.phase !== "PAUSED_FAULT") {
         throw new Error("Candidate recovery fault pause did not persist the expected atomic authority.");
@@ -1128,7 +1131,7 @@ function buildFaultProvenanceJson(input: {
 function buildReadFailureProvenanceJson(input: {
   reasonCode: "SNAPSHOT_PROVENANCE_INVALID";
   operation: string;
-  failureKind: PersistenceReadFault["persistenceReadFailureKind"];
+  failureClass: string;
   configured: {
     exchangeAccountId: string;
     deploymentId: string;
@@ -1138,14 +1141,13 @@ function buildReadFailureProvenanceJson(input: {
     policyVersion: string;
   };
   receipt: Readonly<PositionGuardPilotRefreshReceipt>;
-  deployment: PositionGuardPilotDeploymentRecord | null;
 }): string {
   return canonicalJson({
-    schemaVersion: 1,
+    schemaVersion: 2,
     reasonCode: input.reasonCode,
     faultKind: "PERSISTENCE_READ_FAILURE",
     readOperation: input.operation,
-    readFailureKind: input.failureKind,
+    readFailureClass: input.failureClass,
     configuredIdentity: {
       exchangeAccountId: input.configured.exchangeAccountId,
       deploymentId: input.configured.deploymentId,
@@ -1155,19 +1157,6 @@ function buildReadFailureProvenanceJson(input: {
       policyVersion: input.configured.policyVersion,
     },
     refreshReceipt: input.receipt,
-    establishedDeploymentIdentity: input.deployment ? {
-      id: input.deployment.id,
-      exchangeAccountId: input.deployment.exchangeAccountId,
-      pilotId: input.deployment.pilotId,
-      market: input.deployment.market,
-      policyId: input.deployment.policyId,
-      policyVersion: input.deployment.policyVersion,
-      phase: input.deployment.phase,
-      activationAt: input.deployment.activationAt,
-      activationEpochNs: input.deployment.activationEpochNs,
-      createdAt: input.deployment.createdAt,
-      updatedAt: input.deployment.updatedAt,
-    } : null,
   });
 }
 
@@ -1257,7 +1246,7 @@ function verifyRecoveryObservations(
         createdAt !== observedAt ||
         observedAt < requestedAt ||
         observedAt > nowEpochNanoseconds ||
-        !isValidRecoveryObservationDetail(observation.outcome, detail)
+        !isValidRecoveryObservationDetail(order, observation.outcome, detail)
       ) {
         throw new Error("Recovery observation authority is invalid.");
       }
@@ -1269,37 +1258,54 @@ function verifyRecoveryObservations(
 }
 
 function isValidRecoveryObservationDetail(
+  order: OrderRecord,
   outcome: OrderSubmissionRecoveryObservationRecord["outcome"],
   detail: unknown,
 ): boolean {
   if (!isPlainRecord(detail)) return false;
+  const expectedQueries = recoveryQueriesForOrder(order);
+  if (!expectedQueries) return false;
   if (outcome === "NOT_FOUND") {
-    return hasExactOwnKeys(detail, ["attemptedQueries"]) && isValidRecoveryQueries(detail.attemptedQueries);
+    return hasExactOwnKeys(detail, ["attemptedQueries"]) &&
+      isValidRecoveryQueries(detail.attemptedQueries, expectedQueries);
   }
   if (outcome === "TRANSIENT_FAILURE") {
     return hasExactOwnKeys(detail, ["attemptedQueries", "reason"]) &&
-      isValidRecoveryQueries(detail.attemptedQueries) && isNonEmptyString(detail.reason);
+      isValidRecoveryQueries(detail.attemptedQueries, expectedQueries) && isNonEmptyString(detail.reason);
   }
   if (outcome === "FOUND") {
     return hasExactOwnKeys(detail, ["query", "attemptedQueries", "uuid"]) &&
       isValidRecoveryQuery(detail.query) &&
-      isValidRecoveryQueries(detail.attemptedQueries) &&
-      isNonEmptyString(detail.uuid) &&
+      expectedQueries.some((query) => canonicalJson(query) === canonicalJson(detail.query)) &&
+      isValidRecoveryQueries(detail.attemptedQueries, expectedQueries) &&
+      order.upbitUuid !== null &&
+      detail.uuid === order.upbitUuid &&
       (detail.attemptedQueries as unknown[]).some((query) => canonicalJson(query) === canonicalJson(detail.query));
   }
   return false;
 }
 
-function isValidRecoveryQueries(value: unknown): value is unknown[] {
+function isValidRecoveryQueries(value: unknown, expected: unknown[]): value is unknown[] {
   if (!Array.isArray(value) || value.length === 0 || !value.every(isValidRecoveryQuery)) return false;
   const canonical = value.map((query) => canonicalJson(query));
-  return new Set(canonical).size === canonical.length;
+  const allowed = new Set(expected.map((query) => canonicalJson(query)));
+  return new Set(canonical).size === canonical.length && canonical.every((query) => allowed.has(query));
 }
 
 function isValidRecoveryQuery(value: unknown): boolean {
   return isPlainRecord(value) &&
     ((hasExactOwnKeys(value, ["uuid"]) && isNonEmptyString(value.uuid)) ||
       (hasExactOwnKeys(value, ["identifier"]) && isNonEmptyString(value.identifier)));
+}
+
+function recoveryQueriesForOrder(order: OrderRecord): Array<{ uuid: string } | { identifier: string }> | null {
+  if (!isNonEmptyString(order.identifier) || (order.upbitUuid !== null && !isNonEmptyString(order.upbitUuid))) {
+    return null;
+  }
+  return [
+    ...(order.upbitUuid ? [{ uuid: order.upbitUuid }] : []),
+    { identifier: order.identifier },
+  ];
 }
 
 function isDefinitivelyAbsentOrder(
@@ -1381,36 +1387,39 @@ function isDefinitivelyAbsentOrder(
     ) {
       return false;
     }
-    const expectedQueries = [
-      ...(order.upbitUuid ? [{ uuid: order.upbitUuid }] : []),
-      ...(order.identifier ? [{ identifier: order.identifier }] : []),
-    ];
+    const expectedQueries = recoveryQueriesForOrder(order);
+    if (!expectedQueries) return false;
     const observationIds = new Set<string>();
     for (const observation of observations) {
       const observationAt = parseCandidateEvidenceTimestamp(
         observation.observedAt,
         "absence observation observedAt",
       );
-      const detail = JSON.parse(observation.detailJson) as unknown;
       if (
         observationIds.has(observation.id) ||
         observation.orderId !== order.id ||
-        observation.outcome !== "NOT_FOUND" ||
         observation.createdAt !== observation.observedAt ||
         Date.parse(observation.observedAt) !== observation.observedAtEpochMs ||
         observationAt < requestedAt ||
         observationAt > eventAt ||
-        observationAt > nowEpochNanoseconds ||
-        !isPlainRecord(detail) ||
-        !hasExactOwnKeys(detail, ["attemptedQueries"]) ||
-        !Array.isArray(detail.attemptedQueries) ||
-        canonicalJson(detail.attemptedQueries) !== canonicalJson(expectedQueries)
+        observationAt > nowEpochNanoseconds
       ) {
         return false;
       }
       observationIds.add(observation.id);
     }
-    const ordered = [...observations].sort((left, right) =>
+    const absenceObservations = observations.filter((observation) => observation.outcome === "NOT_FOUND");
+    for (const observation of absenceObservations) {
+      const detail = JSON.parse(observation.detailJson) as unknown;
+      if (
+        !isPlainRecord(detail) ||
+        !hasExactOwnKeys(detail, ["attemptedQueries"]) ||
+        canonicalJson(detail.attemptedQueries) !== canonicalJson(expectedQueries)
+      ) {
+        return false;
+      }
+    }
+    const ordered = [...absenceObservations].sort((left, right) =>
       left.observedAtEpochMs - right.observedAtEpochMs || left.id.localeCompare(right.id)
     );
     const first = ordered[0];
@@ -1418,9 +1427,9 @@ function isDefinitivelyAbsentOrder(
     if (!first || !latest || latest.observedAt !== event.createdAt) return false;
     const elapsedMs = latest.observedAtEpochMs - first.observedAtEpochMs;
     return !hasLaterContradictoryOrderEvidence(event, events) &&
-      observations.length === payload.absenceObservationCount &&
+      absenceObservations.length === payload.absenceObservationCount &&
       elapsedMs === payload.elapsedMs &&
-      observations.length >= policy.minimumNotFoundObservations &&
+      absenceObservations.length >= policy.minimumNotFoundObservations &&
       elapsedMs >= policy.minimumElapsedMs;
   } catch {
     return false;
@@ -1761,22 +1770,32 @@ function recoveryFault(reasonCode: CandidatePilotRecoveryFaultReason, message: s
 }
 
 function persistenceReadFault(operation: string, cause: unknown): PersistenceReadFault {
-  const persistenceReadFailureKind: PersistenceReadFault["persistenceReadFailureKind"] = cause instanceof TypeError
-    ? "TYPE_ERROR"
-    : cause instanceof RangeError
-      ? "RANGE_ERROR"
-      : "READ_ERROR";
+  const persistenceReadFailureClass = sanitizedReadFailureClass(cause);
   return Object.assign(new Error(`Persistence read failed during ${operation}.`), {
     persistenceReadOperation: operation,
-    persistenceReadFailureKind,
+    persistenceReadFailureClass,
   });
 }
 
 function isPersistenceReadFault(value: unknown): value is PersistenceReadFault {
   return value instanceof Error &&
     "persistenceReadOperation" in value && typeof value.persistenceReadOperation === "string" &&
-    "persistenceReadFailureKind" in value &&
-    ["READ_ERROR", "TYPE_ERROR", "RANGE_ERROR"].includes(value.persistenceReadFailureKind as string);
+    "persistenceReadFailureClass" in value &&
+    typeof value.persistenceReadFailureClass === "string" &&
+    isSanitizedReadFailureClass(value.persistenceReadFailureClass);
+}
+
+function sanitizedReadFailureClass(cause: unknown): string {
+  if (cause instanceof Error) {
+    const constructorName = cause.constructor?.name;
+    return isSanitizedReadFailureClass(constructorName) ? constructorName : "Error";
+  }
+  const kind = cause === null ? "NULL" : (typeof cause).toUpperCase();
+  return `NON_ERROR_${kind}`;
+}
+
+function isSanitizedReadFailureClass(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_$.-]{0,63}$/u.test(value);
 }
 
 function asRecoveryFault(error: unknown): RecoveryFault {

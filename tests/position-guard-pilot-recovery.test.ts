@@ -335,6 +335,54 @@ test("every authoritative persistence read failure returns a sanitized durable B
   assert.deepEqual(outcomes, operations.map(() => "BLOCKED_FAULT"));
 });
 
+test("read-failure restart reuses immutable fault identity and separates operation and error class", async () => {
+  const restartFixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+  const failingPilots = overrideCandidatePilots(restartFixture.candidatePilots, {
+    listEvidenceRecords: async () => {
+      throw new Error("SECRET_RESTART_READ_FAILURE");
+    },
+  });
+
+  const first = await restartFixture.createRecovery(failingPilots)
+    .verifyAndPrepareBtcRun(restartFixture.receipt);
+  const retry = await restartFixture.createRecovery(
+    failingPilots,
+    undefined,
+    undefined,
+    "2026-08-21T00:01:05.000Z",
+  )
+    .verifyAndPrepareBtcRun(restartFixture.receipt);
+
+  assert.equal(first.status, "BLOCKED_FAULT");
+  assert.equal(retry.status, "BLOCKED_FAULT");
+  if (first.status !== "BLOCKED_FAULT" || retry.status !== "BLOCKED_FAULT") return;
+  assert.equal(first.faultId, retry.faultId);
+  assert.equal((await restartFixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID))
+    .filter((event) => event.id === first.faultId).length, 1);
+  assert.equal((await restartFixture.operatorState.listTransitions(100))
+    .filter((transition) => transition.id === first.faultId).length, 1);
+
+  class DistinctReadError extends Error {}
+  const distinctFaultIds: string[] = [];
+  for (const scenario of [
+    { operation: "getExactState" as const, error: new Error("same-message") },
+    { operation: "listEvidenceRecords" as const, error: new Error("same-message") },
+    { operation: "getExactState" as const, error: new TypeError("same-message") },
+    { operation: "getExactState" as const, error: new DistinctReadError("same-message") },
+  ]) {
+    const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+    const fail = async () => {
+      throw scenario.error;
+    };
+    const result = await fixture.createRecovery(overrideCandidatePilots(fixture.candidatePilots, {
+      [scenario.operation]: fail,
+    })).verifyAndPrepareBtcRun(fixture.receipt);
+    assert.equal(result.status, "BLOCKED_FAULT");
+    if (result.status === "BLOCKED_FAULT") distinctFaultIds.push(result.faultId);
+  }
+  assert.equal(new Set(distinctFaultIds).size, 4);
+});
+
 test("missing configured deployment pauses only the target global execution state", async () => {
   const fixture = await createFixture({ createDeployment: false });
 
@@ -584,6 +632,78 @@ test("definitive rejection and bounded absence lifecycle evidence are safe", asy
   assert.equal(result.status, "READY");
 });
 
+test("bounded absence ignores transient history but FOUND remains contradictory", async () => {
+  const transientFixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+  const transientAbsent = {
+    ...orderRecord({ id: "order-transient-absence", status: "FAILED", failureCode: "ORDER_SUBMISSION_ABSENCE_CONFIRMED" }),
+    failureMessage: "Bounded identifier recovery confirmed persistent exchange absence.",
+    updatedAt: "2026-08-21T00:00:36.000Z",
+  };
+  await transientFixture.repositories.saveOrder(transientAbsent);
+  await transientFixture.repositories.saveOrderSubmissionRecoveryObservation(
+    recoveryObservation(transientAbsent.id, "transient-absence-1", "2026-08-21T00:00:26.000Z"),
+  );
+  await transientFixture.repositories.saveOrderSubmissionRecoveryObservation({
+    ...recoveryObservation(transientAbsent.id, "transient-middle", "2026-08-21T00:00:31.000Z"),
+    outcome: "TRANSIENT_FAILURE",
+    detailJson: JSON.stringify({
+      attemptedQueries: [{ identifier: transientAbsent.identifier }],
+      reason: "temporary lookup failure",
+    }),
+  });
+  await transientFixture.repositories.saveOrderSubmissionRecoveryObservation(
+    recoveryObservation(transientAbsent.id, "transient-absence-2", "2026-08-21T00:00:36.000Z"),
+  );
+  await transientFixture.repositories.appendOrderEvent({
+    ...orderEvent(transientAbsent.id, "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED", "RECONCILIATION"),
+    id: `identifier-recovery-absence-event:${transientAbsent.id}`,
+    payloadJson: JSON.stringify(ABSENCE_PROOF_PAYLOAD),
+    createdAt: transientAbsent.updatedAt,
+  });
+
+  const transientResult = await transientFixture.recovery.verifyAndPrepareBtcRun(transientFixture.receipt);
+  assert.equal(transientResult.status, "READY");
+
+  const foundFixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+  const foundAbsent = {
+    ...orderRecord({ id: "order-found-absence", status: "FAILED", failureCode: "ORDER_SUBMISSION_ABSENCE_CONFIRMED" }),
+    upbitUuid: "current-order-uuid",
+    failureMessage: "Bounded identifier recovery confirmed persistent exchange absence.",
+    updatedAt: "2026-08-21T00:00:36.000Z",
+  };
+  const attemptedQueries = [
+    { uuid: foundAbsent.upbitUuid },
+    { identifier: foundAbsent.identifier },
+  ];
+  await foundFixture.repositories.saveOrder(foundAbsent);
+  for (const [id, observedAt] of [
+    ["found-absence-1", "2026-08-21T00:00:26.000Z"],
+    ["found-absence-2", "2026-08-21T00:00:36.000Z"],
+  ] as const) {
+    await foundFixture.repositories.saveOrderSubmissionRecoveryObservation({
+      ...recoveryObservation(foundAbsent.id, id, observedAt),
+      detailJson: JSON.stringify({ attemptedQueries }),
+    });
+  }
+  await foundFixture.repositories.saveOrderSubmissionRecoveryObservation({
+    ...recoveryObservation(foundAbsent.id, "found-middle", "2026-08-21T00:00:31.000Z"),
+    outcome: "FOUND",
+    detailJson: JSON.stringify({
+      query: { identifier: foundAbsent.identifier },
+      attemptedQueries,
+      uuid: foundAbsent.upbitUuid,
+    }),
+  });
+  await foundFixture.repositories.appendOrderEvent({
+    ...orderEvent(foundAbsent.id, "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED", "RECONCILIATION"),
+    id: `identifier-recovery-absence-event:${foundAbsent.id}`,
+    payloadJson: JSON.stringify(ABSENCE_PROOF_PAYLOAD),
+    createdAt: foundAbsent.updatedAt,
+  });
+
+  await expectFault(foundFixture, "UNCERTAIN_ORDER");
+});
+
 test("marker-shaped rejection and absence events cannot prove terminal safety", async () => {
   for (const scenario of ["rejection-payload", "terminal-chronology", "absence-observations"] as const) {
     const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
@@ -776,6 +896,86 @@ test("every order status rejects malformed, future, mismatched, or unknown recov
   assert.deepEqual(outcomes, scenarios.map(() => "BLOCKED_FAULT"));
 });
 
+test("every observation query and returned UUID is bound to the persisted order", async () => {
+  const statuses: OrderRecord["status"][] = [
+    "INTENT_CREATED",
+    "PERSISTED",
+    "SUBMITTING",
+    "OPEN",
+    "PARTIALLY_FILLED",
+    "CANCEL_REQUESTED",
+    "RECONCILIATION_REQUIRED",
+    "FAILED",
+    "REJECTED",
+    "RISK_REJECTED",
+    "FILLED",
+    "CANCELED",
+  ];
+  for (const status of statuses) {
+    const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+    const order = orderRecord({ id: `foreign-query-${status.toLowerCase()}`, status });
+    await fixture.repositories.saveOrder(order);
+    await fixture.repositories.saveOrderSubmissionRecoveryObservation({
+      ...recoveryObservation(order.id, `foreign-observation-${status.toLowerCase()}`, "2026-08-21T00:00:28.000Z"),
+      detailJson: JSON.stringify({ attemptedQueries: [{ identifier: "foreign-order-identifier" }] }),
+    });
+
+    await expectFault(fixture, "UNCERTAIN_ORDER", status);
+  }
+
+  const returnedUuidFixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+  const returnedUuidOrder = {
+    ...orderRecord({ id: "foreign-returned-uuid", status: "FILLED" }),
+    upbitUuid: "persisted-order-uuid",
+  };
+  const returnedUuidQueries = [
+    { uuid: returnedUuidOrder.upbitUuid },
+    { identifier: returnedUuidOrder.identifier },
+  ];
+  await returnedUuidFixture.repositories.saveOrder(returnedUuidOrder);
+  await returnedUuidFixture.repositories.saveOrderSubmissionRecoveryObservation({
+    ...recoveryObservation(returnedUuidOrder.id, "foreign-returned-uuid-observation", "2026-08-21T00:00:28.000Z"),
+    outcome: "FOUND",
+    detailJson: JSON.stringify({
+      query: { identifier: returnedUuidOrder.identifier },
+      attemptedQueries: returnedUuidQueries,
+      uuid: "foreign-returned-uuid",
+    }),
+  });
+  await expectFault(returnedUuidFixture, "UNCERTAIN_ORDER", "foreign returned UUID");
+
+  const legitimateFixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+  const legitimateOrder = {
+    ...orderRecord({ id: "legitimate-observation-bindings", status: "FILLED" }),
+    upbitUuid: "legitimate-order-uuid",
+  };
+  await legitimateFixture.repositories.saveOrder(legitimateOrder);
+  await legitimateFixture.repositories.saveOrderSubmissionRecoveryObservation({
+    ...recoveryObservation(legitimateOrder.id, "legitimate-not-found", "2026-08-21T00:00:27.000Z"),
+    detailJson: JSON.stringify({ attemptedQueries: [{ identifier: legitimateOrder.identifier }] }),
+  });
+  await legitimateFixture.repositories.saveOrderSubmissionRecoveryObservation({
+    ...recoveryObservation(legitimateOrder.id, "legitimate-transient", "2026-08-21T00:00:28.000Z"),
+    outcome: "TRANSIENT_FAILURE",
+    detailJson: JSON.stringify({
+      attemptedQueries: [{ uuid: legitimateOrder.upbitUuid }],
+      reason: "temporary lookup failure",
+    }),
+  });
+  await legitimateFixture.repositories.saveOrderSubmissionRecoveryObservation({
+    ...recoveryObservation(legitimateOrder.id, "legitimate-found", "2026-08-21T00:00:29.000Z"),
+    outcome: "FOUND",
+    detailJson: JSON.stringify({
+      query: { identifier: legitimateOrder.identifier },
+      attemptedQueries: [{ identifier: legitimateOrder.identifier }],
+      uuid: legitimateOrder.upbitUuid,
+    }),
+  });
+
+  const legitimateResult = await legitimateFixture.recovery.verifyAndPrepareBtcRun(legitimateFixture.receipt);
+  assert.equal(legitimateResult.status, "READY");
+});
+
 test("balance, position, replay inventory, and malformed numeric mismatches fault closed", async () => {
   const scenarios = [
     { name: "balance-position", balanceFree: "0.2", positionQuantity: "0.1", evidenceQuantity: "0.1" },
@@ -907,6 +1107,7 @@ interface RecoveryFixture {
       minimumAbsenceObservations: number;
       minimumAbsenceElapsedMs: number;
     },
+    recoveryNow?: string,
   ): PositionGuardPilotRecovery;
 }
 
@@ -983,6 +1184,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<RecoveryFixt
       minimumAbsenceObservations: options.minimumAbsenceObservations ?? MINIMUM_ABSENCE_OBSERVATIONS,
       minimumAbsenceElapsedMs: options.minimumAbsenceElapsedMs ?? MINIMUM_ABSENCE_ELAPSED_MS,
     },
+    recoveryNow = NOW,
   ) => {
     const dependencies = {
       exchangeAccountId: ACCOUNT_ID,
@@ -995,7 +1197,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<RecoveryFixt
       minimumAbsenceObservations: absencePolicy.minimumAbsenceObservations,
       minimumAbsenceElapsedMs: absencePolicy.minimumAbsenceElapsedMs,
       clock: {
-        now: () => ({ occurredAt: NOW, occurredAtEpochMs: Date.parse(NOW) }),
+        now: () => ({ occurredAt: recoveryNow, occurredAtEpochMs: Date.parse(recoveryNow) }),
       },
       repositories: executionRepositories,
       candidatePilots: pilotRepository,
