@@ -104,6 +104,8 @@ The intended live path is:
 6. ingest order-state changes and fills
 7. reconcile until terminal state is consistent
 
+The real Upbit order-create adapter distinguishes a clear exchange rejection from an outcome that needs recovery. Only a clear `4xx` creation rejection is definitive; timeouts, disconnects, `5xx` responses, malformed successful responses, and other dispatched-request failures remain uncertain. Typed submission failures retain only HTTP status, sanitized exchange code/name, and whether a response was received. They never retain request credentials, JWTs, access keys, secret keys, or raw error responses. A confirmed authenticated order lookup `404` remains an absent (`null`) lookup result.
+
 The live send path is selected only when mode, live gate, and credentials are explicitly configured.
 Upbit `price` market buys may return exchange state `cancel` after a successful fill when only dust-sized KRW or fee lock remains. In that specific filled `bid`/`price` case, the local lifecycle records the order as `FILLED` and preserves the raw exchange `cancel` payload plus fill and fee evidence. Ordinary canceled orders without this filled market-buy pattern remain `CANCELED`.
 If an older local row already stored that filled market-buy dust-cancel pattern as `CANCELED`, terminal reconciliation must recheck the order and repair it to local `FILLED` rather than leaving misleading operator evidence.

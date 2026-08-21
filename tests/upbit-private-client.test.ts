@@ -3,6 +3,133 @@ import assert from "node:assert/strict";
 import { UpbitPrivateClient } from "../src/modules/exchange/upbit/private-client.js";
 import { test } from "./harness.js";
 
+const orderRequest = {
+  market: "KRW-BTC" as const,
+  side: "bid" as const,
+  ordType: "limit" as const,
+  volume: "0.001",
+  price: "100000000",
+  identifier: "submission-identifier",
+  timeInForce: null,
+  smpType: null,
+};
+
+test("create-order classifies a clear Upbit 400 rejection without exposing response secrets", async () => {
+  const client = createPrivateClient(async () => upbitErrorResponse(400, "invalid_price", "secret-key Bearer jwt"));
+
+  await assert.rejects(
+    () => client.createOrder(orderRequest),
+    (error: unknown) => {
+      const submissionError = assertSubmissionError(error, {
+        kind: "DEFINITIVE_REJECTION",
+        status: 400,
+        exchangeCode: "invalid_price",
+        exchangeName: "invalid_price",
+        responseReceived: true,
+      });
+      assert.doesNotMatch(submissionError.message, /secret-key|Bearer|jwt/i);
+      return true;
+    },
+  );
+});
+
+test("create-order classifies a transport disconnect as uncertain", async () => {
+  const client = createPrivateClient(async () => {
+    throw new TypeError("socket disconnected");
+  });
+
+  await assert.rejects(
+    () => client.createOrder(orderRequest),
+    (error: unknown) => {
+      assertSubmissionError(error, {
+        kind: "UNCERTAIN",
+        status: null,
+        exchangeCode: null,
+        exchangeName: null,
+        responseReceived: false,
+      });
+      return true;
+    },
+  );
+});
+
+test("create-order classifies a 5xx response as uncertain", async () => {
+  const client = createPrivateClient(async () => upbitErrorResponse(503, "temporary_error", "retry later"));
+
+  await assert.rejects(
+    () => client.createOrder(orderRequest),
+    (error: unknown) => {
+      assertSubmissionError(error, {
+        kind: "UNCERTAIN",
+        status: 503,
+        exchangeCode: "temporary_error",
+        exchangeName: "temporary_error",
+        responseReceived: true,
+      });
+      return true;
+    },
+  );
+});
+
+test("create-order treats a malformed 2xx response as uncertain", async () => {
+  const client = createPrivateClient(async () => jsonResponse({ uuid: "order-uuid" }));
+
+  await assert.rejects(
+    () => client.createOrder(orderRequest),
+    (error: unknown) => {
+      assertSubmissionError(error, {
+        kind: "UNCERTAIN",
+        status: 200,
+        exchangeCode: null,
+        exchangeName: null,
+        responseReceived: true,
+      });
+      return true;
+    },
+  );
+});
+
+test("create-order retains the duplicate identifier code for recovery lookup", async () => {
+  const client = createPrivateClient(async () => upbitErrorResponse(400, "duplicate_identifier", "already exists"));
+
+  await assert.rejects(
+    () => client.createOrder(orderRequest),
+    (error: unknown) => {
+      assertSubmissionError(error, {
+        kind: "DEFINITIVE_REJECTION",
+        status: 400,
+        exchangeCode: "duplicate_identifier",
+        exchangeName: "duplicate_identifier",
+        responseReceived: true,
+      });
+      return true;
+    },
+  );
+});
+
+test("authenticated order lookup returns null for a confirmed Upbit not-found response", async () => {
+  const client = createPrivateClient(async () => upbitErrorResponse(404, "order_not_found", "not found"));
+
+  const order = await client.getOrder({ identifier: "missing-order" });
+
+  assert.equal(order, null);
+});
+
+test("non-order private endpoint failures remain generic request failures", async () => {
+  const client = createPrivateClient(async () => upbitErrorResponse(400, "invalid_query_payload", "invalid test payload"));
+
+  await assert.rejects(
+    () => client.testOrder(orderRequest),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.name, "Error");
+      assert.equal("kind" in error, false);
+      assert.match(error.message, /Upbit private request failed \(400 /);
+      return true;
+    },
+  );
+});
+
 test("upbit private client lists open orders with state-array filters", async () => {
   const requests: Array<{ url: string; method: string | undefined }> = [];
   const client = new UpbitPrivateClient({
@@ -117,3 +244,55 @@ test("upbit private client lists closed orders with done/cancel defaults", async
   assert.equal(orders[0]?.state, "done");
   assert.equal(orders[0]?.identifier, null);
 });
+
+function createPrivateClient(fetchImpl: typeof fetch): UpbitPrivateClient {
+  return new UpbitPrivateClient({
+    accessKey: "access-key",
+    secretKey: "secret-key",
+    fetchImpl,
+  });
+}
+
+function upbitErrorResponse(status: number, name: string, message: string): Response {
+  return new Response(JSON.stringify({ error: { name, message } }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function assertSubmissionError(
+  error: unknown,
+  expected: {
+    kind: "DEFINITIVE_REJECTION" | "UNCERTAIN";
+    status: number | null;
+    exchangeCode: string | null;
+    exchangeName: string | null;
+    responseReceived: boolean;
+  },
+): Error {
+  assert.ok(error instanceof Error);
+  assert.equal(error.name, "ExchangeOrderSubmissionError");
+
+  const typedError = error as Error & {
+    kind?: unknown;
+    status?: unknown;
+    exchangeCode?: unknown;
+    exchangeName?: unknown;
+    responseReceived?: unknown;
+  };
+
+  assert.equal(typedError.kind, expected.kind);
+  assert.equal(typedError.status, expected.status);
+  assert.equal(typedError.exchangeCode, expected.exchangeCode);
+  assert.equal(typedError.exchangeName, expected.exchangeName);
+  assert.equal(typedError.responseReceived, expected.responseReceived);
+
+  return typedError;
+}

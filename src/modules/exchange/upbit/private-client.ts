@@ -1,4 +1,5 @@
 import type { ExchangeBalance, SupportedMarket } from "../../../domain/types.js";
+import { ExchangeOrderSubmissionError } from "../errors.js";
 import type {
   CancelOrderResult,
   ExchangeAdapter,
@@ -130,13 +131,58 @@ export class UpbitPrivateClient implements ExchangeAdapter {
   }
 
   async createOrder(request: UpbitOrderRequest): Promise<ExchangeOrderSnapshot> {
-    const response = await this.requestJson<UpbitOrderResponse>({
-      method: "POST",
-      path: "/v1/orders",
-      body: mapOrderRequest(request),
-    });
+    let response: Response;
+    try {
+      response = await this.dispatch({
+        method: "POST",
+        path: "/v1/orders",
+        body: mapOrderRequest(request),
+      });
+    } catch {
+      throw new ExchangeOrderSubmissionError({
+        kind: "UNCERTAIN",
+        status: null,
+        exchangeCode: null,
+        exchangeName: null,
+        responseReceived: false,
+      });
+    }
 
-    return mapOrderResponse(response);
+    if (!response.ok) {
+      const exchangeError = await readUpbitErrorMetadata(response);
+      throw new ExchangeOrderSubmissionError({
+        kind: isDefinitiveOrderRejection(response.status) ? "DEFINITIVE_REJECTION" : "UNCERTAIN",
+        status: response.status,
+        exchangeCode: exchangeError.code,
+        exchangeName: exchangeError.name,
+        responseReceived: true,
+      });
+    }
+
+    let orderResponse: unknown;
+    try {
+      orderResponse = await response.json();
+    } catch {
+      throw new ExchangeOrderSubmissionError({
+        kind: "UNCERTAIN",
+        status: response.status,
+        exchangeCode: null,
+        exchangeName: null,
+        responseReceived: true,
+      });
+    }
+
+    if (!isValidOrderSubmissionResponse(orderResponse)) {
+      throw new ExchangeOrderSubmissionError({
+        kind: "UNCERTAIN",
+        status: response.status,
+        exchangeCode: null,
+        exchangeName: null,
+        responseReceived: true,
+      });
+    }
+
+    return mapOrderResponse(orderResponse);
   }
 
   async cancelOrder(query: { uuid?: string; identifier?: string }): Promise<CancelOrderResult> {
@@ -158,13 +204,21 @@ export class UpbitPrivateClient implements ExchangeAdapter {
       return null;
     }
 
-    const response = await this.requestJson<UpbitOrderResponse>({
-      method: "GET",
-      path: "/v1/order",
-      query,
-    });
+    try {
+      const response = await this.requestJson<UpbitOrderResponse>({
+        method: "GET",
+        path: "/v1/order",
+        query,
+      });
 
-    return mapOrderResponse(response);
+      return mapOrderResponse(response);
+    } catch (error) {
+      if (error instanceof UpbitPrivateRequestError && error.status === 404) {
+        return null;
+      }
+
+      throw error;
+    }
   }
 
   async listOpenOrders(query: ExchangeOrderHistoryQuery = {}): Promise<ExchangeOrderSnapshot[]> {
@@ -187,12 +241,18 @@ export class UpbitPrivateClient implements ExchangeAdapter {
     return response.map(mapOrderResponse);
   }
 
-  private async requestJson<T>(options: {
-    method: "GET" | "POST" | "DELETE";
-    path: string;
-    query?: Record<string, string | number | boolean | Array<string | number | boolean> | null | undefined>;
-    body?: Record<string, string | number | boolean | Array<string | number | boolean> | null | undefined>;
-  }): Promise<T> {
+  private async requestJson<T>(options: UpbitPrivateRequestOptions): Promise<T> {
+    const response = await this.dispatch(options);
+
+    if (!response.ok) {
+      await response.text().catch(() => "");
+      throw new UpbitPrivateRequestError(response.status, response.statusText);
+    }
+
+    return (await response.json()) as T;
+  }
+
+  private async dispatch(options: UpbitPrivateRequestOptions): Promise<Response> {
     const queryString = options.query ? buildUpbitQueryString(options.query) : "";
     const bodyQueryString = options.body ? buildUpbitQueryString(options.body) : "";
     const authPayload = bodyQueryString || queryString || undefined;
@@ -209,15 +269,79 @@ export class UpbitPrivateClient implements ExchangeAdapter {
       ...(options.body ? { body: JSON.stringify(options.body) } : {}),
     };
 
-    const response = await this.fetchImpl(`${this.baseUrl}${options.path}${suffix}`, requestInit);
-
-    if (!response.ok) {
-      await response.text().catch(() => "");
-      throw new Error(`Upbit private request failed (${response.status} ${response.statusText}).`);
-    }
-
-    return (await response.json()) as T;
+    return this.fetchImpl(`${this.baseUrl}${options.path}${suffix}`, requestInit);
   }
+}
+
+interface UpbitPrivateRequestOptions {
+  method: "GET" | "POST" | "DELETE";
+  path: string;
+  query?: Record<string, string | number | boolean | Array<string | number | boolean> | null | undefined>;
+  body?: Record<string, string | number | boolean | Array<string | number | boolean> | null | undefined>;
+}
+
+class UpbitPrivateRequestError extends Error {
+  readonly status: number;
+
+  constructor(status: number, statusText: string) {
+    super(`Upbit private request failed (${status} ${statusText}).`);
+    this.status = status;
+  }
+}
+
+async function readUpbitErrorMetadata(response: Response): Promise<{ code: string | null; name: string | null }> {
+  try {
+    return extractUpbitErrorMetadata(await response.json());
+  } catch {
+    return { code: null, name: null };
+  }
+}
+
+function extractUpbitErrorMetadata(payload: unknown): { code: string | null; name: string | null } {
+  if (!isRecord(payload)) {
+    return { code: null, name: null };
+  }
+
+  const error = isRecord(payload.error) ? payload.error : payload;
+  const name = sanitizeExchangeIdentifier(error.name);
+
+  return {
+    code: sanitizeExchangeIdentifier(error.code) ?? name,
+    name,
+  };
+}
+
+function sanitizeExchangeIdentifier(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return /^[A-Za-z][A-Za-z0-9._:-]{0,127}$/.test(trimmed) ? trimmed : null;
+}
+
+function isDefinitiveOrderRejection(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
+function isValidOrderSubmissionResponse(response: unknown): response is UpbitOrderResponse {
+  return (
+    isRecord(response) &&
+    isNonEmptyString(response.uuid) &&
+    (response.market === "KRW-BTC" || response.market === "KRW-ETH") &&
+    (response.side === "bid" || response.side === "ask") &&
+    (response.ord_type === "limit" || response.ord_type === "price" || response.ord_type === "market" || response.ord_type === "best") &&
+    isNonEmptyString(response.state) &&
+    isNonEmptyString(response.created_at)
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function buildHistoryQuery(
