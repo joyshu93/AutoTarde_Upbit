@@ -24,6 +24,7 @@ import {
   validateCandidatePilotDeployment,
   type AdvanceCandidatePilotStateInput,
   type AdvanceCandidatePilotStateResult,
+  type ActivateCandidatePilotDeploymentInput,
   type CandidateEvidenceRecord,
   type CandidatePilotRepository,
   type CreateCandidatePilotDeploymentInput,
@@ -38,6 +39,8 @@ interface DeploymentRow {
   policy_id: PositionGuardPilotDeploymentRecord["policyId"];
   policy_version: PositionGuardPilotDeploymentRecord["policyVersion"];
   phase: PositionGuardPilotDeploymentRecord["phase"];
+  activation_at: string | null;
+  activation_epoch_ns: string | number | bigint | null;
   created_at: string;
   updated_at: string;
 }
@@ -133,8 +136,8 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
       this.db.prepare(`
         INSERT INTO strategy_pilot_deployments (
           id, exchange_account_id, pilot_id, market, policy_id, policy_version,
-          phase, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          phase, activation_at, activation_epoch_ns, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         deployment.id,
         deployment.exchangeAccountId,
@@ -143,6 +146,8 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
         deployment.policyId,
         deployment.policyVersion,
         deployment.phase,
+        deployment.activationAt,
+        deployment.activationEpochNs === null ? null : deployment.activationEpochNs.toString(),
         deployment.createdAt,
         deployment.updatedAt,
       );
@@ -182,13 +187,61 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
   ): Promise<PositionGuardPilotDeploymentRecord | null> {
     const row = this.db.prepare(`
       SELECT id, exchange_account_id, pilot_id, market, policy_id, policy_version,
-        phase, created_at, updated_at
+        phase, activation_at, activation_epoch_ns, created_at, updated_at
       FROM strategy_pilot_deployments
       WHERE exchange_account_id = ?
       ORDER BY created_at ASC, id ASC
       LIMIT 1
     `).get(exchangeAccountId) as DeploymentRow | undefined;
     return row ? deploymentFromRow(row) : null;
+  }
+
+  async activateDeployment(
+    input: ActivateCandidatePilotDeploymentInput,
+  ): Promise<PositionGuardPilotDeploymentRecord | null> {
+    return withImmediateTransaction(this.db, () => {
+      const deployment = selectDeploymentRow(this.db, input.deploymentId);
+      if (!deployment || deployment.phase !== input.expectedPhase || deployment.updated_at !== input.expectedUpdatedAt ||
+        deployment.activation_at !== null || deployment.activation_epoch_ns !== null) {
+        return null;
+      }
+      validateActivationInput(input, deploymentFromRow(deployment));
+      const update = this.db.prepare(`
+        UPDATE strategy_pilot_deployments
+        SET phase = 'ACTIVE', activation_at = ?, activation_epoch_ns = ?, updated_at = ?
+        WHERE id = ? AND phase = ? AND updated_at = ?
+          AND activation_at IS NULL AND activation_epoch_ns IS NULL
+      `).run(
+        input.activationAt,
+        input.activationEpochNs.toString(),
+        input.activationAt,
+        input.deploymentId,
+        input.expectedPhase,
+        input.expectedUpdatedAt,
+      );
+      if (update.changes !== 1) return null;
+      const state = selectStateRow(this.db, input.deploymentId);
+      if (!state) throw new Error(`Candidate state ${input.deploymentId} does not exist.`);
+      this.db.prepare(`
+        INSERT INTO strategy_pilot_audit_events (
+          id, deployment_id, event_type, from_phase, to_phase, state_version,
+          payload_json, created_at, created_at_epoch_ns
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        `${input.deploymentId}:activation:${input.activationEpochNs.toString()}`,
+        input.deploymentId,
+        "PHASE_TRANSITION",
+        input.expectedPhase,
+        "ACTIVE",
+        state.state_version,
+        JSON.stringify({ activationAt: input.activationAt, activationEpochNs: input.activationEpochNs.toString() }),
+        input.activationAt,
+        input.activationEpochNs,
+      );
+      const activated = selectDeploymentRow(this.db, input.deploymentId);
+      if (!activated) throw new Error(`Activated candidate deployment ${input.deploymentId} disappeared.`);
+      return deploymentFromRow(activated);
+    });
   }
 
   async getState(deploymentId: string): Promise<Readonly<PositionGuardCandidateState> | null> {
@@ -277,6 +330,15 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
       const deployment = selectDeploymentRow(this.db, binding.deploymentId);
       if (!deployment || deployment.exchange_account_id !== binding.exchangeAccountId) {
         throw new Error("Candidate execution binding deployment does not match its exchange account.");
+      }
+      if (
+        (deployment.phase !== "ACTIVE" && deployment.phase !== "DRAINING") ||
+        deployment.activation_at === null ||
+        deployment.activation_epoch_ns === null ||
+        binding.activationAt !== deployment.activation_at ||
+        binding.activationEpochNs.toString() !== deployment.activation_epoch_ns.toString()
+      ) {
+        throw new Error("Candidate execution binding must use the persisted active deployment instant.");
       }
       this.db.prepare(`
         INSERT INTO strategy_candidate_execution_bindings (
@@ -454,7 +516,8 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
 
 function selectDeploymentRow(db: DatabaseSync, deploymentId: string): DeploymentRow | undefined {
   return db.prepare(`
-    SELECT id, exchange_account_id, pilot_id, market, policy_id, policy_version, phase, created_at, updated_at
+    SELECT id, exchange_account_id, pilot_id, market, policy_id, policy_version,
+      phase, activation_at, activation_epoch_ns, created_at, updated_at
     FROM strategy_pilot_deployments WHERE id = ?
   `).get(deploymentId) as DeploymentRow | undefined;
 }
@@ -552,9 +615,25 @@ function deploymentFromRow(row: DeploymentRow): PositionGuardPilotDeploymentReco
     policyId: row.policy_id,
     policyVersion: row.policy_version,
     phase: row.phase,
+    activationAt: row.activation_at,
+    activationEpochNs: row.activation_epoch_ns === null ? null : BigInt(row.activation_epoch_ns),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function validateActivationInput(
+  input: ActivateCandidatePilotDeploymentInput,
+  deployment: PositionGuardPilotDeploymentRecord,
+): void {
+  const activation = parsePositionGuardCandidateTimestamp(input.activationAt, "deployment activationAt");
+  if (activation < 0n || activation !== input.activationEpochNs) {
+    throw new Error("Candidate deployment activation epoch does not match its timestamp.");
+  }
+  if (activation < parsePositionGuardCandidateTimestamp(deployment.createdAt, "deployment createdAt") ||
+    activation < parsePositionGuardCandidateTimestamp(deployment.updatedAt, "deployment updatedAt")) {
+    throw new Error("Candidate deployment activation cannot precede persisted deployment chronology.");
+  }
 }
 
 function legacyStateFromRow(row: StateRow): PositionGuardCandidateState {

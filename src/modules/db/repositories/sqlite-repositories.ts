@@ -51,6 +51,7 @@ import type {
   FinalizeBoundedSubmissionAbsenceInput,
   FaultPauseInput,
   OperatorStateStore,
+  PersistCandidateProjectionFaultInput,
   PersistExchangeSubmissionInput,
   PersistOrderIntentInput,
   PersistUncertainSubmissionInput,
@@ -1256,6 +1257,90 @@ export class SqliteExecutionRepository implements ExecutionRepository {
         createdAt: input.faultPause.occurredAt,
       });
       return true;
+    });
+  }
+
+  async persistCandidateProjectionFault(
+    input: PersistCandidateProjectionFaultInput,
+  ): Promise<"APPLIED" | "DUPLICATE"> {
+    return withImmediateTransaction(this.db, () => {
+      const order = this.getOrderById(input.orderId);
+      if (!order || input.event.orderId !== order.id || input.faultPause.exchangeAccountId !== order.exchangeAccountId) {
+        throw new Error("Candidate projection fault provenance does not match a persisted order.");
+      }
+      validateFaultPauseInput(input.faultPause);
+      const existingEvent = this.getOrderEventById(input.event.id);
+      if (existingEvent && !recordsEqual(existingEvent, input.event)) {
+        throw new Error(`Conflicting candidate projection fault event ${input.event.id}.`);
+      }
+      const stateRow = this.db.prepare(`
+        SELECT * FROM execution_state WHERE exchange_account_id = ? LIMIT 1
+      `).get(order.exchangeAccountId) as SqliteExecutionStateRow | undefined;
+      if (!stateRow) {
+        throw new Error(`Execution state is missing for exchange account ${order.exchangeAccountId}.`);
+      }
+      const currentState = mapExecutionStateRow(stateRow);
+      const reason = formatFaultPauseReason(input.faultPause);
+      const existingTransitionRow = this.db.prepare(`
+        SELECT * FROM execution_state_transitions WHERE id = ? LIMIT 1
+      `).get(input.faultPause.faultId) as SqliteExecutionStateTransitionRow | undefined;
+      if (existingTransitionRow) {
+        const existingTransition = mapExecutionStateTransitionRow(existingTransitionRow);
+        if (
+          existingTransition.command !== "AUTOMATIC_PAUSE" ||
+          existingTransition.exchangeAccountId !== order.exchangeAccountId ||
+          existingTransition.reason !== reason ||
+          existingTransition.createdAt !== input.faultPause.occurredAt
+        ) {
+          throw new Error(`Conflicting duplicate automatic pause ${input.faultPause.faultId}.`);
+        }
+      } else {
+        validateFaultPauseTimestamp(input.faultPause, currentState);
+      }
+      const preservesKillSwitch = currentState.killSwitchActive || currentState.systemStatus === "KILL_SWITCHED";
+      const nextState: ExecutionStateRecord = {
+        ...currentState,
+        systemStatus: preservesKillSwitch ? "KILL_SWITCHED" : "PAUSED",
+        pauseReason: preservesKillSwitch ? currentState.pauseReason : reason,
+        updatedAt: existingTransitionRow ? currentState.updatedAt : input.faultPause.occurredAt,
+      };
+      if (!existingEvent) {
+        this.insertOrderEvent(input.event);
+      }
+      this.db.prepare(`
+        UPDATE execution_state
+        SET execution_mode = ?, live_execution_gate = ?, system_status = ?, kill_switch_active = ?,
+            pause_reason = ?, degraded_reason = ?, degraded_at = ?, updated_at = ?
+        WHERE exchange_account_id = ?
+      `).run(
+        nextState.executionMode,
+        nextState.liveExecutionGate,
+        nextState.systemStatus,
+        toSqliteBoolean(nextState.killSwitchActive),
+        nextState.pauseReason,
+        nextState.degradedReason,
+        nextState.degradedAt,
+        nextState.updatedAt,
+        nextState.exchangeAccountId,
+      );
+      if (!existingTransitionRow) {
+        recordExecutionStateTransition(this.db, {
+          id: input.faultPause.faultId,
+          exchangeAccountId: order.exchangeAccountId,
+          command: "AUTOMATIC_PAUSE",
+          fromExecutionMode: currentState.executionMode,
+          toExecutionMode: nextState.executionMode,
+          fromLiveExecutionGate: currentState.liveExecutionGate,
+          toLiveExecutionGate: nextState.liveExecutionGate,
+          fromSystemStatus: currentState.systemStatus,
+          toSystemStatus: nextState.systemStatus,
+          fromKillSwitchActive: currentState.killSwitchActive,
+          toKillSwitchActive: nextState.killSwitchActive,
+          reason,
+          createdAt: input.faultPause.occurredAt,
+        });
+      }
+      return existingEvent ? "DUPLICATE" : "APPLIED";
     });
   }
 

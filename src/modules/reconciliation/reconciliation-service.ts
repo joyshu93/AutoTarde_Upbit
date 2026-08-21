@@ -1135,22 +1135,29 @@ export class ReconciliationService {
     message: string,
   ): Promise<void> {
     const eventId = `candidate-evidence-recovery-fault:${order.id}`;
-    const existing = await this.dependencies.repositories.listOrderEvents(order.id);
-    if (!existing.some((event) => event.id === eventId)) {
-      await this.dependencies.repositories.appendOrderEvent({
-        id: eventId,
-        orderId: order.id,
-        eventType: "CANDIDATE_EVIDENCE_PROJECTION_FAILED",
-        eventSource: "RECONCILIATION",
-        payloadJson: JSON.stringify({ code: "RECOVERED_SNAPSHOT_PROJECTION_FAILED", message }),
-        createdAt: occurredAt,
-      });
+    const existingEvent = (await this.dependencies.repositories.listOrderEvents(order.id))
+      .find((event) => event.id === eventId);
+    const event = existingEvent ?? {
+      id: eventId,
+      orderId: order.id,
+      eventType: "CANDIDATE_EVIDENCE_PROJECTION_FAILED" as const,
+      eventSource: "RECONCILIATION" as const,
+      payloadJson: JSON.stringify({ code: "RECOVERED_SNAPSHOT_PROJECTION_FAILED", message }),
+      createdAt: occurredAt,
+    };
+    const persistCandidateProjectionFault = this.dependencies.repositories.persistCandidateProjectionFault;
+    if (!persistCandidateProjectionFault) {
+      throw new Error("Recovered candidate projection failures require atomic fault persistence.");
     }
-    await this.dependencies.operatorState.pauseForFault({
-      exchangeAccountId: order.exchangeAccountId,
-      faultId: eventId,
-      reason: `RECOVERED_SNAPSHOT_PROJECTION_FAILED: ${message}`,
-      occurredAt,
+    await persistCandidateProjectionFault.call(this.dependencies.repositories, {
+      orderId: order.id,
+      event,
+      faultPause: {
+        exchangeAccountId: order.exchangeAccountId,
+        faultId: eventId,
+        reason: `RECOVERED_SNAPSHOT_PROJECTION_FAILED: ${message}`,
+        occurredAt: event.createdAt,
+      },
     });
   }
 

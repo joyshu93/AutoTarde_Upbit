@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import {
   createEmptyPositionGuardCandidateState,
+  parsePositionGuardCandidateTimestamp,
   type PositionGuardCandidateExecutionEvidence,
 } from "../src/modules/strategy/position-guard-candidate-state.js";
 import type {
@@ -33,6 +34,8 @@ export function initialDeploymentInput(
       policyId: "COMBINED_CONSERVATIVE",
       policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
       phase: "PENDING_FLAT",
+      activationAt: null,
+      activationEpochNs: null,
       createdAt: "2026-08-21T00:00:00.000Z",
       updatedAt: "2026-08-21T00:00:00.000Z",
     },
@@ -302,6 +305,37 @@ export async function verifyCandidatePilotIdentityValidation(
   );
 }
 
+export async function verifyCandidateDeploymentActivationContract(
+  create: CandidatePilotRepositoryFactory,
+): Promise<void> {
+  const repository = await create();
+  const deployment = await repository.createDeploymentWithInitialState(
+    initialDeploymentInput("deployment-activation-contract"),
+  );
+  const activationAt = "2026-08-21T00:00:01.000000001Z";
+  const input = {
+    deploymentId: deployment.id,
+    expectedPhase: "PENDING_FLAT" as const,
+    expectedUpdatedAt: deployment.updatedAt,
+    activationAt,
+    activationEpochNs: parsePositionGuardCandidateTimestamp(activationAt, "activation contract").toString(),
+  };
+  const activated = await repository.activateDeployment({
+    ...input,
+    activationEpochNs: BigInt(input.activationEpochNs),
+  });
+  const replay = await repository.activateDeployment({
+    ...input,
+    activationEpochNs: BigInt(input.activationEpochNs),
+  });
+
+  assert.equal(activated?.phase, "ACTIVE");
+  assert.equal(activated?.activationAt, activationAt);
+  assert.equal(activated?.activationEpochNs, BigInt(input.activationEpochNs));
+  assert.equal(replay, null);
+  assert.equal((await repository.listAuditEvents(deployment.id)).at(-1)?.eventType, "PHASE_TRANSITION");
+}
+
 test("in-memory candidate pilot repository satisfies the common contract", async () => {
   await verifyCandidatePilotRepositoryContract(() => new InMemoryCandidatePilotRepository());
 });
@@ -322,6 +356,10 @@ test("in-memory candidate pilot rejects pre-epoch evidence without mutation", as
 
 test("in-memory candidate pilot repository rejects forged persisted identity", async () => {
   await verifyCandidatePilotIdentityValidation(() => new InMemoryCandidatePilotRepository());
+});
+
+test("in-memory candidate pilot activation persists an actual active instant with compare-and-set", async () => {
+  await verifyCandidateDeploymentActivationContract(() => new InMemoryCandidatePilotRepository());
 });
 
 test("exact candidate residuals use the canonical persisted quantity tolerance", () => {

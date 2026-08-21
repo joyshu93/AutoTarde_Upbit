@@ -28,6 +28,7 @@ import type {
   ExecutionRepository,
   FinalizeBoundedSubmissionAbsenceInput,
   FaultPauseInput,
+  PersistCandidateProjectionFaultInput,
   OperatorStateStore,
   PersistExchangeSubmissionInput,
   PersistOrderIntentInput,
@@ -333,6 +334,30 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     this.orders = this.orders.map((order) => order.id === input.orderId ? cloneRecord(nextOrder) : order);
     this.orderEvents = [...this.orderEvents, cloneRecord(input.event)];
     return true;
+  }
+
+  async persistCandidateProjectionFault(
+    input: PersistCandidateProjectionFaultInput,
+  ): Promise<"APPLIED" | "DUPLICATE"> {
+    if (!this.atomicFaultPauseStore) {
+      throw new Error("In-memory candidate projection faults require an atomic fault-pause store.");
+    }
+    const order = this.orders.find((candidate) => candidate.id === input.orderId);
+    if (!order || input.event.orderId !== order.id || input.faultPause.exchangeAccountId !== order.exchangeAccountId) {
+      throw new Error("Candidate projection fault provenance does not match a persisted order.");
+    }
+    validateFaultPauseInput(input.faultPause);
+    const existing = this.orderEvents.find((event) => event.id === input.event.id);
+    if (existing && !recordsEqual(existing, input.event)) {
+      throw new Error(`Conflicting candidate projection fault event ${input.event.id}.`);
+    }
+    // Validate and durably pause before exposing a new disposal event to callers.
+    this.atomicFaultPauseStore.applyFaultPauseAtomically(input.faultPause);
+    if (!existing) {
+      this.orderEvents = [...this.orderEvents, cloneRecord(input.event)];
+      return "APPLIED";
+    }
+    return "DUPLICATE";
   }
 
   async saveBalanceSnapshot(record: BalanceSnapshotRecord): Promise<void> {

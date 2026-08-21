@@ -18,6 +18,7 @@ import { evaluateRiskGuards } from "../risk/guards.js";
 import type { OperatorNotificationReporter } from "../telegram/reporter.js";
 import { buildOrderIdentifier, buildOrderIdempotencyKey } from "./idempotency.js";
 import type { SubmitOrderFromDecisionInput, SubmitOrderFromDecisionResult } from "./interfaces.js";
+import { parseCandidateEvidenceTimestamp } from "./candidate-evidence-decimals.js";
 
 export class ExecutionService {
   constructor(
@@ -391,7 +392,9 @@ export class ExecutionService {
         updatedAt: submittedAt,
       };
 
-      const fills: FillRecord[] = exchangeOrder.fills.map((fill): FillRecord => ({
+      const fills: FillRecord[] = exchangeOrder.fills.map((fill): FillRecord => {
+        const executionTimestamp = directExchangeFillTimestamp(fill.createdAt);
+        return {
           id: createId("fill"),
           orderId: order.id,
           exchangeFillId: fill.tradeUuid ?? createId("exchange_fill"),
@@ -402,9 +405,12 @@ export class ExecutionService {
           feeCurrency: "KRW",
           feeAmount: fill.fee,
           feeProvenance: fill.fee === null ? "MISSING" : "EXCHANGE_FILL_CONFIRMED",
-          filledAt: fill.createdAt ?? updatedOrder.updatedAt,
+          executionTimestampProvenance: executionTimestamp.provenance,
+          executionEpochNs: executionTimestamp.epochNanoseconds,
+          filledAt: executionTimestamp.filledAt,
           rawPayloadJson: JSON.stringify(fill.raw),
-        }));
+        };
+      });
 
       if (this.dependencies.executionAdapter.sendPath === "DRY_RUN_ADAPTER") {
         const settledAt = this.currentTimestamp();
@@ -1125,6 +1131,8 @@ function createDryRunSyntheticFill(input: {
     feeCurrency: "KRW",
     feeAmount: "0",
     feeProvenance: "SIMULATED",
+    executionTimestampProvenance: "LOCAL_SYNTHETIC",
+    executionEpochNs: parseCandidateEvidenceTimestamp(input.filledAt, "dry-run synthetic fill timestamp").toString(),
     filledAt: input.filledAt,
     rawPayloadJson: JSON.stringify({
       mode: "DRY_RUN",
@@ -1132,6 +1140,33 @@ function createDryRunSyntheticFill(input: {
       exchangeOrderRaw: input.exchangeOrderRaw,
     }),
   };
+}
+
+function directExchangeFillTimestamp(createdAt: string | null): {
+  provenance: NonNullable<FillRecord["executionTimestampProvenance"]>;
+  epochNanoseconds: string | null;
+  filledAt: string;
+} {
+  if (createdAt === null) {
+    return {
+      provenance: "LEGACY_UNVERIFIED",
+      epochNanoseconds: null,
+      filledAt: "",
+    };
+  }
+  try {
+    return {
+      provenance: "EXCHANGE_FILL_CONFIRMED",
+      epochNanoseconds: parseCandidateEvidenceTimestamp(createdAt, "exchange fill createdAt").toString(),
+      filledAt: createdAt,
+    };
+  } catch {
+    return {
+      provenance: "LEGACY_UNVERIFIED",
+      epochNanoseconds: null,
+      filledAt: createdAt,
+    };
+  }
 }
 
 function deriveDryRunVolume(requestedNotionalKrw: number | null, referencePrice: number): string | null {

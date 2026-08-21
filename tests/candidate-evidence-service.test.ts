@@ -11,7 +11,6 @@ import { parsePositionGuardCandidateTimestamp } from "../src/modules/strategy/po
 import { test } from "./harness.js";
 
 test("partial fills aggregate once per terminal order and canceled-with-fill advances once", async () => {
-  const repositories = new InMemoryExecutionRepository();
   const pilotRepository = new InMemoryCandidatePilotRepository();
   const operatorState = new InMemoryOperatorStateStore({
     id: "state-1",
@@ -25,6 +24,7 @@ test("partial fills aggregate once per terminal order and canceled-with-fill adv
     degradedAt: null,
     updatedAt: "2026-08-21T00:00:00.000Z",
   });
+  const repositories = new InMemoryExecutionRepository(operatorState);
   const deployment = await pilotRepository.createDeploymentWithInitialState({
     deployment: {
       id: "deployment-1",
@@ -34,6 +34,8 @@ test("partial fills aggregate once per terminal order and canceled-with-fill adv
       policyId: "COMBINED_CONSERVATIVE",
       policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
       phase: "ACTIVE",
+      activationAt: "2026-08-21T00:00:00.000Z",
+      activationEpochNs: 1_787_270_400_000_000_000n,
       createdAt: "2026-08-21T00:00:00.000Z",
       updatedAt: "2026-08-21T00:00:00.000Z",
     },
@@ -184,6 +186,24 @@ test("candidate evidence rejects a reconciliation timestamp substituted for an e
   assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
 });
 
+test("candidate evidence fails closed for a direct-send fill with no exchange execution timestamp", async () => {
+  const fixture = await createCandidateFixture({
+    fills: [{
+      ...fill("direct-missing-timestamp", "0.1", "2026-08-21T00:00:03.000Z", "500"),
+      executionTimestampProvenance: "LEGACY_UNVERIFIED",
+      executionEpochNs: null,
+      filledAt: "",
+    }],
+  });
+
+  const result = await fixture.service.processTerminalOrder("order-1");
+
+  assert.equal(result.outcome, "FAULT");
+  assert.match(result.detail, /EXECUTION_TIMESTAMP.*UNVERIFIED|TIMESTAMP.*PROVENANCE/i);
+  assert.equal((await fixture.pilotRepository.listEvidenceAfter(fixture.deploymentId, null)).length, 0);
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+});
+
 test("conflicting persisted terminal evidence faults instead of advancing twice", async () => {
   const fixture = await createCandidateFixture({
     fills: [fill("conflict-fill", "0.1", "2026-08-21T00:00:03.000Z", "500")],
@@ -323,6 +343,120 @@ test("bounded terminal sweep filters durable disposed rows before applying its p
   assert.deepEqual(projected, ["crash-window-order"]);
 });
 
+test("terminal sweep excludes persisted submission-absence conclusions across restart replays", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const projected: string[] = [];
+  for (const [id, failureCode] of [
+    ["absence-before-terminal", "ORDER_SUBMISSION_ABSENCE_CONFIRMED"],
+    ["eligible-terminal", null],
+  ] as const) {
+    await repositories.saveOrder(terminalSweepOrder(id, failureCode));
+  }
+  const makeSweep = () => new TerminalCandidateProjectionSweep({
+    repositories,
+    projector: {
+      async processTerminalOrder(orderId: string) {
+        projected.push(orderId);
+        return { outcome: "ADVANCED", orderId, detail: "projected" };
+      },
+    } as never,
+    maximumPerRun: 1,
+  });
+
+  const first = await makeSweep().run("primary");
+  const restart = await makeSweep().run("primary");
+
+  assert.equal(first.processedCount, 1);
+  assert.equal(restart.processedCount, 1);
+  assert.deepEqual(projected, ["eligible-terminal", "eligible-terminal"]);
+});
+
+test("candidate fault persistence repairs an event-written pause-missing crash state atomically and idempotently", async () => {
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "fault-atomic-state",
+    exchangeAccountId: "primary",
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-08-21T00:00:00.000Z",
+  });
+  const repositories = new InMemoryExecutionRepository(operatorState);
+  const order = terminalSweepOrder("fault-atomic-order", null);
+  const event = {
+    id: "candidate-evidence-fault:fault-atomic-order:UNVERIFIED_FEE_PROVENANCE",
+    orderId: order.id,
+    eventType: "CANDIDATE_EVIDENCE_PROJECTION_FAILED" as const,
+    eventSource: "RECONCILIATION" as const,
+    payloadJson: JSON.stringify({ code: "UNVERIFIED_FEE_PROVENANCE" }),
+    createdAt: "2026-08-21T00:00:06.000Z",
+  };
+  await repositories.saveOrder(order);
+  // Simulate a legacy/intermediate crash from the former event-then-pause sequence.
+  await repositories.appendOrderEvent(event);
+  const atomicRepository = repositories as unknown as {
+    persistCandidateProjectionFault(input: {
+      orderId: string;
+      event: typeof event;
+      faultPause: { exchangeAccountId: string; faultId: string; reason: string; occurredAt: string };
+    }): Promise<"APPLIED" | "DUPLICATE">;
+  };
+  const input = {
+    orderId: order.id,
+    event,
+    faultPause: {
+      exchangeAccountId: "primary",
+      faultId: event.id,
+      reason: "UNVERIFIED_FEE_PROVENANCE",
+      occurredAt: event.createdAt,
+    },
+  };
+
+  const first = await atomicRepository.persistCandidateProjectionFault(input);
+  const second = await atomicRepository.persistCandidateProjectionFault(input);
+
+  assert.equal(first, "DUPLICATE");
+  assert.equal(second, "DUPLICATE");
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await repositories.listOrderEvents(order.id)).length, 1);
+});
+
+test("candidate projection restart re-drives a legacy fault event with its original evidence timestamp", async () => {
+  const fixture = await createCandidateFixture({
+    fills: [fill("restart-missing-fee", "0.1", "2026-08-21T00:00:03.000Z", null)],
+  });
+  const eventId = "candidate-evidence-fault:order-1:UNVERIFIED_FEE_PROVENANCE";
+  await fixture.repositories.appendOrderEvent({
+    id: eventId,
+    orderId: "order-1",
+    eventType: "CANDIDATE_EVIDENCE_PROJECTION_FAILED",
+    eventSource: "RECONCILIATION",
+    payloadJson: JSON.stringify({
+      code: "UNVERIFIED_FEE_PROVENANCE",
+      message: "Every terminal fill requires a confirmed per-fill KRW fee source.",
+    }),
+    createdAt: "2026-08-21T00:00:06.000Z",
+  });
+  const restarted = new CandidateExecutionEvidenceService({
+    exchangeAccountId: "primary",
+    repositories: fixture.repositories,
+    pilotRepository: fixture.pilotRepository,
+    operatorState: fixture.operatorState,
+    clock: {
+      now: () => ({ occurredAt: "2026-08-21T00:00:07.000Z", occurredAtEpochMs: 1_787_270_407_000 }),
+    },
+  });
+
+  const result = await restarted.processTerminalOrder("order-1");
+
+  assert.equal(result.outcome, "FAULT");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await fixture.repositories.listOrderEvents("order-1")).length, 1);
+});
+
 test("unbound terminal candidate evidence faults instead of attaching to the current deployment", async () => {
   const fixture = await createCandidateFixture({
     fills: [fill("unbound-fill", "0.1", "2026-08-21T00:00:03.000Z", "500")],
@@ -350,6 +484,20 @@ test("pre-deployment terminal strategy history is excluded without a candidate f
   assert.equal((await fixture.operatorState.getState()).systemStatus, "RUNNING");
   assert.equal((await fixture.repositories.listOrderEvents("order-1"))
     .filter((event) => event.eventType === "CANDIDATE_EVIDENCE_PROJECTION_FAILED").length, 0);
+});
+
+test("pre-activation terminal history uses the persisted ACTIVE instant rather than deployment creation", async () => {
+  const fixture = await createCandidateFixture({
+    bound: false,
+    activationAt: "2026-08-21T00:00:10.000Z",
+    orderRequestedAt: "2026-08-21T00:00:05.000Z",
+    fills: [fill("pre-activation-fill", "0.1", "2026-08-21T00:00:06.000Z", "500")],
+  });
+
+  const result = await fixture.service.processTerminalOrder("order-1");
+
+  assert.equal(result.outcome, "NOT_CANDIDATE_ORDER");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "RUNNING");
 });
 
 test("bound execution mode must match the persisted terminal order", async () => {
@@ -413,6 +561,14 @@ test("persisted terminal sweep progress skips applied, no-fill, and fault dispos
   await seedFixtureTerminalOrder(fixture, "fault-before-crash", [
     fill("fault-before-crash-fill", "0.1", "2026-08-21T00:00:03.000Z", "500"),
   ], false);
+  await seedFixtureTerminalOrder(
+    fixture,
+    "preactivation-before-crash",
+    [],
+    false,
+    "ENTER",
+    "2026-08-20T23:59:59.000Z",
+  );
   await seedFixtureTerminalOrder(fixture, "crash-window-order", [
     fill("crash-window-fill", "0.1", "2026-08-21T00:00:04.000Z", "500"),
   ], true, "ADD");
@@ -432,9 +588,15 @@ test("persisted terminal sweep progress skips applied, no-fill, and fault dispos
     projector: fixture.createService(),
     maximumPerRun: 1,
   }).run("primary");
+  const secondRestartReplay = await new TerminalCandidateProjectionSweep({
+    repositories: fixture.repositories,
+    projector: fixture.createService(),
+    maximumPerRun: 1,
+  }).run("primary");
 
   assert.equal(firstAfterRestart.processedCount, 1);
   assert.equal(replay.processedCount, 0);
+  assert.equal(secondRestartReplay.processedCount, 0);
   assert.equal((await fixture.pilotRepository.getEvidenceRecord(
     fixture.deploymentId,
     "terminal-order:crash-window-order",
@@ -463,6 +625,7 @@ async function createCandidateFixture(input: {
   bound?: boolean;
   terminalStatus?: "FILLED" | "CANCELED";
   orderRequestedAt?: string;
+  activationAt?: string;
 }): Promise<{
   repositories: InMemoryExecutionRepository;
   pilotRepository: InMemoryCandidatePilotRepository;
@@ -471,7 +634,6 @@ async function createCandidateFixture(input: {
   service: CandidateExecutionEvidenceService;
   createService: () => CandidateExecutionEvidenceService;
 }> {
-  const repositories = new InMemoryExecutionRepository();
   const pilotRepository = new InMemoryCandidatePilotRepository();
   const operatorState = new InMemoryOperatorStateStore({
     id: "candidate-fixture-state",
@@ -485,6 +647,7 @@ async function createCandidateFixture(input: {
     degradedAt: null,
     updatedAt: "2026-08-21T00:00:00.000Z",
   });
+  const repositories = new InMemoryExecutionRepository(operatorState);
   const deployment = await pilotRepository.createDeploymentWithInitialState({
     deployment: {
       id: "candidate-fixture-deployment",
@@ -494,6 +657,11 @@ async function createCandidateFixture(input: {
       policyId: "COMBINED_CONSERVATIVE",
       policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
       phase: "ACTIVE",
+      activationAt: input.activationAt ?? "2026-08-21T00:00:00.000Z",
+      activationEpochNs: parsePositionGuardCandidateTimestamp(
+        input.activationAt ?? "2026-08-21T00:00:00.000Z",
+        "fixture activationAt",
+      ),
       createdAt: "2026-08-21T00:00:00.000Z",
       updatedAt: "2026-08-21T00:00:00.000Z",
     },
@@ -574,6 +742,33 @@ async function createCandidateFixture(input: {
   };
 }
 
+function terminalSweepOrder(id: string, failureCode: string | null) {
+  return {
+    id,
+    strategyDecisionId: `decision-${id}`,
+    exchangeAccountId: "primary",
+    market: "KRW-BTC" as const,
+    side: "bid" as const,
+    ordType: "price" as const,
+    volume: null,
+    price: "10000000",
+    timeInForce: null,
+    smpType: null,
+    identifier: id,
+    idempotencyKey: id,
+    origin: "STRATEGY" as const,
+    requestedAt: "2026-08-21T00:00:02.000Z",
+    upbitUuid: `uuid-${id}`,
+    status: "CANCELED" as const,
+    executionMode: "LIVE" as const,
+    exchangeResponseJson: null,
+    failureCode,
+    failureMessage: failureCode ? "bounded absence confirmed" : null,
+    createdAt: "2026-08-21T00:00:02.000Z",
+    updatedAt: "2026-08-21T00:00:05.000Z",
+  };
+}
+
 function fill(
   id: string,
   volume: string,
@@ -641,6 +836,7 @@ async function seedFixtureTerminalOrder(
   fills: FillRecord[],
   bound = true,
   action: "ENTER" | "ADD" = "ENTER",
+  requestedAt = "2026-08-21T00:00:02.000Z",
 ): Promise<void> {
   const decisionId = `decision-${id}`;
   await fixture.repositories.saveStrategyDecision({
@@ -673,14 +869,14 @@ async function seedFixtureTerminalOrder(
     identifier: id,
     idempotencyKey: id,
     origin: "STRATEGY",
-    requestedAt: "2026-08-21T00:00:02.000Z",
+    requestedAt,
     upbitUuid: `uuid-${id}`,
     status: fills.length === 0 ? "CANCELED" : "FILLED",
     executionMode: "LIVE",
     exchangeResponseJson: null,
     failureCode: null,
     failureMessage: null,
-    createdAt: "2026-08-21T00:00:02.000Z",
+    createdAt: requestedAt,
     updatedAt: "2026-08-21T00:00:05.000Z",
   });
   if (bound) {

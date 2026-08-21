@@ -15,6 +15,7 @@ import {
   initialDeploymentInput,
   verifyCandidatePilotRepositoryContract,
   verifyCandidatePilotIdentityValidation,
+  verifyCandidateDeploymentActivationContract,
   verifyDeploymentScopedEvidenceIdentityContract,
   verifyMixedOffsetReplayContract,
   verifyPreEpochEvidenceRejectionContract,
@@ -25,6 +26,7 @@ const MIGRATION_0018 = "0018_scope_candidate_evidence_identity_to_deployment.sql
 const MIGRATION_0019 = "0019_store_candidate_evidence_decimals_as_text.sql";
 const MIGRATION_0020 = "0020_add_candidate_execution_bindings.sql";
 const MIGRATION_0021 = "0021_add_candidate_fill_timestamp_and_binding_shape.sql";
+const MIGRATION_0022 = "0022_add_candidate_deployment_activation.sql";
 
 test("sqlite candidate pilot repository satisfies the common contracts", async () => {
   await withFreshBundle("candidate-contract", async (bundle) => {
@@ -35,6 +37,66 @@ test("sqlite candidate pilot repository satisfies the common contracts", async (
   });
   await withFreshBundle("candidate-identity", async (bundle) => {
     await verifyCandidatePilotIdentityValidation(() => bundle.candidatePilots);
+  });
+  await withFreshBundle("candidate-activation", async (bundle) => {
+    await verifyCandidateDeploymentActivationContract(() => bundle.candidatePilots);
+  });
+});
+
+test("sqlite candidate projection fault persistence repairs an event-written pause-missing state atomically", async () => {
+  await withFreshBundle("candidate-fault-atomic", async (bundle) => {
+    const state = await bundle.operatorState.getState();
+    const order = {
+      id: "candidate-fault-atomic-order",
+      strategyDecisionId: null,
+      exchangeAccountId: "primary",
+      market: "KRW-BTC" as const,
+      side: "bid" as const,
+      ordType: "price" as const,
+      volume: null,
+      price: "10000000",
+      timeInForce: null,
+      smpType: null,
+      identifier: "candidate-fault-atomic-order",
+      idempotencyKey: "candidate-fault-atomic-order",
+      origin: "STRATEGY" as const,
+      requestedAt: state.updatedAt,
+      upbitUuid: "candidate-fault-atomic-uuid",
+      status: "CANCELED" as const,
+      executionMode: "DRY_RUN" as const,
+      exchangeResponseJson: null,
+      failureCode: null,
+      failureMessage: null,
+      createdAt: state.updatedAt,
+      updatedAt: state.updatedAt,
+    };
+    const event = {
+      id: "candidate-evidence-fault:candidate-fault-atomic-order:UNVERIFIED_FEE_PROVENANCE",
+      orderId: order.id,
+      eventType: "CANDIDATE_EVIDENCE_PROJECTION_FAILED" as const,
+      eventSource: "RECONCILIATION" as const,
+      payloadJson: JSON.stringify({ code: "UNVERIFIED_FEE_PROVENANCE" }),
+      createdAt: state.updatedAt,
+    };
+    await bundle.repositories.saveOrder(order);
+    await bundle.repositories.appendOrderEvent(event);
+    const input = {
+      orderId: order.id,
+      event,
+      faultPause: {
+        exchangeAccountId: "primary",
+        faultId: event.id,
+        reason: "UNVERIFIED_FEE_PROVENANCE",
+        occurredAt: state.updatedAt,
+      },
+    };
+    const first = await bundle.repositories.persistCandidateProjectionFault?.(input);
+    const second = await bundle.repositories.persistCandidateProjectionFault?.(input);
+
+    assert.equal(first, "DUPLICATE");
+    assert.equal(second, "DUPLICATE");
+    assert.equal((await bundle.operatorState.getState()).systemStatus, "PAUSED");
+    assert.equal((await bundle.repositories.listOrderEvents(order.id)).length, 1);
   });
 });
 
@@ -90,7 +152,7 @@ test("migration 0019 preserves legacy mirrors and writes authoritative canonical
   });
 });
 
-test("fresh migration list applies 0019, candidate execution bindings, and fill provenance in order", async () => {
+test("fresh migration list applies candidate exactness, binding, fill provenance, and activation in order", async () => {
   await withFreshBundle("migration-list-0019-0020", async (_bundle, _databasePath, db) => {
     const filenames = (db.prepare(
       "SELECT filename FROM _schema_migrations ORDER BY filename ASC",
@@ -99,15 +161,20 @@ test("fresh migration list applies 0019, candidate execution bindings, and fill 
     assert.ok(filenames.includes(MIGRATION_0019));
     assert.ok(filenames.includes(MIGRATION_0020));
     assert.ok(filenames.includes(MIGRATION_0021));
+    assert.ok(filenames.includes(MIGRATION_0022));
     assert.ok(filenames.indexOf(MIGRATION_0019) < filenames.indexOf(MIGRATION_0020));
     assert.ok(filenames.indexOf(MIGRATION_0020) < filenames.indexOf(MIGRATION_0021));
+    assert.ok(filenames.indexOf(MIGRATION_0021) < filenames.indexOf(MIGRATION_0022));
     const fillColumns = db.prepare("PRAGMA table_info(fills)").all() as Array<{ name: string; type: string }>;
     assert.equal(fillColumns.find((column) => column.name === "execution_epoch_ns")?.type, "TEXT");
+    const deploymentColumns = db.prepare("PRAGMA table_info(strategy_pilot_deployments)").all() as Array<{ name: string; type: string }>;
+    assert.equal(deploymentColumns.find((column) => column.name === "activation_at")?.type, "TEXT");
+    assert.equal(deploymentColumns.find((column) => column.name === "activation_epoch_ns")?.type, "TEXT");
     assertDatabaseIntegrity(db);
   });
 });
 
-test("recorded unsafe 0019 TEXT-affinity exact columns remain legacy and preserve original hashes", async () => {
+test("recorded unsafe 0019 rebuilt TEXT-affinity tables remain legacy and preserve original hashes", async () => {
   const databasePath = await createTempDatabasePath("recorded-unsafe-0019-text-affinity");
   await createAppliedOriginal0017Fixture(databasePath);
   const before = new DatabaseSync(databasePath);
@@ -115,34 +182,7 @@ test("recorded unsafe 0019 TEXT-affinity exact columns remain legacy and preserv
     before.exec(await readFile(path.resolve(process.cwd(), "migrations", MIGRATION_0018), "utf8"));
     before.prepare("INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)")
       .run(MIGRATION_0018, "2026-08-21T00:00:00.000Z");
-    before.exec(`
-      ALTER TABLE strategy_candidate_execution_evidence ADD COLUMN material_version TEXT NOT NULL DEFAULT 'LEGACY_APPROXIMATE_V1';
-      ALTER TABLE strategy_candidate_execution_evidence ADD COLUMN executed_quantity_exact TEXT;
-      ALTER TABLE strategy_candidate_execution_evidence ADD COLUMN gross_quote_value_krw_exact TEXT;
-      ALTER TABLE strategy_candidate_execution_evidence ADD COLUMN confirmed_fee_krw_exact TEXT;
-      ALTER TABLE strategy_candidate_execution_evidence ADD COLUMN remaining_quantity_exact TEXT;
-    `);
-    before.exec("DROP TRIGGER strategy_candidate_execution_evidence_no_update;");
-    before.prepare(`
-      UPDATE strategy_candidate_execution_evidence
-      SET executed_quantity_exact = ?, gross_quote_value_krw_exact = ?,
-          confirmed_fee_krw_exact = ?, remaining_quantity_exact = ?
-      WHERE deployment_id = ? AND id = ?
-    `).run(
-      "1e-20",
-      "123456789.123456789123456789",
-      "0.000000000000000001",
-      "1e-20",
-      "original-0017-primary",
-      "original-evidence",
-    );
-    before.exec(`
-      CREATE TRIGGER strategy_candidate_execution_evidence_no_update
-      BEFORE UPDATE ON strategy_candidate_execution_evidence
-      BEGIN
-        SELECT RAISE(ABORT, 'strategy candidate execution evidence is append-only');
-      END;
-    `);
+    rebuildUnsafe0019TextAffinityTables(before);
     before.prepare("INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)")
       .run(MIGRATION_0019, "2026-08-21T00:00:00.000Z");
   } finally {
@@ -152,7 +192,8 @@ test("recorded unsafe 0019 TEXT-affinity exact columns remain legacy and preserv
   const handle = openSqliteDatabase(databasePath);
   try {
     const evidence = handle.db.prepare(`
-      SELECT material_hash, material_version, executed_quantity_exact, gross_quote_value_krw_exact
+      SELECT material_hash, material_version, executed_quantity_exact, gross_quote_value_krw_exact,
+        typeof(executed_quantity) AS executed_quantity_type
       FROM strategy_candidate_execution_evidence
       WHERE deployment_id = ? AND id = ?
     `).get("original-0017-primary", "original-evidence") as {
@@ -160,12 +201,30 @@ test("recorded unsafe 0019 TEXT-affinity exact columns remain legacy and preserv
       material_version: string;
       executed_quantity_exact: string | null;
       gross_quote_value_krw_exact: string | null;
+      executed_quantity_type: string;
+    } | undefined;
+    const stateColumns = handle.db.prepare("PRAGMA table_info(strategy_candidate_states)").all() as Array<{ name: string; type: string }>;
+    const unsafeText = handle.db.prepare(`
+      SELECT material_hash, executed_quantity, gross_quote_value_krw, executed_quantity_exact
+      FROM strategy_candidate_execution_evidence
+      WHERE deployment_id = ? AND id = ?
+    `).get("original-0017-primary", "unsafe-text-exponent") as {
+      material_hash: string;
+      executed_quantity: string;
+      gross_quote_value_krw: string;
+      executed_quantity_exact: string | null;
     } | undefined;
 
     assert.equal(evidence?.material_hash, "c".repeat(64));
     assert.equal(evidence?.material_version, "LEGACY_APPROXIMATE_V1");
-    assert.equal(evidence?.executed_quantity_exact, "1e-20");
-    assert.equal(evidence?.gross_quote_value_krw_exact, "123456789.123456789123456789");
+    assert.equal(evidence?.executed_quantity_type, "text");
+    assert.equal(evidence?.executed_quantity_exact, null);
+    assert.equal(evidence?.gross_quote_value_krw_exact, null);
+    assert.equal(unsafeText?.material_hash, "d".repeat(64));
+    assert.equal(unsafeText?.executed_quantity, "1e-20");
+    assert.equal(unsafeText?.gross_quote_value_krw, "123456789.123456789123456789");
+    assert.equal(unsafeText?.executed_quantity_exact, null);
+    assert.equal(stateColumns.find((column) => column.name === "current_episode_inventory_quantity")?.type, "TEXT");
     assert.equal(await new SqliteCandidatePilotRepository(handle.db).getExactState("original-0017-primary"), null);
     assertDatabaseIntegrity(handle.db);
   } finally {
@@ -1008,6 +1067,121 @@ async function createAppliedOriginal0017Fixture(databasePath: string): Promise<v
   } finally {
     db.close();
   }
+}
+
+function rebuildUnsafe0019TextAffinityTables(db: DatabaseSync): void {
+  db.exec(`
+    PRAGMA foreign_keys = OFF;
+    BEGIN IMMEDIATE;
+    DROP TRIGGER strategy_candidate_execution_evidence_no_update;
+    DROP TRIGGER strategy_candidate_execution_evidence_no_delete;
+    ALTER TABLE strategy_candidate_states RENAME TO strategy_candidate_states_unsafe_0019;
+    ALTER TABLE strategy_candidate_execution_evidence RENAME TO strategy_candidate_execution_evidence_unsafe_0019;
+
+    CREATE TABLE strategy_candidate_execution_evidence (
+      deployment_id TEXT NOT NULL,
+      id TEXT NOT NULL,
+      executed_at TEXT NOT NULL,
+      executed_at_epoch_ns INTEGER NOT NULL CHECK (executed_at_epoch_ns >= 0),
+      action TEXT NOT NULL CHECK (action IN ('ENTER', 'ADD', 'REDUCE', 'EXIT')),
+      entry_path TEXT NOT NULL CHECK (entry_path IN ('PULLBACK', 'RECLAIM', 'BREAKOUT_HOLD', 'NONE')),
+      terminal_status TEXT NOT NULL CHECK (terminal_status IN ('FILLED', 'CANCELED')),
+      executed_quantity TEXT NOT NULL,
+      gross_quote_value_krw TEXT NOT NULL,
+      confirmed_fee_krw TEXT NOT NULL,
+      remaining_quantity TEXT NOT NULL,
+      material_hash TEXT NOT NULL CHECK (length(material_hash) = 64),
+      created_at TEXT NOT NULL,
+      material_version TEXT NOT NULL DEFAULT 'LEGACY_APPROXIMATE_V1',
+      executed_quantity_exact TEXT,
+      gross_quote_value_krw_exact TEXT,
+      confirmed_fee_krw_exact TEXT,
+      remaining_quantity_exact TEXT,
+      FOREIGN KEY (deployment_id) REFERENCES strategy_pilot_deployments(id) ON DELETE RESTRICT,
+      PRIMARY KEY (deployment_id, id)
+    );
+    INSERT INTO strategy_candidate_execution_evidence (
+      deployment_id, id, executed_at, executed_at_epoch_ns, action, entry_path,
+      terminal_status, executed_quantity, gross_quote_value_krw, confirmed_fee_krw,
+      remaining_quantity, material_hash, created_at, material_version,
+      executed_quantity_exact, gross_quote_value_krw_exact, confirmed_fee_krw_exact,
+      remaining_quantity_exact
+    ) SELECT
+      deployment_id, id, executed_at, executed_at_epoch_ns, action, entry_path,
+      terminal_status, executed_quantity, gross_quote_value_krw, confirmed_fee_krw,
+      remaining_quantity, material_hash, created_at, 'LEGACY_APPROXIMATE_V1',
+      NULL, NULL, NULL, NULL
+    FROM strategy_candidate_execution_evidence_unsafe_0019;
+    INSERT INTO strategy_candidate_execution_evidence (
+      deployment_id, id, executed_at, executed_at_epoch_ns, action, entry_path,
+      terminal_status, executed_quantity, gross_quote_value_krw, confirmed_fee_krw,
+      remaining_quantity, material_hash, created_at, material_version,
+      executed_quantity_exact, gross_quote_value_krw_exact, confirmed_fee_krw_exact,
+      remaining_quantity_exact
+    ) VALUES (
+      'original-0017-primary', 'unsafe-text-exponent', '2026-08-21T00:00:01.000000001Z',
+      1787270401000000001, 'ENTER', 'PULLBACK', 'FILLED', '1e-20',
+      '123456789.123456789123456789', '0.000000000000000001', '1e-20',
+      'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+      '2026-08-21T00:00:01.000000001Z', 'LEGACY_APPROXIMATE_V1', NULL, NULL, NULL, NULL
+    );
+
+    CREATE TABLE strategy_candidate_states (
+      deployment_id TEXT PRIMARY KEY,
+      current_episode_add_count INTEGER NOT NULL CHECK (current_episode_add_count >= 0),
+      current_episode_cost_basis_krw TEXT NOT NULL,
+      current_episode_inventory_quantity TEXT NOT NULL,
+      current_episode_realized_pnl_krw TEXT NOT NULL,
+      last_full_exit_at TEXT,
+      last_full_exit_realized_pnl_krw TEXT,
+      last_entry_path TEXT CHECK (last_entry_path IN ('PULLBACK', 'RECLAIM', 'BREAKOUT_HOLD', 'NONE')),
+      last_evidence_at TEXT,
+      last_evidence_id TEXT,
+      state_version INTEGER NOT NULL CHECK (state_version >= 0),
+      updated_at TEXT NOT NULL,
+      material_version TEXT NOT NULL DEFAULT 'LEGACY_APPROXIMATE_V1',
+      current_episode_cost_basis_krw_exact TEXT,
+      current_episode_inventory_quantity_exact TEXT,
+      current_episode_realized_pnl_krw_exact TEXT,
+      last_full_exit_realized_pnl_krw_exact TEXT,
+      CHECK ((last_full_exit_at IS NULL) = (last_full_exit_realized_pnl_krw IS NULL)),
+      CHECK ((last_evidence_at IS NULL) = (last_evidence_id IS NULL)),
+      FOREIGN KEY (deployment_id) REFERENCES strategy_pilot_deployments(id) ON DELETE RESTRICT,
+      FOREIGN KEY (deployment_id, last_evidence_id)
+        REFERENCES strategy_candidate_execution_evidence(deployment_id, id) ON DELETE RESTRICT
+    );
+    INSERT INTO strategy_candidate_states (
+      deployment_id, current_episode_add_count, current_episode_cost_basis_krw,
+      current_episode_inventory_quantity, current_episode_realized_pnl_krw,
+      last_full_exit_at, last_full_exit_realized_pnl_krw, last_entry_path,
+      last_evidence_at, last_evidence_id, state_version, updated_at, material_version,
+      current_episode_cost_basis_krw_exact, current_episode_inventory_quantity_exact,
+      current_episode_realized_pnl_krw_exact, last_full_exit_realized_pnl_krw_exact
+    ) SELECT
+      deployment_id, current_episode_add_count, current_episode_cost_basis_krw,
+      current_episode_inventory_quantity, current_episode_realized_pnl_krw,
+      last_full_exit_at, last_full_exit_realized_pnl_krw, last_entry_path,
+      last_evidence_at, last_evidence_id, state_version, updated_at, 'LEGACY_APPROXIMATE_V1',
+      NULL, NULL, NULL, NULL
+    FROM strategy_candidate_states_unsafe_0019;
+
+    DROP TABLE strategy_candidate_states_unsafe_0019;
+    DROP TABLE strategy_candidate_execution_evidence_unsafe_0019;
+    CREATE INDEX idx_strategy_candidate_evidence_replay
+      ON strategy_candidate_execution_evidence(deployment_id, executed_at_epoch_ns, id);
+    CREATE TRIGGER strategy_candidate_execution_evidence_no_update
+    BEFORE UPDATE ON strategy_candidate_execution_evidence
+    BEGIN
+      SELECT RAISE(ABORT, 'strategy candidate execution evidence is append-only');
+    END;
+    CREATE TRIGGER strategy_candidate_execution_evidence_no_delete
+    BEFORE DELETE ON strategy_candidate_execution_evidence
+    BEGIN
+      SELECT RAISE(ABORT, 'strategy candidate execution evidence is append-only');
+    END;
+    COMMIT;
+    PRAGMA foreign_keys = ON;
+  `);
 }
 
 function insertNotification(db: DatabaseSync, id: string, type: string): void {

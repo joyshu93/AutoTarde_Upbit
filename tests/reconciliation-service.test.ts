@@ -1713,6 +1713,41 @@ test("immediate persisted terminal strategy orders are swept without consuming e
   assert.deepEqual(projected, [order.id]);
 });
 
+test("complete reconciliation restarts never spend terminal projection budget on absence-confirmed orders", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = pausedUncertainSubmissionState();
+  const absenceConfirmed = uncertainSubmissionOrder({
+    id: "absence-confirmed-terminal",
+    status: "CANCELED",
+    failureCode: "ORDER_SUBMISSION_ABSENCE_CONFIRMED",
+    failureMessage: "Bounded identifier recovery confirmed persistent exchange absence.",
+  });
+  const eligible = uncertainSubmissionOrder({
+    id: "eligible-terminal-after-absence",
+    status: "FILLED",
+  });
+  await repositories.saveOrder(absenceConfirmed);
+  await repositories.saveOrder(eligible);
+  const projected: string[] = [];
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    maxOrderLookupsPerRun: 0,
+    maxTerminalCandidateProjectionsPerRun: 1,
+    candidateEvidenceService: {
+      async processTerminalOrder(orderId) {
+        projected.push(orderId);
+        return { outcome: "ADVANCED", orderId, detail: "projected" };
+      },
+    },
+  });
+
+  await reconciliation.run("primary");
+  await reconciliation.run("primary");
+
+  assert.deepEqual(projected, [eligible.id, eligible.id]);
+});
+
 test("terminal sweep orders persisted fill instants before order update time with deterministic order IDs", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = pausedUncertainSubmissionState();
@@ -1870,7 +1905,7 @@ test("recovered terminal projection failures persist a fault marker and pause ex
     degradedAt: null,
     updatedAt: "2026-08-21T00:00:00.000Z",
   });
-  const repositories = new InMemoryExecutionRepository();
+  const repositories = new InMemoryExecutionRepository(operatorState);
   const order = uncertainSubmissionOrder({ id: "recovered-projection-failure-order" });
   await repositories.saveOrder(order);
   const reconciliation = new ReconciliationService({

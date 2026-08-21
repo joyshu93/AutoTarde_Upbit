@@ -1,5 +1,6 @@
 import type {
   CandidateExecutionBindingRecord,
+  PositionGuardPilotDeploymentRecord,
 } from "../../domain/pilot-types.js";
 import type {
   FillRecord,
@@ -82,9 +83,15 @@ export class CandidateExecutionEvidenceService {
     }
 
     try {
+      if (!hasVerifiedDeploymentActivation(deployment)) {
+        throw new CandidateEvidenceFault(
+          "CANDIDATE_DEPLOYMENT_ACTIVATION_UNVERIFIED",
+          "Active candidate deployment has no authoritative persisted activation instant.",
+        );
+      }
       const binding = await this.dependencies.pilotRepository.getExecutionBindingForOrder(order.id);
       if (!binding) {
-        if (isPreDeploymentOrder(order, deployment)) {
+        if (isPreActivationOrder(order, deployment)) {
           return {
             outcome: "NOT_CANDIDATE_ORDER",
             orderId: order.id,
@@ -218,7 +225,8 @@ export class CandidateExecutionEvidenceService {
       // A persisted legacy or malformed binding remains eligible so projection records a fault.
       return "ELIGIBLE";
     }
-    if (!binding && isPreDeploymentOrder(order, deployment)) {
+    if (!hasVerifiedDeploymentActivation(deployment)) return "ELIGIBLE";
+    if (!binding && isPreActivationOrder(order, deployment)) {
       return "PRE_ACTIVATION";
     }
     if (!binding) return "ELIGIBLE";
@@ -231,7 +239,7 @@ export class CandidateExecutionEvidenceService {
 
   private async getVerifiedDecision(
     order: OrderRecord,
-    deployment: Awaited<ReturnType<CandidatePilotRepository["getDeployment"]>> & {},
+    deployment: PositionGuardPilotDeploymentRecord,
     binding: CandidateExecutionBindingRecord,
   ): Promise<VerifiedDecision> {
     if (!order.strategyDecisionId) {
@@ -250,6 +258,8 @@ export class CandidateExecutionEvidenceService {
       binding.strategyKey !== POSITION_GUARD_STRATEGY_KEY ||
       binding.policyId !== deployment.policyId ||
       binding.policyVersion !== deployment.policyVersion ||
+      binding.activationAt !== deployment.activationAt ||
+      binding.activationEpochNs !== deployment.activationEpochNs ||
       binding.executionMode !== order.executionMode ||
       binding.ordType !== order.ordType ||
       !sameOptionalCanonicalDecimal(binding.boundPrice, order.price) ||
@@ -283,7 +293,13 @@ export class CandidateExecutionEvidenceService {
     }
     const decisionAt = parseTimestamp(decision.createdAt, "strategy decision createdAt");
     const requestedAt = parseTimestamp(order.requestedAt, "order requestedAt");
-    const activationAt = binding.activationEpochNs;
+    const activationAt = deployment.activationEpochNs;
+    if (activationAt === null) {
+      throw new CandidateEvidenceFault(
+        "CANDIDATE_DEPLOYMENT_ACTIVATION_UNVERIFIED",
+        "Candidate deployment activation instant is unavailable.",
+      );
+    }
     const bindingCreatedAt = parseTimestamp(binding.createdAt, "candidate execution binding createdAt");
     if (decisionAt > requestedAt || requestedAt < activationAt || bindingCreatedAt >= requestedAt) {
       throw new CandidateEvidenceFault("ORDER_TIMESTAMP_INVALID", "Decision, activation, and order timestamps are inconsistent.");
@@ -300,22 +316,30 @@ export class CandidateExecutionEvidenceService {
     const now = this.dependencies.clock.now();
     validateClock(now);
     const eventId = `candidate-evidence-fault:${order.id}:${code}`;
-    const existingEvents = await this.dependencies.repositories.listOrderEvents(order.id);
-    if (!existingEvents.some((event) => event.id === eventId)) {
-      await this.dependencies.repositories.appendOrderEvent({
-        id: eventId,
-        orderId: order.id,
-        eventType: "CANDIDATE_EVIDENCE_PROJECTION_FAILED",
-        eventSource: "RECONCILIATION",
-        payloadJson: JSON.stringify({ code, message }),
-        createdAt: now.occurredAt,
-      });
+    const existingEvent = (await this.dependencies.repositories.listOrderEvents(order.id))
+      .find((event) => event.id === eventId);
+    const event = existingEvent ?? {
+      id: eventId,
+      orderId: order.id,
+      eventType: "CANDIDATE_EVIDENCE_PROJECTION_FAILED" as const,
+      eventSource: "RECONCILIATION" as const,
+      payloadJson: JSON.stringify({ code, message }),
+      createdAt: now.occurredAt,
+    };
+    const persistCandidateProjectionFault = this.dependencies.repositories.persistCandidateProjectionFault;
+    if (!persistCandidateProjectionFault) {
+      throw new Error("Candidate projection fault persistence requires an atomic repository implementation.");
     }
-    await this.dependencies.operatorState.pauseForFault({
-      exchangeAccountId: order.exchangeAccountId,
-      faultId: eventId,
-      reason: `${code}: ${message}`,
-      occurredAt: now.occurredAt,
+    await persistCandidateProjectionFault.call(this.dependencies.repositories, {
+      orderId: order.id,
+      event,
+      faultPause: {
+        exchangeAccountId: order.exchangeAccountId,
+        faultId: eventId,
+        reason: `${code}: ${message}`,
+        // Reuse immutable evidence time so restart retries are exactly idempotent.
+        occurredAt: event.createdAt,
+      },
     });
     return { outcome: "FAULT", orderId: order.id, detail: `${code}: ${message}` };
   }
@@ -466,13 +490,25 @@ function verifiedExchangeFillEpoch(fill: FillRecord): bigint {
   return parsed;
 }
 
-function isPreDeploymentOrder(
+function hasVerifiedDeploymentActivation(
+  deployment: PositionGuardPilotDeploymentRecord,
+): deployment is PositionGuardPilotDeploymentRecord & { activationAt: string; activationEpochNs: bigint } {
+  if (deployment.activationAt === null || deployment.activationEpochNs === null) return false;
+  try {
+    return parseTimestamp(deployment.activationAt, "candidate deployment activationAt") === deployment.activationEpochNs;
+  } catch {
+    return false;
+  }
+}
+
+function isPreActivationOrder(
   order: OrderRecord,
-  deployment: { createdAt: string },
+  deployment: PositionGuardPilotDeploymentRecord,
 ): boolean {
+  if (!hasVerifiedDeploymentActivation(deployment)) return false;
   try {
     return parseTimestamp(order.requestedAt, "order requestedAt") <
-      parseTimestamp(deployment.createdAt, "candidate deployment createdAt");
+      deployment.activationEpochNs;
   } catch {
     return false;
   }

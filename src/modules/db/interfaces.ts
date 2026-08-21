@@ -62,6 +62,12 @@ export interface FinalizeBoundedSubmissionAbsenceInput {
   faultPause: FaultPauseInput;
 }
 
+export interface PersistCandidateProjectionFaultInput {
+  orderId: string;
+  event: OrderEventRecord;
+  faultPause: FaultPauseInput;
+}
+
 export interface ExecutionRepository {
   saveStrategyDecision(record: StrategyDecisionRecord): Promise<void>;
   getLatestStrategyDecision(
@@ -92,6 +98,9 @@ export interface ExecutionRepository {
   finalizeBoundedSubmissionAbsence?(
     input: FinalizeBoundedSubmissionAbsenceInput,
   ): Promise<boolean>;
+  persistCandidateProjectionFault?(
+    input: PersistCandidateProjectionFaultInput,
+  ): Promise<"APPLIED" | "DUPLICATE">;
   saveBalanceSnapshot(record: BalanceSnapshotRecord): Promise<void>;
   getLatestBalanceSnapshot(exchangeAccountId: string): Promise<BalanceSnapshotRecord | null>;
   savePositionSnapshot(record: PositionSnapshotRecord): Promise<void>;

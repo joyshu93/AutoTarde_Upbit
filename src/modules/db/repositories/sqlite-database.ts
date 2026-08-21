@@ -79,6 +79,8 @@ function applyMigrations(db: DatabaseSync, migrationsDir: string): void {
         repairMigration0019(db);
       } else if (filename === "0021_add_candidate_fill_timestamp_and_binding_shape.sql") {
         repairMigration0021(db);
+      } else if (filename === "0022_add_candidate_deployment_activation.sql") {
+        repairMigration0022(db);
       }
       continue;
     }
@@ -270,6 +272,24 @@ function repairMigration0021(db: DatabaseSync): void {
   }
 }
 
+function repairMigration0022(db: DatabaseSync): void {
+  db.exec("BEGIN IMMEDIATE;");
+  try {
+    if (tableExists(db, "strategy_pilot_deployments")) {
+      ensureCandidatePilotColumn(db, "strategy_pilot_deployments", "activation_at", "TEXT");
+      ensureCandidatePilotColumn(db, "strategy_pilot_deployments", "activation_epoch_ns", "TEXT");
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_strategy_pilot_deployments_activation
+          ON strategy_pilot_deployments(exchange_account_id, phase, activation_epoch_ns, id);
+      `);
+    }
+    db.exec("COMMIT;");
+  } catch (error) {
+    if (db.isTransaction) db.exec("ROLLBACK;");
+    throw error;
+  }
+}
+
 function ensureExecutionStateColumn(
   db: DatabaseSync,
   columnName: "degraded_reason" | "degraded_at",
@@ -306,7 +326,8 @@ function ensureCandidatePilotColumn(
     | "strategy_candidate_execution_evidence"
     | "strategy_candidate_states"
     | "fills"
-    | "strategy_candidate_execution_bindings",
+    | "strategy_candidate_execution_bindings"
+    | "strategy_pilot_deployments",
   columnName: string,
   columnType: string,
 ): void {

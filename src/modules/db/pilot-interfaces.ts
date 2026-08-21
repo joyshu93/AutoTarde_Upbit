@@ -21,6 +21,14 @@ export interface CreateCandidatePilotDeploymentInput {
   initialState: PositionGuardCandidateState;
 }
 
+export interface ActivateCandidatePilotDeploymentInput {
+  deploymentId: string;
+  expectedPhase: "PENDING_FLAT";
+  expectedUpdatedAt: string;
+  activationAt: string;
+  activationEpochNs: bigint;
+}
+
 export interface AdvanceCandidatePilotStateInput {
   deploymentId: string;
   expectedStateVersion: number;
@@ -48,6 +56,9 @@ export interface CandidatePilotRepository {
   getDeployment(deploymentId: string): Promise<PositionGuardPilotDeploymentRecord | null>;
   getDeploymentForExchangeAccount(
     exchangeAccountId: string,
+  ): Promise<PositionGuardPilotDeploymentRecord | null>;
+  activateDeployment(
+    input: ActivateCandidatePilotDeploymentInput,
   ): Promise<PositionGuardPilotDeploymentRecord | null>;
   getState(deploymentId: string): Promise<Readonly<PositionGuardCandidateState> | null>;
   getExactState(deploymentId: string): Promise<Readonly<ExactCandidateState> | null>;
@@ -100,6 +111,8 @@ const DEPLOYMENT_KEYS = [
   "policyId",
   "policyVersion",
   "phase",
+  "activationAt",
+  "activationEpochNs",
   "createdAt",
   "updatedAt",
 ] as const;
@@ -156,6 +169,8 @@ export function validateCandidatePilotDeployment(
     policyId: record.policyId,
     policyVersion: record.policyVersion,
     phase: record.phase,
+    activationAt: record.activationAt,
+    activationEpochNs: record.activationEpochNs,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   } as PositionGuardPilotDeploymentRecord;
@@ -182,6 +197,21 @@ export function validateCandidatePilotDeployment(
   );
   if (updatedAt < createdAt) {
     throw new Error("Candidate pilot deployment updatedAt cannot precede createdAt.");
+  }
+  if ((deployment.activationAt === null) !== (deployment.activationEpochNs === null)) {
+    throw new Error("Candidate pilot deployment activation timestamp and epoch must be persisted together.");
+  }
+  if (deployment.activationAt !== null && deployment.activationEpochNs !== null) {
+    const activationEpochNs = parsePositionGuardCandidateTimestamp(
+      deployment.activationAt,
+      "deployment activationAt",
+    );
+    if (activationEpochNs < 0n || activationEpochNs !== deployment.activationEpochNs) {
+      throw new Error("Candidate pilot deployment activation epoch does not match its timestamp.");
+    }
+  }
+  if ((deployment.phase === "ACTIVE" || deployment.phase === "DRAINING") && deployment.activationAt === null) {
+    throw new Error("Active candidate pilot deployments require a persisted activation instant.");
   }
   return deployment;
 }

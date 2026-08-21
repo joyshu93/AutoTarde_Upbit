@@ -27,6 +27,9 @@ export interface PositionGuardPilotDeploymentRecord {
   policyId: "COMBINED_CONSERVATIVE";
   policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1";
   phase: PositionGuardPilotPhase;
+  // Null only for legacy/pre-activation deployments; projection must fail closed for ACTIVE/DRAINING rows without it.
+  activationAt: string | null;
+  activationEpochNs: bigint | null;
   createdAt: string;
   updatedAt: string;
 }

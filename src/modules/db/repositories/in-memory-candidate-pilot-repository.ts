@@ -22,6 +22,7 @@ import {
   validateCandidatePilotDeployment,
   type AdvanceCandidatePilotStateInput,
   type AdvanceCandidatePilotStateResult,
+  type ActivateCandidatePilotDeploymentInput,
   type CandidateEvidenceRecord,
   type CandidatePilotRepository,
   type CreateCandidatePilotDeploymentInput,
@@ -90,6 +91,37 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
     return deployment ? { ...deployment } : null;
   }
 
+  async activateDeployment(
+    input: ActivateCandidatePilotDeploymentInput,
+  ): Promise<PositionGuardPilotDeploymentRecord | null> {
+    const deployment = this.deployments.get(input.deploymentId);
+    if (!deployment || deployment.phase !== input.expectedPhase || deployment.updatedAt !== input.expectedUpdatedAt ||
+      deployment.activationAt !== null || deployment.activationEpochNs !== null) {
+      return null;
+    }
+    validateActivationInput(input, deployment);
+    const activated: PositionGuardPilotDeploymentRecord = {
+      ...deployment,
+      phase: "ACTIVE",
+      activationAt: input.activationAt,
+      activationEpochNs: input.activationEpochNs,
+      updatedAt: input.activationAt,
+    };
+    this.deployments.set(activated.id, activated);
+    const stateVersion = this.exactStates.get(activated.id)?.stateVersion ?? 0;
+    this.auditEvents.set(activated.id, [...(this.auditEvents.get(activated.id) ?? []), {
+      id: `${activated.id}:activation:${input.activationEpochNs.toString()}`,
+      deploymentId: activated.id,
+      eventType: "PHASE_TRANSITION",
+      fromPhase: deployment.phase,
+      toPhase: activated.phase,
+      stateVersion,
+      payloadJson: JSON.stringify({ activationAt: input.activationAt, activationEpochNs: input.activationEpochNs.toString() }),
+      createdAt: input.activationAt,
+    }]);
+    return { ...activated };
+  }
+
   async getState(deploymentId: string): Promise<Readonly<PositionGuardCandidateState> | null> {
     const state = this.exactStates.get(deploymentId);
     return state ? Object.freeze(approximateState(state)) : null;
@@ -148,6 +180,15 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
     const deployment = this.deployments.get(binding.deploymentId);
     if (!deployment || deployment.exchangeAccountId !== binding.exchangeAccountId) {
       throw new Error("Candidate execution binding deployment does not match its exchange account.");
+    }
+    if (
+      (deployment.phase !== "ACTIVE" && deployment.phase !== "DRAINING") ||
+      deployment.activationAt === null ||
+      deployment.activationEpochNs === null ||
+      binding.activationAt !== deployment.activationAt ||
+      binding.activationEpochNs !== deployment.activationEpochNs
+    ) {
+      throw new Error("Candidate execution binding must use the persisted active deployment instant.");
     }
     const existing = this.bindingsByOrderId.get(binding.orderId);
     if (existing) {
@@ -275,6 +316,20 @@ function isPristineInitialState(state: PositionGuardCandidateState): boolean {
     state.lastEvidenceAt === null &&
     state.lastEvidenceId === null &&
     state.stateVersion === 0;
+}
+
+function validateActivationInput(
+  input: ActivateCandidatePilotDeploymentInput,
+  deployment: PositionGuardPilotDeploymentRecord,
+): void {
+  const activation = parsePositionGuardCandidateTimestamp(input.activationAt, "deployment activationAt");
+  if (activation < 0n || activation !== input.activationEpochNs) {
+    throw new Error("Candidate deployment activation epoch does not match its timestamp.");
+  }
+  if (activation < parsePositionGuardCandidateTimestamp(deployment.createdAt, "deployment createdAt") ||
+    activation < parsePositionGuardCandidateTimestamp(deployment.updatedAt, "deployment updatedAt")) {
+    throw new Error("Candidate deployment activation cannot precede persisted deployment chronology.");
+  }
 }
 
 function sameBinding(left: CandidateExecutionBindingRecord, right: CandidateExecutionBindingRecord): boolean {

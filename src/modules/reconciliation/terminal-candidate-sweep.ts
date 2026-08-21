@@ -96,6 +96,7 @@ async function terminalSortKey(
 
 function isTerminalBtcStrategyOrder(order: OrderRecord): boolean {
   return order.origin === "STRATEGY" && order.market === "KRW-BTC" &&
+    order.failureCode !== "ORDER_SUBMISSION_ABSENCE_CONFIRMED" &&
     (order.status === "FILLED" || order.status === "CANCELED");
 }
 

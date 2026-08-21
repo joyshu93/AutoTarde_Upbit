@@ -158,6 +158,41 @@ test("execution service persists a dry-run order and blocks duplicate idempotent
   assert.match(second.reason ?? "", /Duplicate order intent/);
 });
 
+test("direct terminal exchange fills persist only exchange-confirmed execution instants", async () => {
+  const { service, repositories } = createExecutionService({
+    exchangeAdapter: terminalLiveAdapter("2026-04-20T00:00:15.123456789Z"),
+    initialState: { executionMode: "LIVE", liveExecutionGate: "ENABLED" },
+  });
+  await seedReadyExecutionAccount(repositories);
+
+  const result = await service.submitOrderFromDecision(terminalLiveInput("present-timestamp"));
+  const fills = await repositories.listFills(result.order?.id);
+
+  assert.equal(result.order?.status, "FILLED");
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0]?.executionTimestampProvenance, "EXCHANGE_FILL_CONFIRMED");
+  assert.equal(fills[0]?.executionEpochNs, "1776643215123456789");
+  assert.equal(fills[0]?.filledAt, "2026-04-20T00:00:15.123456789Z");
+});
+
+test("direct terminal exchange fills persist explicit unverified timestamp absence without a local fallback", async () => {
+  const { service, repositories } = createExecutionService({
+    exchangeAdapter: terminalLiveAdapter(null),
+    initialState: { executionMode: "LIVE", liveExecutionGate: "ENABLED" },
+  });
+  await seedReadyExecutionAccount(repositories);
+
+  const result = await service.submitOrderFromDecision(terminalLiveInput("missing-timestamp"));
+  const fills = await repositories.listFills(result.order?.id);
+
+  assert.equal(result.order?.status, "FILLED");
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0]?.executionTimestampProvenance, "LEGACY_UNVERIFIED");
+  assert.equal(fills[0]?.executionEpochNs, null);
+  assert.equal(fills[0]?.filledAt, "");
+  assert.notEqual(fills[0]?.filledAt, result.order?.updatedAt);
+});
+
 test("execution service settles dry-run price bids with a synthetic fill derived from reference price", async () => {
   const { service, repositories } = createExecutionService();
   await repositories.saveBalanceSnapshot({
@@ -921,4 +956,85 @@ function createLiveExecutionAdapter(): ExecutionExchangeAdapter {
     listOpenOrders: baseAdapter.listOpenOrders.bind(baseAdapter),
     listClosedOrders: baseAdapter.listClosedOrders.bind(baseAdapter),
   };
+}
+
+function terminalLiveAdapter(fillCreatedAt: string | null): ExecutionExchangeAdapter {
+  const baseAdapter = new DryRunExchangeAdapter();
+  return {
+    sendPath: "LIVE_ADAPTER",
+    getBalances: baseAdapter.getBalances.bind(baseAdapter),
+    getOrderChance: baseAdapter.getOrderChance.bind(baseAdapter),
+    testOrder: baseAdapter.testOrder.bind(baseAdapter),
+    async createOrder(request) {
+      return {
+        uuid: `terminal-${request.identifier}`,
+        identifier: request.identifier,
+        market: request.market,
+        side: request.side,
+        ordType: request.ordType,
+        state: "done",
+        price: request.price,
+        volume: request.volume,
+        remainingVolume: "0",
+        executedVolume: request.volume,
+        paidFee: "500",
+        createdAt: "2026-04-20T00:00:14.000Z",
+        fills: [{
+          tradeUuid: `trade-${request.identifier}`,
+          side: request.side,
+          price: request.price ?? "100000000",
+          volume: request.volume ?? "0.001",
+          funds: "100000",
+          fee: "500",
+          createdAt: fillCreatedAt,
+          raw: { fillCreatedAt },
+        }],
+        raw: { terminal: true, fillCreatedAt },
+      };
+    },
+    cancelOrder: baseAdapter.cancelOrder.bind(baseAdapter),
+    getOrder: baseAdapter.getOrder.bind(baseAdapter),
+    listOpenOrders: baseAdapter.listOpenOrders.bind(baseAdapter),
+    listClosedOrders: baseAdapter.listClosedOrders.bind(baseAdapter),
+  };
+}
+
+function terminalLiveInput(id: string) {
+  return {
+    exchangeAccountId: "primary",
+    strategyDecisionId: `decision-${id}`,
+    referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
+    decision: {
+      strategyKey: "deterministic.stub.v1",
+      market: "KRW-BTC" as const,
+      action: "ENTER" as const,
+      reasonCodes: ["TERMINAL_FILL_TIMESTAMP"],
+      referencePrice: 100_000_000,
+      requestedNotionalKrw: 100_000,
+      requestedQuantity: 0.001,
+      metadata: {},
+    },
+    side: "bid" as const,
+    ordType: "limit" as const,
+    price: "100000000",
+    volume: "0.001",
+  };
+}
+
+async function seedReadyExecutionAccount(repositories: InMemoryExecutionRepository): Promise<void> {
+  await repositories.saveBalanceSnapshot({
+    id: "terminal-fill-balance",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:00:00.000Z",
+    source: "EXCHANGE_POLL",
+    totalKrwValue: "10000000",
+    balancesJson: "[]",
+  });
+  await repositories.savePositionSnapshot({
+    id: "terminal-fill-position",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:00:00.000Z",
+    source: "EXCHANGE_POLL",
+    positionsJson: "[]",
+  });
 }
