@@ -218,8 +218,8 @@ test("candidate state projection matches frozen pre-window execution state throu
     normalizedEvidence.map((item) => item.action),
     ["ENTER", "ADD", "REDUCE", "EXIT", "EXIT"],
   );
-  assert.ok(normalizedEvidence[3]!.remainingQuantity > POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE);
-  assert.equal(normalizedEvidence[4]!.remainingQuantity, POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE);
+  assert.ok(Number(normalizedEvidence[3]!.remainingQuantity) > POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE);
+  assert.equal(Number(normalizedEvidence[4]!.remainingQuantity), POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE);
 
   let projected: Readonly<PositionGuardCandidateState> = candidateState();
   for (const [index, item] of normalizedEvidence.entries()) {

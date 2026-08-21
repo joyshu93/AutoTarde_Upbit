@@ -52,10 +52,10 @@ interface EvidenceRow {
   action: PositionGuardCandidateExecutionEvidence["action"];
   entry_path: PositionGuardCandidateExecutionEvidence["entryPath"];
   terminal_status: PositionGuardCandidateExecutionEvidence["terminalStatus"];
-  executed_quantity: number;
-  gross_quote_value_krw: number;
-  confirmed_fee_krw: number;
-  remaining_quantity: number;
+  executed_quantity: string;
+  gross_quote_value_krw: string;
+  confirmed_fee_krw: string;
+  remaining_quantity: string;
 }
 
 interface AuditRow {
@@ -131,6 +131,20 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
       FROM strategy_pilot_deployments
       WHERE id = ?
     `).get(deploymentId) as DeploymentRow | undefined;
+    return row ? deploymentFromRow(row) : null;
+  }
+
+  async getDeploymentForExchangeAccount(
+    exchangeAccountId: string,
+  ): Promise<PositionGuardPilotDeploymentRecord | null> {
+    const row = this.db.prepare(`
+      SELECT id, exchange_account_id, pilot_id, market, policy_id, policy_version,
+        phase, created_at, updated_at
+      FROM strategy_pilot_deployments
+      WHERE exchange_account_id = ?
+      ORDER BY created_at ASC, id ASC
+      LIMIT 1
+    `).get(exchangeAccountId) as DeploymentRow | undefined;
     return row ? deploymentFromRow(row) : null;
   }
 

@@ -3,6 +3,8 @@ import type { StrategyEntryPath } from "./position-guard-core.js";
 
 export const POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE = 1e-12;
 
+export type PositionGuardCandidateDecimal = string | number;
+
 export interface PositionGuardCandidateState {
   currentEpisodeAddCount: number;
   currentEpisodeCostBasisKrw: number;
@@ -22,10 +24,10 @@ export interface PositionGuardCandidateExecutionEvidence {
   action: Extract<StrategyDecisionAction, "ENTER" | "ADD" | "REDUCE" | "EXIT">;
   entryPath: StrategyEntryPath;
   terminalStatus: "FILLED" | "CANCELED";
-  executedQuantity: number;
-  grossQuoteValueKrw: number;
-  confirmedFeeKrw: number;
-  remainingQuantity: number;
+  executedQuantity: PositionGuardCandidateDecimal;
+  grossQuoteValueKrw: PositionGuardCandidateDecimal;
+  confirmedFeeKrw: PositionGuardCandidateDecimal;
+  remainingQuantity: PositionGuardCandidateDecimal;
 }
 
 const EXPLICIT_ISO_TIMESTAMP =
@@ -126,7 +128,7 @@ export function advancePositionGuardCandidateState(
 ): Readonly<PositionGuardCandidateState> {
   const stateSnapshot = snapshotState(state);
   validateStateSnapshot(stateSnapshot);
-  const evidenceSnapshot = snapshotExecutionEvidence(evidence);
+  const evidenceSnapshot = normalizeExecutionEvidence(evidence);
   validateExecutionEvidence(evidenceSnapshot);
   return advanceValidatedPositionGuardCandidateState(stateSnapshot, evidenceSnapshot);
 }
@@ -141,7 +143,7 @@ export function projectPositionGuardCandidateState(input: {
   if (initialState.lastEvidenceId !== null) evidenceIds.add(initialState.lastEvidenceId);
 
   const ordered = input.evidence.map((item) => {
-    const snapshot = snapshotExecutionEvidence(item);
+    const snapshot = normalizeExecutionEvidence(item);
     validateExecutionEvidence(snapshot);
     if (evidenceIds.has(snapshot.evidenceId)) {
       throw new Error(`Duplicate PositionGuard candidate evidenceId ${snapshot.evidenceId}.`);
@@ -167,9 +169,19 @@ export function projectPositionGuardCandidateState(input: {
   return state;
 }
 
+type NormalizedPositionGuardCandidateExecutionEvidence = Omit<
+  PositionGuardCandidateExecutionEvidence,
+  "executedQuantity" | "grossQuoteValueKrw" | "confirmedFeeKrw" | "remainingQuantity"
+> & {
+  executedQuantity: number;
+  grossQuoteValueKrw: number;
+  confirmedFeeKrw: number;
+  remainingQuantity: number;
+};
+
 function advanceValidatedPositionGuardCandidateState(
   state: PositionGuardCandidateState,
-  evidence: Readonly<PositionGuardCandidateExecutionEvidence>,
+  evidence: Readonly<NormalizedPositionGuardCandidateExecutionEvidence>,
 ): Readonly<PositionGuardCandidateState> {
   assertEvidenceAfterStateCursor(state, evidence);
   if (evidence.executedQuantity === 0) {
@@ -232,9 +244,9 @@ function snapshotState(value: PositionGuardCandidateState): PositionGuardCandida
   };
 }
 
-function snapshotExecutionEvidence(
+function normalizeExecutionEvidence(
   value: PositionGuardCandidateExecutionEvidence,
-): Readonly<PositionGuardCandidateExecutionEvidence> {
+): Readonly<NormalizedPositionGuardCandidateExecutionEvidence> {
   const record = exactOwnDataRecord(value, "execution evidence", EVIDENCE_KEYS);
   return Object.freeze({
     evidenceId: record.evidenceId as string,
@@ -242,10 +254,10 @@ function snapshotExecutionEvidence(
     action: record.action as PositionGuardCandidateExecutionEvidence["action"],
     entryPath: record.entryPath as StrategyEntryPath,
     terminalStatus: record.terminalStatus as PositionGuardCandidateExecutionEvidence["terminalStatus"],
-    executedQuantity: record.executedQuantity as number,
-    grossQuoteValueKrw: record.grossQuoteValueKrw as number,
-    confirmedFeeKrw: record.confirmedFeeKrw as number,
-    remainingQuantity: record.remainingQuantity as number,
+    executedQuantity: parseCandidateDecimal(record.executedQuantity, "executedQuantity"),
+    grossQuoteValueKrw: parseCandidateDecimal(record.grossQuoteValueKrw, "grossQuoteValueKrw"),
+    confirmedFeeKrw: parseCandidateDecimal(record.confirmedFeeKrw, "confirmedFeeKrw"),
+    remainingQuantity: parseCandidateDecimal(record.remainingQuantity, "remainingQuantity"),
   });
 }
 
@@ -351,7 +363,7 @@ function validateCursor(state: PositionGuardCandidateState): void {
   }
 }
 
-function validateExecutionEvidence(evidence: Readonly<PositionGuardCandidateExecutionEvidence>): void {
+function validateExecutionEvidence(evidence: Readonly<NormalizedPositionGuardCandidateExecutionEvidence>): void {
   if (typeof evidence.evidenceId !== "string" || evidence.evidenceId.trim() === "") {
     throw new Error("PositionGuard candidate evidenceId must be a non-empty string.");
   }
@@ -394,14 +406,14 @@ function validateExecutionEvidence(evidence: Readonly<PositionGuardCandidateExec
 
 function assertNoFillEvidenceMatchesState(
   state: PositionGuardCandidateState,
-  evidence: Readonly<PositionGuardCandidateExecutionEvidence>,
+  evidence: Readonly<NormalizedPositionGuardCandidateExecutionEvidence>,
 ): void {
   assertResidualMatches(state.currentEpisodeInventoryQuantity, evidence.remainingQuantity, evidence.evidenceId);
 }
 
 function assertNonZeroFillLifecycle(
   state: PositionGuardCandidateState,
-  evidence: Readonly<PositionGuardCandidateExecutionEvidence>,
+  evidence: Readonly<NormalizedPositionGuardCandidateExecutionEvidence>,
 ): void {
   if (isBuyAction(evidence.action)) {
     if (evidence.action === "ENTER" && state.currentEpisodeInventoryQuantity !== 0) {
@@ -428,7 +440,7 @@ function assertResidualMatches(expected: number, actual: number, evidenceId: str
 
 function assertEvidenceAfterStateCursor(
   state: PositionGuardCandidateState,
-  evidence: Readonly<PositionGuardCandidateExecutionEvidence>,
+  evidence: Readonly<NormalizedPositionGuardCandidateExecutionEvidence>,
 ): void {
   if (state.lastEvidenceAt === null) return;
   const cursorEpoch = parsePositionGuardCandidateTimestamp(state.lastEvidenceAt, "state lastEvidenceAt");
@@ -441,6 +453,23 @@ function assertEvidenceAfterStateCursor(
       "PositionGuard candidate evidence must be ordered after the state chronology cursor by epoch nanoseconds and evidenceId.",
     );
   }
+}
+
+function parseCandidateDecimal(value: unknown, label: string): number {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new Error(`PositionGuard candidate evidence ${label} must be finite and non-negative.`);
+    }
+    return Object.is(value, -0) ? 0 : value;
+  }
+  if (typeof value !== "string" || !/^(?:0|[1-9]\d*)(?:\.\d+)?$/u.test(value)) {
+    throw new Error(`PositionGuard candidate evidence ${label} must be a non-negative decimal string.`);
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`PositionGuard candidate evidence ${label} must be finite and non-negative.`);
+  }
+  return parsed;
 }
 
 function exactOwnDataRecord<Keys extends readonly string[]>(

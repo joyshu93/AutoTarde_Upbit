@@ -149,6 +149,16 @@ export interface SqliteFillRow {
   raw_payload_json: string;
 }
 
+export interface SqliteOrderSubmissionRecoveryObservationRow {
+  id: string;
+  order_id: string;
+  outcome: "FOUND" | "NOT_FOUND" | "TRANSIENT_FAILURE";
+  observed_at: string;
+  observed_at_epoch_ms: number;
+  detail_json: string;
+  created_at: string;
+}
+
 export interface SqliteReconciliationRunRow {
   id: string;
   exchange_account_id: string;

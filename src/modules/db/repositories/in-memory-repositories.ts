@@ -23,6 +23,7 @@ import type {
   SupportedMarket,
   TelegramInboundOffsetRecord,
 } from "../../../domain/types.js";
+import type { OrderSubmissionRecoveryObservationRecord } from "../../../domain/pilot-types.js";
 import type {
   ExecutionRepository,
   FaultPauseInput,
@@ -59,6 +60,7 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   private orders: OrderRecord[] = [];
   private orderEvents: OrderEventRecord[] = [];
   private fills: FillRecord[] = [];
+  private readonly orderSubmissionRecoveryObservations: OrderSubmissionRecoveryObservationRecord[] = [];
   private readonly balanceSnapshots: BalanceSnapshotRecord[] = [];
   private readonly positionSnapshots: PositionSnapshotRecord[] = [];
   private riskEvents: RiskEventRecord[] = [];
@@ -101,6 +103,11 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     }
 
     this.orders[index] = cloneRecord(record);
+  }
+
+  async getStrategyDecisionById(id: string): Promise<StrategyDecisionRecord | null> {
+    const decision = this.strategyDecisions.find((candidate) => candidate.id === id);
+    return decision ? cloneRecord(decision) : null;
   }
 
   async persistOrderIntent(input: PersistOrderIntentInput): Promise<void> {
@@ -269,6 +276,25 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     }
 
     return this.fills.filter((candidate) => candidate.orderId === orderId).map(cloneRecord);
+  }
+
+  async saveOrderSubmissionRecoveryObservation(
+    record: OrderSubmissionRecoveryObservationRecord,
+  ): Promise<void> {
+    const existing = this.orderSubmissionRecoveryObservations.find((candidate) => candidate.id === record.id);
+    if (existing && !recordsEqual(existing, record)) {
+      throw new Error(`Conflicting duplicate order submission recovery observation ${record.id}.`);
+    }
+    if (!existing) this.orderSubmissionRecoveryObservations.push(cloneRecord(record));
+  }
+
+  async listOrderSubmissionRecoveryObservations(
+    orderId: string,
+  ): Promise<OrderSubmissionRecoveryObservationRecord[]> {
+    return this.orderSubmissionRecoveryObservations
+      .filter((candidate) => candidate.orderId === orderId)
+      .sort((left, right) => left.observedAtEpochMs - right.observedAtEpochMs || left.id.localeCompare(right.id))
+      .map(cloneRecord);
   }
 
   async saveBalanceSnapshot(record: BalanceSnapshotRecord): Promise<void> {

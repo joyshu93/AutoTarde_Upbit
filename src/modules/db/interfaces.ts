@@ -24,6 +24,7 @@ import type {
   SupportedMarket,
   TelegramInboundOffsetRecord,
 } from "../../domain/types.js";
+import type { OrderSubmissionRecoveryObservationRecord } from "../../domain/pilot-types.js";
 
 export interface PersistOrderIntentInput {
   order: OrderRecord;
@@ -57,6 +58,7 @@ export interface ExecutionRepository {
     market: SupportedMarket,
     strategyKey?: string,
   ): Promise<StrategyDecisionRecord | null>;
+  getStrategyDecisionById?(id: string): Promise<StrategyDecisionRecord | null>;
   saveOrder(record: OrderRecord): Promise<void>;
   updateOrder(record: OrderRecord): Promise<void>;
   persistOrderIntent(input: PersistOrderIntentInput): Promise<void>;
@@ -70,6 +72,12 @@ export interface ExecutionRepository {
   listOrderEvents(orderId: string): Promise<OrderEventRecord[]>;
   saveFill(record: FillRecord): Promise<void>;
   listFills(orderId?: string): Promise<FillRecord[]>;
+  saveOrderSubmissionRecoveryObservation?(
+    record: OrderSubmissionRecoveryObservationRecord,
+  ): Promise<void>;
+  listOrderSubmissionRecoveryObservations?(
+    orderId: string,
+  ): Promise<OrderSubmissionRecoveryObservationRecord[]>;
   saveBalanceSnapshot(record: BalanceSnapshotRecord): Promise<void>;
   getLatestBalanceSnapshot(exchangeAccountId: string): Promise<BalanceSnapshotRecord | null>;
   savePositionSnapshot(record: PositionSnapshotRecord): Promise<void>;

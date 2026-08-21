@@ -10,6 +10,7 @@ await import("./position-guard-pilot-authority.test.js");
 await import("./create-app.test.js");
 await import("./db-sqlite-wiring.test.js");
 await import("./candidate-pilot-repository-contract.test.js");
+await import("./candidate-evidence-service.test.js");
 await import("./account-execution-lease-contract.test.js");
 await import("./db-candidate-pilot-persistence.test.js");
 await import("./risk-guards.test.js");

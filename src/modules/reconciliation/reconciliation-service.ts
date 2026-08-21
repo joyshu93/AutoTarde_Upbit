@@ -11,6 +11,7 @@ import type {
 import { SUPPORTED_MARKETS } from "../../domain/types.js";
 import { createFingerprint, createId } from "../../shared/ids.js";
 import type { ExecutionRepository, OperatorStateStore } from "../db/interfaces.js";
+import type { CandidateExecutionEvidenceService } from "../execution/candidate-evidence-service.js";
 import type { ExchangeAdapter, ExchangeOrderSnapshot, ExchangeFillSnapshot } from "../exchange/interfaces.js";
 import type { OperatorNotificationReporter } from "../telegram/reporter.js";
 import type { ReconciliationIssue, ReconciliationSummary, ReconciliationTrigger } from "./interfaces.js";
@@ -28,11 +29,36 @@ const DEFAULT_HISTORY_MAX_PAGES_PER_MARKET = 3;
 const DEFAULT_CLOSED_ORDER_LOOKBACK_DAYS = 7;
 const DEFAULT_HISTORY_STOP_BEFORE_DAYS = 365;
 const DEFAULT_HISTORY_RETENTION_ASSUMPTION_DAYS = 365;
+export const DEFAULT_IDENTIFIER_RECOVERY_POLICY = Object.freeze({
+  minimumNotFoundObservations: 2,
+  minimumElapsedMs: 60_000,
+});
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 
 interface ExchangeHistoryRecoveryResult {
   snapshots: ExchangeOrderSnapshot[];
   historyRecovery: NonNullable<ReconciliationSummary["historyRecovery"]> | null;
+}
+
+export interface IdentifierRecoveryPolicy {
+  minimumNotFoundObservations: number;
+  minimumElapsedMs: number;
+}
+
+export interface ReconciliationRecoveryClock {
+  now(): { observedAt: string; observedAtEpochMs: number };
+}
+
+export type IdentifierRecoveryOutcome =
+  | "RECOVERED"
+  | "STILL_UNCERTAIN"
+  | "ABSENCE_CONFIRMED"
+  | "TRANSIENT_FAILURE";
+
+export interface IdentifierRecoverySummary {
+  outcome: IdentifierRecoveryOutcome;
+  orderId: string;
+  detail: string;
 }
 
 export class ReconciliationService {
@@ -48,8 +74,128 @@ export class ReconciliationService {
       closedOrderLookbackDays?: number;
       historyStopBeforeDays?: number;
       historyRetentionAssumptionDays?: number;
+      identifierRecovery?: IdentifierRecoveryPolicy;
+      recoveryClock?: ReconciliationRecoveryClock;
+      candidateEvidenceService?: Pick<CandidateExecutionEvidenceService, "processTerminalOrder">;
     },
   ) {}
+
+  async recoverOrderByIdentifier(order: OrderRecord): Promise<IdentifierRecoverySummary> {
+    if (order.status !== "RECONCILIATION_REQUIRED" && order.status !== "SUBMITTING") {
+      throw new Error(`Order ${order.id} is not eligible for submission recovery.`);
+    }
+    if (!this.dependencies.orderReader || (!order.upbitUuid && !order.identifier)) {
+      return {
+        outcome: "STILL_UNCERTAIN",
+        orderId: order.id,
+        detail: "No exchange lookup reference is available for uncertain submission recovery.",
+      };
+    }
+    const observations = this.recoveryObservationRepository();
+    const now = this.recoveryClock().now();
+    validateRecoveryObservationTime(now);
+    const queries = [
+      ...(order.upbitUuid ? [{ uuid: order.upbitUuid }] : []),
+      ...(order.identifier ? [{ identifier: order.identifier }] : []),
+    ];
+
+    try {
+      let snapshot = null;
+      let matchedQuery: { uuid?: string; identifier?: string } | null = null;
+      for (const query of queries) {
+        const candidate = await this.dependencies.orderReader.getOrder(query);
+        if (candidate) {
+          snapshot = candidate;
+          matchedQuery = query;
+          break;
+        }
+      }
+      if (snapshot) {
+        await this.recordRecoveryObservation(order, "FOUND", now, {
+          query: matchedQuery,
+          attemptedQueries: queries,
+          uuid: snapshot.uuid,
+        });
+        await this.applyExchangeSnapshot(order, snapshot, now.observedAt);
+        return {
+          outcome: "RECOVERED",
+          orderId: order.id,
+          detail: "Exchange order recovery lookup found a matching order.",
+        };
+      }
+
+      await this.recordRecoveryObservation(order, "NOT_FOUND", now, { attemptedQueries: queries });
+      const policy = validateIdentifierRecoveryPolicy(
+        this.dependencies.identifierRecovery ?? DEFAULT_IDENTIFIER_RECOVERY_POLICY,
+      );
+      const persisted = await observations.listOrderSubmissionRecoveryObservations(order.id);
+      const absence = persisted.filter((observation) => observation.outcome === "NOT_FOUND");
+      const firstAbsence = absence[0];
+      const latestAbsence = absence.at(-1);
+      const elapsedMs = firstAbsence && latestAbsence
+        ? latestAbsence.observedAtEpochMs - firstAbsence.observedAtEpochMs
+        : 0;
+      if (
+        absence.length < policy.minimumNotFoundObservations ||
+        elapsedMs < policy.minimumElapsedMs
+      ) {
+        return {
+          outcome: "STILL_UNCERTAIN",
+          orderId: order.id,
+          detail:
+            `Persisted absence evidence is below the explicit recovery bound ` +
+            `(${absence.length}/${policy.minimumNotFoundObservations}; ${elapsedMs}/${policy.minimumElapsedMs}ms).`,
+        };
+      }
+
+      const message = "Bounded identifier recovery confirmed persistent exchange absence.";
+      await this.dependencies.repositories.updateOrder({
+        ...order,
+        status: "FAILED",
+        failureCode: "ORDER_SUBMISSION_ABSENCE_CONFIRMED",
+        failureMessage: message,
+        updatedAt: now.observedAt,
+      });
+      await this.dependencies.repositories.appendOrderEvent({
+        id: createId("order_event"),
+        orderId: order.id,
+        eventType: "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED",
+        eventSource: "RECONCILIATION",
+        payloadJson: JSON.stringify({
+          absenceObservationCount: absence.length,
+          elapsedMs,
+          minimumNotFoundObservations: policy.minimumNotFoundObservations,
+          minimumElapsedMs: policy.minimumElapsedMs,
+        }),
+        createdAt: now.observedAt,
+      });
+      await this.dependencies.operatorState.pauseForFault({
+        exchangeAccountId: order.exchangeAccountId,
+        faultId: `identifier-recovery-absence:${order.id}`,
+        reason: message,
+        occurredAt: now.observedAt,
+      });
+      return {
+        outcome: "ABSENCE_CONFIRMED",
+        orderId: order.id,
+        detail: message,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown identifier recovery lookup failure.";
+      if (isTransientLookupError(message)) {
+        await this.recordRecoveryObservation(order, "TRANSIENT_FAILURE", now, {
+          attemptedQueries: queries,
+          reason: message,
+        });
+        return {
+          outcome: "TRANSIENT_FAILURE",
+          orderId: order.id,
+          detail: `Transient identifier recovery lookup failure: ${message}`,
+        };
+      }
+      throw error;
+    }
+  }
 
   async run(
     exchangeAccountId: string,
@@ -670,6 +816,16 @@ export class ReconciliationService {
       ];
     }
 
+    if (order.status === "RECONCILIATION_REQUIRED" || order.status === "SUBMITTING") {
+      const recovery = await this.recoverOrderByIdentifier(order);
+      const code = recovery.outcome === "RECOVERED"
+        ? "ORDER_IDENTIFIER_RECOVERED"
+        : recovery.outcome === "ABSENCE_CONFIRMED"
+          ? "ORDER_SUBMISSION_ABSENCE_CONFIRMED"
+          : "ORDER_IDENTIFIER_RECOVERY_UNCERTAIN";
+      return [{ code, message: `Order ${order.id} identifier recovery: ${recovery.detail}` }];
+    }
+
     if (!order.upbitUuid && !order.identifier) {
       return [
         await this.markOrderForRecovery(
@@ -872,6 +1028,19 @@ export class ReconciliationService {
       });
     }
 
+    if (
+      (nextOrder.status === "FILLED" || nextOrder.status === "CANCELED") &&
+      this.dependencies.candidateEvidenceService
+    ) {
+      const projection = await this.dependencies.candidateEvidenceService.processTerminalOrder(order.id);
+      if (projection.outcome === "FAULT") {
+        issues.push({
+          code: "CANDIDATE_EVIDENCE_PROJECTION_FAILED",
+          message: `Candidate evidence projection failed for order ${order.id}. ${projection.detail}`,
+        });
+      }
+    }
+
     return issues;
   }
 
@@ -906,6 +1075,53 @@ export class ReconciliationService {
       code: issueCode,
       message: `Order ${order.id} marked RECONCILIATION_REQUIRED. ${message}`,
     };
+  }
+
+  private recoveryObservationRepository(): Required<Pick<ExecutionRepository,
+    "saveOrderSubmissionRecoveryObservation" | "listOrderSubmissionRecoveryObservations"
+  >> {
+    const { saveOrderSubmissionRecoveryObservation, listOrderSubmissionRecoveryObservations } = this.dependencies.repositories;
+    if (!saveOrderSubmissionRecoveryObservation || !listOrderSubmissionRecoveryObservations) {
+      throw new Error("Order submission recovery observation persistence is unavailable.");
+    }
+    return {
+      saveOrderSubmissionRecoveryObservation: saveOrderSubmissionRecoveryObservation.bind(this.dependencies.repositories),
+      listOrderSubmissionRecoveryObservations: listOrderSubmissionRecoveryObservations.bind(this.dependencies.repositories),
+    };
+  }
+
+  private recoveryClock(): ReconciliationRecoveryClock {
+    if (!this.dependencies.recoveryClock) {
+      throw new Error("Identifier recovery requires an injected persisted-observation clock.");
+    }
+    return this.dependencies.recoveryClock;
+  }
+
+  private async recordRecoveryObservation(
+    order: OrderRecord,
+    outcome: "FOUND" | "NOT_FOUND" | "TRANSIENT_FAILURE",
+    now: ReturnType<ReconciliationRecoveryClock["now"]>,
+    detail: Record<string, unknown>,
+  ): Promise<void> {
+    const observations = this.recoveryObservationRepository();
+    const observationId = createId("order_recovery_observation");
+    await observations.saveOrderSubmissionRecoveryObservation({
+      id: observationId,
+      orderId: order.id,
+      outcome,
+      observedAt: now.observedAt,
+      observedAtEpochMs: now.observedAtEpochMs,
+      detailJson: JSON.stringify(detail),
+      createdAt: now.observedAt,
+    });
+    await this.dependencies.repositories.appendOrderEvent({
+      id: createId("order_event"),
+      orderId: order.id,
+      eventType: "RECONCILIATION_IDENTIFIER_RECOVERY_OBSERVED",
+      eventSource: "RECONCILIATION",
+      payloadJson: JSON.stringify({ outcome, observationId, ...detail }),
+      createdAt: now.observedAt,
+    });
   }
 
   private async safeReport(input: {
@@ -1308,6 +1524,30 @@ function isTransientLookupError(message: string): boolean {
   return /429|too many requests|timeout|temporar|network|unavailable|503|502|504|connection|econnreset|fetch failed/iu.test(
     message,
   );
+}
+
+function validateIdentifierRecoveryPolicy(policy: IdentifierRecoveryPolicy): IdentifierRecoveryPolicy {
+  if (!Number.isSafeInteger(policy.minimumNotFoundObservations) || policy.minimumNotFoundObservations < 2) {
+    throw new Error("Identifier recovery requires at least two persisted not-found observations.");
+  }
+  if (!Number.isSafeInteger(policy.minimumElapsedMs) || policy.minimumElapsedMs <= 0) {
+    throw new Error("Identifier recovery requires a positive persisted elapsed-time bound.");
+  }
+
+  return policy;
+}
+
+function validateRecoveryObservationTime(value: ReturnType<ReconciliationRecoveryClock["now"]>): void {
+  if (!Number.isSafeInteger(value.observedAtEpochMs) || value.observedAtEpochMs < 0) {
+    throw new Error("Recovery observation time must include a non-negative integer epoch timestamp.");
+  }
+  const parsedObservedAt = Date.parse(value.observedAt);
+  if (!Number.isFinite(parsedObservedAt)) {
+    throw new Error("Recovery observation time must include a valid persisted timestamp.");
+  }
+  if (parsedObservedAt !== value.observedAtEpochMs) {
+    throw new Error("Recovery observation ISO timestamp and epoch timestamp must identify the same instant.");
+  }
 }
 
 function buildFillRecords(

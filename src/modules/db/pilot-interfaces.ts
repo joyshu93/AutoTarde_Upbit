@@ -7,6 +7,7 @@ import type {
 } from "../../domain/pilot-types.js";
 import {
   parsePositionGuardCandidateTimestamp,
+  type PositionGuardCandidateDecimal,
   type PositionGuardCandidateExecutionEvidence,
   type PositionGuardCandidateState,
 } from "../strategy/position-guard-candidate-state.js";
@@ -33,6 +34,9 @@ export interface CandidatePilotRepository {
     input: CreateCandidatePilotDeploymentInput,
   ): Promise<PositionGuardPilotDeploymentRecord>;
   getDeployment(deploymentId: string): Promise<PositionGuardPilotDeploymentRecord | null>;
+  getDeploymentForExchangeAccount(
+    exchangeAccountId: string,
+  ): Promise<PositionGuardPilotDeploymentRecord | null>;
   getState(deploymentId: string): Promise<Readonly<PositionGuardCandidateState> | null>;
   listEvidenceAfter(
     deploymentId: string,
@@ -146,10 +150,10 @@ export function candidateEvidenceMaterial(
     action: record.action as PositionGuardCandidateExecutionEvidence["action"],
     entryPath: record.entryPath as PositionGuardCandidateExecutionEvidence["entryPath"],
     terminalStatus: record.terminalStatus as PositionGuardCandidateExecutionEvidence["terminalStatus"],
-    executedQuantity: canonicalNonNegativeNumber(record.executedQuantity, "executedQuantity"),
-    grossQuoteValueKrw: canonicalNonNegativeNumber(record.grossQuoteValueKrw, "grossQuoteValueKrw"),
-    confirmedFeeKrw: canonicalNonNegativeNumber(record.confirmedFeeKrw, "confirmedFeeKrw"),
-    remainingQuantity: canonicalNonNegativeNumber(record.remainingQuantity, "remainingQuantity"),
+    executedQuantity: canonicalNonNegativeDecimal(record.executedQuantity, "executedQuantity"),
+    grossQuoteValueKrw: canonicalNonNegativeDecimal(record.grossQuoteValueKrw, "grossQuoteValueKrw"),
+    confirmedFeeKrw: canonicalNonNegativeDecimal(record.confirmedFeeKrw, "confirmedFeeKrw"),
+    remainingQuantity: canonicalNonNegativeDecimal(record.remainingQuantity, "remainingQuantity"),
   };
   requireNonEmpty(snapshot.evidenceId, "evidenceId");
   if (!EVIDENCE_ACTIONS.includes(snapshot.action)) {
@@ -161,17 +165,16 @@ export function candidateEvidenceMaterial(
   if (snapshot.terminalStatus !== "FILLED" && snapshot.terminalStatus !== "CANCELED") {
     throw new Error("Candidate execution evidence terminalStatus is invalid.");
   }
-  if (snapshot.executedQuantity === 0) {
+  if (isZeroDecimal(snapshot.executedQuantity)) {
     if (
       snapshot.terminalStatus !== "CANCELED" ||
-      snapshot.grossQuoteValueKrw !== 0 ||
-      snapshot.confirmedFeeKrw !== 0
+      !isZeroDecimal(snapshot.grossQuoteValueKrw) ||
+      !isZeroDecimal(snapshot.confirmedFeeKrw)
     ) {
       throw new Error("Candidate no-fill evidence must be canceled with zero value and fee.");
     }
   } else if (
-    snapshot.grossQuoteValueKrw <= 0 ||
-    !Number.isFinite(snapshot.grossQuoteValueKrw / snapshot.executedQuantity)
+    isZeroDecimal(snapshot.grossQuoteValueKrw)
   ) {
     throw new Error("Candidate filled evidence must have a finite positive quote value.");
   }
@@ -191,10 +194,10 @@ export function candidateEvidenceMaterial(
     action: snapshot.action,
     entryPath: snapshot.entryPath,
     terminalStatus: snapshot.terminalStatus,
-    executedQuantity: canonicalNumberText(snapshot.executedQuantity),
-    grossQuoteValueKrw: canonicalNumberText(snapshot.grossQuoteValueKrw),
-    confirmedFeeKrw: canonicalNumberText(snapshot.confirmedFeeKrw),
-    remainingQuantity: canonicalNumberText(snapshot.remainingQuantity),
+    executedQuantity: snapshot.executedQuantity,
+    grossQuoteValueKrw: snapshot.grossQuoteValueKrw,
+    confirmedFeeKrw: snapshot.confirmedFeeKrw,
+    remainingQuantity: snapshot.remainingQuantity,
   });
   return {
     hash: createHash("sha256").update(canonical, "utf8").digest("hex"),
@@ -217,15 +220,31 @@ export function validateLeaseWindow(
   }
 }
 
-function canonicalNonNegativeNumber(value: unknown, label: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+function canonicalNonNegativeDecimal(value: unknown, label: string): PositionGuardCandidateDecimal {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new Error(`Candidate evidence ${label} must be finite and non-negative.`);
+    }
+    return canonicalDecimalText(String(Object.is(value, -0) ? 0 : value));
+  }
+  if (typeof value !== "string") {
     throw new Error(`Candidate evidence ${label} must be finite and non-negative.`);
   }
-  return Object.is(value, -0) ? 0 : value;
+  return canonicalDecimalText(value);
 }
 
-function canonicalNumberText(value: number): string {
-  return String(value);
+function canonicalDecimalText(value: string): string {
+  if (!/^(?:0|[1-9]\d*)(?:\.\d+)?$/u.test(value)) {
+    throw new Error("Candidate evidence decimal values must be non-negative decimal strings.");
+  }
+  const [whole, fractional] = value.split(".");
+  const canonicalWhole = whole!.replace(/^0+(?=\d)/u, "");
+  const canonicalFractional = fractional?.replace(/0+$/u, "") ?? "";
+  return canonicalFractional === "" ? canonicalWhole : `${canonicalWhole}.${canonicalFractional}`;
+}
+
+function isZeroDecimal(value: PositionGuardCandidateDecimal): boolean {
+  return value === 0 || value === "0";
 }
 
 function requireNonEmpty(value: string, label: string): void {

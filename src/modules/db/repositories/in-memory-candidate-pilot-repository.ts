@@ -79,6 +79,15 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
     return deployment ? { ...deployment } : null;
   }
 
+  async getDeploymentForExchangeAccount(
+    exchangeAccountId: string,
+  ): Promise<PositionGuardPilotDeploymentRecord | null> {
+    const deployment = [...this.deployments.values()].find(
+      (candidate) => candidate.exchangeAccountId === exchangeAccountId,
+    );
+    return deployment ? { ...deployment } : null;
+  }
+
   async getState(deploymentId: string): Promise<Readonly<PositionGuardCandidateState> | null> {
     const state = this.states.get(deploymentId);
     return state ? Object.freeze(cloneState(state)) : null;

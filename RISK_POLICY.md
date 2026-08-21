@@ -104,6 +104,8 @@ The execution path should validate orders through:
 - simulated `DRY_RUN` fills must not be used as exchange-balance explanations in portfolio drift detection
 - partial fills, cancel requests, rejects, and unresolved states must remain queryable
 - a typed or untyped exception from `createOrder` is uncertain unless it is a clear definitive exchange rejection; `duplicate_identifier` remains `RECONCILIATION_REQUIRED` so recovery can query by identifier without resending
+- uncertain submission recovery is lookup-only. Each UUID-first/identifier-fallback found, not-found, and transient observation is persisted with an injected-clock timestamp; transient errors never count as absence, and terminal absence requires both persisted count and elapsed-time bounds before a fault pause. Recovery never resumes execution or releases the retained lease.
+- terminal BTC candidate evidence may advance only from a persisted `STRATEGY` order with a valid persisted PositionGuard decision, terminal `FILLED` or `CANCELED` lifecycle, nonzero aggregate fills, and confirmed KRW fees on every fill. Exact decimal evidence is persisted atomically with candidate-state CAS and audit data; missing or conflicting provenance faults and pauses instead of substituting values or retrying execution.
 - if post-send local persistence fails, retain the durable `SUBMITTING` order and lease, attempt an automatic pause, and fail the run rather than retrying transmission
 
 ## Operator Controls
@@ -186,7 +188,7 @@ Registration preview is not a registration or approval path. It must remain a pu
 
 The experiment uses the fixed 120-day `[2026-08-23T08:00:00.000Z,2026-12-21T08:00:00.000Z)` no-peek window. Publication A must already contain the implementation and workflow on public `origin/main`; the registration is frozen against that commit and reserves 72 hours before `from`; Publication B then adds only the canonical registration and registry entry. The Publication B Actions evidence uses the exact run's REST `created_at`, must prove at least 48 hours of public lead time, remains non-cryptographic, and requires manual public-run confirmation plus external preservation beyond ephemeral artifact retention. Final evaluation also requires a public closure run at or after `to` plus separate manual closure and public-path-history confirmation. `PCS-2026-001` is publicly registered, and neither registration nor any prospective status grants deployment, strategy-change, `DRY_RUN`, `LIVE`, scheduler, or order approval.
 
-Candidate policy and state modules are pure, execution-disconnected, configuration-free, and have no runtime reachability. They exist only for post-closure deployment readiness; current percentage-based sizing and all execution guards are unchanged.
+Candidate policy and state modules remain pure, configuration-free, and execution-disconnected. Their reconciliation-only terminal-evidence projector has no order-send, resume, or lease-release authority; current percentage-based sizing and all execution guards are unchanged.
 
 ## Audit Expectations
 

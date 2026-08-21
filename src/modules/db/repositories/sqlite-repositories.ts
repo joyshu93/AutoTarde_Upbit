@@ -24,6 +24,7 @@ import type {
   TelegramInboundOffsetRecord,
   UserRecord,
 } from "../../../domain/types.js";
+import type { OrderSubmissionRecoveryObservationRecord } from "../../../domain/pilot-types.js";
 import type {
   SqliteBalanceSnapshotRow,
   SqliteExecutionStateRow,
@@ -35,6 +36,7 @@ import type {
   SqliteOperatorNotificationDeliveryRunRow,
   SqliteOperatorNotificationRow,
   SqliteOrderEventRow,
+  SqliteOrderSubmissionRecoveryObservationRow,
   SqliteOrderRow,
   SqlitePositionSnapshotRow,
   SqliteReconciliationRunRow,
@@ -212,6 +214,15 @@ export class SqliteExecutionRepository implements ExecutionRepository {
           LIMIT 1
         `).get(exchangeAccountId, market, strategyKey) as SqliteStrategyDecisionRow | undefined);
 
+    return row ? mapStrategyDecisionRow(row) : null;
+  }
+
+  async getStrategyDecisionById(id: string): Promise<StrategyDecisionRecord | null> {
+    const row = this.db.prepare(`
+      SELECT * FROM strategy_decisions
+      WHERE id = ?
+      LIMIT 1
+    `).get(id) as SqliteStrategyDecisionRow | undefined;
     return row ? mapStrategyDecisionRow(row) : null;
   }
 
@@ -1118,6 +1129,37 @@ export class SqliteExecutionRepository implements ExecutionRepository {
     return rows.map(mapFillRow);
   }
 
+  async saveOrderSubmissionRecoveryObservation(
+    record: OrderSubmissionRecoveryObservationRecord,
+  ): Promise<void> {
+    this.db.prepare(`
+      INSERT INTO order_submission_recovery_observations (
+        id, order_id, outcome, observed_at, observed_at_epoch_ms, detail_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO NOTHING
+    `).run(
+      record.id,
+      record.orderId,
+      record.outcome,
+      record.observedAt,
+      record.observedAtEpochMs,
+      record.detailJson,
+      record.createdAt,
+    );
+  }
+
+  async listOrderSubmissionRecoveryObservations(
+    orderId: string,
+  ): Promise<OrderSubmissionRecoveryObservationRecord[]> {
+    const rows = this.db.prepare(`
+      SELECT id, order_id, outcome, observed_at, observed_at_epoch_ms, detail_json, created_at
+      FROM order_submission_recovery_observations
+      WHERE order_id = ?
+      ORDER BY observed_at_epoch_ms ASC, id ASC
+    `).all(orderId) as unknown as SqliteOrderSubmissionRecoveryObservationRow[];
+    return rows.map(mapOrderSubmissionRecoveryObservationRow);
+  }
+
   private getRiskEventById(id: string): RiskEventRecord | null {
     const row = this.db.prepare("SELECT * FROM risk_events WHERE id = ? LIMIT 1").get(id) as SqliteRiskEventRow | undefined;
     return row ? mapRiskEventRow(row) : null;
@@ -1699,6 +1741,20 @@ function mapFillRow(row: SqliteFillRow): FillRecord {
     feeAmount: row.fee_amount,
     filledAt: row.filled_at,
     rawPayloadJson: row.raw_payload_json,
+  };
+}
+
+function mapOrderSubmissionRecoveryObservationRow(
+  row: SqliteOrderSubmissionRecoveryObservationRow,
+): OrderSubmissionRecoveryObservationRecord {
+  return {
+    id: row.id,
+    orderId: row.order_id,
+    outcome: row.outcome,
+    observedAt: row.observed_at,
+    observedAtEpochMs: row.observed_at_epoch_ms,
+    detailJson: row.detail_json,
+    createdAt: row.created_at,
   };
 }
 

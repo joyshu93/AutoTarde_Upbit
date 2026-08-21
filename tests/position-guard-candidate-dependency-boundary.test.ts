@@ -24,6 +24,7 @@ const APPROVED_PERSISTENCE_PROJECTOR_IMPORTERS = new Set([
   "/src/modules/db/pilot-interfaces.ts",
   "/src/modules/db/repositories/in-memory-candidate-pilot-repository.ts",
   "/src/modules/db/repositories/sqlite-candidate-pilot-repository.ts",
+  "/src/modules/execution/candidate-evidence-service.ts",
 ]);
 const APPROVED_PERSISTENCE_PROJECTOR =
   "/src/modules/strategy/position-guard-candidate-state.ts";

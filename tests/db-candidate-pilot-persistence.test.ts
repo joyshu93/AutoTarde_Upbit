@@ -22,6 +22,7 @@ import {
 import { verifyAccountExecutionLeaseContract } from "./account-execution-lease-contract.test.js";
 
 const MIGRATION_0018 = "0018_scope_candidate_evidence_identity_to_deployment.sql";
+const MIGRATION_0019 = "0019_store_candidate_evidence_decimals_as_text.sql";
 
 test("sqlite candidate pilot repository satisfies the common contracts", async () => {
   await withFreshBundle("candidate-contract", async (bundle) => {
@@ -33,6 +34,101 @@ test("sqlite candidate pilot repository satisfies the common contracts", async (
   await withFreshBundle("candidate-identity", async (bundle) => {
     await verifyCandidatePilotIdentityValidation(() => bundle.candidatePilots);
   });
+});
+
+test("migration 0019 stores canonical candidate evidence decimals as exact text", async () => {
+  await withFreshBundle("candidate-exact-decimals", async (bundle, _databasePath, db) => {
+    const deployment = await bundle.candidatePilots.createDeploymentWithInitialState(
+      initialDeploymentInput("candidate-exact-decimals"),
+    );
+    await bundle.candidatePilots.advanceStateWithEvidence(
+      advanceInput(deployment.id, "exact-decimal-evidence", 0, {
+        executedQuantity: "0.123456789123456789",
+        grossQuoteValueKrw: "12345678.987654321",
+        confirmedFeeKrw: "1234.567890123",
+        remainingQuantity: "0.123456789123456789",
+      }),
+    );
+
+    const migration = db.prepare(
+      "SELECT filename FROM _schema_migrations WHERE filename = ?",
+    ).get(MIGRATION_0019) as { filename: string } | undefined;
+    const evidence = db.prepare(`
+      SELECT
+        typeof(executed_quantity) AS executed_quantity_type,
+        executed_quantity,
+        gross_quote_value_krw,
+        confirmed_fee_krw,
+        remaining_quantity
+      FROM strategy_candidate_execution_evidence
+      WHERE deployment_id = ? AND id = ?
+    `).get(deployment.id, "exact-decimal-evidence") as {
+      executed_quantity_type: string;
+      executed_quantity: string;
+      gross_quote_value_krw: string;
+      confirmed_fee_krw: string;
+      remaining_quantity: string;
+    } | undefined;
+
+    assert.equal(migration?.filename, MIGRATION_0019);
+    assert.equal(evidence?.executed_quantity_type, "text");
+    assert.equal(evidence?.executed_quantity, "0.123456789123456789");
+    assert.equal(evidence?.gross_quote_value_krw, "12345678.987654321");
+    assert.equal(evidence?.confirmed_fee_krw, "1234.567890123");
+    assert.equal(evidence?.remaining_quantity, "0.123456789123456789");
+    assertDatabaseIntegrity(db);
+  });
+});
+
+test("migration 0019 upgrades existing candidate evidence without losing state", async () => {
+  const databasePath = await createTempDatabasePath("upgrade-0019");
+  await createAppliedOriginal0017Fixture(databasePath);
+
+  const before = new DatabaseSync(databasePath);
+  try {
+    before.exec(await readFile(path.resolve(process.cwd(), "migrations", MIGRATION_0018), "utf8"));
+    before.prepare(
+      "INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)",
+    ).run(MIGRATION_0018, "2026-08-21T00:00:00.000Z");
+    const repository = new SqliteCandidatePilotRepository(before);
+    await repository.advanceStateWithEvidence(
+      advanceInput("original-0017-primary", "pre-0019-evidence", 1, {
+        action: "ADD",
+        executedAt: "2026-08-21T00:00:02.000Z",
+        executedQuantity: 0.1,
+        grossQuoteValueKrw: 10_000_000,
+        confirmedFeeKrw: 5_000,
+        remainingQuantity: 0.2,
+      }),
+    );
+  } finally {
+    before.close();
+  }
+
+  const handle = openSqliteDatabase(databasePath);
+  try {
+    const migration = handle.db.prepare(
+      "SELECT filename FROM _schema_migrations WHERE filename = ?",
+    ).get(MIGRATION_0019) as { filename: string } | undefined;
+    const evidence = handle.db.prepare(`
+      SELECT typeof(executed_quantity) AS value_type, executed_quantity
+      FROM strategy_candidate_execution_evidence
+      WHERE deployment_id = ? AND id = ?
+    `).get("original-0017-primary", "pre-0019-evidence") as {
+      value_type: string;
+      executed_quantity: string;
+    } | undefined;
+    const repository = new SqliteCandidatePilotRepository(handle.db);
+
+    assert.equal(migration?.filename, MIGRATION_0019);
+    assert.equal(evidence?.value_type, "text");
+    assert.equal(evidence?.executed_quantity, "0.1");
+    assert.equal((await repository.getState("original-0017-primary"))?.stateVersion, 2);
+    assertDatabaseIntegrity(handle.db);
+  } finally {
+    handle.close();
+    await cleanupTempDatabase(databasePath);
+  }
 });
 
 test("sqlite candidate evidence identity is scoped to its deployment", async () => {

@@ -10,6 +10,7 @@ import { InlineTelegramSyncController } from "./sync-controller.js";
 import type { ExecutionRepository, OperatorStateStore } from "../modules/db/interfaces.js";
 import type { SqlitePersistenceBundle } from "../modules/db/repositories/contracts.js";
 import { createSqlitePersistence } from "../modules/db/repositories/sqlite-repositories.js";
+import { CandidateExecutionEvidenceService } from "../modules/execution/candidate-evidence-service.js";
 import { ExecutionService } from "../modules/execution/execution-service.js";
 import {
   DryRunExchangeAdapter,
@@ -20,7 +21,10 @@ import {
 import { UpbitPublicTickerClient } from "../modules/exchange/upbit/public-client.js";
 import { UpbitPrivateClient } from "../modules/exchange/upbit/private-client.js";
 import { PortfolioSyncService } from "../modules/reconciliation/portfolio-sync-service.js";
-import { ReconciliationService } from "../modules/reconciliation/reconciliation-service.js";
+import {
+  DEFAULT_IDENTIFIER_RECOVERY_POLICY,
+  ReconciliationService,
+} from "../modules/reconciliation/reconciliation-service.js";
 import { DeterministicStubStrategy } from "../modules/strategy/deterministic-strategy.js";
 import {
   createDefaultPositionGuardRunnerConfig,
@@ -44,6 +48,7 @@ export interface AppServices {
   repositories: ExecutionRepository;
   operatorState: OperatorStateStore;
   executionService: ExecutionService;
+  candidateEvidenceService: CandidateExecutionEvidenceService;
   reconciliationService: ReconciliationService;
   portfolioSyncService: PortfolioSyncService;
   telegramRouter: TelegramCommandRouter;
@@ -136,6 +141,24 @@ export function createApp(
     operatorState,
     reporter,
   });
+  const recoveryClock = {
+    now: () => {
+      const observedAt = new Date().toISOString();
+      return { observedAt, observedAtEpochMs: Date.parse(observedAt) };
+    },
+  };
+  const candidateEvidenceService = new CandidateExecutionEvidenceService({
+    exchangeAccountId: "primary",
+    repositories,
+    pilotRepository: persistence.candidatePilots,
+    operatorState,
+    clock: {
+      now: () => {
+        const occurredAt = new Date().toISOString();
+        return { occurredAt, occurredAtEpochMs: Date.parse(occurredAt) };
+      },
+    },
+  });
   const positionGuardRunner = new PositionGuardStrategyRunner({
     repositories,
     executionService,
@@ -163,6 +186,9 @@ export function createApp(
     closedOrderLookbackDays: config.reconciliationClosedOrderLookbackDays,
     historyStopBeforeDays: config.reconciliationHistoryStopBeforeDays,
     historyRetentionAssumptionDays: config.reconciliationHistoryRetentionAssumptionDays,
+    identifierRecovery: DEFAULT_IDENTIFIER_RECOVERY_POLICY,
+    recoveryClock,
+    candidateEvidenceService,
     ...(exchangeBackedReadEnabled ? {
       orderReader: privateExchangeAdapter,
       orderHistoryReader: privateExchangeAdapter,
@@ -303,6 +329,7 @@ export function createApp(
     repositories,
     operatorState,
     executionService,
+    candidateEvidenceService,
     reconciliationService,
     portfolioSyncService,
     telegramRouter,

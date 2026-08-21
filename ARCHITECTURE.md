@@ -162,6 +162,8 @@ Current slice:
 - exchange-backed active-order reconciliation through `/sync`
 - local dry-run order repair during reconciliation, so `dryrun_*` UUIDs are never queried against Upbit as real exchange orders
 - terminal-order fill backfill during `/sync`
+- bounded `RECONCILIATION_REQUIRED` / `SUBMITTING` identifier recovery using injected-clock, persisted lookup observations; it tries a persisted UUID before identifier fallback, never resends, and only records terminal exchange absence after both the configured persisted not-found count and elapsed-time bounds are met
+- terminal BTC candidate evidence projection after durable order/fill backfill; it validates persisted deployment, decision, order, fill, fee, quantity, timestamp, and lifecycle provenance, then uses the candidate repository's atomic evidence/state-CAS/audit contract with exact decimal text values
 - balance and position drift detection by comparing new exchange-backed snapshots against the prior persisted snapshots plus local fill history, using parsed timestamp instants rather than raw timestamp text
 - fill backfill preserves Upbit order-level `paid_fee` as KRW fill-fee evidence when individual trade rows omit fee data, and KRW balance drift detection tolerates only explicit 1 KRW rounding dust after fee-adjusted fills
 - portfolio drift detection re-evaluates otherwise-drifting windows with a bounded one-second fill-start grace so Upbit trade timestamps rounded to whole seconds do not create false drift when the fill explains the later snapshot
@@ -363,7 +365,7 @@ The workflow has only `contents: read` and `actions: read`. It performs one evid
 
 Static dependency characterization walks the prospective graph recursively. It forbids app, execution, exchange, reconciliation, Telegram, migrations, scheduler/runtime, SQLite/operational DB, Upbit acquisition, secret, and operational process-control dependencies, and it forbids the runtime graph from importing prospective modules. The only process exception is narrowly scoped read-only `git` inspection used to verify public commitment and the exact clean implementation checkout. No result enters strategy, order, scheduler, Telegram, migration, or LIVE dependency graphs. `PCS-2026-001` is publicly registered for the immutable window `[2026-08-23T08:00:00.000Z,2026-12-21T08:00:00.000Z)`; registration grants no deployment, `DRY_RUN`, scheduler, order, or `LIVE` authority.
 
-Candidate policy and state modules are pure, execution-disconnected, configuration-free, and have no runtime reachability. They exist only for post-closure deployment readiness; current percentage-based sizing and all execution guards are unchanged.
+Candidate policy and state modules remain pure, configuration-free, and execution-disconnected. The separately bounded candidate evidence projector is reconciliation-only: it consumes durable terminal evidence, never sends or resumes an order, and does not alter current percentage-based sizing or execution guards.
 
 The prospective CLI `preview` path is stricter than registration inspection: it samples the clock once and uses only pure registration construction and serialization. It has no writer or read adapter, performs no Git, network, database, runtime, or operational call, and returns `NOT_REGISTERED` with explicit zero-side-effect flags. A later `register` invocation independently samples its clock and is the only path that may create the canonical registration and registry files.
 
