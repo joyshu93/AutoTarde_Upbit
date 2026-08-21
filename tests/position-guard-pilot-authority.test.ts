@@ -53,3 +53,30 @@ test("pilot authority rejects an inherited abandonment record with unrelated own
 
   assert.throws(() => validatePositionGuardPilotAbandonment(inheritedRecord));
 });
+
+test("pilot authority rejects non-enumerable required keys with unrelated enumerable keys", () => {
+  const nonEnumerableRecord = Object.create(null) as Record<string, unknown>;
+  Object.defineProperties(
+    nonEnumerableRecord,
+    Object.fromEntries(
+      Object.entries(EXACT_ABANDONED_EVENT).map(([key, value]) => [key, {
+        configurable: true,
+        enumerable: false,
+        value,
+        writable: true,
+      }]),
+    ),
+  );
+  Object.assign(nonEnumerableRecord, {
+    unrelated1: true,
+    unrelated2: true,
+    unrelated3: true,
+    unrelated4: true,
+    unrelated5: true,
+    unrelated6: true,
+    unrelated7: true,
+    unrelated8: true,
+  });
+
+  assert.throws(() => validatePositionGuardPilotAbandonment(nonEnumerableRecord));
+});

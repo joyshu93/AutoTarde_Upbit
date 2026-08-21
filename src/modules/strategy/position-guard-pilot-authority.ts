@@ -13,6 +13,7 @@ const EXACT_ABANDONED_RECORD = Object.freeze({
   registrationPayloadSha256: "978e31695707453507fa604bae71f3f1657a061f891e621f2026f1e293c53b40",
   schemaVersion: 1,
 } as const);
+const EXACT_ABANDONED_KEYS = Object.keys(EXACT_ABANDONED_RECORD);
 
 export function validatePositionGuardPilotAbandonment(
   value: unknown,
@@ -35,7 +36,13 @@ function isExactAbandonedRecord(value: unknown): value is PositionGuardPilotAban
 
   const candidate = value as Record<string, unknown>;
   const expectedEntries = Object.entries(EXACT_ABANDONED_RECORD);
-  if (Object.keys(candidate).length !== expectedEntries.length) {
+  const candidateKeys = Reflect.ownKeys(candidate);
+  if (
+    candidateKeys.length !== EXACT_ABANDONED_KEYS.length
+    || !candidateKeys.every(
+      (key) => typeof key === "string" && EXACT_ABANDONED_KEYS.includes(key),
+    )
+  ) {
     return false;
   }
 
