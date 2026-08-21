@@ -16,7 +16,7 @@ import type {
   StrategySchedulerRunRecord,
   StrategyDecisionRecord,
 } from "../src/domain/types.js";
-import type { ExecutionRepository } from "../src/modules/db/interfaces.js";
+import type { ExecutionRepository, OperatorStateStore } from "../src/modules/db/interfaces.js";
 import {
   InMemoryExecutionRepository,
   InMemoryOperatorStateStore,
@@ -54,6 +54,8 @@ test("in-memory atomic lifecycle writes are idempotent, validated, and detached"
 });
 
 test("in-memory automatic fault pauses are idempotent and preserve kill switches", async () => {
+  await assertFaultTimestampPrecisionContract(createInMemoryOperatorState());
+
   const operatorState = createInMemoryOperatorState();
   const fault = {
     exchangeAccountId: "primary",
@@ -109,6 +111,11 @@ test("sqlite atomic lifecycle writes roll back conflicts and fault pauses stay s
   try {
     const repositories = bundle.repositories;
     await assertAtomicLifecycleContract(repositories);
+    await assertFaultTimestampPrecisionContract(
+      bundle.operatorState,
+      "2099-08-21T00:00:00.000000009Z",
+      "2099-08-21T09:00:00.000000009+09:00",
+    );
 
     const original = createOrderRecord({
       id: "rollback-order",
@@ -170,7 +177,7 @@ test("sqlite atomic lifecycle writes roll back conflicts and fault pauses stay s
     assert.deepEqual(await bundle.operatorState.getState(), state);
     assert.equal(
       (await bundle.operatorState.listTransitions()).filter((transition) => transition.command === "AUTOMATIC_PAUSE").length,
-      2,
+      4,
     );
   } finally {
     bundle.close();
@@ -1597,6 +1604,37 @@ function toReconciliationRequiredOrder(order: OrderRecord): OrderRecord {
     failureMessage: "Submission outcome requires reconciliation.",
     updatedAt: "2026-08-21T00:00:04.000Z",
   };
+}
+
+async function assertFaultTimestampPrecisionContract(
+  operatorState: OperatorStateStore,
+  latestOccurredAt = "2026-08-21T00:00:00.000000009Z",
+  offsetEquivalentOccurredAt = "2026-08-21T09:00:00.000000009+09:00",
+): Promise<void> {
+  const latestFault = {
+    exchangeAccountId: "primary",
+    faultId: "nanosecond-latest-fault",
+    reason: "NANOSECOND_PRECISION",
+    occurredAt: latestOccurredAt,
+  };
+  await operatorState.pauseForFault(latestFault);
+  await assert.rejects(operatorState.pauseForFault({
+    ...latestFault,
+    faultId: "nanosecond-rewind-fault",
+    occurredAt: latestOccurredAt.replace("000000009", "000000001"),
+  }));
+
+  const offsetEquivalentFault = {
+    ...latestFault,
+    faultId: "nanosecond-offset-equivalent-fault",
+    occurredAt: offsetEquivalentOccurredAt,
+  };
+  await operatorState.pauseForFault(offsetEquivalentFault);
+  assert.equal((await operatorState.getState()).updatedAt, offsetEquivalentFault.occurredAt);
+  assert.equal(
+    (await operatorState.listTransitions()).filter((transition) => transition.command === "AUTOMATIC_PAUSE").length,
+    2,
+  );
 }
 
 function createOrderEvent(orderId: string, id: string, eventType: string): OrderEventRecord {

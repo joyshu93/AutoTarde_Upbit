@@ -173,10 +173,13 @@ function validateFills(order: OrderRecord, fills: FillRecord[]): void {
   }
 }
 
-function parseStrictIsoTimestamp(input: string, label: string): number {
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|([+-])(\d{2}):(\d{2}))$/.exec(input);
+function parseStrictIsoTimestamp(input: string, label: string): bigint {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|([+-])(\d{2}):(\d{2}))$/.exec(input);
   if (!match) throw new Error(`${label} must be an ISO-8601 timestamp with explicit timezone.`);
-  const [, yearText, monthText, dayText, hourText, minuteText, secondText, , , offsetHourText, offsetMinuteText] = match;
+  const [
+    , yearText, monthText, dayText, hourText, minuteText, secondText, fractionText,
+    timezoneText, , offsetHourText, offsetMinuteText,
+  ] = match;
   const year = Number(yearText); const month = Number(monthText); const day = Number(dayText);
   const hour = Number(hourText); const minute = Number(minuteText); const second = Number(secondText);
   const offsetHour = offsetHourText === undefined ? 0 : Number(offsetHourText);
@@ -185,7 +188,10 @@ function parseStrictIsoTimestamp(input: string, label: string): number {
   if (month < 1 || month > 12 || day < 1 || day > daysInMonth || hour > 23 || minute > 59 || second > 59 || offsetHour > 23 || offsetMinute > 59) {
     throw new Error(`${label} must be a valid ISO-8601 timestamp.`);
   }
-  const timestamp = Date.parse(input);
-  if (!Number.isFinite(timestamp)) throw new Error(`${label} must be a valid ISO-8601 timestamp.`);
-  return timestamp;
+  const wholeSecondTimestamp = Date.parse(
+    `${yearText}-${monthText}-${dayText}T${hourText}:${minuteText}:${secondText}${timezoneText}`,
+  );
+  if (!Number.isFinite(wholeSecondTimestamp)) throw new Error(`${label} must be a valid ISO-8601 timestamp.`);
+  const fractionNanoseconds = BigInt((fractionText ?? "").padEnd(9, "0"));
+  return BigInt(wholeSecondTimestamp) * 1_000_000n + fractionNanoseconds;
 }
