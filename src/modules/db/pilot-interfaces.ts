@@ -6,6 +6,8 @@ import type {
   PositionGuardPilotAuditEventRecord,
   PositionGuardPilotDeploymentRecord,
 } from "../../domain/pilot-types.js";
+import type { ExecutionStateRecord, ExecutionStateTransitionRecord } from "../../domain/types.js";
+import type { FaultPauseInput } from "./interfaces.js";
 import {
   canonicalNonNegativeDecimal,
   type ExactCandidateState,
@@ -49,6 +51,40 @@ export interface CandidateEvidenceRecord {
   materialVersion: CandidateMaterialVersion;
 }
 
+export type CandidatePilotRecoveryFaultReason =
+  | "SNAPSHOT_PROVENANCE_INVALID"
+  | "STALE_SNAPSHOT"
+  | "IDENTITY_MISMATCH"
+  | "REPLAY_MISMATCH"
+  | "INVENTORY_MISMATCH"
+  | "BLOCKING_RECONCILIATION"
+  | "ACTIVE_ORDER"
+  | "UNCERTAIN_ORDER"
+  | "ACTIVATION_CAS_CONFLICT";
+
+export interface PauseCandidatePilotForRecoveryFaultInput {
+  deploymentId: string;
+  exchangeAccountId: string;
+  faultId: string;
+  reasonCode: CandidatePilotRecoveryFaultReason;
+  provenanceJson: string;
+  occurredAt: string;
+}
+
+export interface PauseCandidatePilotForRecoveryFaultResult {
+  deployment: PositionGuardPilotDeploymentRecord;
+  executionState: ExecutionStateRecord;
+  auditEvent: PositionGuardPilotAuditEventRecord;
+  duplicate: boolean;
+}
+
+export interface InMemoryAtomicFaultPauseStore {
+  getState(): Promise<ExecutionStateRecord>;
+  listTransitions(limit?: number): Promise<ExecutionStateTransitionRecord[]>;
+  getTransitionById?(id: string): Promise<ExecutionStateTransitionRecord | null>;
+  applyFaultPauseAtomically(input: FaultPauseInput): ExecutionStateRecord;
+}
+
 export interface CandidatePilotRepository {
   createDeploymentWithInitialState(
     input: CreateCandidatePilotDeploymentInput,
@@ -79,6 +115,9 @@ export interface CandidatePilotRepository {
   advanceStateWithEvidence(
     input: AdvanceCandidatePilotStateInput,
   ): Promise<AdvanceCandidatePilotStateResult>;
+  pauseForRecoveryFault(
+    input: PauseCandidatePilotForRecoveryFaultInput,
+  ): Promise<PauseCandidatePilotForRecoveryFaultResult>;
 }
 
 export interface AcquireAccountExecutionLeaseInput {
@@ -288,6 +327,51 @@ export function candidateEvidenceMaterial(
     epochNanoseconds,
     evidence: snapshot,
     materialVersion: "EXACT_V2",
+  };
+}
+
+export function validateCandidatePilotRecoveryFaultInput(
+  input: PauseCandidatePilotForRecoveryFaultInput,
+): void {
+  requireNonEmpty(input.deploymentId, "candidate recovery fault deploymentId");
+  requireNonEmpty(input.exchangeAccountId, "candidate recovery fault exchangeAccountId");
+  requireNonEmpty(input.faultId, "candidate recovery fault faultId");
+  requireNonEmpty(input.reasonCode, "candidate recovery fault reasonCode");
+  parsePositionGuardCandidateTimestamp(input.occurredAt, "candidate recovery fault occurredAt");
+  let provenance: unknown;
+  try {
+    provenance = JSON.parse(input.provenanceJson) as unknown;
+  } catch {
+    throw new Error("Candidate recovery fault provenanceJson must be valid JSON.");
+  }
+  if (provenance === null || typeof provenance !== "object" || Array.isArray(provenance)) {
+    throw new Error("Candidate recovery fault provenanceJson must contain an object.");
+  }
+}
+
+export function candidatePilotRecoveryFaultReason(
+  input: PauseCandidatePilotForRecoveryFaultInput,
+): string {
+  return `candidate_pilot_recovery:${input.reasonCode}; provenance=${input.provenanceJson}`;
+}
+
+export function buildCandidatePilotRecoveryFaultAuditEvent(input: {
+  fault: PauseCandidatePilotForRecoveryFaultInput;
+  fromPhase: PositionGuardPilotDeploymentRecord["phase"];
+  stateVersion: number;
+}): PositionGuardPilotAuditEventRecord {
+  return {
+    id: input.fault.faultId,
+    deploymentId: input.fault.deploymentId,
+    eventType: "FAULT_PAUSED",
+    fromPhase: input.fromPhase,
+    toPhase: "PAUSED_FAULT",
+    stateVersion: input.stateVersion,
+    payloadJson: JSON.stringify({
+      reasonCode: input.fault.reasonCode,
+      provenanceJson: input.fault.provenanceJson,
+    }),
+    createdAt: input.fault.occurredAt,
   };
 }
 

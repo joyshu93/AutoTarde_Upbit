@@ -18,14 +18,20 @@ import {
 } from "../../strategy/position-guard-candidate-state.js";
 import {
   candidateEvidenceMaterial,
+  buildCandidatePilotRecoveryFaultAuditEvent,
+  candidatePilotRecoveryFaultReason,
   validateCandidateExecutionBinding,
   validateCandidatePilotDeployment,
+  validateCandidatePilotRecoveryFaultInput,
   type AdvanceCandidatePilotStateInput,
   type AdvanceCandidatePilotStateResult,
   type ActivateCandidatePilotDeploymentInput,
   type CandidateEvidenceRecord,
   type CandidatePilotRepository,
   type CreateCandidatePilotDeploymentInput,
+  type InMemoryAtomicFaultPauseStore,
+  type PauseCandidatePilotForRecoveryFaultInput,
+  type PauseCandidatePilotForRecoveryFaultResult,
 } from "../pilot-interfaces.js";
 
 interface StoredEvidence {
@@ -39,6 +45,8 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
   private readonly evidence = new Map<string, StoredEvidence[]>();
   private readonly auditEvents = new Map<string, PositionGuardPilotAuditEventRecord[]>();
   private readonly bindingsByOrderId = new Map<string, CandidateExecutionBindingRecord>();
+
+  constructor(private readonly atomicFaultPauseStore?: InMemoryAtomicFaultPauseStore) {}
 
   async createDeploymentWithInitialState(
     input: CreateCandidatePilotDeploymentInput,
@@ -272,6 +280,113 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
       duplicate: false,
     };
   }
+
+  async pauseForRecoveryFault(
+    input: PauseCandidatePilotForRecoveryFaultInput,
+  ): Promise<PauseCandidatePilotForRecoveryFaultResult> {
+    validateCandidatePilotRecoveryFaultInput(input);
+    if (!this.atomicFaultPauseStore) {
+      throw new Error("In-memory candidate recovery faults require an atomic fault-pause store.");
+    }
+    const deployment = this.deployments.get(input.deploymentId);
+    const state = this.exactStates.get(input.deploymentId);
+    if (!deployment || !state || deployment.exchangeAccountId !== input.exchangeAccountId) {
+      throw new Error("Candidate recovery fault deployment provenance does not match persisted state.");
+    }
+    const existingAudit = (this.auditEvents.get(input.deploymentId) ?? [])
+      .find((event) => event.id === input.faultId);
+    const existingTransition = this.atomicFaultPauseStore.getTransitionById
+      ? await this.atomicFaultPauseStore.getTransitionById(input.faultId)
+      : (await this.atomicFaultPauseStore.listTransitions(Number.MAX_SAFE_INTEGER))
+        .find((transition) => transition.id === input.faultId) ?? null;
+    const executionState = await this.atomicFaultPauseStore.getState();
+    if (existingAudit || existingTransition) {
+      if (!existingAudit || !existingTransition || deployment.phase !== "PAUSED_FAULT" ||
+        deployment.updatedAt !== input.occurredAt ||
+        (executionState.systemStatus !== "PAUSED" && executionState.systemStatus !== "KILL_SWITCHED")) {
+        throw new Error(`Conflicting partial candidate recovery fault ${input.faultId}.`);
+      }
+      if (existingAudit.fromPhase === null || !isFaultPausablePhase(existingAudit.fromPhase)) {
+        throw new Error(`Conflicting duplicate candidate recovery fault ${input.faultId}.`);
+      }
+      const expectedAudit = buildCandidatePilotRecoveryFaultAuditEvent({
+        fault: input,
+        fromPhase: existingAudit.fromPhase,
+        stateVersion: state.stateVersion,
+      });
+      const expectedReason = `faultId=${input.faultId}; reason=${candidatePilotRecoveryFaultReason(input)}`;
+      if (!sameAuditEvent(existingAudit, expectedAudit) ||
+        existingTransition.command !== "AUTOMATIC_PAUSE" ||
+        existingTransition.exchangeAccountId !== input.exchangeAccountId ||
+        existingTransition.reason !== expectedReason) {
+        throw new Error(`Conflicting duplicate candidate recovery fault ${input.faultId}.`);
+      }
+      return {
+        deployment: { ...deployment },
+        executionState,
+        auditEvent: { ...existingAudit },
+        duplicate: true,
+      };
+    }
+    if (!isFaultPausablePhase(deployment.phase)) {
+      throw new Error(`Candidate recovery fault cannot pause phase ${deployment.phase}.`);
+    }
+    const occurredAtEpoch = parsePositionGuardCandidateTimestamp(
+      input.occurredAt,
+      "candidate recovery fault occurredAt",
+    );
+    const latestAuditEpoch = (this.auditEvents.get(input.deploymentId) ?? []).reduce<bigint | null>(
+      (latest, event) => {
+        const epoch = parsePositionGuardCandidateTimestamp(event.createdAt, "candidate audit createdAt");
+        return latest === null || epoch > latest ? epoch : latest;
+      },
+      null,
+    );
+    if (
+      occurredAtEpoch < parsePositionGuardCandidateTimestamp(deployment.updatedAt, "deployment updatedAt") ||
+      (latestAuditEpoch !== null && occurredAtEpoch < latestAuditEpoch)
+    ) {
+      throw new Error("Candidate recovery fault cannot precede deployment chronology.");
+    }
+    const auditEvent = buildCandidatePilotRecoveryFaultAuditEvent({
+      fault: input,
+      fromPhase: deployment.phase,
+      stateVersion: state.stateVersion,
+    });
+    const nextExecutionState = this.atomicFaultPauseStore.applyFaultPauseAtomically({
+      exchangeAccountId: input.exchangeAccountId,
+      faultId: input.faultId,
+      reason: candidatePilotRecoveryFaultReason(input),
+      occurredAt: input.occurredAt,
+    });
+    const pausedDeployment: PositionGuardPilotDeploymentRecord = {
+      ...deployment,
+      phase: "PAUSED_FAULT",
+      updatedAt: input.occurredAt,
+    };
+    this.deployments.set(input.deploymentId, pausedDeployment);
+    this.auditEvents.set(input.deploymentId, [
+      ...(this.auditEvents.get(input.deploymentId) ?? []),
+      auditEvent,
+    ]);
+    return {
+      deployment: { ...pausedDeployment },
+      executionState: { ...nextExecutionState },
+      auditEvent: { ...auditEvent },
+      duplicate: false,
+    };
+  }
+}
+
+function isFaultPausablePhase(phase: PositionGuardPilotDeploymentRecord["phase"]): boolean {
+  return phase === "PENDING_FLAT" || phase === "ACTIVE" || phase === "DRAINING";
+}
+
+function sameAuditEvent(
+  left: PositionGuardPilotAuditEventRecord,
+  right: PositionGuardPilotAuditEventRecord,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function orderedEvidence(records: readonly StoredEvidence[]): StoredEvidence[] {
