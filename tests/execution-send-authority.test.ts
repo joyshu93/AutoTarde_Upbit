@@ -163,6 +163,83 @@ test("a final execution-state read failure pauses and prevents the send", async 
   assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
 });
 
+test("a final LIVE mode transition blocks the configured live send path", async () => {
+  const operatorState = new FinalAuthorityDriftOperatorStateStore(
+    createRunningState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    createRunningState({ executionMode: "DRY_RUN", liveExecutionGate: "DISABLED" }),
+  );
+  const exchange = createCountingAdapter();
+  const { service, repositories } = await createService({
+    operatorState,
+    exchangeAdapter: exchange,
+    sendPath: "LIVE_ADAPTER",
+  });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /final pre-send authority check/i);
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+});
+
+test("a final LIVE gate transition blocks the configured live send path", async () => {
+  const operatorState = new FinalAuthorityDriftOperatorStateStore(
+    createRunningState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    createRunningState({ executionMode: "LIVE", liveExecutionGate: "DISABLED" }),
+  );
+  const exchange = createCountingAdapter();
+  const { service, repositories } = await createService({
+    operatorState,
+    exchangeAdapter: exchange,
+    sendPath: "LIVE_ADAPTER",
+  });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /final pre-send authority check/i);
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+});
+
+test("a final mode and gate mismatch blocks the configured dry-run send path", async () => {
+  const operatorState = new FinalAuthorityDriftOperatorStateStore(
+    createRunningState(),
+    createRunningState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+  );
+  const exchange = createCountingAdapter();
+  const { service, repositories } = await createService({ operatorState, exchangeAdapter: exchange });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /final pre-send authority check/i);
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+});
+
+test("an initial active-order read failure pauses and prevents the send", async () => {
+  const repositories = new FailingInitialActiveOrdersRepository();
+  const exchange = createCountingAdapter();
+  const { service, operatorState } = await createService({ repositories, exchangeAdapter: exchange });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /initial post-acquisition authority check/i);
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+});
+
+test("an initial execution-state read failure pauses and prevents the send", async () => {
+  const operatorState = new FailingInitialStateReadOperatorStateStore(createRunningState());
+  const exchange = createCountingAdapter();
+  const { service, repositories } = await createService({ operatorState, exchangeAdapter: exchange });
+
+  await assert.rejects(service.submitOrderFromDecision(validInput()), /initial post-acquisition authority check/i);
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await repositories.listRiskEvents("primary"))[0]?.ruleCode, "ACCOUNT_EXECUTION_LEASE_BLOCKED");
+});
+
 test("unsafe lease expiry arithmetic records risk and pauses before any order exists", async () => {
   const { service, repositories, operatorState } = await createService({ accountExecutionLeaseMs: Number.MAX_SAFE_INTEGER });
 
@@ -382,6 +459,7 @@ async function createService(overrides: {
   operatorState?: InMemoryOperatorStateStore;
   accountExecutionLeaseMs?: number;
   now?: () => string;
+  sendPath?: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
 } = {}) {
   const repositories = overrides.repositories ?? new InMemoryExecutionRepository();
   const operatorState = overrides.operatorState ?? new InMemoryOperatorStateStore(createRunningState());
@@ -394,6 +472,7 @@ async function createService(overrides: {
       minimumOrderValueKrw: 5_000,
     },
     exchangeAdapter: overrides.exchangeAdapter ?? new DryRunExchangeAdapter(),
+    sendPath: overrides.sendPath ?? "DRY_RUN_ADAPTER",
     repositories,
     accountExecutionLeases,
     accountExecutionLeaseMs: overrides.accountExecutionLeaseMs ?? 30_000,
@@ -440,6 +519,33 @@ class FailingFinalStateReadOperatorStateStore extends InMemoryOperatorStateStore
   }
 }
 
+class FailingInitialStateReadOperatorStateStore extends InMemoryOperatorStateStore {
+  private reads = 0;
+
+  override async getState(): Promise<ExecutionStateRecord> {
+    this.reads += 1;
+    if (this.reads === 1) throw new Error("injected initial state read failure");
+    return super.getState();
+  }
+}
+
+class FinalAuthorityDriftOperatorStateStore extends InMemoryOperatorStateStore {
+  private reads = 0;
+
+  constructor(
+    initialState: ExecutionStateRecord,
+    private readonly finalState: ExecutionStateRecord,
+  ) {
+    super(initialState);
+  }
+
+  override async getState(): Promise<ExecutionStateRecord> {
+    this.reads += 1;
+    if (this.reads === 2) return { ...this.finalState };
+    return super.getState();
+  }
+}
+
 class FailingFinalActiveOrdersRepository extends InMemoryExecutionRepository {
   private reads = 0;
 
@@ -450,13 +556,19 @@ class FailingFinalActiveOrdersRepository extends InMemoryExecutionRepository {
   }
 }
 
+class FailingInitialActiveOrdersRepository extends InMemoryExecutionRepository {
+  override async listActiveOrders(): Promise<[]> {
+    throw new Error("injected initial active-order read failure");
+  }
+}
+
 class FailingLeaseRiskRepository extends InMemoryExecutionRepository {
   override async saveRiskEvent(): Promise<void> {
     throw new Error("injected lease risk persistence failure");
   }
 }
 
-function createRunningState(): ExecutionStateRecord {
+function createRunningState(overrides: Partial<ExecutionStateRecord> = {}): ExecutionStateRecord {
   return {
     id: "state-1",
     exchangeAccountId: "primary",
@@ -468,6 +580,7 @@ function createRunningState(): ExecutionStateRecord {
     degradedReason: null,
     degradedAt: null,
     updatedAt: "2026-04-20T00:00:00.000Z",
+    ...overrides,
   };
 }
 

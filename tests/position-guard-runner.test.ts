@@ -385,6 +385,7 @@ function createExecutionService(
       minimumOrderValueKrw: 5_000,
     },
     exchangeAdapter,
+    sendPath: "DRY_RUN_ADAPTER",
     validationAdapter: exchangeAdapter,
     repositories,
     accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),

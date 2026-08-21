@@ -102,7 +102,7 @@ The intended live path is:
 4. risk approve and run Upbit order-chance and order-test validation
 5. atomically persist `PERSISTED` plus `ORDER_PERSISTED`
 6. transition the durable order to `SUBMITTING`
-7. renew and verify lease ownership, re-read account-wide active orders, then make authoritative execution state the final awaited check before calling the exchange adapter exactly once
+7. renew and verify lease ownership, re-read account-wide active orders, then make authoritative execution state the final awaited check before calling the exchange adapter exactly once; the configured `LIVE` path requires persisted `LIVE`/`ENABLED` mode and gate, while the configured `DRY_RUN` path requires persisted `DRY_RUN`/`DISABLED`
 8. atomically store accepted, definitive rejection, or uncertain-submission evidence; every immediate `FILLED` result includes distinct submitted and terminal event ids plus fill evidence in the same transaction
 9. reconcile until terminal state is consistent
 

@@ -23,6 +23,7 @@ export class ExecutionService {
     private readonly dependencies: {
       riskLimits: ExecutionRiskLimits;
       exchangeAdapter: ExchangeAdapter;
+      sendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
       validationAdapter?: Pick<ExchangeAdapter, "getOrderChance" | "testOrder">;
       repositories: ExecutionRepository;
       accountExecutionLeases: AccountExecutionLeaseStore;
@@ -108,7 +109,22 @@ export class ExecutionService {
     let releaseLease = true;
     try {
 
-    const accountActiveOrders = await this.dependencies.repositories.listActiveOrders(input.exchangeAccountId);
+    let accountActiveOrders: OrderRecord[];
+    let state: ExecutionStateRecord;
+    try {
+      accountActiveOrders = await this.dependencies.repositories.listActiveOrders(input.exchangeAccountId);
+      state = await this.dependencies.operatorState.getState();
+    } catch {
+      releaseLease = false;
+      await this.recordLeaseBlockedAndPause({
+        input,
+        idempotencyKey,
+        market,
+        occurredAt: this.currentTimestamp(),
+        reason: "Initial post-acquisition authority check is ambiguous; order submission is blocked pending recovery.",
+      });
+      throw new AccountExecutionLeaseSafetyError("Initial post-acquisition authority check failed.");
+    }
     if (accountActiveOrders.length > 0) {
       const message = "Account execution lease is blocked by active or uncertain local orders pending recovery.";
       try {
@@ -120,7 +136,6 @@ export class ExecutionService {
       return { accepted: false, outcome: "LEASE_BLOCKED", order: null, reason: message };
     }
 
-    const state = await this.dependencies.operatorState.getState();
     const policy = composeExecutionPolicy(state, this.dependencies.riskLimits);
     const openOrders = accountActiveOrders;
     const portfolio = await this.dependencies.repositories.getPortfolioExposure(input.exchangeAccountId);
@@ -609,7 +624,15 @@ export class ExecutionService {
     // Keep this as the final await before createOrder so a persisted pause wins the send race.
     const state = await this.dependencies.operatorState.getState();
     const competingOrders = activeOrders.filter((order) => order.id !== input.orderId);
-    if (competingOrders.length > 0 || state.systemStatus !== "RUNNING" || state.killSwitchActive) {
+    const configuredPathMatchesState = this.dependencies.sendPath === "LIVE_ADAPTER"
+      ? state.executionMode === "LIVE" && state.liveExecutionGate === "ENABLED"
+      : state.executionMode === "DRY_RUN" && state.liveExecutionGate === "DISABLED";
+    if (
+      competingOrders.length > 0 ||
+      state.systemStatus !== "RUNNING" ||
+      state.killSwitchActive ||
+      !configuredPathMatchesState
+    ) {
       throw new Error("final pre-send authority is blocked");
     }
   }

@@ -124,6 +124,7 @@ export function createApp(
   const executionService = new ExecutionService({
     riskLimits: buildExecutionRiskLimits(config),
     exchangeAdapter: executionExchangeAdapter,
+    sendPath: liveSendPath,
     validationAdapter: syncExchangeAdapter,
     repositories,
     accountExecutionLeases,
