@@ -5,6 +5,8 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 
 await import("./env.test.js");
+await import("./position-guard-pilot-config.test.js");
+await import("./position-guard-pilot-authority.test.js");
 await import("./create-app.test.js");
 await import("./db-sqlite-wiring.test.js");
 await import("./risk-guards.test.js");

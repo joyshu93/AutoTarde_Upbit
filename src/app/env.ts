@@ -4,15 +4,18 @@ import type {
   LiveExecutionGate,
   SupportedAsset,
 } from "../domain/types.js";
+import type { PositionGuardPolicySelection } from "../domain/pilot-types.js";
 import {
   normalizeTelegramLocale,
   type TelegramLocale,
 } from "../modules/telegram/presentation/locale.js";
+import { parsePositionGuardPolicySelection } from "./position-guard-pilot-config.js";
 
 export interface AppConfig {
   serviceName: string;
   executionMode: ExecutionMode;
   liveExecutionGate: LiveExecutionGate;
+  positionGuardPolicySelection?: PositionGuardPolicySelection;
   globalKillSwitch: boolean;
   upbitBaseUrl: string;
   databasePath: string;
@@ -77,6 +80,7 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     serviceName: env.APP_SERVICE_NAME?.trim() || DEFAULT_SERVICE_NAME,
     executionMode,
     liveExecutionGate,
+    positionGuardPolicySelection: parsePositionGuardPolicySelection(env),
     globalKillSwitch: parseBoolean(env.GLOBAL_KILL_SWITCH),
     upbitBaseUrl: env.UPBIT_BASE_URL?.trim() || DEFAULT_UPBIT_BASE_URL,
     databasePath: env.DATABASE_PATH?.trim() || DEFAULT_DATABASE_PATH,
