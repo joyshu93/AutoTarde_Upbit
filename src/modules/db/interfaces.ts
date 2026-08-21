@@ -25,6 +25,30 @@ import type {
   TelegramInboundOffsetRecord,
 } from "../../domain/types.js";
 
+export interface PersistOrderIntentInput {
+  order: OrderRecord;
+  event: OrderEventRecord;
+}
+
+export interface PersistExchangeSubmissionInput {
+  order: OrderRecord;
+  event: OrderEventRecord;
+  fills: FillRecord[];
+}
+
+export interface PersistUncertainSubmissionInput {
+  order: OrderRecord;
+  event: OrderEventRecord;
+  riskEvent: RiskEventRecord;
+}
+
+export interface FaultPauseInput {
+  exchangeAccountId: string;
+  faultId: string;
+  reason: string;
+  occurredAt: string;
+}
+
 export interface ExecutionRepository {
   saveStrategyDecision(record: StrategyDecisionRecord): Promise<void>;
   getLatestStrategyDecision(
@@ -34,6 +58,9 @@ export interface ExecutionRepository {
   ): Promise<StrategyDecisionRecord | null>;
   saveOrder(record: OrderRecord): Promise<void>;
   updateOrder(record: OrderRecord): Promise<void>;
+  persistOrderIntent?(input: PersistOrderIntentInput): Promise<void>;
+  persistExchangeSubmission?(input: PersistExchangeSubmissionInput): Promise<void>;
+  persistUncertainSubmission?(input: PersistUncertainSubmissionInput): Promise<void>;
   findOrderByIdempotencyKey(exchangeAccountId: string, idempotencyKey: string): Promise<OrderRecord | null>;
   findOrderByReference(exchangeAccountId: string, reference: string): Promise<OrderRecord | null>;
   listActiveOrders(exchangeAccountId: string, market?: SupportedMarket, limit?: number): Promise<OrderRecord[]>;
@@ -99,6 +126,7 @@ export interface ExecutionRepository {
 export interface OperatorStateStore {
   getState(): Promise<ExecutionStateRecord>;
   listTransitions(limit?: number): Promise<ExecutionStateTransitionRecord[]>;
+  pauseForFault?(input: FaultPauseInput): Promise<ExecutionStateRecord>;
   pause(reason?: string): Promise<ExecutionStateRecord>;
   resume(): Promise<ExecutionStateRecord>;
   activateKillSwitch(reason?: string): Promise<ExecutionStateRecord>;

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import type { ExecutionStateRecord } from "../src/domain/types.js";
 import { ExecutionService } from "../src/modules/execution/execution-service.js";
+import type { SubmissionOutcome, SubmitOrderFromDecisionResult } from "../src/modules/execution/interfaces.js";
 import { DryRunExchangeAdapter, type ExchangeAdapter } from "../src/modules/exchange/interfaces.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { DurableTelegramReporter, type OperatorNotificationReporter } from "../src/modules/telegram/reporter.js";
@@ -50,6 +51,25 @@ function createExecutionService(overrides?: {
 
   return { service, repositories };
 }
+
+test("submission outcomes retain compatibility with existing execution results", () => {
+  const outcomes: SubmissionOutcome[] = [
+    "SUBMITTED",
+    "SIMULATED_FILLED",
+    "REJECTED",
+    "DUPLICATE",
+    "LEASE_BLOCKED",
+    "RECONCILIATION_REQUIRED",
+  ];
+  const existingResult: SubmitOrderFromDecisionResult = {
+    accepted: true,
+    order: null,
+    reason: null,
+  };
+
+  assert.equal(outcomes.length, 6);
+  assert.equal(existingResult.outcome, undefined);
+});
 
 test("execution service persists a dry-run order and blocks duplicate idempotent submissions", async () => {
   const { service, repositories } = createExecutionService();

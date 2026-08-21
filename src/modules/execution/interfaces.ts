@@ -1,5 +1,13 @@
 import type { OrderOrigin, OrderRecord, StrategyDecision, SupportedMarket } from "../../domain/types.js";
 
+export type SubmissionOutcome =
+  | "SUBMITTED"
+  | "SIMULATED_FILLED"
+  | "REJECTED"
+  | "DUPLICATE"
+  | "LEASE_BLOCKED"
+  | "RECONCILIATION_REQUIRED";
+
 export interface SubmitOrderFromDecisionInput {
   exchangeAccountId: string;
   strategyDecisionId: string | null;
@@ -17,4 +25,5 @@ export interface SubmitOrderFromDecisionResult {
   accepted: boolean;
   order: OrderRecord | null;
   reason: string | null;
+  outcome?: SubmissionOutcome;
 }

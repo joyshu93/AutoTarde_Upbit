@@ -23,7 +23,15 @@ import type {
   SupportedMarket,
   TelegramInboundOffsetRecord,
 } from "../../../domain/types.js";
-import type { ExecutionRepository, OperatorStateStore, TelegramInboundOffsetStore } from "../interfaces.js";
+import type {
+  ExecutionRepository,
+  FaultPauseInput,
+  OperatorStateStore,
+  PersistExchangeSubmissionInput,
+  PersistOrderIntentInput,
+  PersistUncertainSubmissionInput,
+  TelegramInboundOffsetStore,
+} from "../interfaces.js";
 
 const ACTIVE_ORDER_STATUSES: ReadonlySet<OrderLifecycleStatus> = new Set([
   "INTENT_CREATED",
@@ -34,15 +42,21 @@ const ACTIVE_ORDER_STATUSES: ReadonlySet<OrderLifecycleStatus> = new Set([
   "CANCEL_REQUESTED",
   "RECONCILIATION_REQUIRED",
 ]);
+const EXCHANGE_SUBMISSION_STATUSES: ReadonlySet<OrderLifecycleStatus> = new Set([
+  "OPEN",
+  "PARTIALLY_FILLED",
+  "FILLED",
+  "REJECTED",
+]);
 
 export class InMemoryExecutionRepository implements ExecutionRepository {
   private readonly strategyDecisions: StrategyDecisionRecord[] = [];
-  private readonly orders: OrderRecord[] = [];
-  private readonly orderEvents: OrderEventRecord[] = [];
-  private readonly fills: FillRecord[] = [];
+  private orders: OrderRecord[] = [];
+  private orderEvents: OrderEventRecord[] = [];
+  private fills: FillRecord[] = [];
   private readonly balanceSnapshots: BalanceSnapshotRecord[] = [];
   private readonly positionSnapshots: PositionSnapshotRecord[] = [];
-  private readonly riskEvents: RiskEventRecord[] = [];
+  private riskEvents: RiskEventRecord[] = [];
   private readonly reconciliationRuns: ReconciliationRunRecord[] = [];
   private readonly strategySchedulerRuns: StrategySchedulerRunRecord[] = [];
   private readonly historyRecoveryCheckpoints: HistoryRecoveryCheckpointRecord[] = [];
@@ -71,32 +85,130 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   }
 
   async saveOrder(record: OrderRecord): Promise<void> {
-    this.orders.push(record);
+    this.orders.push(cloneRecord(record));
   }
 
   async updateOrder(record: OrderRecord): Promise<void> {
     const index = this.orders.findIndex((candidate) => candidate.id === record.id);
     if (index === -1) {
-      this.orders.push(record);
+      this.orders.push(cloneRecord(record));
       return;
     }
 
-    this.orders[index] = record;
+    this.orders[index] = cloneRecord(record);
+  }
+
+  async persistOrderIntent(input: PersistOrderIntentInput): Promise<void> {
+    assertOrderIntentInput(input);
+    const existingOrder = this.orders.find((candidate) => candidate.id === input.order.id);
+    const existingEvent = this.orderEvents.find((candidate) => candidate.id === input.event.id);
+
+    if (existingOrder) {
+      if (!recordsEqual(existingOrder, input.order) || !existingEvent || !recordsEqual(existingEvent, input.event)) {
+        throw new Error(`Conflicting duplicate order intent ${input.order.id}.`);
+      }
+      return;
+    }
+    if (existingEvent) {
+      throw new Error(`Conflicting duplicate order event ${input.event.id}.`);
+    }
+
+    const nextOrders = [...this.orders, cloneRecord(input.order)];
+    const nextOrderEvents = [...this.orderEvents, cloneRecord(input.event)];
+    this.orders = nextOrders;
+    this.orderEvents = nextOrderEvents;
+  }
+
+  async persistExchangeSubmission(input: PersistExchangeSubmissionInput): Promise<void> {
+    assertExchangeSubmissionInput(input);
+    const existingOrder = this.orders.find((candidate) => candidate.id === input.order.id);
+    if (!existingOrder) {
+      throw new Error(`Cannot persist exchange submission for missing order ${input.order.id}.`);
+    }
+    assertSameAccount(existingOrder, input.order);
+    const existingEvent = this.orderEvents.find((candidate) => candidate.id === input.event.id);
+    assertNoConflictingRecord(existingEvent, input.event, "order event");
+    const existingFills = input.fills.map((fill) => findStoredFill(this.fills, fill));
+    input.fills.forEach((fill, index) => assertNoConflictingRecord(existingFills[index], fill, "fill"));
+
+    const isExactRetry =
+      recordsEqual(existingOrder, input.order) &&
+      Boolean(existingEvent && recordsEqual(existingEvent, input.event)) &&
+      existingFills.every((fill, index) => Boolean(fill && recordsEqual(fill, input.fills[index]!)));
+    if (isExactRetry) {
+      return;
+    }
+    if (existingOrder.status !== "PERSISTED" && existingOrder.status !== "SUBMITTING") {
+      throw new Error(`Conflicting exchange submission for order ${input.order.id}.`);
+    }
+
+    const nextOrders = this.orders.map((candidate) =>
+      candidate.id === input.order.id ? cloneRecord(input.order) : candidate,
+    );
+    const nextOrderEvents = existingEvent
+      ? [...this.orderEvents]
+      : [...this.orderEvents, cloneRecord(input.event)];
+    const nextFills = [
+      ...this.fills,
+      ...input.fills.filter((_, index) => !existingFills[index]).map(cloneRecord),
+    ];
+    this.orders = nextOrders;
+    this.orderEvents = nextOrderEvents;
+    this.fills = nextFills;
+  }
+
+  async persistUncertainSubmission(input: PersistUncertainSubmissionInput): Promise<void> {
+    assertUncertainSubmissionInput(input);
+    const existingOrder = this.orders.find((candidate) => candidate.id === input.order.id);
+    if (!existingOrder) {
+      throw new Error(`Cannot persist uncertain submission for missing order ${input.order.id}.`);
+    }
+    assertSameAccount(existingOrder, input.order);
+    const existingEvent = this.orderEvents.find((candidate) => candidate.id === input.event.id);
+    const existingRiskEvent = this.riskEvents.find((candidate) => candidate.id === input.riskEvent.id);
+    assertNoConflictingRecord(existingEvent, input.event, "order event");
+    assertNoConflictingRecord(existingRiskEvent, input.riskEvent, "risk event");
+
+    const isExactRetry =
+      recordsEqual(existingOrder, input.order) &&
+      Boolean(existingEvent && recordsEqual(existingEvent, input.event)) &&
+      Boolean(existingRiskEvent && recordsEqual(existingRiskEvent, input.riskEvent));
+    if (isExactRetry) {
+      return;
+    }
+    if (existingOrder.status !== "PERSISTED" && existingOrder.status !== "SUBMITTING") {
+      throw new Error(`Conflicting uncertain submission for order ${input.order.id}.`);
+    }
+
+    const nextOrders = this.orders.map((candidate) =>
+      candidate.id === input.order.id ? cloneRecord(input.order) : candidate,
+    );
+    const nextOrderEvents = existingEvent
+      ? [...this.orderEvents]
+      : [...this.orderEvents, cloneRecord(input.event)];
+    const nextRiskEvents = existingRiskEvent
+      ? [...this.riskEvents]
+      : [...this.riskEvents, cloneRecord(input.riskEvent)];
+    this.orders = nextOrders;
+    this.orderEvents = nextOrderEvents;
+    this.riskEvents = nextRiskEvents;
   }
 
   async findOrderByIdempotencyKey(exchangeAccountId: string, idempotencyKey: string): Promise<OrderRecord | null> {
-    return this.orders.find(
+    const order = this.orders.find(
       (candidate) =>
         candidate.exchangeAccountId === exchangeAccountId && candidate.idempotencyKey === idempotencyKey,
-    ) ?? null;
+    );
+    return order ? cloneRecord(order) : null;
   }
 
   async findOrderByReference(exchangeAccountId: string, reference: string): Promise<OrderRecord | null> {
-    return this.orders.find(
+    const order = this.orders.find(
       (candidate) =>
         candidate.exchangeAccountId === exchangeAccountId &&
         (candidate.id === reference || candidate.identifier === reference || candidate.upbitUuid === reference),
-    ) ?? null;
+    );
+    return order ? cloneRecord(order) : null;
   }
 
   async listActiveOrders(
@@ -116,21 +228,22 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       })
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 
-    return typeof limit === "number" ? orders.slice(0, limit) : orders;
+    return (typeof limit === "number" ? orders.slice(0, limit) : orders).map(cloneRecord);
   }
 
   async listOrders(exchangeAccountId: string): Promise<OrderRecord[]> {
-    return this.orders.filter((candidate) => candidate.exchangeAccountId === exchangeAccountId);
+    return this.orders.filter((candidate) => candidate.exchangeAccountId === exchangeAccountId).map(cloneRecord);
   }
 
   async appendOrderEvent(record: OrderEventRecord): Promise<void> {
-    this.orderEvents.push(record);
+    this.orderEvents.push(cloneRecord(record));
   }
 
   async listOrderEvents(orderId: string): Promise<OrderEventRecord[]> {
     return this.orderEvents
       .filter((candidate) => candidate.orderId === orderId)
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .map(cloneRecord);
   }
 
   async saveFill(record: FillRecord): Promise<void> {
@@ -138,19 +251,19 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       (candidate) => candidate.orderId === record.orderId && candidate.exchangeFillId === record.exchangeFillId,
     );
     if (index === -1) {
-      this.fills.push(record);
+      this.fills.push(cloneRecord(record));
       return;
     }
 
-    this.fills[index] = record;
+    this.fills[index] = cloneRecord(record);
   }
 
   async listFills(orderId?: string): Promise<FillRecord[]> {
     if (!orderId) {
-      return [...this.fills];
+      return this.fills.map(cloneRecord);
     }
 
-    return this.fills.filter((candidate) => candidate.orderId === orderId);
+    return this.fills.filter((candidate) => candidate.orderId === orderId).map(cloneRecord);
   }
 
   async saveBalanceSnapshot(record: BalanceSnapshotRecord): Promise<void> {
@@ -194,7 +307,7 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   }
 
   async saveRiskEvent(record: RiskEventRecord): Promise<void> {
-    this.riskEvents.push(record);
+    this.riskEvents.push(cloneRecord(record));
   }
 
   async listRiskEvents(exchangeAccountId: string, limit?: number): Promise<RiskEventRecord[]> {
@@ -202,7 +315,7 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       .filter((candidate) => candidate.exchangeAccountId === exchangeAccountId)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 
-    return typeof limit === "number" ? events.slice(0, limit) : events;
+    return (typeof limit === "number" ? events.slice(0, limit) : events).map(cloneRecord);
   }
 
   async saveReconciliationRun(record: ReconciliationRunRecord): Promise<void> {
@@ -488,23 +601,26 @@ export class InMemoryTelegramInboundOffsetStore implements TelegramInboundOffset
 export class InMemoryOperatorStateStore implements OperatorStateStore {
   private readonly transitions: ExecutionStateTransitionRecord[] = [];
 
-  constructor(private state: ExecutionStateRecord) {
+  constructor(state: ExecutionStateRecord) {
+    this.state = cloneRecord(state);
     this.transitions.push({
       id: "execution_state_transition_bootstrap",
-      exchangeAccountId: state.exchangeAccountId,
+      exchangeAccountId: this.state.exchangeAccountId,
       command: "BOOTSTRAP",
       fromExecutionMode: null,
-      toExecutionMode: state.executionMode,
+      toExecutionMode: this.state.executionMode,
       fromLiveExecutionGate: null,
-      toLiveExecutionGate: state.liveExecutionGate,
+      toLiveExecutionGate: this.state.liveExecutionGate,
       fromSystemStatus: null,
-      toSystemStatus: state.systemStatus,
+      toSystemStatus: this.state.systemStatus,
       fromKillSwitchActive: null,
-      toKillSwitchActive: state.killSwitchActive,
+      toKillSwitchActive: this.state.killSwitchActive,
       reason: "bootstrap_seed",
-      createdAt: state.updatedAt,
+      createdAt: this.state.updatedAt,
     });
   }
+
+  private state: ExecutionStateRecord;
 
   async getState(): Promise<ExecutionStateRecord> {
     return { ...this.state };
@@ -512,6 +628,43 @@ export class InMemoryOperatorStateStore implements OperatorStateStore {
 
   async listTransitions(limit = 20): Promise<ExecutionStateTransitionRecord[]> {
     return this.transitions.slice(0, limit).map((record) => ({ ...record }));
+  }
+
+  async pauseForFault(input: FaultPauseInput): Promise<ExecutionStateRecord> {
+    if (input.exchangeAccountId !== this.state.exchangeAccountId) {
+      throw new Error(`Fault ${input.faultId} is for a different exchange account.`);
+    }
+    const reason = formatFaultPauseReason(input);
+    const existing = this.transitions.find((transition) => transition.id === input.faultId);
+    if (existing) {
+      if (
+        String(existing.command) === "AUTOMATIC_PAUSE" &&
+        existing.exchangeAccountId === input.exchangeAccountId &&
+        existing.reason === reason &&
+        (this.state.systemStatus === "PAUSED" || this.state.systemStatus === "KILL_SWITCHED")
+      ) {
+        return this.getState();
+      }
+      throw new Error(`Conflicting duplicate automatic pause ${input.faultId}.`);
+    }
+
+    const previousState = { ...this.state };
+    this.state = {
+      ...this.state,
+      systemStatus: this.state.killSwitchActive || this.state.systemStatus === "KILL_SWITCHED"
+        ? "KILL_SWITCHED"
+        : "PAUSED",
+      pauseReason: reason,
+      updatedAt: input.occurredAt,
+    };
+    this.recordTransition(
+      previousState,
+      this.state,
+      "AUTOMATIC_PAUSE" as ExecutionStateTransitionRecord["command"],
+      reason,
+      input.faultId,
+    );
+    return this.getState();
   }
 
   async pause(reason?: string): Promise<ExecutionStateRecord> {
@@ -606,9 +759,10 @@ export class InMemoryOperatorStateStore implements OperatorStateStore {
     toState: ExecutionStateRecord,
     command: ExecutionStateTransitionRecord["command"],
     reason: string | null,
+    id = `execution_state_transition_${this.transitions.length + 1}`,
   ): void {
     this.transitions.unshift({
-      id: `execution_state_transition_${this.transitions.length + 1}`,
+      id,
       exchangeAccountId: toState.exchangeAccountId,
       command,
       fromExecutionMode: fromState.executionMode,
@@ -668,4 +822,100 @@ function aggregateAssetExposure(positions: PositionSnapshot[]): Record<Supported
     },
     { BTC: 0, ETH: 0 },
   );
+}
+
+function assertOrderIntentInput(input: PersistOrderIntentInput): void {
+  if (input.order.status !== "PERSISTED") {
+    throw new Error("Order intent must have PERSISTED status.");
+  }
+  assertOrderEventLink(input.order, input.event);
+}
+
+function assertExchangeSubmissionInput(input: PersistExchangeSubmissionInput): void {
+  if (!EXCHANGE_SUBMISSION_STATUSES.has(input.order.status)) {
+    throw new Error(`Exchange submission has unsupported status ${input.order.status}.`);
+  }
+  assertOrderEventLink(input.order, input.event);
+  assertUniqueFills(input.fills);
+  for (const fill of input.fills) {
+    if (fill.orderId !== input.order.id || fill.market !== input.order.market || fill.side !== input.order.side) {
+      throw new Error(`Fill ${fill.id} does not belong to order ${input.order.id}.`);
+    }
+  }
+}
+
+function assertUniqueFills(fills: FillRecord[]): void {
+  const ids = new Set<string>();
+  const exchangeIdentities = new Set<string>();
+  for (const fill of fills) {
+    const exchangeIdentity = `${fill.orderId}\u0000${fill.exchangeFillId}`;
+    if (ids.has(fill.id) || exchangeIdentities.has(exchangeIdentity)) {
+      throw new Error(`Duplicate fill ${fill.id} in atomic exchange submission.`);
+    }
+    ids.add(fill.id);
+    exchangeIdentities.add(exchangeIdentity);
+  }
+}
+
+function assertUncertainSubmissionInput(input: PersistUncertainSubmissionInput): void {
+  if (input.order.status !== "RECONCILIATION_REQUIRED") {
+    throw new Error("Uncertain submission must have RECONCILIATION_REQUIRED status.");
+  }
+  if (input.riskEvent.level !== "BLOCK") {
+    throw new Error("Uncertain submission must record a BLOCK risk event.");
+  }
+  assertOrderEventLink(input.order, input.event);
+  if (
+    input.riskEvent.orderId !== input.order.id ||
+    input.riskEvent.exchangeAccountId !== input.order.exchangeAccountId
+  ) {
+    throw new Error(`Risk event ${input.riskEvent.id} does not belong to order ${input.order.id}.`);
+  }
+}
+
+function assertOrderEventLink(order: OrderRecord, event: OrderEventRecord): void {
+  if (event.orderId !== order.id) {
+    throw new Error(`Order event ${event.id} does not belong to order ${order.id}.`);
+  }
+}
+
+function assertSameAccount(existing: OrderRecord, next: OrderRecord): void {
+  if (existing.exchangeAccountId !== next.exchangeAccountId) {
+    throw new Error(`Order ${next.id} cannot change exchange account.`);
+  }
+}
+
+function assertNoConflictingRecord<T extends { id: string }>(
+  existing: T | undefined,
+  next: T,
+  label: string,
+): void {
+  if (existing && !recordsEqual(existing, next)) {
+    throw new Error(`Conflicting duplicate ${label} ${next.id}.`);
+  }
+}
+
+function findStoredFill(fills: FillRecord[], fill: FillRecord): FillRecord | undefined {
+  return fills.find(
+    (candidate) => candidate.id === fill.id ||
+      (candidate.orderId === fill.orderId && candidate.exchangeFillId === fill.exchangeFillId),
+  );
+}
+
+function recordsEqual<T extends object>(left: T, right: T): boolean {
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord);
+  const rightKeys = Object.keys(rightRecord);
+  return leftKeys.length === rightKeys.length && leftKeys.every(
+    (key) => Object.prototype.hasOwnProperty.call(rightRecord, key) && leftRecord[key] === rightRecord[key],
+  );
+}
+
+function cloneRecord<T extends object>(record: T): T {
+  return { ...record };
+}
+
+function formatFaultPauseReason(input: FaultPauseInput): string {
+  return `faultId=${input.faultId}; reason=${input.reason}`;
 }

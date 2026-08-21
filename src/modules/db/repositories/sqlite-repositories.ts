@@ -44,13 +44,22 @@ import type {
   SqliteTelegramInboundOffsetRow,
   SqliteUserRow,
 } from "../types.js";
-import type { ExecutionRepository, OperatorStateStore, TelegramInboundOffsetStore } from "../interfaces.js";
+import type {
+  ExecutionRepository,
+  FaultPauseInput,
+  OperatorStateStore,
+  PersistExchangeSubmissionInput,
+  PersistOrderIntentInput,
+  PersistUncertainSubmissionInput,
+  TelegramInboundOffsetStore,
+} from "../interfaces.js";
 import type { SqliteBootstrapOptions, SqlitePersistenceBundle } from "./contracts.js";
 import { fromSqliteBoolean, parseJson, stringifyJson, toSqliteBoolean } from "./sqlite-shapes.js";
 import { openSqliteDatabase } from "./sqlite-database.js";
 import { createId } from "../../../shared/ids.js";
 import { SqliteAccountExecutionLeaseStore } from "./sqlite-account-execution-lease-store.js";
 import { SqliteCandidatePilotRepository } from "./sqlite-candidate-pilot-repository.js";
+import { withImmediateTransaction } from "./sqlite-transaction.js";
 
 const ACTIVE_ORDER_STATUSES = new Set<OrderRecord["status"]>([
   "INTENT_CREATED",
@@ -63,6 +72,12 @@ const ACTIVE_ORDER_STATUSES = new Set<OrderRecord["status"]>([
 ]);
 const ACTIVE_ORDER_STATUS_VALUES = Array.from(ACTIVE_ORDER_STATUSES);
 const ACTIVE_ORDER_STATUS_PLACEHOLDERS = ACTIVE_ORDER_STATUS_VALUES.map(() => "?").join(", ");
+const EXCHANGE_SUBMISSION_STATUSES: ReadonlySet<OrderRecord["status"]> = new Set([
+  "OPEN",
+  "PARTIALLY_FILLED",
+  "FILLED",
+  "REJECTED",
+]);
 
 export function createSqlitePersistence(options: SqliteBootstrapOptions): SqlitePersistenceBundle {
   const handle = openSqliteDatabase(options.databasePath);
@@ -204,6 +219,96 @@ export class SqliteExecutionRepository implements ExecutionRepository {
     this.upsertOrder(record);
   }
 
+  async persistOrderIntent(input: PersistOrderIntentInput): Promise<void> {
+    withImmediateTransaction(this.db, () => {
+      assertOrderIntentInput(input);
+      const existingOrder = this.getOrderById(input.order.id);
+      const existingEvent = this.getOrderEventById(input.event.id);
+      if (existingOrder) {
+        if (!recordsEqual(existingOrder, input.order) || !existingEvent || !recordsEqual(existingEvent, input.event)) {
+          throw new Error(`Conflicting duplicate order intent ${input.order.id}.`);
+        }
+        return;
+      }
+      if (existingEvent) {
+        throw new Error(`Conflicting duplicate order event ${input.event.id}.`);
+      }
+
+      this.upsertOrder(input.order);
+      this.insertOrderEvent(input.event);
+    });
+  }
+
+  async persistExchangeSubmission(input: PersistExchangeSubmissionInput): Promise<void> {
+    withImmediateTransaction(this.db, () => {
+      assertExchangeSubmissionInput(input);
+      const existingOrder = this.getOrderById(input.order.id);
+      if (!existingOrder) {
+        throw new Error(`Cannot persist exchange submission for missing order ${input.order.id}.`);
+      }
+      assertSameAccount(existingOrder, input.order);
+      const existingEvent = this.getOrderEventById(input.event.id);
+      assertNoConflictingRecord(existingEvent, input.event, "order event");
+      const existingFills = input.fills.map((fill) => this.getFillByIdentity(fill));
+      input.fills.forEach((fill, index) => assertNoConflictingRecord(existingFills[index] ?? null, fill, "fill"));
+
+      const isExactRetry =
+        recordsEqual(existingOrder, input.order) &&
+        Boolean(existingEvent && recordsEqual(existingEvent, input.event)) &&
+        existingFills.every((fill, index) => Boolean(fill && recordsEqual(fill, input.fills[index]!)));
+      if (isExactRetry) {
+        return;
+      }
+      if (existingOrder.status !== "PERSISTED" && existingOrder.status !== "SUBMITTING") {
+        throw new Error(`Conflicting exchange submission for order ${input.order.id}.`);
+      }
+
+      this.upsertOrder(input.order);
+      if (!existingEvent) {
+        this.insertOrderEvent(input.event);
+      }
+      input.fills.forEach((fill, index) => {
+        if (!existingFills[index]) {
+          this.upsertFill(fill);
+        }
+      });
+    });
+  }
+
+  async persistUncertainSubmission(input: PersistUncertainSubmissionInput): Promise<void> {
+    withImmediateTransaction(this.db, () => {
+      assertUncertainSubmissionInput(input);
+      const existingOrder = this.getOrderById(input.order.id);
+      if (!existingOrder) {
+        throw new Error(`Cannot persist uncertain submission for missing order ${input.order.id}.`);
+      }
+      assertSameAccount(existingOrder, input.order);
+      const existingEvent = this.getOrderEventById(input.event.id);
+      const existingRiskEvent = this.getRiskEventById(input.riskEvent.id);
+      assertNoConflictingRecord(existingEvent, input.event, "order event");
+      assertNoConflictingRecord(existingRiskEvent, input.riskEvent, "risk event");
+
+      const isExactRetry =
+        recordsEqual(existingOrder, input.order) &&
+        Boolean(existingEvent && recordsEqual(existingEvent, input.event)) &&
+        Boolean(existingRiskEvent && recordsEqual(existingRiskEvent, input.riskEvent));
+      if (isExactRetry) {
+        return;
+      }
+      if (existingOrder.status !== "PERSISTED" && existingOrder.status !== "SUBMITTING") {
+        throw new Error(`Conflicting uncertain submission for order ${input.order.id}.`);
+      }
+
+      this.upsertOrder(input.order);
+      if (!existingEvent) {
+        this.insertOrderEvent(input.event);
+      }
+      if (!existingRiskEvent) {
+        this.upsertRiskEvent(input.riskEvent);
+      }
+    });
+  }
+
   async findOrderByIdempotencyKey(exchangeAccountId: string, idempotencyKey: string): Promise<OrderRecord | null> {
     const row = this.db.prepare(`
       SELECT * FROM orders
@@ -270,6 +375,10 @@ export class SqliteExecutionRepository implements ExecutionRepository {
   }
 
   async appendOrderEvent(record: OrderEventRecord): Promise<void> {
+    this.insertOrderEvent(record);
+  }
+
+  private insertOrderEvent(record: OrderEventRecord): void {
     this.db.prepare(`
       INSERT INTO order_events (id, order_id, event_type, event_source, payload_json, created_at)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -284,6 +393,10 @@ export class SqliteExecutionRepository implements ExecutionRepository {
   }
 
   async saveFill(record: FillRecord): Promise<void> {
+    this.upsertFill(record);
+  }
+
+  private upsertFill(record: FillRecord): void {
     this.db.prepare(`
       INSERT INTO fills (
         id, order_id, exchange_fill_id, market, side, price, volume,
@@ -407,6 +520,10 @@ export class SqliteExecutionRepository implements ExecutionRepository {
   }
 
   async saveRiskEvent(record: RiskEventRecord): Promise<void> {
+    this.upsertRiskEvent(record);
+  }
+
+  private upsertRiskEvent(record: RiskEventRecord): void {
     this.db.prepare(`
       INSERT INTO risk_events (
         id, exchange_account_id, strategy_decision_id, order_id,
@@ -963,6 +1080,34 @@ export class SqliteExecutionRepository implements ExecutionRepository {
     return rows.map(mapOperatorNotificationRow);
   }
 
+  private getOrderById(id: string): OrderRecord | null {
+    const row = this.db.prepare("SELECT * FROM orders WHERE id = ? LIMIT 1").get(id) as SqliteOrderRow | undefined;
+    return row ? mapOrderRow(row) : null;
+  }
+
+  private getOrderEventById(id: string): OrderEventRecord | null {
+    const row = this.db.prepare("SELECT * FROM order_events WHERE id = ? LIMIT 1").get(id) as SqliteOrderEventRow | undefined;
+    return row ? mapOrderEventRow(row) : null;
+  }
+
+  private getFillByIdentity(fill: FillRecord): FillRecord | null {
+    const rows = this.db.prepare(`
+      SELECT * FROM fills
+      WHERE id = ? OR (order_id = ? AND exchange_fill_id = ?)
+      ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END
+      LIMIT 2
+    `).all(fill.id, fill.orderId, fill.exchangeFillId, fill.id) as unknown as SqliteFillRow[];
+    if (rows.length > 1 && !recordsEqual(mapFillRow(rows[0]!), mapFillRow(rows[1]!))) {
+      throw new Error(`Conflicting fill identity ${fill.id}.`);
+    }
+    return rows[0] ? mapFillRow(rows[0]) : null;
+  }
+
+  private getRiskEventById(id: string): RiskEventRecord | null {
+    const row = this.db.prepare("SELECT * FROM risk_events WHERE id = ? LIMIT 1").get(id) as SqliteRiskEventRow | undefined;
+    return row ? mapRiskEventRow(row) : null;
+  }
+
   private upsertOrder(record: OrderRecord): void {
     this.db.prepare(`
       INSERT INTO orders (
@@ -1049,6 +1194,61 @@ export class SqliteOperatorStateStore implements OperatorStateStore {
     `).all(this.exchangeAccountId, limit) as unknown as SqliteExecutionStateTransitionRow[];
 
     return rows.map(mapExecutionStateTransitionRow);
+  }
+
+  async pauseForFault(input: FaultPauseInput): Promise<ExecutionStateRecord> {
+    if (input.exchangeAccountId !== this.exchangeAccountId) {
+      throw new Error(`Fault ${input.faultId} is for a different exchange account.`);
+    }
+    if (!input.faultId || !input.reason || !input.occurredAt) {
+      throw new Error("Automatic fault pauses require faultId, reason, and occurredAt.");
+    }
+
+    return withImmediateTransaction(this.db, () => {
+      const current = this.getStateSync();
+      const reason = formatFaultPauseReason(input);
+      const existingRow = this.db.prepare(`
+        SELECT * FROM execution_state_transitions WHERE id = ? LIMIT 1
+      `).get(input.faultId) as SqliteExecutionStateTransitionRow | undefined;
+      if (existingRow) {
+        const existing = mapExecutionStateTransitionRow(existingRow);
+        if (
+          String(existing.command) === "AUTOMATIC_PAUSE" &&
+          existing.exchangeAccountId === input.exchangeAccountId &&
+          existing.reason === reason &&
+          (current.systemStatus === "PAUSED" || current.systemStatus === "KILL_SWITCHED")
+        ) {
+          return current;
+        }
+        throw new Error(`Conflicting duplicate automatic pause ${input.faultId}.`);
+      }
+
+      const nextState: ExecutionStateRecord = {
+        ...current,
+        systemStatus: current.killSwitchActive || current.systemStatus === "KILL_SWITCHED"
+          ? "KILL_SWITCHED"
+          : "PAUSED",
+        pauseReason: reason,
+        updatedAt: input.occurredAt,
+      };
+      this.writeState(nextState);
+      recordExecutionStateTransition(this.db, {
+        id: input.faultId,
+        exchangeAccountId: input.exchangeAccountId,
+        command: "AUTOMATIC_PAUSE" as ExecutionStateTransitionRecord["command"],
+        fromExecutionMode: current.executionMode,
+        toExecutionMode: nextState.executionMode,
+        fromLiveExecutionGate: current.liveExecutionGate,
+        toLiveExecutionGate: nextState.liveExecutionGate,
+        fromSystemStatus: current.systemStatus,
+        toSystemStatus: nextState.systemStatus,
+        fromKillSwitchActive: current.killSwitchActive,
+        toKillSwitchActive: nextState.killSwitchActive,
+        reason,
+        createdAt: input.occurredAt,
+      });
+      return nextState;
+    });
   }
 
   async pause(reason?: string): Promise<ExecutionStateRecord> {
@@ -1162,22 +1362,7 @@ export class SqliteOperatorStateStore implements OperatorStateStore {
       updatedAt: new Date().toISOString(),
     };
 
-    this.db.prepare(`
-      UPDATE execution_state
-      SET execution_mode = ?, live_execution_gate = ?, system_status = ?,
-          kill_switch_active = ?, pause_reason = ?, degraded_reason = ?, degraded_at = ?, updated_at = ?
-      WHERE exchange_account_id = ?
-    `).run(
-      nextState.executionMode,
-      nextState.liveExecutionGate,
-      nextState.systemStatus,
-      toSqliteBoolean(nextState.killSwitchActive),
-      nextState.pauseReason,
-      nextState.degradedReason,
-      nextState.degradedAt,
-      nextState.updatedAt,
-      this.exchangeAccountId,
-    );
+    this.writeState(nextState);
 
     recordExecutionStateTransition(this.db, {
       id: createId("execution_state_transition"),
@@ -1196,6 +1381,37 @@ export class SqliteOperatorStateStore implements OperatorStateStore {
     });
 
     return nextState;
+  }
+
+  private getStateSync(): ExecutionStateRecord {
+    const row = this.db.prepare(`
+      SELECT * FROM execution_state
+      WHERE exchange_account_id = ?
+      LIMIT 1
+    `).get(this.exchangeAccountId) as SqliteExecutionStateRow | undefined;
+    if (!row) {
+      throw new Error(`Execution state is missing for exchange account ${this.exchangeAccountId}.`);
+    }
+    return mapExecutionStateRow(row);
+  }
+
+  private writeState(nextState: ExecutionStateRecord): void {
+    this.db.prepare(`
+      UPDATE execution_state
+      SET execution_mode = ?, live_execution_gate = ?, system_status = ?,
+          kill_switch_active = ?, pause_reason = ?, degraded_reason = ?, degraded_at = ?, updated_at = ?
+      WHERE exchange_account_id = ?
+    `).run(
+      nextState.executionMode,
+      nextState.liveExecutionGate,
+      nextState.systemStatus,
+      toSqliteBoolean(nextState.killSwitchActive),
+      nextState.pauseReason,
+      nextState.degradedReason,
+      nextState.degradedAt,
+      nextState.updatedAt,
+      this.exchangeAccountId,
+    );
   }
 }
 
@@ -1240,6 +1456,91 @@ export class SqliteTelegramInboundOffsetStore implements TelegramInboundOffsetSt
       record.updatedAt,
     );
   }
+}
+
+function assertOrderIntentInput(input: PersistOrderIntentInput): void {
+  if (input.order.status !== "PERSISTED") {
+    throw new Error("Order intent must have PERSISTED status.");
+  }
+  assertOrderEventLink(input.order, input.event);
+}
+
+function assertExchangeSubmissionInput(input: PersistExchangeSubmissionInput): void {
+  if (!EXCHANGE_SUBMISSION_STATUSES.has(input.order.status)) {
+    throw new Error(`Exchange submission has unsupported status ${input.order.status}.`);
+  }
+  assertOrderEventLink(input.order, input.event);
+  assertUniqueFills(input.fills);
+  for (const fill of input.fills) {
+    if (fill.orderId !== input.order.id || fill.market !== input.order.market || fill.side !== input.order.side) {
+      throw new Error(`Fill ${fill.id} does not belong to order ${input.order.id}.`);
+    }
+  }
+}
+
+function assertUniqueFills(fills: FillRecord[]): void {
+  const ids = new Set<string>();
+  const exchangeIdentities = new Set<string>();
+  for (const fill of fills) {
+    const exchangeIdentity = `${fill.orderId}\u0000${fill.exchangeFillId}`;
+    if (ids.has(fill.id) || exchangeIdentities.has(exchangeIdentity)) {
+      throw new Error(`Duplicate fill ${fill.id} in atomic exchange submission.`);
+    }
+    ids.add(fill.id);
+    exchangeIdentities.add(exchangeIdentity);
+  }
+}
+
+function assertUncertainSubmissionInput(input: PersistUncertainSubmissionInput): void {
+  if (input.order.status !== "RECONCILIATION_REQUIRED") {
+    throw new Error("Uncertain submission must have RECONCILIATION_REQUIRED status.");
+  }
+  if (input.riskEvent.level !== "BLOCK") {
+    throw new Error("Uncertain submission must record a BLOCK risk event.");
+  }
+  assertOrderEventLink(input.order, input.event);
+  if (
+    input.riskEvent.orderId !== input.order.id ||
+    input.riskEvent.exchangeAccountId !== input.order.exchangeAccountId
+  ) {
+    throw new Error(`Risk event ${input.riskEvent.id} does not belong to order ${input.order.id}.`);
+  }
+}
+
+function assertOrderEventLink(order: OrderRecord, event: OrderEventRecord): void {
+  if (event.orderId !== order.id) {
+    throw new Error(`Order event ${event.id} does not belong to order ${order.id}.`);
+  }
+}
+
+function assertSameAccount(existing: OrderRecord, next: OrderRecord): void {
+  if (existing.exchangeAccountId !== next.exchangeAccountId) {
+    throw new Error(`Order ${next.id} cannot change exchange account.`);
+  }
+}
+
+function assertNoConflictingRecord<T extends { id: string }>(
+  existing: T | null,
+  next: T,
+  label: string,
+): void {
+  if (existing && !recordsEqual(existing, next)) {
+    throw new Error(`Conflicting duplicate ${label} ${next.id}.`);
+  }
+}
+
+function recordsEqual<T extends object>(left: T, right: T): boolean {
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord);
+  const rightKeys = Object.keys(rightRecord);
+  return leftKeys.length === rightKeys.length && leftKeys.every(
+    (key) => Object.prototype.hasOwnProperty.call(rightRecord, key) && leftRecord[key] === rightRecord[key],
+  );
+}
+
+function formatFaultPauseReason(input: FaultPauseInput): string {
+  return `faultId=${input.faultId}; reason=${input.reason}`;
 }
 
 function resolveResumedSystemStatus(current: ExecutionStateRecord): ExecutionStateRecord["systemStatus"] {

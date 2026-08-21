@@ -6,12 +6,26 @@ import { pathToFileURL } from "node:url";
 
 import type {
   BalanceSnapshotRecord,
+  ExecutionStateRecord,
+  FillRecord,
   OperatorNotificationRecord,
+  OrderEventRecord,
   OrderRecord,
   PositionSnapshotRecord,
+  RiskEventRecord,
   StrategySchedulerRunRecord,
   StrategyDecisionRecord,
 } from "../src/domain/types.js";
+import type {
+  ExecutionRepository,
+  PersistExchangeSubmissionInput,
+  PersistOrderIntentInput,
+  PersistUncertainSubmissionInput,
+} from "../src/modules/db/interfaces.js";
+import {
+  InMemoryExecutionRepository,
+  InMemoryOperatorStateStore,
+} from "../src/modules/db/repositories/in-memory-repositories.js";
 import { openSqliteDatabase } from "../src/modules/db/repositories/sqlite-database.js";
 import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
 import {
@@ -37,6 +51,115 @@ test("sqlite shape helpers preserve boolean and JSON payload values", () => {
   assert.equal(fromSqliteBoolean(5), true);
   assert.equal(stringifyJson(payload), JSON.stringify(payload));
   assert.deepEqual(parseJson<typeof payload>(JSON.stringify(payload)), payload);
+});
+
+test("in-memory atomic lifecycle writes are idempotent, validated, and detached", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await assertAtomicLifecycleContract(repository);
+});
+
+test("in-memory automatic fault pauses are idempotent and preserve kill switches", async () => {
+  const operatorState = createInMemoryOperatorState();
+  const fault = {
+    exchangeAccountId: "primary",
+    faultId: "fault-uncertain-order",
+    reason: "UNCERTAIN_ORDER",
+    occurredAt: "2026-08-21T00:00:00.000Z",
+  };
+
+  await operatorState.pauseForFault(fault);
+  await operatorState.pauseForFault(fault);
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal(
+    (await operatorState.listTransitions()).filter((transition) => String(transition.command) === "AUTOMATIC_PAUSE").length,
+    1,
+  );
+
+  await operatorState.activateKillSwitch("operator");
+  await operatorState.pauseForFault({
+    ...fault,
+    faultId: "fault-second",
+    occurredAt: "2026-08-21T00:01:00.000Z",
+  });
+  const state = await operatorState.getState();
+  assert.equal(state.systemStatus, "KILL_SWITCHED");
+  assert.equal(state.killSwitchActive, true);
+  assert.equal(
+    (await operatorState.listTransitions()).filter((transition) => String(transition.command) === "AUTOMATIC_PAUSE").length,
+    2,
+  );
+});
+
+test("sqlite atomic lifecycle writes roll back conflicts and fault pauses stay safe", async () => {
+  const databasePath = await createTempDatabasePath("atomic-lifecycle");
+  const bundle = createSqlitePersistence({
+    databasePath,
+    exchangeAccountId: "primary",
+    userId: "operator",
+    userTelegramId: "telegram-user",
+    userDisplayName: "Operator",
+    accessKeyRef: "ENV:UPBIT_ACCESS_KEY",
+    secretKeyRef: "ENV:UPBIT_SECRET_KEY",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    killSwitchActive: false,
+  });
+
+  try {
+    const repositories = requireAtomicRepository(bundle.repositories);
+    await assertAtomicLifecycleContract(repositories);
+
+    const original = createOrderRecord({
+      id: "rollback-order",
+      status: "PERSISTED",
+      updatedAt: "2026-08-21T00:00:00.000Z",
+    });
+    await repositories.persistOrderIntent({
+      order: original,
+      event: createOrderEvent(original.id, "rollback-event", "ORDER_PERSISTED"),
+    });
+    await repositories.appendOrderEvent(createOrderEvent(original.id, "conflicting-event", "EXISTING"));
+
+    const uncertain = {
+      ...original,
+      status: "RECONCILIATION_REQUIRED" as const,
+      updatedAt: "2026-08-21T00:01:00.000Z",
+      failureCode: "UNKNOWN_SUBMISSION",
+      failureMessage: "Submission outcome requires reconciliation.",
+    };
+    await assert.rejects(
+      repositories.persistUncertainSubmission({
+        order: uncertain,
+        event: createOrderEvent(uncertain.id, "conflicting-event", "RECONCILIATION_REQUIRED"),
+        riskEvent: createRiskEvent(uncertain.id, "rollback-risk"),
+      }),
+    );
+    assert.equal((await repositories.findOrderByReference("primary", original.id))?.status, "PERSISTED");
+    assert.equal((await repositories.listRiskEvents("primary")).some((event) => event.id === "rollback-risk"), false);
+
+    const fault = {
+      exchangeAccountId: "primary",
+      faultId: "sqlite-uncertain-order",
+      reason: "UNCERTAIN_ORDER",
+      occurredAt: "2026-08-21T00:02:00.000Z",
+    };
+    await requireFaultPause(bundle.operatorState)(fault);
+    await requireFaultPause(bundle.operatorState)(fault);
+    await bundle.operatorState.activateKillSwitch("operator");
+    await requireFaultPause(bundle.operatorState)({
+      ...fault,
+      faultId: "sqlite-second-fault",
+      occurredAt: "2026-08-21T00:03:00.000Z",
+    });
+    assert.equal((await bundle.operatorState.getState()).systemStatus, "KILL_SWITCHED");
+    assert.equal(
+      (await bundle.operatorState.listTransitions()).filter((transition) => String(transition.command) === "AUTOMATIC_PAUSE").length,
+      2,
+    );
+  } finally {
+    bundle.close();
+    await cleanupTempDatabase(databasePath);
+  }
 });
 
 test("openSqliteDatabase applies the initial migrations and exposes the durable tables", async () => {
@@ -1196,4 +1319,205 @@ function createOrderRecord(overrides: Partial<OrderRecord> & Pick<OrderRecord, "
     updatedAt: "2026-04-20T00:00:00.000Z",
     ...overrides,
   };
+}
+
+type AtomicExecutionRepository = ExecutionRepository & {
+  persistOrderIntent(input: PersistOrderIntentInput): Promise<void>;
+  persistExchangeSubmission(input: PersistExchangeSubmissionInput): Promise<void>;
+  persistUncertainSubmission(input: PersistUncertainSubmissionInput): Promise<void>;
+};
+
+async function assertAtomicLifecycleContract(repository: AtomicExecutionRepository): Promise<void> {
+  const intentOrder = createOrderRecord({
+    id: "atomic-intent-order",
+    status: "PERSISTED",
+    updatedAt: "2026-08-21T00:00:00.000Z",
+  });
+  const intentEvent = createOrderEvent(intentOrder.id, "atomic-intent-event", "ORDER_PERSISTED");
+  await repository.persistOrderIntent({ order: intentOrder, event: intentEvent });
+
+  intentOrder.status = "FILLED";
+  intentEvent.eventType = "MUTATED_BY_CALLER";
+  const persistedIntent = await repository.findOrderByReference("primary", "atomic-intent-order");
+  assert.equal(persistedIntent?.status, "PERSISTED");
+  assert.equal((await repository.listOrderEvents("atomic-intent-order"))[0]?.eventType, "ORDER_PERSISTED");
+
+  await repository.persistOrderIntent({
+    order: createOrderRecord({
+      id: "atomic-intent-order",
+      status: "PERSISTED",
+      updatedAt: "2026-08-21T00:00:00.000Z",
+    }),
+    event: createOrderEvent("atomic-intent-order", "atomic-intent-event", "ORDER_PERSISTED"),
+  });
+  assert.equal((await repository.listOrderEvents("atomic-intent-order")).length, 1);
+
+  await assert.rejects(
+    repository.persistOrderIntent({
+      order: createOrderRecord({
+        id: "atomic-intent-order",
+        status: "PERSISTED",
+        updatedAt: "2026-08-21T00:00:01.000Z",
+      }),
+      event: createOrderEvent("atomic-intent-order", "atomic-conflicting-event", "ORDER_PERSISTED"),
+    }),
+  );
+  assert.equal((await repository.listOrderEvents("atomic-intent-order")).length, 1);
+
+  const submittedOrder = createOrderRecord({
+    id: "atomic-intent-order",
+    status: "OPEN",
+    upbitUuid: "atomic-upbit-uuid",
+    exchangeResponseJson: "{\"state\":\"wait\"}",
+    updatedAt: "2026-08-21T00:00:02.000Z",
+  });
+  const submissionEvent = createOrderEvent(submittedOrder.id, "atomic-submission-event", "ORDER_SUBMITTED");
+  const fill = createFill(submittedOrder.id, "atomic-fill");
+  await assert.rejects(
+    repository.persistExchangeSubmission({
+      order: submittedOrder,
+      event: submissionEvent,
+      fills: [fill, { ...fill }],
+    }),
+  );
+  assert.equal((await repository.findOrderByReference("primary", submittedOrder.id))?.status, "PERSISTED");
+  assert.equal((await repository.listFills(submittedOrder.id)).length, 0);
+  await repository.persistExchangeSubmission({
+    order: submittedOrder,
+    event: submissionEvent,
+    fills: [fill],
+  });
+  await repository.persistExchangeSubmission({
+    order: { ...submittedOrder },
+    event: { ...submissionEvent },
+    fills: [{ ...fill }],
+  });
+  fill.price = "1";
+  assert.equal((await repository.findOrderByReference("primary", submittedOrder.id))?.status, "OPEN");
+  assert.equal((await repository.listFills(submittedOrder.id)).length, 1);
+  assert.equal((await repository.listFills(submittedOrder.id))[0]?.price, "500000");
+
+  const uncertainOrder = createOrderRecord({
+    id: "atomic-uncertain-order",
+    status: "PERSISTED",
+    updatedAt: "2026-08-21T00:00:03.000Z",
+  });
+  await repository.persistOrderIntent({
+    order: uncertainOrder,
+    event: createOrderEvent(uncertainOrder.id, "atomic-uncertain-intent", "ORDER_PERSISTED"),
+  });
+  const reconciliationRequiredOrder = {
+    ...uncertainOrder,
+    status: "RECONCILIATION_REQUIRED" as const,
+    failureCode: "UNKNOWN_SUBMISSION",
+    failureMessage: "Submission outcome requires reconciliation.",
+    updatedAt: "2026-08-21T00:00:04.000Z",
+  };
+  const recoveryEvent = createOrderEvent(
+    reconciliationRequiredOrder.id,
+    "atomic-recovery-event",
+    "RECONCILIATION_REQUIRED",
+  );
+  const riskEvent = createRiskEvent(reconciliationRequiredOrder.id, "atomic-uncertain-risk");
+  await repository.persistUncertainSubmission({
+    order: reconciliationRequiredOrder,
+    event: recoveryEvent,
+    riskEvent,
+  });
+  await repository.persistUncertainSubmission({
+    order: { ...reconciliationRequiredOrder },
+    event: { ...recoveryEvent },
+    riskEvent: { ...riskEvent },
+  });
+  assert.equal(
+    (await repository.findOrderByReference("primary", reconciliationRequiredOrder.id))?.status,
+    "RECONCILIATION_REQUIRED",
+  );
+  assert.equal((await repository.listOrderEvents(reconciliationRequiredOrder.id)).length, 2);
+  assert.equal((await repository.listRiskEvents("primary")).filter((event) => event.id === riskEvent.id).length, 1);
+
+  const invalidOrder = createOrderRecord({ id: "invalid-atomic-order", status: "PERSISTED" });
+  await assert.rejects(
+    repository.persistOrderIntent({
+      order: invalidOrder,
+      event: createOrderEvent("another-order", "invalid-atomic-event", "ORDER_PERSISTED"),
+    }),
+  );
+  assert.equal(await repository.findOrderByReference("primary", invalidOrder.id), null);
+}
+
+function createOrderEvent(orderId: string, id: string, eventType: string): OrderEventRecord {
+  return {
+    id,
+    orderId,
+    eventType,
+    eventSource: "LOCAL",
+    payloadJson: "{}",
+    createdAt: "2026-08-21T00:00:00.000Z",
+  };
+}
+
+function createFill(orderId: string, id: string): FillRecord {
+  return {
+    id,
+    orderId,
+    exchangeFillId: `${id}-exchange`,
+    market: "KRW-BTC",
+    side: "bid",
+    price: "500000",
+    volume: "0.001",
+    feeCurrency: "KRW",
+    feeAmount: "250",
+    filledAt: "2026-08-21T00:00:02.000Z",
+    rawPayloadJson: "{}",
+  };
+}
+
+function createRiskEvent(orderId: string, id: string): RiskEventRecord {
+  return {
+    id,
+    exchangeAccountId: "primary",
+    strategyDecisionId: null,
+    orderId,
+    level: "BLOCK",
+    ruleCode: "ORDER_RECOVERY_REQUIRED",
+    message: "Order submission requires reconciliation.",
+    payloadJson: "{}",
+    createdAt: "2026-08-21T00:00:04.000Z",
+  };
+}
+
+function createInMemoryOperatorState(): InMemoryOperatorStateStore {
+  const state: ExecutionStateRecord = {
+    id: "state-primary",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: "persisted-drift",
+    degradedAt: "2026-08-20T00:00:00.000Z",
+    updatedAt: "2026-08-20T00:00:00.000Z",
+  };
+  return new InMemoryOperatorStateStore(state);
+}
+
+function requireFaultPause(operatorState: {
+  pauseForFault?: (input: {
+    exchangeAccountId: string;
+    faultId: string;
+    reason: string;
+    occurredAt: string;
+  }) => Promise<ExecutionStateRecord>;
+}): NonNullable<typeof operatorState.pauseForFault> {
+  assert.ok(operatorState.pauseForFault, "Expected fault-pause capability.");
+  return operatorState.pauseForFault.bind(operatorState);
+}
+
+function requireAtomicRepository(repository: ExecutionRepository): AtomicExecutionRepository {
+  assert.ok(repository.persistOrderIntent, "Expected atomic order-intent persistence.");
+  assert.ok(repository.persistExchangeSubmission, "Expected atomic exchange-submission persistence.");
+  assert.ok(repository.persistUncertainSubmission, "Expected atomic uncertain-submission persistence.");
+  return repository as AtomicExecutionRepository;
 }
