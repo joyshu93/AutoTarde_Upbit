@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { setTimeout as delay } from "node:timers/promises";
 
 import type { ExecutionStateRecord } from "../src/domain/types.js";
 import type {
@@ -75,6 +76,69 @@ test("candidate recovery fault pause is atomic and idempotent in every repositor
           `provenance=${input.provenanceJson}`,
         factory.name,
       );
+    } finally {
+      await fixture.close();
+    }
+  }
+});
+
+test("concurrent identical candidate recovery faults serialize to one audit and transition", async () => {
+  for (const factory of FACTORIES) {
+    const fixture = await factory.create(`concurrent-idempotent-${factory.name}`);
+    try {
+      const deployment = await createDeployment(fixture, `deployment-concurrent-${factory.name}`);
+      const input = recoveryFaultInput(deployment.id, addMilliseconds(deployment.updatedAt, 1));
+
+      const results = await Promise.all([
+        fixture.candidatePilots.pauseForRecoveryFault(input),
+        fixture.candidatePilots.pauseForRecoveryFault(input),
+      ]);
+      const faultAudits = (await fixture.candidatePilots.listAuditEvents(deployment.id))
+        .filter((event) => event.id === input.faultId);
+      const faultTransitions = (await fixture.operatorState.listTransitions(100))
+        .filter((transition) => transition.id === input.faultId);
+
+      assert.deepEqual(results.map((result) => result.duplicate).sort(), [false, true], factory.name);
+      assert.equal(faultAudits.length, 1, factory.name);
+      assert.equal(faultTransitions.length, 1, factory.name);
+    } finally {
+      await fixture.close();
+    }
+  }
+});
+
+test("candidate recovery fault keeps occurrence provenance after a later kill switch", async () => {
+  for (const factory of FACTORIES) {
+    const fixture = await factory.create(`later-kill-switch-${factory.name}`);
+    try {
+      const deployment = await createDeployment(fixture, `deployment-later-kill-${factory.name}`);
+      const input = recoveryFaultInput(deployment.id, addMilliseconds(deployment.updatedAt, 1));
+      await waitUntilAfter(input.occurredAt);
+      const killSwitchState = await fixture.operatorState.activateKillSwitch("operator_before_fault_persistence");
+
+      assert.ok(Date.parse(killSwitchState.updatedAt) > Date.parse(input.occurredAt), factory.name);
+      const first = await fixture.candidatePilots.pauseForRecoveryFault(input);
+      const retry = await fixture.candidatePilots.pauseForRecoveryFault(input);
+      const faultAudit = (await fixture.candidatePilots.listAuditEvents(deployment.id))
+        .filter((event) => event.id === input.faultId);
+      const faultTransition = (await fixture.operatorState.listTransitions(100))
+        .filter((transition) => transition.id === input.faultId);
+
+      assert.equal(first.duplicate, false, factory.name);
+      assert.equal(retry.duplicate, true, factory.name);
+      assert.equal(first.deployment.updatedAt, input.occurredAt, factory.name);
+      assert.equal(first.auditEvent.createdAt, input.occurredAt, factory.name);
+      assert.equal(first.executionState.systemStatus, "KILL_SWITCHED", factory.name);
+      assert.equal(first.executionState.killSwitchActive, true, factory.name);
+      assert.equal(first.executionState.pauseReason, killSwitchState.pauseReason, factory.name);
+      assert.equal(first.executionState.updatedAt, killSwitchState.updatedAt, factory.name);
+      assert.equal(faultAudit.length, 1, factory.name);
+      assert.equal(faultTransition.length, 1, factory.name);
+      assert.equal(faultTransition[0]?.createdAt, killSwitchState.updatedAt, factory.name);
+      assert.equal(faultTransition[0]?.fromSystemStatus, "KILL_SWITCHED", factory.name);
+      assert.equal(faultTransition[0]?.toSystemStatus, "KILL_SWITCHED", factory.name);
+      assert.equal(faultTransition[0]?.fromKillSwitchActive, true, factory.name);
+      assert.equal(faultTransition[0]?.toKillSwitchActive, true, factory.name);
     } finally {
       await fixture.close();
     }
@@ -268,6 +332,13 @@ function initialExecutionState(): ExecutionStateRecord {
 
 function addMilliseconds(value: string, milliseconds: number): string {
   return new Date(Date.parse(value) + milliseconds).toISOString();
+}
+
+async function waitUntilAfter(value: string): Promise<void> {
+  const epochMilliseconds = Date.parse(value);
+  while (Date.now() <= epochMilliseconds) {
+    await delay(2);
+  }
 }
 
 async function createTempDatabasePath(label: string): Promise<string> {

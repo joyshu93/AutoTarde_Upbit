@@ -41,6 +41,7 @@ import {
 import type { SqliteExecutionStateRow } from "../types.js";
 import { fromSqliteBoolean, toSqliteBoolean } from "./sqlite-shapes.js";
 import {
+  deriveFaultPauseTransitionAt,
   faultPauseTransitionMatchesOccurrence,
   validateFaultPauseInput,
   validateFaultPauseTimestamp,
@@ -549,13 +550,13 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
     input: PauseCandidatePilotForRecoveryFaultInput,
   ): Promise<PauseCandidatePilotForRecoveryFaultResult> {
     validateCandidatePilotRecoveryFaultInput(input);
-    const faultPause = {
+    const faultOccurrence = {
       exchangeAccountId: input.exchangeAccountId,
       faultId: input.faultId,
       reason: candidatePilotRecoveryFaultReason(input),
       occurredAt: input.occurredAt,
     };
-    validateFaultPauseInput(faultPause);
+    validateFaultPauseInput(faultOccurrence);
 
     return withImmediateTransaction(this.db, () => {
       const deploymentRow = selectDeploymentRow(this.db, input.deploymentId);
@@ -571,6 +572,11 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
       const existingAuditRow = selectAuditRowById(this.db, input.faultId);
       const existingTransitionRow = selectExecutionStateTransitionRow(this.db, input.faultId);
       const executionState = selectExecutionState(this.db, input.exchangeAccountId);
+      const faultPause = {
+        ...faultOccurrence,
+        transitionAt: deriveFaultPauseTransitionAt(input.occurredAt, executionState.updatedAt),
+      };
+      validateFaultPauseInput(faultPause);
 
       if (existingAuditRow || existingTransitionRow) {
         if (

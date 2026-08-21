@@ -154,6 +154,15 @@ export function validateFaultPauseTimestamp(input: FaultPauseInput, current: Exe
   return requestedEpoch < currentEpoch ? current.updatedAt : requestedTransitionAt;
 }
 
+export function deriveFaultPauseTransitionAt(
+  occurredAt: string,
+  currentUpdatedAt: string,
+): string {
+  const occurredAtEpoch = parseStrictIsoTimestamp(occurredAt, "occurredAt");
+  const currentEpoch = parseStrictIsoTimestamp(currentUpdatedAt, "current updatedAt");
+  return occurredAtEpoch < currentEpoch ? currentUpdatedAt : occurredAt;
+}
+
 export function faultPauseTransitionMatchesOccurrence(input: FaultPauseInput, transitionAt: string): boolean {
   try {
     if (input.transitionAt === undefined) return transitionAt === input.occurredAt;

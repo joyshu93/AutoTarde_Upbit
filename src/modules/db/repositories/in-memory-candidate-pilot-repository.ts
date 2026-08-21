@@ -33,6 +33,7 @@ import {
   type PauseCandidatePilotForRecoveryFaultInput,
   type PauseCandidatePilotForRecoveryFaultResult,
 } from "../pilot-interfaces.js";
+import { deriveFaultPauseTransitionAt } from "./atomic-lifecycle-validation.js";
 
 interface StoredEvidence {
   record: Readonly<CandidateEvidenceRecord>;
@@ -45,6 +46,7 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
   private readonly evidence = new Map<string, StoredEvidence[]>();
   private readonly auditEvents = new Map<string, PositionGuardPilotAuditEventRecord[]>();
   private readonly bindingsByOrderId = new Map<string, CandidateExecutionBindingRecord>();
+  private recoveryFaultSerialization: Promise<void> = Promise.resolve();
 
   constructor(private readonly atomicFaultPauseStore?: InMemoryAtomicFaultPauseStore) {}
 
@@ -288,6 +290,15 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
     if (!this.atomicFaultPauseStore) {
       throw new Error("In-memory candidate recovery faults require an atomic fault-pause store.");
     }
+    return this.serializeRecoveryFault(() => this.pauseForRecoveryFaultSerialized(input));
+  }
+
+  private async pauseForRecoveryFaultSerialized(
+    input: PauseCandidatePilotForRecoveryFaultInput,
+  ): Promise<PauseCandidatePilotForRecoveryFaultResult> {
+    if (!this.atomicFaultPauseStore) {
+      throw new Error("In-memory candidate recovery faults require an atomic fault-pause store.");
+    }
     const deployment = this.deployments.get(input.deploymentId);
     const state = this.exactStates.get(input.deploymentId);
     if (!deployment || !state || deployment.exchangeAccountId !== input.exchangeAccountId) {
@@ -300,6 +311,7 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
       : (await this.atomicFaultPauseStore.listTransitions(Number.MAX_SAFE_INTEGER))
         .find((transition) => transition.id === input.faultId) ?? null;
     const executionState = await this.atomicFaultPauseStore.getState();
+    const transitionAt = deriveFaultPauseTransitionAt(input.occurredAt, executionState.updatedAt);
     if (existingAudit || existingTransition) {
       if (!existingAudit || !existingTransition || deployment.phase !== "PAUSED_FAULT" ||
         deployment.updatedAt !== input.occurredAt ||
@@ -358,6 +370,7 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
       faultId: input.faultId,
       reason: candidatePilotRecoveryFaultReason(input),
       occurredAt: input.occurredAt,
+      transitionAt,
     });
     const pausedDeployment: PositionGuardPilotDeploymentRecord = {
       ...deployment,
@@ -375,6 +388,20 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
       auditEvent: { ...auditEvent },
       duplicate: false,
     };
+  }
+
+  private async serializeRecoveryFault<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.recoveryFaultSerialization;
+    let release!: () => void;
+    this.recoveryFaultSerialization = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 }
 
