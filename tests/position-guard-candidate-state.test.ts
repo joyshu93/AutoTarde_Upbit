@@ -243,6 +243,45 @@ test("candidate state rejects incoherent cursor and full-exit chronology", () =>
   }), /chronolog|full-exit|cursor/i);
 });
 
+test("candidate state rejects an open ADD episode with too-small stateVersion", () => {
+  assert.throws(() => validatePositionGuardCandidateState({
+    ...emptyState(),
+    currentEpisodeAddCount: 1,
+    currentEpisodeCostBasisKrw: 150,
+    currentEpisodeInventoryQuantity: 1.5,
+    lastEntryPath: "PULLBACK",
+    lastEvidenceAt: "2026-08-20T01:00:00Z",
+    lastEvidenceId: "add",
+    stateVersion: 1,
+  }), /stateVersion|version/i);
+});
+
+test("candidate state rejects a completed episode with too-small stateVersion", () => {
+  assert.throws(() => validatePositionGuardCandidateState({
+    ...emptyState(),
+    lastFullExitAt: "2026-08-20T01:00:00Z",
+    lastFullExitRealizedPnlKrw: 10,
+    lastEntryPath: "PULLBACK",
+    lastEvidenceAt: "2026-08-20T01:00:00Z",
+    lastEvidenceId: "exit",
+    stateVersion: 1,
+  }), /stateVersion|version/i);
+});
+
+test("candidate state sums completed and open episode minimum stateVersion bounds", () => {
+  assert.throws(() => validatePositionGuardCandidateState({
+    ...emptyState(),
+    currentEpisodeCostBasisKrw: 100,
+    currentEpisodeInventoryQuantity: 1,
+    lastFullExitAt: "2026-08-20T01:00:00Z",
+    lastFullExitRealizedPnlKrw: 10,
+    lastEntryPath: "RECLAIM",
+    lastEvidenceAt: "2026-08-20T02:00:00Z",
+    lastEvidenceId: "reenter",
+    stateVersion: 2,
+  }), /stateVersion|version/i);
+});
+
 test("candidate state and evidence require exact own data properties", () => {
   const inheritedState = Object.create(emptyState()) as PositionGuardCandidateState;
   const inheritedEvidence = Object.create(buyEvidence({

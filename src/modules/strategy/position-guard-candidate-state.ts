@@ -288,6 +288,18 @@ function validateStateSnapshot(state: PositionGuardCandidateState): void {
   } else if (state.currentEpisodeCostBasisKrw <= 0 || state.lastEntryPath === null) {
     throw new Error("Open PositionGuard candidate state requires positive cost basis and entry path.");
   }
+  if (state.stateVersion < minimumReachableStateVersion(state)) {
+    throw new Error("PositionGuard candidate state stateVersion is below the minimum implied by its persisted episode state.");
+  }
+}
+
+function minimumReachableStateVersion(state: PositionGuardCandidateState): number {
+  let minimum = state.lastFullExitAt === null ? 0 : 2;
+  if (state.currentEpisodeInventoryQuantity > POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE) {
+    minimum += 1 + state.currentEpisodeAddCount;
+    if (state.currentEpisodeRealizedPnlKrw !== 0) minimum += 1;
+  }
+  return minimum;
 }
 
 function validateFullExitMetadata(state: PositionGuardCandidateState): void {

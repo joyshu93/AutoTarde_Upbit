@@ -474,12 +474,20 @@ function state(overrides: Partial<PositionGuardCandidateState> = {}): PositionGu
     result.lastEntryPath ??= "PULLBACK";
     result.lastEvidenceAt ??= "2026-01-01T00:00:00Z";
     result.lastEvidenceId ??= "fixture-open-evidence";
-    result.stateVersion ||= 1;
   }
   if (result.lastFullExitAt !== null) {
     result.lastEvidenceAt ??= result.lastFullExitAt;
     result.lastEvidenceId ??= "fixture-full-exit";
-    result.stateVersion ||= 1;
   }
+  result.stateVersion = Math.max(result.stateVersion, minimumReachableStateVersion(result));
   return result;
+}
+
+function minimumReachableStateVersion(state: PositionGuardCandidateState): number {
+  let minimum = state.lastFullExitAt === null ? 0 : 2;
+  if (state.currentEpisodeInventoryQuantity > 1e-12) {
+    minimum += 1 + state.currentEpisodeAddCount;
+    if (state.currentEpisodeRealizedPnlKrw !== 0) minimum += 1;
+  }
+  return minimum;
 }
