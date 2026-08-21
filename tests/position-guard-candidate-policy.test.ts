@@ -142,6 +142,7 @@ test("candidate policy releases exact cooldown boundaries and rejects future ful
   assert.equal(evaluate({
     candidateState: nonPositiveState,
     generatedAt: "2026-08-20T12:00:00Z",
+    analysis: analysis({ entryPath: "RECLAIM" }),
   }).outcome, "ALLOW");
 
   const samePathState = state({
@@ -476,6 +477,7 @@ function state(overrides: Partial<PositionGuardCandidateState> = {}): PositionGu
     result.lastEvidenceId ??= "fixture-open-evidence";
   }
   if (result.lastFullExitAt !== null) {
+    result.lastEntryPath ??= "PULLBACK";
     result.lastEvidenceAt ??= result.lastFullExitAt;
     result.lastEvidenceId ??= "fixture-full-exit";
   }

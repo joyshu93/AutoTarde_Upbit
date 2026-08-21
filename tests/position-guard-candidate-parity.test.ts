@@ -378,6 +378,7 @@ function candidateState(overrides: Partial<PositionGuardCandidateState> = {}): P
     result.lastEvidenceId ??= "fixture-open-evidence";
   }
   if (result.lastFullExitAt !== null) {
+    result.lastEntryPath ??= "PULLBACK";
     result.lastEvidenceAt ??= result.lastFullExitAt;
     result.lastEvidenceId ??= "fixture-full-exit";
   }

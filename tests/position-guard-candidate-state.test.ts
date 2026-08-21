@@ -237,6 +237,7 @@ test("candidate state rejects incoherent cursor and full-exit chronology", () =>
     ...emptyState(),
     lastFullExitAt: "2026-08-20T01:00:00Z",
     lastFullExitRealizedPnlKrw: 0,
+    lastEntryPath: "PULLBACK",
     lastEvidenceAt: "2026-08-20T00:00:00Z",
     lastEvidenceId: "cursor",
     stateVersion: 1,
@@ -266,6 +267,17 @@ test("candidate state rejects a completed episode with too-small stateVersion", 
     lastEvidenceId: "exit",
     stateVersion: 1,
   }), /stateVersion|version/i);
+});
+
+test("candidate state rejects a completed episode without its entry path", () => {
+  assert.throws(() => validatePositionGuardCandidateState({
+    ...emptyState(),
+    lastFullExitAt: "2026-08-20T01:00:00Z",
+    lastFullExitRealizedPnlKrw: 10,
+    lastEvidenceAt: "2026-08-20T01:00:00Z",
+    lastEvidenceId: "exit",
+    stateVersion: 2,
+  }), /entry path|lastEntryPath/i);
 });
 
 test("candidate state sums completed and open episode minimum stateVersion bounds", () => {

@@ -269,6 +269,9 @@ function validateStateSnapshot(state: PositionGuardCandidateState): void {
     throw new Error("PositionGuard candidate state lastEntryPath is invalid.");
   }
   validateFullExitMetadata(state);
+  if (state.lastFullExitAt !== null && state.lastEntryPath === null) {
+    throw new Error("Completed PositionGuard candidate state requires lastEntryPath.");
+  }
   validateCursor(state);
 
   if (state.currentEpisodeInventoryQuantity <= POSITION_GUARD_CANDIDATE_QUANTITY_TOLERANCE) {
