@@ -39,5 +39,7 @@ function isExactAbandonedRecord(value: unknown): value is PositionGuardPilotAban
     return false;
   }
 
-  return expectedEntries.every(([key, expectedValue]) => candidate[key] === expectedValue);
+  return expectedEntries.every(
+    ([key, expectedValue]) => Object.hasOwn(candidate, key) && candidate[key] === expectedValue,
+  );
 }

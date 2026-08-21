@@ -15,7 +15,7 @@ export interface AppConfig {
   serviceName: string;
   executionMode: ExecutionMode;
   liveExecutionGate: LiveExecutionGate;
-  positionGuardPolicySelection?: PositionGuardPolicySelection;
+  positionGuardPolicySelection: PositionGuardPolicySelection;
   globalKillSwitch: boolean;
   upbitBaseUrl: string;
   databasePath: string;

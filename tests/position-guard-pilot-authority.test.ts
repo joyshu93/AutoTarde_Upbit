@@ -38,3 +38,18 @@ test("pilot authority rejects every material mutation of the published abandonme
     assert.throws(() => validatePositionGuardPilotAbandonment(event));
   }
 });
+
+test("pilot authority rejects an inherited abandonment record with unrelated own keys", () => {
+  const inheritedRecord = Object.assign(Object.create(EXACT_ABANDONED_EVENT), {
+    unrelated1: true,
+    unrelated2: true,
+    unrelated3: true,
+    unrelated4: true,
+    unrelated5: true,
+    unrelated6: true,
+    unrelated7: true,
+    unrelated8: true,
+  });
+
+  assert.throws(() => validatePositionGuardPilotAbandonment(inheritedRecord));
+});

@@ -202,6 +202,7 @@ function createConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     serviceName: "AutoTrade_Upbit",
     executionMode: "DRY_RUN",
     liveExecutionGate: "DISABLED",
+    positionGuardPolicySelection: { kind: "BASELINE", pilotId: null },
     globalKillSwitch: false,
     upbitBaseUrl: "https://api.upbit.com",
     databasePath: "./var/autotrade-upbit.sqlite",
