@@ -74,6 +74,7 @@ await import("./position-guard-pilot-recovery.test.js");
 await import("./candidate-bound-order-validation.test.js");
 await import("./candidate-bound-order-intent-in-memory.test.js");
 await import("./candidate-bound-order-intent-sqlite.test.js");
+await import("./candidate-execution-authority.test.js");
 await import("./performance-calculator.test.js");
 await import("./performance-trade-matcher.test.js");
 await import("./performance-diagnostics.test.js");
