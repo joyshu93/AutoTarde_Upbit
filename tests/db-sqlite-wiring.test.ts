@@ -66,6 +66,7 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
     assert.ok(migrationRows.some((row) => row.filename === "0014_extend_scheduler_operator_notification_types.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0015_add_scheduler_startup_blocked_notification_type.sql"));
     assert.ok(migrationRows.some((row) => row.filename === "0016_add_pending_confirmation_strategy_decision_status.sql"));
+    assert.ok(migrationRows.some((row) => row.filename === "0017_add_btc_candidate_live_pilot.sql"));
 
     const foreignKeyViolations = handle.db.prepare("PRAGMA foreign_key_check").all();
     assert.deepEqual(foreignKeyViolations, []);
@@ -88,6 +89,12 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
       "strategy_scheduler_runs",
       "telegram_inbound_offsets",
       "risk_events",
+      "strategy_pilot_deployments",
+      "strategy_candidate_states",
+      "strategy_candidate_execution_evidence",
+      "strategy_pilot_audit_events",
+      "account_execution_leases",
+      "order_submission_recovery_observations",
     ]) {
       assert.ok(tableNames.has(tableName), `Expected migrated table ${tableName} to exist.`);
     }
@@ -122,6 +129,8 @@ test("createSqlitePersistence bootstraps operator state and round-trips app-faci
     assert.equal(initialState.killSwitchActive, false);
     assert.equal(initialState.degradedReason, null);
     assert.equal(initialState.degradedAt, null);
+    assert.notEqual(bundle.candidatePilots, bundle.repositories);
+    assert.notEqual(bundle.accountExecutionLeases, bundle.repositories);
     assert.equal(bootstrapTransitions[0]?.command, "BOOTSTRAP");
 
     const pausedState = await bundle.operatorState.pause("maintenance_window");

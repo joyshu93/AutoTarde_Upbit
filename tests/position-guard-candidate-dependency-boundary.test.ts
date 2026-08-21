@@ -20,6 +20,13 @@ const RUNTIME_SURFACE_DIRECTORIES = [
   "src/modules/telegram",
   "src/smoke",
 ] as const;
+const APPROVED_PERSISTENCE_PROJECTOR_IMPORTERS = new Set([
+  "/src/modules/db/pilot-interfaces.ts",
+  "/src/modules/db/repositories/in-memory-candidate-pilot-repository.ts",
+  "/src/modules/db/repositories/sqlite-candidate-pilot-repository.ts",
+]);
+const APPROVED_PERSISTENCE_PROJECTOR =
+  "/src/modules/strategy/position-guard-candidate-state.ts";
 const FORBIDDEN_CANDIDATE_SOURCE_REFERENCES: readonly [RegExp, string][] = [
   [/\bprocess\.env\b/u, "runtime environment configuration"],
   [/(?:node:)?fs(?:\/promises)?\b/iu, "filesystem APIs"],
@@ -257,7 +264,7 @@ test("candidate modules recursively exclude operational, prospective, and side-e
   assert.ok(visited.size >= candidateFiles.length, "candidate dependency traversal must include every discovered candidate file");
 });
 
-test("runtime surfaces cannot reach candidate modules through static imports", async () => {
+test("runtime surfaces reach only the reviewed candidate persistence projector bridge", async () => {
   const candidateFiles = new Set((await discoverCandidateFiles()).map(toRepositoryPath));
   const runtimeFiles = await discoverRuntimeSurfaceFiles();
   assert.ok(runtimeFiles.length > 0, "the guard must discover runtime surface files");
@@ -265,17 +272,21 @@ test("runtime surfaces cannot reach candidate modules through static imports", a
   await walkStaticImports(runtimeFiles, async (absoluteFile, _source, edges) => {
     const relativeFile = toRepositoryPath(absoluteFile);
     assert.equal(
-      candidateFiles.has(relativeFile),
+      candidateFiles.has(relativeFile) && relativeFile !== APPROVED_PERSISTENCE_PROJECTOR,
       false,
       `${relativeFile} is a candidate module reachable from a runtime surface`,
     );
     for (const edge of edges) {
       if (!edge.specifier.startsWith(".")) continue;
       const dependency = await resolveSourceImport(absoluteFile, edge.specifier);
+      const dependencyPath = toRepositoryPath(dependency);
+      const approvedPersistenceBridge =
+        APPROVED_PERSISTENCE_PROJECTOR_IMPORTERS.has(relativeFile) &&
+        dependencyPath === APPROVED_PERSISTENCE_PROJECTOR;
       assert.equal(
-        candidateFiles.has(toRepositoryPath(dependency)),
+        candidateFiles.has(dependencyPath) && !approvedPersistenceBridge,
         false,
-        `${relativeFile} directly imports candidate module ${toRepositoryPath(dependency)}`,
+        `${relativeFile} directly imports candidate module ${dependencyPath}`,
       );
     }
   });

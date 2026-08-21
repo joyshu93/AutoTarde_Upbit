@@ -19,6 +19,55 @@ export type PositionGuardPilotPhase =
   | "PAUSED_FAULT"
   | "DRAINING";
 
+export interface PositionGuardPilotDeploymentRecord {
+  id: string;
+  exchangeAccountId: string;
+  pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1";
+  market: "KRW-BTC";
+  policyId: "COMBINED_CONSERVATIVE";
+  policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1";
+  phase: PositionGuardPilotPhase;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type PositionGuardPilotAuditEventType =
+  | "DEPLOYMENT_CREATED"
+  | "STATE_ADVANCED"
+  | "PHASE_TRANSITION"
+  | "FAULT_PAUSED"
+  | "ROLLBACK_STARTED"
+  | "ROLLBACK_COMPLETED";
+
+export interface PositionGuardPilotAuditEventRecord {
+  id: string;
+  deploymentId: string;
+  eventType: PositionGuardPilotAuditEventType;
+  fromPhase: PositionGuardPilotPhase | null;
+  toPhase: PositionGuardPilotPhase | null;
+  stateVersion: number;
+  payloadJson: string;
+  createdAt: string;
+}
+
+export interface AccountExecutionLeaseRecord {
+  exchangeAccountId: string;
+  ownerToken: string;
+  purpose: "ORDER_SUBMISSION";
+  acquiredAtEpochMs: number;
+  expiresAtEpochMs: number;
+}
+
+export interface OrderSubmissionRecoveryObservationRecord {
+  id: string;
+  orderId: string;
+  outcome: "FOUND" | "NOT_FOUND" | "TRANSIENT_FAILURE";
+  observedAt: string;
+  observedAtEpochMs: number;
+  detailJson: string;
+  createdAt: string;
+}
+
 export type PositionGuardPilotAbandonmentRecord = Readonly<{
   authority: string;
   event: string;

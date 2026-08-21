@@ -49,6 +49,8 @@ import type { SqliteBootstrapOptions, SqlitePersistenceBundle } from "./contract
 import { fromSqliteBoolean, parseJson, stringifyJson, toSqliteBoolean } from "./sqlite-shapes.js";
 import { openSqliteDatabase } from "./sqlite-database.js";
 import { createId } from "../../../shared/ids.js";
+import { SqliteAccountExecutionLeaseStore } from "./sqlite-account-execution-lease-store.js";
+import { SqliteCandidatePilotRepository } from "./sqlite-candidate-pilot-repository.js";
 
 const ACTIVE_ORDER_STATUSES = new Set<OrderRecord["status"]>([
   "INTENT_CREATED",
@@ -65,6 +67,8 @@ const ACTIVE_ORDER_STATUS_PLACEHOLDERS = ACTIVE_ORDER_STATUS_VALUES.map(() => "?
 export function createSqlitePersistence(options: SqliteBootstrapOptions): SqlitePersistenceBundle {
   const handle = openSqliteDatabase(options.databasePath);
   const repositories = new SqliteExecutionRepository(handle.db);
+  const candidatePilots = new SqliteCandidatePilotRepository(handle.db);
+  const accountExecutionLeases = new SqliteAccountExecutionLeaseStore(handle.db);
   const telegramInboundOffsets = new SqliteTelegramInboundOffsetStore(handle.db);
 
   const now = new Date().toISOString();
@@ -124,6 +128,8 @@ export function createSqlitePersistence(options: SqliteBootstrapOptions): Sqlite
 
   return {
     repositories,
+    candidatePilots,
+    accountExecutionLeases,
     operatorState: new SqliteOperatorStateStore(handle.db, options.exchangeAccountId),
     telegramInboundOffsets,
     close() {
