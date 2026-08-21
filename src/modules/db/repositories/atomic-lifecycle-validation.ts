@@ -3,6 +3,7 @@ import type {
   FillRecord,
   OrderEventRecord,
   OrderRecord,
+  RiskEventRecord,
 } from "../../../domain/types.js";
 import type {
   FaultPauseInput,
@@ -66,27 +67,64 @@ export function validateNewOrderUniqueness(existingOrders: OrderRecord[], next: 
   }
 }
 
-export function validateAtomicCompletion(
+export function validateExchangeSubmissionCompletion(
   currentOrder: OrderRecord,
   nextOrder: OrderRecord,
-  childStates: Array<{ present: boolean; exact: boolean }>,
-  operation: string,
+  input: PersistExchangeSubmissionInput,
+  existingEvents: OrderEventRecord[],
+  existingFills: FillRecord[],
 ): "APPLY" | "RETRY" {
   validateOrderIdentity(currentOrder, nextOrder);
-  const allAbsent = childStates.every((child) => !child.present);
-  const allExact = childStates.every((child) => child.present && child.exact);
+  const submissionEvents = existingEvents.filter(
+    (event) => event.eventType === "ORDER_SUBMITTED" || event.eventType === "ORDER_REJECTED",
+  );
   if (currentOrder.status === "PERSISTED" || currentOrder.status === "SUBMITTING") {
-    if (allAbsent) return "APPLY";
-    throw new Error(`Corrupt partial ${operation} children for order ${nextOrder.id}.`);
+    if (submissionEvents.length === 0 && existingFills.length === 0) return "APPLY";
+    throw new Error(`Corrupt partial exchange submission children for order ${nextOrder.id}.`);
   }
-  if (recordsEqual(currentOrder, nextOrder) && allExact) return "RETRY";
-  throw new Error(`Conflicting ${operation} for order ${nextOrder.id}.`);
+  if (
+    recordsEqual(currentOrder, nextOrder) &&
+    submissionEvents.length === 1 &&
+    recordsEqual(submissionEvents[0]!, input.event) &&
+    recordsEqualSet(existingFills, input.fills, fillIdentity)
+  ) return "RETRY";
+  throw new Error(`Conflicting exchange submission for order ${nextOrder.id}.`);
 }
 
-export function validateFaultPauseInput(input: FaultPauseInput, current: ExecutionStateRecord): void {
+export function validateUncertainSubmissionCompletion(
+  currentOrder: OrderRecord,
+  nextOrder: OrderRecord,
+  input: PersistUncertainSubmissionInput,
+  existingEvents: OrderEventRecord[],
+  existingRiskEvents: RiskEventRecord[],
+): "APPLY" | "RETRY" {
+  validateOrderIdentity(currentOrder, nextOrder);
+  const recoveryEvents = existingEvents.filter((event) => event.eventType === "RECONCILIATION_RECOVERY_REQUIRED");
+  const uncertainRiskEvents = existingRiskEvents.filter(
+    (event) => event.ruleCode === "POSITION_GUARD_PILOT_UNCERTAIN_ORDER",
+  );
+  if (currentOrder.status === "PERSISTED" || currentOrder.status === "SUBMITTING") {
+    if (recoveryEvents.length === 0 && uncertainRiskEvents.length === 0) return "APPLY";
+    throw new Error(`Corrupt partial uncertain submission children for order ${nextOrder.id}.`);
+  }
+  if (
+    recordsEqual(currentOrder, nextOrder) &&
+    recoveryEvents.length === 1 &&
+    uncertainRiskEvents.length === 1 &&
+    recordsEqual(recoveryEvents[0]!, input.event) &&
+    recordsEqual(uncertainRiskEvents[0]!, input.riskEvent)
+  ) return "RETRY";
+  throw new Error(`Conflicting uncertain submission for order ${nextOrder.id}.`);
+}
+
+export function validateFaultPauseInput(input: FaultPauseInput): void {
   if (!input.exchangeAccountId || !input.faultId.trim() || !input.reason.trim()) {
     throw new Error("Automatic fault pauses require non-empty account, faultId, and reason.");
   }
+  parseStrictIsoTimestamp(input.occurredAt, "occurredAt");
+}
+
+export function validateFaultPauseTimestamp(input: FaultPauseInput, current: ExecutionStateRecord): void {
   if (parseStrictIsoTimestamp(input.occurredAt, "occurredAt") < parseStrictIsoTimestamp(current.updatedAt, "current updatedAt")) {
     throw new Error("Automatic fault pause occurredAt cannot predate current execution state.");
   }
@@ -100,6 +138,20 @@ export function recordsEqual<T extends object>(left: T, right: T): boolean {
   return leftKeys.length === rightKeys.length && leftKeys.every(
     (key) => Object.prototype.hasOwnProperty.call(rightRecord, key) && leftRecord[key] === rightRecord[key],
   );
+}
+
+function recordsEqualSet<T extends object>(left: T[], right: T[], identity: (record: T) => string): boolean {
+  if (left.length !== right.length) return false;
+  const rightByIdentity = new Map(right.map((record) => [identity(record), record]));
+  if (rightByIdentity.size !== right.length) return false;
+  return left.every((record) => {
+    const matching = rightByIdentity.get(identity(record));
+    return matching !== undefined && recordsEqual(record, matching);
+  });
+}
+
+function fillIdentity(fill: FillRecord): string {
+  return `${fill.id}\u0000${fill.orderId}\u0000${fill.exchangeFillId}`;
 }
 
 function validateOrderEvent(order: OrderRecord, event: OrderEventRecord, type: string, source: OrderEventRecord["eventSource"]): void {

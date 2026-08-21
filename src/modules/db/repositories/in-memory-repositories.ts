@@ -34,11 +34,13 @@ import type {
 } from "../interfaces.js";
 import {
   recordsEqual,
-  validateAtomicCompletion,
   validateExchangeSubmissionInput,
   validateFaultPauseInput,
+  validateFaultPauseTimestamp,
+  validateExchangeSubmissionCompletion,
   validateNewOrderUniqueness,
   validateOrderIntentInput,
+  validateUncertainSubmissionCompletion,
   validateUncertainSubmissionInput,
 } from "./atomic-lifecycle-validation.js";
 
@@ -135,17 +137,12 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     const existingFills = input.fills.map((fill) => findStoredFill(this.fills, fill));
     input.fills.forEach((fill, index) => assertNoConflictingRecord(existingFills[index], fill, "fill"));
 
-    const completion = validateAtomicCompletion(
+    const completion = validateExchangeSubmissionCompletion(
       existingOrder,
       input.order,
-      [
-        { present: Boolean(existingEvent), exact: Boolean(existingEvent && recordsEqual(existingEvent, input.event)) },
-        ...existingFills.map((fill, index) => ({
-          present: Boolean(fill),
-          exact: Boolean(fill && recordsEqual(fill, input.fills[index]!)),
-        })),
-      ],
-      "exchange submission",
+      input,
+      this.orderEvents.filter((candidate) => candidate.orderId === input.order.id),
+      this.fills.filter((candidate) => candidate.orderId === input.order.id),
     );
     if (completion === "RETRY") {
       return;
@@ -154,13 +151,8 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     const nextOrders = this.orders.map((candidate) =>
       candidate.id === input.order.id ? cloneRecord(input.order) : candidate,
     );
-    const nextOrderEvents = existingEvent
-      ? [...this.orderEvents]
-      : [...this.orderEvents, cloneRecord(input.event)];
-    const nextFills = [
-      ...this.fills,
-      ...input.fills.filter((_, index) => !existingFills[index]).map(cloneRecord),
-    ];
+    const nextOrderEvents = [...this.orderEvents, cloneRecord(input.event)];
+    const nextFills = [...this.fills, ...input.fills.map(cloneRecord)];
     this.orders = nextOrders;
     this.orderEvents = nextOrderEvents;
     this.fills = nextFills;
@@ -178,14 +170,12 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     assertNoConflictingRecord(existingEvent, input.event, "order event");
     assertNoConflictingRecord(existingRiskEvent, input.riskEvent, "risk event");
 
-    const completion = validateAtomicCompletion(
+    const completion = validateUncertainSubmissionCompletion(
       existingOrder,
       input.order,
-      [
-        { present: Boolean(existingEvent), exact: Boolean(existingEvent && recordsEqual(existingEvent, input.event)) },
-        { present: Boolean(existingRiskEvent), exact: Boolean(existingRiskEvent && recordsEqual(existingRiskEvent, input.riskEvent)) },
-      ],
-      "uncertain submission",
+      input,
+      this.orderEvents.filter((candidate) => candidate.orderId === input.order.id),
+      this.riskEvents.filter((candidate) => candidate.orderId === input.order.id),
     );
     if (completion === "RETRY") {
       return;
@@ -194,12 +184,8 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     const nextOrders = this.orders.map((candidate) =>
       candidate.id === input.order.id ? cloneRecord(input.order) : candidate,
     );
-    const nextOrderEvents = existingEvent
-      ? [...this.orderEvents]
-      : [...this.orderEvents, cloneRecord(input.event)];
-    const nextRiskEvents = existingRiskEvent
-      ? [...this.riskEvents]
-      : [...this.riskEvents, cloneRecord(input.riskEvent)];
+    const nextOrderEvents = [...this.orderEvents, cloneRecord(input.event)];
+    const nextRiskEvents = [...this.riskEvents, cloneRecord(input.riskEvent)];
     this.orders = nextOrders;
     this.orderEvents = nextOrderEvents;
     this.riskEvents = nextRiskEvents;
@@ -642,10 +628,10 @@ export class InMemoryOperatorStateStore implements OperatorStateStore {
   }
 
   async pauseForFault(input: FaultPauseInput): Promise<ExecutionStateRecord> {
+    validateFaultPauseInput(input);
     if (input.exchangeAccountId !== this.state.exchangeAccountId) {
       throw new Error(`Fault ${input.faultId} is for a different exchange account.`);
     }
-    validateFaultPauseInput(input, this.state);
     const reason = formatFaultPauseReason(input);
     const existing = this.transitions.find((transition) => transition.id === input.faultId);
     if (existing) {
@@ -653,12 +639,14 @@ export class InMemoryOperatorStateStore implements OperatorStateStore {
         existing.command === "AUTOMATIC_PAUSE" &&
         existing.exchangeAccountId === input.exchangeAccountId &&
         existing.reason === reason &&
+        existing.createdAt === input.occurredAt &&
         (this.state.systemStatus === "PAUSED" || this.state.systemStatus === "KILL_SWITCHED")
       ) {
         return this.getState();
       }
       throw new Error(`Conflicting duplicate automatic pause ${input.faultId}.`);
     }
+    validateFaultPauseTimestamp(input, this.state);
 
     const previousState = { ...this.state };
     const preservesKillSwitch = this.state.killSwitchActive || this.state.systemStatus === "KILL_SWITCHED";

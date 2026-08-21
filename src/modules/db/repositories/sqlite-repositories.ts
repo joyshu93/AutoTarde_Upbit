@@ -62,10 +62,12 @@ import { SqliteCandidatePilotRepository } from "./sqlite-candidate-pilot-reposit
 import { withImmediateTransaction } from "./sqlite-transaction.js";
 import {
   recordsEqual,
-  validateAtomicCompletion,
   validateExchangeSubmissionInput,
+  validateExchangeSubmissionCompletion,
   validateFaultPauseInput,
+  validateFaultPauseTimestamp,
   validateOrderIntentInput,
+  validateUncertainSubmissionCompletion,
   validateUncertainSubmissionInput,
 } from "./atomic-lifecycle-validation.js";
 
@@ -256,31 +258,20 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       const existingFills = input.fills.map((fill) => this.getFillByIdentity(fill));
       input.fills.forEach((fill, index) => assertNoConflictingRecord(existingFills[index] ?? null, fill, "fill"));
 
-      const completion = validateAtomicCompletion(
+      const completion = validateExchangeSubmissionCompletion(
         existingOrder,
         input.order,
-        [
-          { present: Boolean(existingEvent), exact: Boolean(existingEvent && recordsEqual(existingEvent, input.event)) },
-          ...existingFills.map((fill, index) => ({
-            present: Boolean(fill),
-            exact: Boolean(fill && recordsEqual(fill, input.fills[index]!)),
-          })),
-        ],
-        "exchange submission",
+        input,
+        this.getOrderEventsForOrder(input.order.id),
+        this.getFillsForOrder(input.order.id),
       );
       if (completion === "RETRY") {
         return;
       }
 
       this.upsertOrder(input.order);
-      if (!existingEvent) {
-        this.insertOrderEvent(input.event);
-      }
-      input.fills.forEach((fill, index) => {
-        if (!existingFills[index]) {
-          this.upsertFill(fill);
-        }
-      });
+      this.insertOrderEvent(input.event);
+      input.fills.forEach((fill) => this.upsertFill(fill));
     });
   }
 
@@ -297,26 +288,20 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       assertNoConflictingRecord(existingEvent, input.event, "order event");
       assertNoConflictingRecord(existingRiskEvent, input.riskEvent, "risk event");
 
-      const completion = validateAtomicCompletion(
+      const completion = validateUncertainSubmissionCompletion(
         existingOrder,
         input.order,
-        [
-          { present: Boolean(existingEvent), exact: Boolean(existingEvent && recordsEqual(existingEvent, input.event)) },
-          { present: Boolean(existingRiskEvent), exact: Boolean(existingRiskEvent && recordsEqual(existingRiskEvent, input.riskEvent)) },
-        ],
-        "uncertain submission",
+        input,
+        this.getOrderEventsForOrder(input.order.id),
+        this.getRiskEventsForOrder(input.order.id),
       );
       if (completion === "RETRY") {
         return;
       }
 
       this.upsertOrder(input.order);
-      if (!existingEvent) {
-        this.insertOrderEvent(input.event);
-      }
-      if (!existingRiskEvent) {
-        this.upsertRiskEvent(input.riskEvent);
-      }
+      this.insertOrderEvent(input.event);
+      this.upsertRiskEvent(input.riskEvent);
     });
   }
 
@@ -1101,6 +1086,13 @@ export class SqliteExecutionRepository implements ExecutionRepository {
     return row ? mapOrderEventRow(row) : null;
   }
 
+  private getOrderEventsForOrder(orderId: string): OrderEventRecord[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM order_events WHERE order_id = ? ORDER BY created_at ASC, rowid ASC
+    `).all(orderId) as unknown as SqliteOrderEventRow[];
+    return rows.map(mapOrderEventRow);
+  }
+
   private getFillByIdentity(fill: FillRecord): FillRecord | null {
     const rows = this.db.prepare(`
       SELECT * FROM fills
@@ -1114,9 +1106,23 @@ export class SqliteExecutionRepository implements ExecutionRepository {
     return rows[0] ? mapFillRow(rows[0]) : null;
   }
 
+  private getFillsForOrder(orderId: string): FillRecord[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM fills WHERE order_id = ? ORDER BY filled_at ASC, rowid ASC
+    `).all(orderId) as unknown as SqliteFillRow[];
+    return rows.map(mapFillRow);
+  }
+
   private getRiskEventById(id: string): RiskEventRecord | null {
     const row = this.db.prepare("SELECT * FROM risk_events WHERE id = ? LIMIT 1").get(id) as SqliteRiskEventRow | undefined;
     return row ? mapRiskEventRow(row) : null;
+  }
+
+  private getRiskEventsForOrder(orderId: string): RiskEventRecord[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM risk_events WHERE order_id = ? ORDER BY created_at ASC, rowid ASC
+    `).all(orderId) as unknown as SqliteRiskEventRow[];
+    return rows.map(mapRiskEventRow);
   }
 
   private upsertOrder(record: OrderRecord): void {
@@ -1208,16 +1214,13 @@ export class SqliteOperatorStateStore implements OperatorStateStore {
   }
 
   async pauseForFault(input: FaultPauseInput): Promise<ExecutionStateRecord> {
+    validateFaultPauseInput(input);
     if (input.exchangeAccountId !== this.exchangeAccountId) {
       throw new Error(`Fault ${input.faultId} is for a different exchange account.`);
-    }
-    if (!input.faultId || !input.reason || !input.occurredAt) {
-      throw new Error("Automatic fault pauses require faultId, reason, and occurredAt.");
     }
 
     return withImmediateTransaction(this.db, () => {
       const current = this.getStateSync();
-      validateFaultPauseInput(input, current);
       const reason = formatFaultPauseReason(input);
       const existingRow = this.db.prepare(`
         SELECT * FROM execution_state_transitions WHERE id = ? LIMIT 1
@@ -1228,12 +1231,14 @@ export class SqliteOperatorStateStore implements OperatorStateStore {
           existing.command === "AUTOMATIC_PAUSE" &&
           existing.exchangeAccountId === input.exchangeAccountId &&
           existing.reason === reason &&
+          existing.createdAt === input.occurredAt &&
           (current.systemStatus === "PAUSED" || current.systemStatus === "KILL_SWITCHED")
         ) {
           return current;
         }
         throw new Error(`Conflicting duplicate automatic pause ${input.faultId}.`);
       }
+      validateFaultPauseTimestamp(input, current);
 
       const preservesKillSwitch = current.killSwitchActive || current.systemStatus === "KILL_SWITCHED";
       const nextState: ExecutionStateRecord = {

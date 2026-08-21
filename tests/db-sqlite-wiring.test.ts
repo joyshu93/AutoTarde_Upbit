@@ -83,6 +83,8 @@ test("in-memory automatic fault pauses are idempotent and preserve kill switches
   assert.equal(state.systemStatus, "KILL_SWITCHED");
   assert.equal(state.killSwitchActive, true);
   assert.equal(state.pauseReason, "operator");
+  assert.deepEqual(await operatorState.pauseForFault(fault), state);
+  assert.deepEqual(await operatorState.getState(), state);
   assert.equal(
     (await operatorState.listTransitions()).filter((transition) => transition.command === "AUTOMATIC_PAUSE").length,
     2,
@@ -162,7 +164,10 @@ test("sqlite atomic lifecycle writes roll back conflicts and fault pauses stay s
       faultId: "sqlite-second-fault",
       occurredAt: "2099-08-21T00:03:00.000Z",
     });
-    assert.equal((await bundle.operatorState.getState()).systemStatus, "KILL_SWITCHED");
+    const state = await bundle.operatorState.getState();
+    assert.equal(state.systemStatus, "KILL_SWITCHED");
+    assert.deepEqual(await bundle.operatorState.pauseForFault(fault), state);
+    assert.deepEqual(await bundle.operatorState.getState(), state);
     assert.equal(
       (await bundle.operatorState.listTransitions()).filter((transition) => transition.command === "AUTOMATIC_PAUSE").length,
       2,
@@ -1506,6 +1511,74 @@ async function assertAtomicLifecycleContract(repository: ExecutionRepository): P
   assert.equal((await repository.findOrderByReference("primary", partialOrder.id))?.status, "PERSISTED");
   assert.equal((await repository.listFills(partialOrder.id)).length, 0);
 
+  const extraSubmissionEventOrder = createOrderRecord({ id: "extra-submission-event-order", status: "PERSISTED" });
+  await repository.persistOrderIntent({
+    order: extraSubmissionEventOrder,
+    event: createOrderEvent(extraSubmissionEventOrder.id, "extra-submission-event-intent", "ORDER_PERSISTED"),
+  });
+  const extraSubmissionEvent = createOrderEvent(
+    extraSubmissionEventOrder.id,
+    "extra-submission-event-existing",
+    "ORDER_SUBMITTED",
+  );
+  extraSubmissionEvent.eventSource = "EXCHANGE";
+  await repository.appendOrderEvent(extraSubmissionEvent);
+  const incomingSubmissionEvent = createOrderEvent(
+    extraSubmissionEventOrder.id,
+    "extra-submission-event-incoming",
+    "ORDER_SUBMITTED",
+  );
+  incomingSubmissionEvent.eventSource = "EXCHANGE";
+  await assert.rejects(repository.persistExchangeSubmission({
+    order: { ...extraSubmissionEventOrder, status: "PARTIALLY_FILLED" },
+    event: incomingSubmissionEvent,
+    fills: [createFill(extraSubmissionEventOrder.id, "extra-submission-event-fill")],
+  }));
+
+  const extraFillOrder = createOrderRecord({ id: "extra-fill-order", status: "PERSISTED" });
+  await repository.persistOrderIntent({
+    order: extraFillOrder,
+    event: createOrderEvent(extraFillOrder.id, "extra-fill-intent", "ORDER_PERSISTED"),
+  });
+  await repository.saveFill(createFill(extraFillOrder.id, "extra-fill-existing"));
+  const extraFillEvent = createOrderEvent(extraFillOrder.id, "extra-fill-event", "ORDER_SUBMITTED");
+  extraFillEvent.eventSource = "EXCHANGE";
+  await assert.rejects(repository.persistExchangeSubmission({
+    order: { ...extraFillOrder, status: "PARTIALLY_FILLED" },
+    event: extraFillEvent,
+    fills: [createFill(extraFillOrder.id, "extra-fill-incoming")],
+  }));
+
+  const extraRecoveryEventOrder = createOrderRecord({ id: "extra-recovery-event-order", status: "PERSISTED" });
+  await repository.persistOrderIntent({
+    order: extraRecoveryEventOrder,
+    event: createOrderEvent(extraRecoveryEventOrder.id, "extra-recovery-event-intent", "ORDER_PERSISTED"),
+  });
+  await repository.appendOrderEvent(createOrderEvent(
+    extraRecoveryEventOrder.id,
+    "extra-recovery-event-existing",
+    "RECONCILIATION_RECOVERY_REQUIRED",
+  ));
+  const extraRecoveryEventNext = toReconciliationRequiredOrder(extraRecoveryEventOrder);
+  await assert.rejects(repository.persistUncertainSubmission({
+    order: extraRecoveryEventNext,
+    event: createOrderEvent(extraRecoveryEventOrder.id, "extra-recovery-event-incoming", "RECONCILIATION_RECOVERY_REQUIRED"),
+    riskEvent: createRiskEvent(extraRecoveryEventOrder.id, "extra-recovery-event-risk"),
+  }));
+
+  const extraRiskOrder = createOrderRecord({ id: "extra-risk-order", status: "PERSISTED" });
+  await repository.persistOrderIntent({
+    order: extraRiskOrder,
+    event: createOrderEvent(extraRiskOrder.id, "extra-risk-intent", "ORDER_PERSISTED"),
+  });
+  await repository.saveRiskEvent(createRiskEvent(extraRiskOrder.id, "extra-risk-existing"));
+  const extraRiskNext = toReconciliationRequiredOrder(extraRiskOrder);
+  await assert.rejects(repository.persistUncertainSubmission({
+    order: extraRiskNext,
+    event: createOrderEvent(extraRiskOrder.id, "extra-risk-event", "RECONCILIATION_RECOVERY_REQUIRED"),
+    riskEvent: createRiskEvent(extraRiskOrder.id, "extra-risk-incoming"),
+  }));
+
   const invalidOrder = createOrderRecord({ id: "invalid-atomic-order", status: "PERSISTED" });
   await assert.rejects(
     repository.persistOrderIntent({
@@ -1514,6 +1587,16 @@ async function assertAtomicLifecycleContract(repository: ExecutionRepository): P
     }),
   );
   assert.equal(await repository.findOrderByReference("primary", invalidOrder.id), null);
+}
+
+function toReconciliationRequiredOrder(order: OrderRecord): OrderRecord {
+  return {
+    ...order,
+    status: "RECONCILIATION_REQUIRED",
+    failureCode: "RECONCILIATION_REQUIRED",
+    failureMessage: "Submission outcome requires reconciliation.",
+    updatedAt: "2026-08-21T00:00:04.000Z",
+  };
 }
 
 function createOrderEvent(orderId: string, id: string, eventType: string): OrderEventRecord {
