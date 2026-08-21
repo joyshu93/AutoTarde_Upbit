@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
 
 import type {
+  OrderSubmissionRecoveryObservationRecord,
   PositionGuardPilotAuditEventRecord,
   PositionGuardPilotDeploymentRecord,
 } from "../domain/pilot-types.js";
 import type {
   BalanceSnapshotRecord,
   OrderEventRecord,
-  OrderLifecycleStatus,
   OrderRecord,
   PositionSnapshotRecord,
   ReconciliationRunRecord,
@@ -79,6 +79,7 @@ type RecoveryExecutionReads = Pick<
   | "listReconciliationRuns"
   | "listOrders"
   | "listOrderEvents"
+  | "listOrderSubmissionRecoveryObservations"
 >;
 
 type RecoveryCandidateRepository = Pick<
@@ -104,20 +105,12 @@ interface RecoveryReadback {
   evidenceRecords: Array<Readonly<CandidateEvidenceRecord>>;
   auditEvents: PositionGuardPilotAuditEventRecord[];
   orderEvents: Map<string, OrderEventRecord[]>;
+  orderRecoveryObservations: Map<string, OrderSubmissionRecoveryObservationRecord[]>;
 }
 
 interface RecoveryFault extends Error {
   reasonCode: CandidatePilotRecoveryFaultReason;
 }
-
-const ACTIVE_ORDER_STATUSES = new Set<OrderLifecycleStatus>([
-  "INTENT_CREATED",
-  "PERSISTED",
-  "SUBMITTING",
-  "OPEN",
-  "PARTIALLY_FILLED",
-  "CANCEL_REQUESTED",
-]);
 
 const REVIEWED_NON_BLOCKING_RECONCILIATION_CODES = new Set([
   "ORDER_STATUS_RECONCILED",
@@ -126,6 +119,34 @@ const REVIEWED_NON_BLOCKING_RECONCILIATION_CODES = new Set([
   "ORDER_IDENTIFIER_RECOVERED",
   "ORDER_SUBMISSION_ABSENCE_CONFIRMED",
   "EXCHANGE_ORDER_RECOVERED",
+  "DRY_RUN_ORDER_REPAIRED",
+]);
+
+const RECONCILIATION_SOURCES = new Set([
+  "DIRECT_RUN",
+  "OPERATOR_SYNC",
+  "STARTUP_RECOVERY",
+  "SCHEDULER_PREFLIGHT",
+]);
+
+const RECONCILIATION_ISSUE_CODES = new Set([
+  "OPEN_ORDER_NEEDS_REVIEW",
+  "ORDER_MARKED_FOR_RECOVERY",
+  "ORDER_STATUS_RECONCILED",
+  "ORDER_FILLS_BACKFILLED",
+  "BALANCE_DRIFT_DETECTED",
+  "POSITION_DRIFT_DETECTED",
+  "TERMINAL_ORDER_RECHECKED",
+  "ORDER_REFERENCE_MISSING",
+  "ORDER_LOOKUP_TRANSIENT_FAILURE",
+  "ORDER_LOOKUP_DEFERRED",
+  "ORDER_IDENTIFIER_RECOVERY_UNCERTAIN",
+  "ORDER_IDENTIFIER_RECOVERED",
+  "ORDER_SUBMISSION_ABSENCE_CONFIRMED",
+  "CANDIDATE_EVIDENCE_PROJECTION_FAILED",
+  "CANDIDATE_EVIDENCE_PROJECTION_DEFERRED",
+  "EXCHANGE_ORDER_RECOVERED",
+  "ORDER_HISTORY_LOOKUP_FAILED",
   "DRY_RUN_ORDER_REPAIRED",
 ]);
 
@@ -193,45 +214,21 @@ export class PositionGuardPilotRecovery {
       return this.blockForFault("IDENTITY_MISMATCH", receipt, readback, clock);
     }
 
-    const [state, evidenceRecords, auditEvents] = await Promise.all([
-      this.dependencies.candidatePilots.getExactState(this.dependencies.deploymentId),
-      this.dependencies.candidatePilots.listEvidenceRecords(this.dependencies.deploymentId),
-      this.dependencies.candidatePilots.listAuditEvents(this.dependencies.deploymentId),
-    ]);
-    readback.state = state;
-    readback.evidenceRecords = evidenceRecords;
-    readback.auditEvents = auditEvents;
+    await this.readCandidateAuthority(readback);
 
     const existingFault = await this.readExistingPersistedFault(readback);
     if (existingFault) return existingFault;
 
     try {
-      this.verifyDeploymentIdentity(readback.deployment);
-      this.verifyRefreshCorrelation(receipt, readback, clock.epochNanoseconds);
-      this.verifyReconciliation(receipt, readback.reconciliationRun);
-      await this.verifyOrders(readback, clock.epochNanoseconds);
-      const replayedState = this.verifyEvidenceAndState(readback);
-      const inventory = this.readInventory(readback.balanceSnapshot, readback.positionSnapshot);
-      this.verifyExchangeInventoryAgreement(inventory.balanceQuantity, inventory.positionQuantity);
+      const verified = this.verifyReadyAuthority(readback, receipt, clock.epochNanoseconds);
 
       if (readback.deployment.phase === "PENDING_FLAT") {
-        this.verifyPendingFlatState(replayedState, readback.evidenceRecords);
-        if (!withinTolerance(inventory.balanceQuantity, zeroDecimal())) {
-          return this.ready(readback.deployment, replayedState, receipt);
+        if (!withinTolerance(verified.inventory.balanceQuantity, zeroDecimal())) {
+          return await this.confirmStableReady(readback, receipt, clock);
         }
-        return await this.activatePendingFlat(readback, replayedState, receipt, clock);
+        return await this.activatePendingFlat(readback, verified.state, receipt, clock);
       }
-
-      if (readback.deployment.phase !== "ACTIVE") {
-        throw recoveryFault("IDENTITY_MISMATCH", `Candidate phase ${readback.deployment.phase} is not recoverable.`);
-      }
-      this.verifyActiveChronology(readback.deployment, readback.auditEvents, replayedState, clock.epochNanoseconds);
-      this.verifyReplayInventoryAgreement(
-        replayedState.currentEpisodeInventoryQuantity,
-        inventory.balanceQuantity,
-        inventory.positionQuantity,
-      );
-      return this.ready(readback.deployment, replayedState, receipt);
+      return await this.confirmStableReady(readback, receipt, clock);
     } catch (error) {
       const fault = asRecoveryFault(error);
       return this.blockForFault(fault.reasonCode, receipt, readback, clock);
@@ -246,6 +243,17 @@ export class PositionGuardPilotRecovery {
       this.dependencies.repositories.listOrders(this.dependencies.exchangeAccountId),
       this.dependencies.candidatePilots.getDeployment(this.dependencies.deploymentId),
     ]);
+    const orderEvents = new Map<string, OrderEventRecord[]>();
+    const orderRecoveryObservations = new Map<string, OrderSubmissionRecoveryObservationRecord[]>();
+    await Promise.all(orders.map(async (order) => {
+      const events = await this.dependencies.repositories.listOrderEvents(order.id);
+      orderEvents.set(order.id, events);
+      const listObservations = this.dependencies.repositories.listOrderSubmissionRecoveryObservations;
+      const observations = listObservations
+        ? await listObservations.call(this.dependencies.repositories, order.id)
+        : [];
+      orderRecoveryObservations.set(order.id, observations);
+    }));
     return {
       balanceSnapshot,
       positionSnapshot,
@@ -255,11 +263,67 @@ export class PositionGuardPilotRecovery {
       state: null,
       evidenceRecords: [],
       auditEvents: [],
-      orderEvents: new Map(),
+      orderEvents,
+      orderRecoveryObservations,
     };
   }
 
-  private verifyDeploymentIdentity(deployment: PositionGuardPilotDeploymentRecord): void {
+  private async readCandidateAuthority(readback: RecoveryReadback): Promise<void> {
+    const [state, evidenceRecords, auditEvents] = await Promise.all([
+      this.dependencies.candidatePilots.getExactState(this.dependencies.deploymentId),
+      this.dependencies.candidatePilots.listEvidenceRecords(this.dependencies.deploymentId),
+      this.dependencies.candidatePilots.listAuditEvents(this.dependencies.deploymentId),
+    ]);
+    readback.state = state;
+    readback.evidenceRecords = evidenceRecords;
+    readback.auditEvents = auditEvents;
+  }
+
+  private verifyReadyAuthority(
+    readback: RecoveryReadback,
+    receipt: Readonly<PositionGuardPilotRefreshReceipt>,
+    nowEpochNanoseconds: bigint,
+  ): {
+    state: Readonly<ExactCandidateState>;
+    inventory: { balanceQuantity: ExactDecimal; positionQuantity: ExactDecimal };
+  } {
+    if (!readback.deployment) {
+      throw recoveryFault("IDENTITY_MISMATCH", "Configured candidate deployment is missing.");
+    }
+    this.verifyDeploymentIdentity(readback.deployment, nowEpochNanoseconds);
+    this.verifyRefreshCorrelation(receipt, readback, nowEpochNanoseconds);
+    this.verifyReconciliation(receipt, readback.reconciliationRun);
+    this.verifyAuditAuthority(readback.deployment, readback.auditEvents, nowEpochNanoseconds);
+    this.verifyOrders(readback, nowEpochNanoseconds);
+    const state = this.verifyEvidenceAndState(readback, nowEpochNanoseconds);
+    const inventory = this.readInventory(readback.balanceSnapshot, readback.positionSnapshot);
+    this.verifyExchangeInventoryAgreement(inventory.balanceQuantity, inventory.positionQuantity);
+
+    if (readback.deployment.phase === "PENDING_FLAT") {
+      this.verifyPendingFlatState(state, readback.evidenceRecords);
+    } else if (readback.deployment.phase === "ACTIVE") {
+      this.verifyActiveChronology(
+        readback.deployment,
+        readback.evidenceRecords,
+        readback.auditEvents,
+        state,
+        nowEpochNanoseconds,
+      );
+      this.verifyReplayInventoryAgreement(
+        state.currentEpisodeInventoryQuantity,
+        inventory.balanceQuantity,
+        inventory.positionQuantity,
+      );
+    } else {
+      throw recoveryFault("IDENTITY_MISMATCH", `Candidate phase ${readback.deployment.phase} is not recoverable.`);
+    }
+    return { state, inventory };
+  }
+
+  private verifyDeploymentIdentity(
+    deployment: PositionGuardPilotDeploymentRecord,
+    nowEpochNanoseconds: bigint,
+  ): void {
     if (
       deployment.id !== this.dependencies.deploymentId ||
       deployment.exchangeAccountId !== this.dependencies.exchangeAccountId ||
@@ -272,8 +336,22 @@ export class PositionGuardPilotRecovery {
     }
     const createdAt = parseTimestamp(deployment.createdAt, "deployment createdAt", "IDENTITY_MISMATCH");
     const updatedAt = parseTimestamp(deployment.updatedAt, "deployment updatedAt", "IDENTITY_MISMATCH");
-    if (updatedAt < createdAt) {
+    if (updatedAt < createdAt || createdAt > nowEpochNanoseconds || updatedAt > nowEpochNanoseconds) {
       throw recoveryFault("IDENTITY_MISMATCH", "Candidate deployment chronology is invalid.");
+    }
+    if ((deployment.activationAt === null) !== (deployment.activationEpochNs === null)) {
+      throw recoveryFault("IDENTITY_MISMATCH", "Candidate deployment activation identity is incomplete.");
+    }
+    if (deployment.activationAt !== null && deployment.activationEpochNs !== null) {
+      const activationAt = parseTimestamp(deployment.activationAt, "deployment activationAt", "IDENTITY_MISMATCH");
+      if (
+        activationAt !== deployment.activationEpochNs ||
+        activationAt < createdAt ||
+        activationAt > updatedAt ||
+        activationAt > nowEpochNanoseconds
+      ) {
+        throw recoveryFault("IDENTITY_MISMATCH", "Candidate deployment activation chronology is invalid.");
+      }
     }
   }
 
@@ -359,53 +437,159 @@ export class PositionGuardPilotRecovery {
     } catch {
       throw recoveryFault("BLOCKING_RECONCILIATION", "Reconciliation summary JSON is malformed.");
     }
-    if (!isPlainRecord(summary) || !Array.isArray(summary.issues)) {
+    if (
+      !isPlainRecord(summary) ||
+      !hasExactOwnKeys(
+        summary,
+        ["source", "status", "issues", "candidateCount", "processedCount", "deferredCount", "maxOrderLookupsPerRun"],
+        ["historyRecovery"],
+      ) ||
+      !Array.isArray(summary.issues) ||
+      typeof summary.source !== "string" ||
+      !RECONCILIATION_SOURCES.has(summary.source) ||
+      (summary.status !== "SUCCESS" && summary.status !== "DRIFT_DETECTED" && summary.status !== "ERROR") ||
+      !isNonNegativeSafeInteger(summary.candidateCount) ||
+      !isNonNegativeSafeInteger(summary.processedCount) ||
+      !isNonNegativeSafeInteger(summary.deferredCount) ||
+      !isNonNegativeSafeInteger(summary.maxOrderLookupsPerRun) ||
+      summary.processedCount + summary.deferredCount !== summary.candidateCount ||
+      summary.processedCount > summary.maxOrderLookupsPerRun ||
+      (summary.historyRecovery !== undefined && !isValidHistoryRecoverySummary(summary.historyRecovery))
+    ) {
       throw recoveryFault("BLOCKING_RECONCILIATION", "Reconciliation summary shape is invalid.");
     }
     if (
       summary.source !== receipt.reconciliationSource ||
       summary.status !== run.status ||
       (summary.status !== "SUCCESS" && summary.status !== "DRIFT_DETECTED") ||
-      run.status === "ERROR"
+      run.status === "ERROR" ||
+      run.errorMessage !== null
     ) {
       throw recoveryFault("BLOCKING_RECONCILIATION", "Reconciliation provenance or status is invalid.");
     }
     const issueCodes: string[] = [];
     for (const issue of summary.issues) {
-      if (!isPlainRecord(issue) || typeof issue.code !== "string" || issue.code.trim() === "") {
+      if (
+        !isPlainRecord(issue) ||
+        !hasExactOwnKeys(issue, ["code", "message"]) ||
+        typeof issue.code !== "string" ||
+        !RECONCILIATION_ISSUE_CODES.has(issue.code) ||
+        !isNonEmptyString(issue.message)
+      ) {
         throw recoveryFault("BLOCKING_RECONCILIATION", "Reconciliation issue shape is invalid.");
       }
       issueCodes.push(issue.code);
     }
     if (
       (run.status === "SUCCESS" && issueCodes.length > 0) ||
+      (run.status === "DRIFT_DETECTED" && issueCodes.length === 0) ||
       issueCodes.some((code) => !REVIEWED_NON_BLOCKING_RECONCILIATION_CODES.has(code))
     ) {
       throw recoveryFault("BLOCKING_RECONCILIATION", "Reconciliation contains a blocking issue code.");
     }
   }
 
-  private async verifyOrders(readback: RecoveryReadback, nowEpochNanoseconds: bigint): Promise<void> {
-    for (const order of readback.orders) {
-      if (order.exchangeAccountId !== this.dependencies.exchangeAccountId) {
-        throw recoveryFault("UNCERTAIN_ORDER", "Account-wide order read returned mismatched provenance.");
+  private verifyAuditAuthority(
+    deployment: PositionGuardPilotDeploymentRecord,
+    auditEvents: PositionGuardPilotAuditEventRecord[],
+    nowEpochNanoseconds: bigint,
+  ): void {
+    const ids = new Set<string>();
+    for (const event of auditEvents) {
+      const eventEpoch = parseTimestamp(event.createdAt, "pilot audit createdAt", "IDENTITY_MISMATCH");
+      if (
+        ids.has(event.id) ||
+        event.deploymentId !== deployment.id ||
+        !Number.isSafeInteger(event.stateVersion) ||
+        event.stateVersion < 0 ||
+        eventEpoch > nowEpochNanoseconds
+      ) {
+        throw recoveryFault("IDENTITY_MISMATCH", "Pilot audit chronology, version, or identity is invalid.");
       }
-      if (order.status === "RECONCILIATION_REQUIRED") {
-        throw recoveryFault("UNCERTAIN_ORDER", "An order requires reconciliation.");
-      }
-      if (ACTIVE_ORDER_STATUSES.has(order.status)) {
-        throw recoveryFault("ACTIVE_ORDER", `Order ${order.id} remains nonterminal.`);
-      }
-      if (order.status !== "FAILED" && order.status !== "REJECTED") continue;
-      const events = await this.dependencies.repositories.listOrderEvents(order.id);
-      readback.orderEvents.set(order.id, events);
-      if (!isDefinitivelyAbsentOrder(order, events, nowEpochNanoseconds)) {
-        throw recoveryFault("UNCERTAIN_ORDER", `Order ${order.id} lacks definitive no-order evidence.`);
+      ids.add(event.id);
+      try {
+        const payload = JSON.parse(event.payloadJson) as unknown;
+        if (!isPlainRecord(payload)) throw new Error("Pilot audit payload must be an object.");
+      } catch (error) {
+        throw recoveryFault(
+          "IDENTITY_MISMATCH",
+          error instanceof Error ? error.message : "Pilot audit payload JSON is malformed.",
+        );
       }
     }
   }
 
-  private verifyEvidenceAndState(readback: RecoveryReadback): Readonly<ExactCandidateState> {
+  private verifyOrders(readback: RecoveryReadback, nowEpochNanoseconds: bigint): void {
+    const orderIds = new Set<string>();
+    for (const order of readback.orders) {
+      const events = readback.orderEvents.get(order.id) ?? [];
+      const observations = readback.orderRecoveryObservations.get(order.id) ?? [];
+      this.verifyOrderChronology(order, events, nowEpochNanoseconds);
+      if (orderIds.has(order.id) || order.exchangeAccountId !== this.dependencies.exchangeAccountId) {
+        throw recoveryFault("UNCERTAIN_ORDER", "Account-wide order read returned duplicate or mismatched provenance.");
+      }
+      orderIds.add(order.id);
+      switch (order.status) {
+        case "INTENT_CREATED":
+        case "PERSISTED":
+        case "SUBMITTING":
+        case "OPEN":
+        case "PARTIALLY_FILLED":
+        case "CANCEL_REQUESTED":
+          throw recoveryFault("ACTIVE_ORDER", `Order ${order.id} remains nonterminal.`);
+        case "RECONCILIATION_REQUIRED":
+          throw recoveryFault("UNCERTAIN_ORDER", "An order requires reconciliation.");
+        case "FAILED":
+        case "REJECTED":
+          if (!isDefinitivelyAbsentOrder(order, events, observations, nowEpochNanoseconds)) {
+            throw recoveryFault("UNCERTAIN_ORDER", `Order ${order.id} lacks definitive no-order evidence.`);
+          }
+          break;
+        case "RISK_REJECTED":
+        case "FILLED":
+        case "CANCELED":
+          break;
+        default:
+          throw recoveryFault("UNCERTAIN_ORDER", `Order ${order.id} has an unknown persisted lifecycle status.`);
+      }
+    }
+  }
+
+  private verifyOrderChronology(
+    order: OrderRecord,
+    events: OrderEventRecord[],
+    nowEpochNanoseconds: bigint,
+  ): void {
+    const requestedAt = parseTimestamp(order.requestedAt, "order requestedAt", "UNCERTAIN_ORDER");
+    const createdAt = parseTimestamp(order.createdAt, "order createdAt", "UNCERTAIN_ORDER");
+    const updatedAt = parseTimestamp(order.updatedAt, "order updatedAt", "UNCERTAIN_ORDER");
+    if (
+      requestedAt > createdAt ||
+      createdAt > updatedAt ||
+      updatedAt > nowEpochNanoseconds ||
+      requestedAt > nowEpochNanoseconds
+    ) {
+      throw recoveryFault("UNCERTAIN_ORDER", `Order ${order.id} has invalid persisted chronology.`);
+    }
+    const eventIds = new Set<string>();
+    for (const event of events) {
+      const eventAt = parseTimestamp(event.createdAt, "order event createdAt", "UNCERTAIN_ORDER");
+      if (
+        eventIds.has(event.id) ||
+        event.orderId !== order.id ||
+        eventAt < requestedAt ||
+        eventAt > nowEpochNanoseconds
+      ) {
+        throw recoveryFault("UNCERTAIN_ORDER", `Order ${order.id} has invalid lifecycle event chronology.`);
+      }
+      eventIds.add(event.id);
+    }
+  }
+
+  private verifyEvidenceAndState(
+    readback: RecoveryReadback,
+    nowEpochNanoseconds: bigint,
+  ): Readonly<ExactCandidateState> {
     if (!readback.state || !hasExactStateShape(readback.state)) {
       throw recoveryFault("REPLAY_MISMATCH", "Persisted exact candidate state is missing or malformed.");
     }
@@ -415,6 +599,9 @@ export class PositionGuardPilotRecovery {
           throw new Error("Candidate evidence is not exact material V2.");
         }
         const material = candidateEvidenceMaterial(this.dependencies.deploymentId, record.evidence);
+        if (material.epochNanoseconds > nowEpochNanoseconds) {
+          throw new Error("Candidate evidence timestamp is future-dated.");
+        }
         if (material.materialVersion !== record.materialVersion || material.hash !== record.materialHash) {
           throw new Error("Candidate evidence material hash does not match persistence.");
         }
@@ -520,21 +707,30 @@ export class PositionGuardPilotRecovery {
       return this.blockForFault("ACTIVATION_CAS_CONFLICT", receipt, readback, clock);
     }
     const auditEvents = await this.dependencies.candidatePilots.listAuditEvents(this.dependencies.deploymentId);
+    const activatedReadback = {
+      ...readback,
+      deployment: activated,
+      auditEvents,
+    };
     try {
-      this.verifyDeploymentIdentity(activated);
-      this.verifyActiveChronology(activated, auditEvents, state, clock.epochNanoseconds);
-    } catch (error) {
-      return this.blockForFault("ACTIVATION_CAS_CONFLICT", receipt, {
-        ...readback,
-        deployment: activated,
+      this.verifyDeploymentIdentity(activated, clock.epochNanoseconds);
+      this.verifyAuditAuthority(activated, auditEvents, clock.epochNanoseconds);
+      this.verifyActiveChronology(
+        activated,
+        readback.evidenceRecords,
         auditEvents,
-      }, clock, error);
+        state,
+        clock.epochNanoseconds,
+      );
+    } catch (error) {
+      return this.blockForFault("ACTIVATION_CAS_CONFLICT", receipt, activatedReadback, clock, error);
     }
-    return this.ready(activated, state, receipt);
+    return this.confirmStableReady(activatedReadback, receipt, clock);
   }
 
   private verifyActiveChronology(
     deployment: PositionGuardPilotDeploymentRecord,
+    evidenceRecords: Array<Readonly<CandidateEvidenceRecord>>,
     auditEvents: PositionGuardPilotAuditEventRecord[],
     state: Readonly<ExactCandidateState>,
     nowEpochNanoseconds: bigint,
@@ -549,12 +745,6 @@ export class PositionGuardPilotRecovery {
     const createdEpoch = parseTimestamp(deployment.createdAt, "deployment createdAt", "IDENTITY_MISMATCH");
     if (activationEpoch < createdEpoch) {
       throw recoveryFault("IDENTITY_MISMATCH", "Persisted activation predates deployment creation.");
-    }
-    for (const event of auditEvents) {
-      const eventEpoch = parseTimestamp(event.createdAt, "pilot audit createdAt", "IDENTITY_MISMATCH");
-      if (event.deploymentId !== deployment.id || eventEpoch > nowEpochNanoseconds) {
-        throw recoveryFault("IDENTITY_MISMATCH", "Pilot audit chronology or identity is invalid.");
-      }
     }
     const activationEvents = auditEvents.filter((event) => event.eventType === "PHASE_TRANSITION" &&
       event.fromPhase === "PENDING_FLAT" && event.toPhase === "ACTIVE");
@@ -572,10 +762,77 @@ export class PositionGuardPilotRecovery {
       activationEvent.createdAt !== deployment.activationAt ||
       activationEvent.stateVersion !== 0 ||
       !isPlainRecord(payload) ||
+      !hasExactOwnKeys(payload, ["activationAt", "activationEpochNs"]) ||
       payload.activationAt !== deployment.activationAt ||
       payload.activationEpochNs !== deployment.activationEpochNs.toString()
     ) {
       throw recoveryFault("IDENTITY_MISMATCH", "Activation audit does not match persisted deployment chronology.");
+    }
+    const stateAdvanceEvents = auditEvents.filter((event) => event.eventType === "STATE_ADVANCED");
+    if (stateAdvanceEvents.length !== evidenceRecords.length || state.stateVersion !== evidenceRecords.length) {
+      throw recoveryFault("REPLAY_MISMATCH", "Candidate evidence and STATE_ADVANCED audit counts do not match.");
+    }
+    for (const [index, record] of evidenceRecords.entries()) {
+      const evidenceAt = parseTimestamp(record.evidence.executedAt, "candidate evidence executedAt", "REPLAY_MISMATCH");
+      if (evidenceAt <= activationEpoch || evidenceAt > nowEpochNanoseconds) {
+        throw recoveryFault("REPLAY_MISMATCH", "Candidate evidence does not follow activation chronology.");
+      }
+      const event = stateAdvanceEvents[index];
+      if (!event) {
+        throw recoveryFault("REPLAY_MISMATCH", "Candidate evidence has no STATE_ADVANCED audit event.");
+      }
+      let statePayload: unknown;
+      try {
+        statePayload = JSON.parse(event.payloadJson) as unknown;
+      } catch {
+        throw recoveryFault("REPLAY_MISMATCH", "STATE_ADVANCED audit payload JSON is malformed.");
+      }
+      const expectedVersion = index + 1;
+      if (
+        event.id !== `${deployment.id}:evidence:${record.evidence.evidenceId}` ||
+        event.fromPhase !== "ACTIVE" ||
+        event.toPhase !== "ACTIVE" ||
+        event.stateVersion !== expectedVersion ||
+        event.createdAt !== record.evidence.executedAt ||
+        !isPlainRecord(statePayload) ||
+        !hasExactOwnKeys(
+          statePayload,
+          ["evidenceId", "materialHash", "materialVersion", "fromStateVersion", "toStateVersion"],
+        ) ||
+        statePayload.evidenceId !== record.evidence.evidenceId ||
+        statePayload.materialHash !== record.materialHash ||
+        statePayload.materialVersion !== record.materialVersion ||
+        statePayload.fromStateVersion !== index ||
+        statePayload.toStateVersion !== expectedVersion
+      ) {
+        throw recoveryFault("REPLAY_MISMATCH", "STATE_ADVANCED audit chain does not match candidate evidence.");
+      }
+    }
+  }
+
+  private async confirmStableReady(
+    baseline: RecoveryReadback,
+    receipt: Readonly<PositionGuardPilotRefreshReceipt>,
+    clock: { occurredAt: string; epochNanoseconds: bigint },
+  ): Promise<PositionGuardPilotRecoveryResult> {
+    let latest = baseline;
+    try {
+      latest = await this.readPersistedAccountEvidence();
+      if (!latest.deployment || latest.deployment.exchangeAccountId !== this.dependencies.exchangeAccountId) {
+        throw recoveryFault("IDENTITY_MISMATCH", "Candidate deployment identity changed during recovery verification.");
+      }
+      await this.readCandidateAuthority(latest);
+      if (canonicalAuthorityJson(latest) !== canonicalAuthorityJson(baseline)) {
+        throw recoveryFault(
+          "SNAPSHOT_PROVENANCE_INVALID",
+          "Persisted recovery authority changed during verification.",
+        );
+      }
+      const verified = this.verifyReadyAuthority(latest, receipt, clock.epochNanoseconds);
+      return this.ready(latest.deployment, verified.state, receipt);
+    } catch (error) {
+      const fault = asRecoveryFault(error);
+      return this.blockForFault(fault.reasonCode, receipt, latest, clock);
     }
   }
 
@@ -731,10 +988,8 @@ function buildFaultProvenanceJson(input: {
   receipt: Readonly<PositionGuardPilotRefreshReceipt>;
   readback: RecoveryReadback;
 }): string {
-  const deployment = input.readback.deployment;
-  const state = input.readback.state;
-  return JSON.stringify({
-    schemaVersion: 1,
+  return canonicalJson({
+    schemaVersion: 2,
     reasonCode: input.reasonCode,
     configuredIdentity: {
       exchangeAccountId: input.configured.exchangeAccountId,
@@ -745,58 +1000,74 @@ function buildFaultProvenanceJson(input: {
       policyVersion: input.configured.policyVersion,
     },
     refreshReceipt: input.receipt,
-    persistedCorrelation: {
-      balanceSnapshot: snapshotIdentity(input.readback.balanceSnapshot),
-      positionSnapshot: snapshotIdentity(input.readback.positionSnapshot),
-      reconciliationRun: input.readback.reconciliationRun ? {
-        id: input.readback.reconciliationRun.id,
-        exchangeAccountId: input.readback.reconciliationRun.exchangeAccountId,
-        status: input.readback.reconciliationRun.status,
-        startedAt: input.readback.reconciliationRun.startedAt,
-        completedAt: input.readback.reconciliationRun.completedAt,
-      } : null,
-      deploymentIdentity: deployment ? {
-        id: deployment.id,
-        exchangeAccountId: deployment.exchangeAccountId,
-        pilotId: deployment.pilotId,
-        market: deployment.market,
-        policyId: deployment.policyId,
-        policyVersion: deployment.policyVersion,
-      } : null,
-      stateVersion: state?.stateVersion ?? null,
-      evidence: [...input.readback.evidenceRecords]
-        .map((record) => ({
-          evidenceId: record.evidence.evidenceId,
-          materialHash: record.materialHash,
-          materialVersion: record.materialVersion,
-        }))
-        .sort((left, right) => left.evidenceId.localeCompare(right.evidenceId)),
-      orders: [...input.readback.orders]
-        .map((order) => ({
-          id: order.id,
-          status: order.status,
-          failureCode: order.failureCode,
-          eventIds: [...(input.readback.orderEvents.get(order.id) ?? [])]
-            .map((event) => event.id)
-            .sort(),
-        }))
-        .sort((left, right) => left.id.localeCompare(right.id)),
-    },
+    persistedAuthority: persistedAuthorityMaterial(input.readback),
   });
 }
 
-function snapshotIdentity(value: BalanceSnapshotRecord | PositionSnapshotRecord | null): object | null {
-  return value ? {
-    id: value.id,
-    exchangeAccountId: value.exchangeAccountId,
-    capturedAt: value.capturedAt,
-    source: value.source,
-  } : null;
+function canonicalAuthorityJson(readback: RecoveryReadback): string {
+  return canonicalJson(persistedAuthorityMaterial(readback));
+}
+
+function persistedAuthorityMaterial(readback: RecoveryReadback): object {
+  return {
+    deployment: readback.deployment ? { ...readback.deployment } : null,
+    balanceSnapshot: readback.balanceSnapshot ? {
+      ...readback.balanceSnapshot,
+      balancesPayload: contentMaterial(readback.balanceSnapshot.balancesJson),
+    } : null,
+    positionSnapshot: readback.positionSnapshot ? {
+      ...readback.positionSnapshot,
+      positionsPayload: contentMaterial(readback.positionSnapshot.positionsJson),
+    } : null,
+    reconciliationRun: readback.reconciliationRun ? {
+      ...readback.reconciliationRun,
+      summaryPayload: contentMaterial(readback.reconciliationRun.summaryJson),
+    } : null,
+    exactState: readback.state ? { ...readback.state } : null,
+    evidenceRecords: readback.evidenceRecords.map((record, sequence) => ({
+      sequence,
+      materialHash: record.materialHash,
+      materialVersion: record.materialVersion,
+      evidence: { ...record.evidence },
+    })),
+    auditEvents: [...readback.auditEvents]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((event) => ({
+        ...event,
+        payload: contentMaterial(event.payloadJson),
+      })),
+    orders: [...readback.orders]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((order) => ({
+        ...order,
+        exchangeResponse: order.exchangeResponseJson === null ? null : contentMaterial(order.exchangeResponseJson),
+        lifecycleEvents: [...(readback.orderEvents.get(order.id) ?? [])]
+          .sort((left, right) => left.id.localeCompare(right.id))
+          .map((event) => ({
+            ...event,
+            payload: contentMaterial(event.payloadJson),
+          })),
+        recoveryObservations: [...(readback.orderRecoveryObservations.get(order.id) ?? [])]
+          .sort((left, right) => left.id.localeCompare(right.id))
+          .map((observation) => ({
+            ...observation,
+            detail: contentMaterial(observation.detailJson),
+          })),
+      })),
+  };
+}
+
+function contentMaterial(value: string): { value: string; sha256: string } {
+  return {
+    value,
+    sha256: createHash("sha256").update(value, "utf8").digest("hex"),
+  };
 }
 
 function isDefinitivelyAbsentOrder(
   order: OrderRecord,
   events: OrderEventRecord[],
+  observations: OrderSubmissionRecoveryObservationRecord[],
   nowEpochNanoseconds: bigint,
 ): boolean {
   let requestedAt: bigint;
@@ -805,30 +1076,231 @@ function isDefinitivelyAbsentOrder(
   } catch {
     return false;
   }
-  const isValidProofEvent = (event: OrderEventRecord): boolean => {
+  if (order.status === "REJECTED") {
+    const rejectionEvents = events.filter((event) => event.eventType === "ORDER_REJECTED");
+    if (
+      order.failureCode !== "EXCHANGE_ORDER_REJECTED" ||
+      order.upbitUuid !== null ||
+      !isNonEmptyString(order.failureMessage) ||
+      order.exchangeResponseJson === null ||
+      rejectionEvents.length !== 1
+    ) {
+      return false;
+    }
+    const event = rejectionEvents[0]!;
     try {
-      const eventAt = parseCandidateEvidenceTimestamp(event.createdAt, "order event createdAt");
-      return eventAt >= requestedAt && eventAt <= nowEpochNanoseconds;
+      const eventAt = parseCandidateEvidenceTimestamp(event.createdAt, "order rejection createdAt");
+      const payload = JSON.parse(event.payloadJson) as unknown;
+      const response = JSON.parse(order.exchangeResponseJson) as unknown;
+      return event.orderId === order.id &&
+        event.createdAt === order.updatedAt &&
+        eventAt >= requestedAt &&
+        eventAt <= nowEpochNanoseconds &&
+        (event.eventSource === "EXCHANGE" || (order.executionMode === "DRY_RUN" && event.eventSource === "LOCAL")) &&
+        isDefinitiveRejectionPayload(payload) &&
+        isDefinitiveRejectionPayload(response) &&
+        canonicalJson(payload) === canonicalJson(response);
     } catch {
       return false;
     }
-  };
-  if (order.status === "REJECTED") {
-    return order.failureCode === "EXCHANGE_ORDER_REJECTED" && events.some((event) =>
-      event.orderId === order.id &&
-      event.eventType === "ORDER_REJECTED" &&
-      (event.eventSource === "EXCHANGE" || (order.executionMode === "DRY_RUN" && event.eventSource === "LOCAL")) &&
-      isValidProofEvent(event)
-    );
   }
-  return order.status === "FAILED" &&
-    order.failureCode === "ORDER_SUBMISSION_ABSENCE_CONFIRMED" &&
-    events.some((event) =>
-      event.orderId === order.id &&
-      event.eventType === "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED" &&
-      event.eventSource === "RECONCILIATION" &&
-      isValidProofEvent(event)
+  const absenceEvents = events.filter((event) =>
+    event.eventType === "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED"
+  );
+  if (
+    order.status !== "FAILED" ||
+    order.failureCode !== "ORDER_SUBMISSION_ABSENCE_CONFIRMED" ||
+    order.failureMessage !== "Bounded identifier recovery confirmed persistent exchange absence." ||
+    absenceEvents.length !== 1
+  ) {
+    return false;
+  }
+  const event = absenceEvents[0]!;
+  try {
+    const eventAt = parseCandidateEvidenceTimestamp(event.createdAt, "absence proof createdAt");
+    const payload = JSON.parse(event.payloadJson) as unknown;
+    if (
+      event.id !== `identifier-recovery-absence-event:${order.id}` ||
+      event.orderId !== order.id ||
+      event.eventSource !== "RECONCILIATION" ||
+      event.createdAt !== order.updatedAt ||
+      eventAt < requestedAt ||
+      eventAt > nowEpochNanoseconds ||
+      !isPlainRecord(payload) ||
+      !hasExactOwnKeys(
+        payload,
+        ["absenceObservationCount", "elapsedMs", "minimumNotFoundObservations", "minimumElapsedMs"],
+      ) ||
+      !isNonNegativeSafeInteger(payload.absenceObservationCount) ||
+      !isNonNegativeSafeInteger(payload.elapsedMs) ||
+      !isNonNegativeSafeInteger(payload.minimumNotFoundObservations) ||
+      payload.minimumNotFoundObservations < 2 ||
+      !isNonNegativeSafeInteger(payload.minimumElapsedMs) ||
+      payload.minimumElapsedMs <= 0
+    ) {
+      return false;
+    }
+    const expectedQueries = [
+      ...(order.upbitUuid ? [{ uuid: order.upbitUuid }] : []),
+      ...(order.identifier ? [{ identifier: order.identifier }] : []),
+    ];
+    const observationIds = new Set<string>();
+    for (const observation of observations) {
+      const observationAt = parseCandidateEvidenceTimestamp(
+        observation.observedAt,
+        "absence observation observedAt",
+      );
+      const detail = JSON.parse(observation.detailJson) as unknown;
+      if (
+        observationIds.has(observation.id) ||
+        observation.orderId !== order.id ||
+        observation.outcome !== "NOT_FOUND" ||
+        observation.createdAt !== observation.observedAt ||
+        Date.parse(observation.observedAt) !== observation.observedAtEpochMs ||
+        observationAt < requestedAt ||
+        observationAt > eventAt ||
+        observationAt > nowEpochNanoseconds ||
+        !isPlainRecord(detail) ||
+        !hasExactOwnKeys(detail, ["attemptedQueries"]) ||
+        !Array.isArray(detail.attemptedQueries) ||
+        canonicalJson(detail.attemptedQueries) !== canonicalJson(expectedQueries)
+      ) {
+        return false;
+      }
+      observationIds.add(observation.id);
+    }
+    const ordered = [...observations].sort((left, right) =>
+      left.observedAtEpochMs - right.observedAtEpochMs || left.id.localeCompare(right.id)
     );
+    const first = ordered[0];
+    const latest = ordered.at(-1);
+    if (!first || !latest || latest.observedAt !== event.createdAt) return false;
+    const elapsedMs = latest.observedAtEpochMs - first.observedAtEpochMs;
+    return observations.length === payload.absenceObservationCount &&
+      elapsedMs === payload.elapsedMs &&
+      observations.length >= payload.minimumNotFoundObservations &&
+      elapsedMs >= payload.minimumElapsedMs;
+  } catch {
+    return false;
+  }
+}
+
+function isDefinitiveRejectionPayload(value: unknown): boolean {
+  if (
+    !isPlainRecord(value) ||
+    !hasExactOwnKeys(value, ["kind", "status", "exchangeCode", "exchangeName", "responseReceived"]) ||
+    value.kind !== "DEFINITIVE_REJECTION" ||
+    !Number.isSafeInteger(value.status) ||
+    (value.status as number) < 400 ||
+    (value.status as number) >= 500 ||
+    value.status === 408 ||
+    value.status === 429 ||
+    value.responseReceived !== true ||
+    !isNullableString(value.exchangeCode) ||
+    !isNullableString(value.exchangeName)
+  ) {
+    return false;
+  }
+  return ![value.exchangeCode, value.exchangeName].some((item) =>
+    typeof item === "string" && item.trim().toLowerCase() === "duplicate_identifier"
+  );
+}
+
+function isValidHistoryRecoverySummary(value: unknown): boolean {
+  if (
+    !isPlainRecord(value) ||
+    !hasExactOwnKeys(value, [
+      "closedOrderLookbackDays",
+      "stopBeforeDays",
+      "stopBeforeAt",
+      "retentionAssumptionDays",
+      "retentionBoundaryAt",
+      "retentionStatus",
+      "coverageStatus",
+      "confidenceLevel",
+      "confidenceReason",
+      "failureMessage",
+      "scannedSnapshotCount",
+      "recoveredOrderCount",
+      "markets",
+    ]) ||
+    !Number.isSafeInteger(value.closedOrderLookbackDays) ||
+    (value.closedOrderLookbackDays as number) <= 0 ||
+    !Number.isSafeInteger(value.stopBeforeDays) ||
+    (value.stopBeforeDays as number) <= 0 ||
+    !isStrictTimestamp(value.stopBeforeAt) ||
+    !Number.isSafeInteger(value.retentionAssumptionDays) ||
+    (value.retentionAssumptionDays as number) <= 0 ||
+    !isStrictTimestamp(value.retentionBoundaryAt) ||
+    (value.retentionStatus !== "WITHIN_ASSUMED_RETENTION" && value.retentionStatus !== "BEYOND_ASSUMED_RETENTION") ||
+    (value.coverageStatus !== "IN_PROGRESS" && value.coverageStatus !== "COMPLETE") ||
+    (value.confidenceLevel !== "HIGH" && value.confidenceLevel !== "PARTIAL" && value.confidenceLevel !== "FAILED") ||
+    ![
+      "ARCHIVE_COMPLETE",
+      "ARCHIVE_IN_PROGRESS",
+      "PAGE_LIMIT_REACHED",
+      "BEYOND_ASSUMED_RETENTION",
+      "LOOKUP_FAILED",
+    ].includes(value.confidenceReason as string) ||
+    (value.confidenceLevel === "FAILED" ? !isNonEmptyString(value.failureMessage) : value.failureMessage !== null) ||
+    !isNonNegativeSafeInteger(value.scannedSnapshotCount) ||
+    !isNonNegativeSafeInteger(value.recoveredOrderCount) ||
+    !Array.isArray(value.markets)
+  ) {
+    return false;
+  }
+  const markets = new Set<string>();
+  for (const market of value.markets) {
+    if (
+      !isPlainRecord(market) ||
+      !hasExactOwnKeys(market, [
+        "market",
+        "recentClosedWindowStartAt",
+        "recentClosedWindowEndAt",
+        "archivalWindowStartAt",
+        "archivalWindowEndAt",
+        "nextWindowEndAt",
+        "archiveComplete",
+        "retentionStatus",
+        "confidenceLevel",
+        "confidenceReason",
+        "openHistoryTruncated",
+        "recentClosedHistoryTruncated",
+        "archivalClosedHistoryTruncated",
+        "openPagesScanned",
+        "recentClosedPagesScanned",
+        "archivalClosedPagesScanned",
+        "snapshotCount",
+      ]) ||
+      (market.market !== "KRW-BTC" && market.market !== "KRW-ETH") ||
+      markets.has(market.market) ||
+      !isStrictTimestamp(market.recentClosedWindowStartAt) ||
+      !isStrictTimestamp(market.recentClosedWindowEndAt) ||
+      !isStrictTimestamp(market.archivalWindowStartAt) ||
+      !isStrictTimestamp(market.archivalWindowEndAt) ||
+      !isStrictTimestamp(market.nextWindowEndAt) ||
+      typeof market.archiveComplete !== "boolean" ||
+      (market.retentionStatus !== "WITHIN_ASSUMED_RETENTION" && market.retentionStatus !== "BEYOND_ASSUMED_RETENTION") ||
+      (market.confidenceLevel !== "HIGH" && market.confidenceLevel !== "PARTIAL") ||
+      ![
+        "ARCHIVE_COMPLETE",
+        "ARCHIVE_IN_PROGRESS",
+        "PAGE_LIMIT_REACHED",
+        "BEYOND_ASSUMED_RETENTION",
+      ].includes(market.confidenceReason as string) ||
+      typeof market.openHistoryTruncated !== "boolean" ||
+      typeof market.recentClosedHistoryTruncated !== "boolean" ||
+      typeof market.archivalClosedHistoryTruncated !== "boolean" ||
+      !isNonNegativeSafeInteger(market.openPagesScanned) ||
+      !isNonNegativeSafeInteger(market.recentClosedPagesScanned) ||
+      !isNonNegativeSafeInteger(market.archivalClosedPagesScanned) ||
+      !isNonNegativeSafeInteger(market.snapshotCount)
+    ) {
+      return false;
+    }
+    markets.add(market.market);
+  }
+  return true;
 }
 
 function parseExchangeDecimal(value: unknown, label: string): ExactDecimal {
@@ -890,6 +1362,58 @@ function isRecoveryFaultReason(value: unknown): value is CandidatePilotRecoveryF
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value) &&
     (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
+
+function hasExactOwnKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const keys = Reflect.ownKeys(value);
+  const allowed = new Set([...required, ...optional]);
+  return keys.length >= required.length &&
+    keys.every((key) => typeof key === "string" && allowed.has(key)) &&
+    required.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "";
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function isStrictTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    parseCandidateEvidenceTimestamp(value, "persisted timestamp");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(canonicalValue(value));
+}
+
+function canonicalValue(value: unknown): unknown {
+  if (typeof value === "bigint") return { $bigint: value.toString() };
+  if (typeof value === "number" && (!Number.isFinite(value) || Object.is(value, -0))) {
+    return { $number: Object.is(value, -0) ? "-0" : String(value) };
+  }
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (isPlainRecord(value)) {
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, canonicalValue(value[key])]),
+    );
+  }
+  return value;
 }
 
 function requireNonEmpty(value: string, label: string): void {

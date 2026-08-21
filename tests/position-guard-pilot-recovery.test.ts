@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 
-import type { PositionGuardPilotDeploymentRecord } from "../src/domain/pilot-types.js";
+import type {
+  OrderSubmissionRecoveryObservationRecord,
+  PositionGuardPilotDeploymentRecord,
+} from "../src/domain/pilot-types.js";
 import type {
   BalanceSnapshotRecord,
   ExecutionStateRecord,
@@ -19,12 +22,15 @@ import {
   type CandidatePilotRecoveryFaultReason,
   type CandidatePilotRepository,
 } from "../src/modules/db/pilot-interfaces.js";
+import type { ExecutionRepository } from "../src/modules/db/interfaces.js";
 import { InMemoryCandidatePilotRepository } from
   "../src/modules/db/repositories/in-memory-candidate-pilot-repository.js";
 import {
   InMemoryExecutionRepository,
   InMemoryOperatorStateStore,
 } from "../src/modules/db/repositories/in-memory-repositories.js";
+import { projectExactCandidateState } from
+  "../src/modules/execution/candidate-evidence-decimals.js";
 import { createEmptyPositionGuardCandidateState } from
   "../src/modules/strategy/position-guard-candidate-state.js";
 import { test } from "./harness.js";
@@ -41,6 +47,19 @@ const SNAPSHOT_AT = "2026-08-21T00:00:30.000Z";
 const RECONCILIATION_COMPLETED_AT = "2026-08-21T00:00:31.000Z";
 const NOW = "2026-08-21T00:01:00.000Z";
 const FRESHNESS_THRESHOLD_MS = 60_000;
+const DEFINITIVE_REJECTION_PAYLOAD = Object.freeze({
+  kind: "DEFINITIVE_REJECTION",
+  status: 400,
+  exchangeCode: "invalid_parameter",
+  exchangeName: "validation_error",
+  responseReceived: true,
+});
+const ABSENCE_PROOF_PAYLOAD = Object.freeze({
+  absenceObservationCount: 2,
+  elapsedMs: 10_000,
+  minimumNotFoundObservations: 2,
+  minimumElapsedMs: 10_000,
+});
 
 test("fresh persisted flat PENDING_FLAT activation returns immutable READY ACTIVE provenance", async () => {
   const fixture = await createFixture();
@@ -131,6 +150,40 @@ test("ACTIVE recovery rejects activation audit chronology that was not pristine"
   await expectFault(fixture, "IDENTITY_MISMATCH");
 });
 
+test("ACTIVE recovery requires post-activation evidence and a complete STATE_ADVANCED audit chain", async () => {
+  for (const scenario of ["pre-activation-evidence", "missing-state-audit"] as const) {
+    const fixture = await createFixture({
+      phase: "ACTIVE",
+      evidenceQuantity: "0.1",
+      balanceFree: "0.1",
+      positionQuantity: "0.1",
+    });
+    const records = await fixture.candidatePilots.listEvidenceRecords(DEPLOYMENT_ID);
+    const audits = await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+    assert.equal(records.length, 1);
+    if (scenario === "pre-activation-evidence") {
+      const material = candidateEvidenceMaterial(DEPLOYMENT_ID, {
+        ...records[0]!.evidence,
+        executedAt: "2026-08-21T00:00:05.000Z",
+      });
+      fixture.recovery = fixture.createRecovery(overrideCandidatePilots(fixture.candidatePilots, {
+        getExactState: async () => projectExactCandidateState([material.evidence]),
+        listEvidenceRecords: async () => [{
+          evidence: material.evidence,
+          materialHash: material.hash,
+          materialVersion: material.materialVersion,
+        }],
+      }));
+    } else {
+      fixture.recovery = fixture.createRecovery(overrideCandidatePilots(fixture.candidatePilots, {
+        listAuditEvents: async () => audits.filter((event) => event.eventType !== "STATE_ADVANCED"),
+      }));
+    }
+
+    await expectFault(fixture, "REPLAY_MISMATCH", scenario);
+  }
+});
+
 test("receipt that does not match the persisted latest rows faults closed", async () => {
   const fixture = await createFixture();
   await fixture.repositories.saveBalanceSnapshot(balanceSnapshot({
@@ -169,6 +222,54 @@ test("stale, future, and malformed persisted refresh timestamps fault closed", a
       reconciliationCompletedAt: scenario.completedAt,
     });
     await expectFault(fixture, scenario.reasonCode, scenario.name);
+  }
+});
+
+test("future deployment, evidence, order, and audit timestamps all fault closed", async () => {
+  for (const scenario of ["deployment", "evidence", "order", "audit"] as const) {
+    const fixture = await createFixture(scenario === "evidence"
+      ? { phase: "ACTIVE", evidenceQuantity: "0.1", balanceFree: "0.1", positionQuantity: "0.1" }
+      : { balanceFree: "0.2", positionQuantity: "0.2" });
+    if (scenario === "deployment") {
+      const deployment = await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID);
+      assert.ok(deployment);
+      fixture.recovery = fixture.createRecovery(overrideCandidatePilots(fixture.candidatePilots, {
+        getDeployment: async () => ({ ...deployment, updatedAt: "2026-08-21T00:02:00.000Z" }),
+      }));
+    } else if (scenario === "evidence") {
+      const records = await fixture.candidatePilots.listEvidenceRecords(DEPLOYMENT_ID);
+      assert.equal(records.length, 1);
+      const material = candidateEvidenceMaterial(DEPLOYMENT_ID, {
+        ...records[0]!.evidence,
+        executedAt: "2026-08-21T00:02:00.000Z",
+      });
+      fixture.recovery = fixture.createRecovery(overrideCandidatePilots(fixture.candidatePilots, {
+        getExactState: async () => projectExactCandidateState([material.evidence]),
+        listEvidenceRecords: async () => [{
+          evidence: material.evidence,
+          materialHash: material.hash,
+          materialVersion: material.materialVersion,
+        }],
+      }));
+    } else if (scenario === "order") {
+      await fixture.repositories.saveOrder({
+        ...orderRecord({ status: "FILLED" }),
+        updatedAt: "2026-08-21T00:02:00.000Z",
+      });
+    } else {
+      const audits = await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+      fixture.recovery = fixture.createRecovery(overrideCandidatePilots(fixture.candidatePilots, {
+        listAuditEvents: async () => audits.map((event, index) =>
+          index === 0 ? { ...event, createdAt: "2026-08-21T00:02:00.000Z" } : event
+        ),
+      }));
+    }
+
+    await expectFault(
+      fixture,
+      scenario === "evidence" ? "REPLAY_MISMATCH" : scenario === "order" ? "UNCERTAIN_ORDER" : "IDENTITY_MISMATCH",
+      scenario,
+    );
   }
 });
 
@@ -263,6 +364,36 @@ test("unknown reconciliation issue codes and malformed summary JSON block by def
   }
 });
 
+test("reconciliation requires a complete schema, allowlisted source, valid counts, and consistent error state", async () => {
+  for (const scenario of ["missing-message", "unknown-source", "invalid-counts", "success-with-error"] as const) {
+    const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+    const summary = JSON.parse(reconciliationSummaryJson(
+      scenario === "missing-message" ? ["ORDER_STATUS_RECONCILED"] : [],
+    )) as Record<string, unknown>;
+    let status: ReconciliationRunRecord["status"] = scenario === "missing-message" ? "DRIFT_DETECTED" : "SUCCESS";
+    let errorMessage: string | null = null;
+    if (scenario === "missing-message") {
+      delete (summary.issues as Array<Record<string, unknown>>)[0]!.message;
+    } else if (scenario === "unknown-source") {
+      summary.source = "UNREVIEWED_SOURCE";
+      fixture.receipt = {
+        ...fixture.receipt,
+        reconciliationSource: "UNREVIEWED_SOURCE" as PositionGuardPilotRefreshReceipt["reconciliationSource"],
+      };
+    } else if (scenario === "invalid-counts") {
+      summary.processedCount = -1;
+    } else {
+      errorMessage = "stale persisted failure";
+    }
+    await fixture.repositories.updateReconciliationRun({
+      ...reconciliationRun({ summaryJson: JSON.stringify(summary), status }),
+      errorMessage,
+    });
+
+    await expectFault(fixture, "BLOCKING_RECONCILIATION", scenario);
+  }
+});
+
 test("reviewed non-blocking reconciliation issue codes pass verification", async () => {
   const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
   await fixture.repositories.updateReconciliationRun(reconciliationRun({
@@ -289,6 +420,15 @@ test("active and reconciliation-required orders block account-wide recovery", as
   }
 });
 
+test("unknown persisted order statuses default to UNCERTAIN_ORDER", async () => {
+  const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+  await fixture.repositories.saveOrder(orderRecord({
+    status: "NEW_PERSISTED_STATUS" as OrderRecord["status"],
+  }));
+
+  await expectFault(fixture, "UNCERTAIN_ORDER");
+});
+
 test("FAILED and REJECTED orders without definitive lifecycle proof remain uncertain", async () => {
   for (const status of ["FAILED", "REJECTED"] as const) {
     const fixture = await createFixture();
@@ -303,22 +443,81 @@ test("FAILED and REJECTED orders without definitive lifecycle proof remain uncer
 
 test("definitive rejection and bounded absence lifecycle evidence are safe", async () => {
   const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
-  const rejected = orderRecord({ id: "order-rejected", status: "REJECTED", failureCode: "EXCHANGE_ORDER_REJECTED" });
-  const absent = orderRecord({
+  const rejected = {
+    ...orderRecord({ id: "order-rejected", status: "REJECTED", failureCode: "EXCHANGE_ORDER_REJECTED" }),
+    exchangeResponseJson: JSON.stringify(DEFINITIVE_REJECTION_PAYLOAD),
+    failureMessage: "Upbit definitively rejected the order submission.",
+    updatedAt: "2026-08-21T00:00:27.000Z",
+  };
+  const absent = {
+    ...orderRecord({
     id: "order-absent",
     status: "FAILED",
     failureCode: "ORDER_SUBMISSION_ABSENCE_CONFIRMED",
-  });
+    }),
+    failureMessage: "Bounded identifier recovery confirmed persistent exchange absence.",
+    updatedAt: "2026-08-21T00:00:36.000Z",
+  };
   await fixture.repositories.saveOrder(rejected);
-  await fixture.repositories.appendOrderEvent(orderEvent(rejected.id, "ORDER_REJECTED", "EXCHANGE"));
+  await fixture.repositories.appendOrderEvent({
+    ...orderEvent(rejected.id, "ORDER_REJECTED", "EXCHANGE"),
+    payloadJson: JSON.stringify(DEFINITIVE_REJECTION_PAYLOAD),
+  });
   await fixture.repositories.saveOrder(absent);
-  await fixture.repositories.appendOrderEvent(
-    orderEvent(absent.id, "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED", "RECONCILIATION"),
+  await fixture.repositories.saveOrderSubmissionRecoveryObservation(
+    recoveryObservation(absent.id, "absence-1", "2026-08-21T00:00:26.000Z"),
   );
+  await fixture.repositories.saveOrderSubmissionRecoveryObservation(
+    recoveryObservation(absent.id, "absence-2", "2026-08-21T00:00:36.000Z"),
+  );
+  await fixture.repositories.appendOrderEvent({
+    ...orderEvent(absent.id, "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED", "RECONCILIATION"),
+    id: `identifier-recovery-absence-event:${absent.id}`,
+    payloadJson: JSON.stringify(ABSENCE_PROOF_PAYLOAD),
+    createdAt: absent.updatedAt,
+  });
 
   const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
 
   assert.equal(result.status, "READY");
+});
+
+test("marker-shaped rejection and absence events cannot prove terminal safety", async () => {
+  for (const scenario of ["rejection-payload", "terminal-chronology", "absence-observations"] as const) {
+    const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+    if (scenario === "absence-observations") {
+      const absent = {
+        ...orderRecord({ status: "FAILED", failureCode: "ORDER_SUBMISSION_ABSENCE_CONFIRMED" }),
+        failureMessage: "Bounded identifier recovery confirmed persistent exchange absence.",
+        updatedAt: "2026-08-21T00:00:36.000Z",
+      };
+      await fixture.repositories.saveOrder(absent);
+      await fixture.repositories.saveOrderSubmissionRecoveryObservation(
+        recoveryObservation(absent.id, "forged-absence-1", "2026-08-21T00:00:26.000Z"),
+      );
+      await fixture.repositories.appendOrderEvent({
+        ...orderEvent(absent.id, "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED", "RECONCILIATION"),
+        id: `identifier-recovery-absence-event:${absent.id}`,
+        payloadJson: JSON.stringify(ABSENCE_PROOF_PAYLOAD),
+        createdAt: absent.updatedAt,
+      });
+    } else {
+      const rejected = {
+        ...orderRecord({ status: "REJECTED", failureCode: "EXCHANGE_ORDER_REJECTED" }),
+        exchangeResponseJson: JSON.stringify(DEFINITIVE_REJECTION_PAYLOAD),
+        failureMessage: "Upbit definitively rejected the order submission.",
+        updatedAt: "2026-08-21T00:00:27.000Z",
+      };
+      await fixture.repositories.saveOrder(rejected);
+      await fixture.repositories.appendOrderEvent({
+        ...orderEvent(rejected.id, "ORDER_REJECTED", "EXCHANGE"),
+        payloadJson: scenario === "rejection-payload" ? "{}" : JSON.stringify(DEFINITIVE_REJECTION_PAYLOAD),
+        createdAt: scenario === "terminal-chronology" ? "2026-08-21T00:00:26.000Z" : rejected.updatedAt,
+      });
+    }
+
+    await expectFault(fixture, "UNCERTAIN_ORDER", scenario);
+  }
 });
 
 test("malformed or future lifecycle timestamps cannot prove definitive rejection", async () => {
@@ -382,6 +581,50 @@ test("restart retry reuses the deterministic Task 9A1 recovery fault", async () 
     .filter((transition) => transition.id === first.faultId).length, 1);
 });
 
+test("fault identity includes complete reason-relevant persisted authority material", async () => {
+  const firstFixture = await createFixture({
+    phase: "ACTIVE",
+    evidenceQuantity: "0.1",
+    balanceFree: "0.2",
+    positionQuantity: "0.1",
+  });
+  const secondFixture = await createFixture({
+    phase: "ACTIVE",
+    evidenceQuantity: "0.1",
+    balanceFree: "0.3",
+    positionQuantity: "0.1",
+  });
+
+  const first = await firstFixture.recovery.verifyAndPrepareBtcRun(firstFixture.receipt);
+  const second = await secondFixture.recovery.verifyAndPrepareBtcRun(secondFixture.receipt);
+
+  assert.equal(first.status, "BLOCKED_FAULT");
+  assert.equal(second.status, "BLOCKED_FAULT");
+  if (first.status !== "BLOCKED_FAULT" || second.status !== "BLOCKED_FAULT") return;
+  assert.equal(first.reasonCode, "INVENTORY_MISMATCH");
+  assert.equal(second.reasonCode, "INVENTORY_MISMATCH");
+  assert.notEqual(first.faultId, second.faultId);
+});
+
+test("a concurrent authoritative change between verification reads cannot return stale READY", async () => {
+  const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+  const firstPosition = await fixture.repositories.getLatestPositionSnapshot(ACCOUNT_ID);
+  assert.ok(firstPosition);
+  let positionReadCount = 0;
+  const changingRepositories = overrideExecutionRepositories(fixture.repositories, {
+    getLatestPositionSnapshot: async () => {
+      positionReadCount += 1;
+      return positionReadCount === 1
+        ? firstPosition
+        : positionSnapshot({ capturedAt: firstPosition.capturedAt, quantity: "0.3" });
+    },
+  });
+  fixture.recovery = fixture.createRecovery(undefined, changingRepositories);
+
+  await expectFault(fixture, "SNAPSHOT_PROVENANCE_INVALID");
+  assert.ok(positionReadCount >= 2);
+});
+
 test("successful recovery never resumes a pre-existing operator pause", async () => {
   const fixture = await createFixture({ operatorStatus: "PAUSED" });
   const beforeTransitions = await fixture.operatorState.listTransitions(100);
@@ -413,7 +656,10 @@ interface RecoveryFixture {
   candidatePilots: InMemoryCandidatePilotRepository;
   receipt: PositionGuardPilotRefreshReceipt;
   recovery: PositionGuardPilotRecovery;
-  createRecovery(candidatePilots?: CandidatePilotRepository): PositionGuardPilotRecovery;
+  createRecovery(
+    candidatePilots?: CandidatePilotRepository,
+    repositories?: ExecutionRepository,
+  ): PositionGuardPilotRecovery;
 }
 
 async function createFixture(options: FixtureOptions = {}): Promise<RecoveryFixture> {
@@ -482,7 +728,10 @@ async function createFixture(options: FixtureOptions = {}): Promise<RecoveryFixt
     reconciliationCompletedAt,
     reconciliationSource: "SCHEDULER_PREFLIGHT",
   };
-  const createRecovery = (pilotRepository: CandidatePilotRepository = candidatePilots) =>
+  const createRecovery = (
+    pilotRepository: CandidatePilotRepository = candidatePilots,
+    executionRepositories: ExecutionRepository = repositories,
+  ) =>
     new PositionGuardPilotRecovery({
       exchangeAccountId: ACCOUNT_ID,
       deploymentId: DEPLOYMENT_ID,
@@ -494,7 +743,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<RecoveryFixt
       clock: {
         now: () => ({ occurredAt: NOW, occurredAtEpochMs: Date.parse(NOW) }),
       },
-      repositories,
+      repositories: executionRepositories,
       candidatePilots: pilotRepository,
       operatorState,
     });
@@ -659,6 +908,22 @@ function orderEvent(
   };
 }
 
+function recoveryObservation(
+  orderId: string,
+  id: string,
+  observedAt: string,
+): OrderSubmissionRecoveryObservationRecord {
+  return {
+    id,
+    orderId,
+    outcome: "NOT_FOUND",
+    observedAt,
+    observedAtEpochMs: Date.parse(observedAt),
+    detailJson: JSON.stringify({ attemptedQueries: [{ identifier: `${orderId}-identifier` }] }),
+    createdAt: observedAt,
+  };
+}
+
 function initialExecutionState(status: "RUNNING" | "PAUSED"): ExecutionStateRecord {
   return {
     id: `execution_state_${ACCOUNT_ID}`,
@@ -678,6 +943,21 @@ function overrideCandidatePilots(
   base: CandidatePilotRepository,
   overrides: Partial<CandidatePilotRepository>,
 ): CandidatePilotRepository {
+  return new Proxy(base, {
+    get(target, property, receiver) {
+      if (Object.prototype.hasOwnProperty.call(overrides, property)) {
+        return Reflect.get(overrides, property, receiver);
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function overrideExecutionRepositories(
+  base: ExecutionRepository,
+  overrides: Partial<ExecutionRepository>,
+): ExecutionRepository {
   return new Proxy(base, {
     get(target, property, receiver) {
       if (Object.prototype.hasOwnProperty.call(overrides, property)) {
