@@ -40,7 +40,7 @@ export interface PositionGuardPolicyRouteInput {
   analysis: Readonly<PositionGuardStructureAnalysis>;
 }
 
-export interface PositionGuardPolicyRouteResult {
+interface PositionGuardPolicyRouteResultBase {
   baselineDecision: Readonly<PositionGuardEngineDecision>;
   effectiveDecision: Readonly<PositionGuardEngineDecision>;
   selection: "BASELINE" | "BTC_COMBINED_CONSERVATIVE_PILOT_V1";
@@ -48,33 +48,63 @@ export interface PositionGuardPolicyRouteResult {
   candidateEvaluation: Readonly<PositionGuardCandidateEvaluation> | null;
   reasonCode: PositionGuardPolicyRouteReason;
   stateVersion: number | null;
-  executionBlocked: boolean;
 }
+
+export type PositionGuardPolicyRouteResult =
+  | Readonly<PositionGuardPolicyRouteResultBase & {
+      executionBlocked: false;
+      executionDecision: Readonly<PositionGuardEngineDecision>;
+    }>
+  | Readonly<PositionGuardPolicyRouteResultBase & {
+      executionBlocked: true;
+      executionDecision: null;
+    }>;
+
+const BASELINE_SELECTION_KEYS = ["kind", "pilotId"] as const;
+const CANDIDATE_SELECTION_KEYS = [
+  "kind",
+  "pilotId",
+  "market",
+  "policyId",
+  "policyVersion",
+  "liveOperatorConfirmed",
+] as const;
 
 export function routePositionGuardPolicy(
   input: Readonly<PositionGuardPolicyRouteInput>,
 ): Readonly<PositionGuardPolicyRouteResult> {
-  if (input.selection.kind === "BASELINE") {
-    return baselineRoute(input, "BASELINE_SELECTION");
+  const selection = validatePositionGuardPolicySelection(input.selection);
+  const routedInput: PositionGuardPolicyRouteInput = {
+    ...input,
+    selection,
+    baselineDecision: freezeDecision(input.baselineDecision),
+  };
+
+  if (routedInput.market !== "KRW-BTC" && routedInput.market !== "KRW-ETH") {
+    throw new Error(`Unsupported PositionGuard route market ${String(routedInput.market)}.`);
   }
 
-  if (input.market === "KRW-ETH") {
-    return baselineRoute(input, "ETH_BASELINE");
+  if (selection.kind === "BASELINE") {
+    return baselineRoute(routedInput, "BASELINE_SELECTION");
   }
 
-  switch (input.pilotPhase) {
+  if (routedInput.market === "KRW-ETH") {
+    return baselineRoute(routedInput, "ETH_BASELINE");
+  }
+
+  switch (routedInput.pilotPhase) {
     case "DISABLED":
-      return baselineRoute(input, "PILOT_DISABLED");
+      return baselineRoute(routedInput, "PILOT_DISABLED");
     case "PENDING_FLAT":
-      return phaseGateRoute(input, "PENDING_FLAT");
+      return phaseGateRoute(routedInput, "PENDING_FLAT");
     case "DRAINING":
-      return phaseGateRoute(input, "DRAINING");
+      return phaseGateRoute(routedInput, "DRAINING");
     case "PAUSED_FAULT":
-      return blockedRoute(input);
+      return blockedRoute(routedInput);
     case "ACTIVE":
-      return activeCandidateRoute(input);
+      return activeCandidateRoute(routedInput);
     default:
-      throw new Error(`Unsupported PositionGuard pilot phase ${String(input.pilotPhase)}.`);
+      throw new Error(`Unsupported PositionGuard pilot phase ${String(routedInput.pilotPhase)}.`);
   }
 }
 
@@ -187,17 +217,28 @@ function routeResult(input: {
   candidateEvaluation: Readonly<PositionGuardCandidateEvaluation> | null;
   reasonCode: PositionGuardPolicyRouteReason;
   stateVersion: number | null;
-  executionBlocked: boolean;
+  executionBlocked: false | true;
 }): Readonly<PositionGuardPolicyRouteResult> {
-  return Object.freeze({
+  const route = {
     baselineDecision: input.input.baselineDecision,
-    effectiveDecision: input.effectiveDecision,
+    effectiveDecision: freezeDecision(input.effectiveDecision),
     selection: input.selection,
     pilotPhase: input.input.pilotPhase,
     candidateEvaluation: input.candidateEvaluation,
     reasonCode: input.reasonCode,
     stateVersion: input.stateVersion,
-    executionBlocked: input.executionBlocked,
+  };
+  if (input.executionBlocked) {
+    return Object.freeze({
+      ...route,
+      executionBlocked: true,
+      executionDecision: null,
+    });
+  }
+  return Object.freeze({
+    ...route,
+    executionBlocked: false,
+    executionDecision: freezeDecision(input.effectiveDecision),
   });
 }
 
@@ -228,4 +269,80 @@ function suppressedDecision(
     targetQuantityFraction: null,
     executionDisposition: "SKIPPED",
   });
+}
+
+function validatePositionGuardPolicySelection(selection: unknown): PositionGuardPolicySelection {
+  const baseline = exactSelectionProperties(selection, BASELINE_SELECTION_KEYS);
+  if (baseline !== null) {
+    if (baseline.kind === "BASELINE" && baseline.pilotId === null) {
+      return Object.freeze({ kind: "BASELINE", pilotId: null });
+    }
+    throw new Error("Invalid PositionGuard policy selection.");
+  }
+
+  const candidate = exactSelectionProperties(selection, CANDIDATE_SELECTION_KEYS);
+  if (candidate !== null) {
+    if (
+      candidate.kind === "BTC_CANDIDATE_PILOT"
+      && candidate.pilotId === "BTC_COMBINED_CONSERVATIVE_PILOT_V1"
+      && candidate.market === "KRW-BTC"
+      && candidate.policyId === "COMBINED_CONSERVATIVE"
+      && candidate.policyVersion === "PCS-2026-001.DEPLOYMENT_READINESS_V1"
+      && candidate.liveOperatorConfirmed === true
+    ) {
+      return Object.freeze({
+        kind: "BTC_CANDIDATE_PILOT",
+        pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+        market: "KRW-BTC",
+        policyId: "COMBINED_CONSERVATIVE",
+        policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+        liveOperatorConfirmed: true,
+      });
+    }
+    throw new Error("Invalid PositionGuard policy selection.");
+  }
+
+  throw new Error("Invalid PositionGuard policy selection.");
+}
+
+function exactSelectionProperties(
+  value: unknown,
+  keys: readonly string[],
+): Record<string, unknown> | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  if (Object.getPrototypeOf(value) !== Object.prototype) return null;
+
+  const names = Object.getOwnPropertyNames(value);
+  if (
+    Object.getOwnPropertySymbols(value).length > 0
+    || names.length !== keys.length
+    || names.some((name) => !keys.includes(name))
+  ) {
+    return null;
+  }
+
+  const result: Record<string, unknown> = {};
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable) return null;
+    result[key] = descriptor.value;
+  }
+  return result;
+}
+
+function freezeDecision(
+  decision: Readonly<PositionGuardEngineDecision>,
+): Readonly<PositionGuardEngineDecision> {
+  const copy: PositionGuardEngineDecision = {
+    ...decision,
+    reasons: [...decision.reasons],
+    signalQuality: { ...decision.signalQuality },
+    exposureGuardrails: { ...decision.exposureGuardrails },
+    diagnostics: { ...decision.diagnostics },
+  };
+  Object.freeze(copy.reasons);
+  Object.freeze(copy.signalQuality);
+  Object.freeze(copy.exposureGuardrails);
+  Object.freeze(copy.diagnostics);
+  return Object.freeze(copy);
 }
