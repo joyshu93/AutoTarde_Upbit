@@ -66,8 +66,51 @@ export function validateCandidateBoundOrderIntent(
   validateDecision(value.decision, value.order, binding);
   validateDeployment(value, deployment, binding);
   validateOrderBinding(value.order, binding);
+  validateCandidateOrderShape(value.expectedPhase, value.decision, value.order);
   validateImmutableRequest(value.order, value.event, binding);
   return value;
+}
+
+function validateCandidateOrderShape(
+  phase: "ACTIVE" | "DRAINING",
+  decision: StrategyDecisionRecord,
+  order: OrderRecord,
+): void {
+  const isEntry = decision.action === "ENTER" || decision.action === "ADD";
+  if (phase === "DRAINING" && isEntry) {
+    throw new Error("DRAINING candidate deployments allow only REDUCE or EXIT orders.");
+  }
+
+  if (isEntry) {
+    if (
+      order.side !== "bid" ||
+      order.ordType !== "price" ||
+      order.price === null ||
+      order.price !== decision.intendedNotionalKrw ||
+      decision.intendedQuantity !== null ||
+      order.volume !== null ||
+      order.timeInForce !== null ||
+      order.smpType !== null
+    ) {
+      throw new Error("Candidate entry order shape is invalid.");
+    }
+    validatePositiveDecimal(order.price, "Candidate entry order shape");
+    return;
+  }
+
+  if (
+    order.side !== "ask" ||
+    order.ordType !== "market" ||
+    decision.intendedNotionalKrw !== null ||
+    order.price !== null ||
+    order.volume === null ||
+    order.volume !== decision.intendedQuantity ||
+    order.timeInForce !== null ||
+    order.smpType !== null
+  ) {
+    throw new Error("Candidate exit order shape is invalid.");
+  }
+  validatePositiveDecimal(order.volume, "Candidate exit order shape");
 }
 
 function validateDecision(
@@ -191,6 +234,13 @@ function validateStateVersion(value: number, label: string): void {
 function validateOptionalDecimal(value: string | null, label: string): void {
   if (value !== null && canonicalNonNegativeDecimal(value, label) !== value) {
     throw new Error(`${label} must be canonical.`);
+  }
+}
+
+function validatePositiveDecimal(value: string, label: string): void {
+  const canonical = canonicalNonNegativeDecimal(value, `${label} value`);
+  if (canonical !== value || canonical === "0") {
+    throw new Error(`${label} requires a canonical positive decimal.`);
   }
 }
 

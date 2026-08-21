@@ -76,6 +76,92 @@ test("candidate-bound order validator rejects incorrect action-side relationship
   assert.throws(() => validateCandidateBoundOrderIntent(exit), /side.*action/i);
 });
 
+test("candidate-bound order validator permits only risk-reducing actions while draining", () => {
+  for (const action of ["ENTER", "ADD"] as const) {
+    const input = validInput({ action, phase: "DRAINING" });
+    assert.throws(() => validateCandidateBoundOrderIntent(input), /draining.*reduce|reduce.*draining/i, action);
+  }
+
+  for (const action of ["REDUCE", "EXIT"] as const) {
+    const input = validInput({ action, phase: "DRAINING" });
+    assert.doesNotThrow(() => validateCandidateBoundOrderIntent(input), action);
+  }
+});
+
+test("candidate-bound order validator rejects jointly forged entry order shapes", () => {
+  const cases: Array<[string, (input: PersistCandidateBoundOrderIntentInput) => void]> = [
+    ["wrong ordType", (input) => {
+      input.order.ordType = "limit";
+      input.binding = rehash({ ...input.binding, ordType: "limit" });
+    }],
+    ["zero notional", (input) => {
+      input.order.price = "0";
+      input.decision.intendedNotionalKrw = "0";
+      input.binding = rehash({ ...input.binding, intendedNotionalKrw: "0", boundPrice: "0" });
+    }],
+    ["unexpected volume", (input) => {
+      input.order.volume = "0.0001";
+      input.decision.intendedQuantity = "0.0001";
+      input.binding = rehash({
+        ...input.binding,
+        intendedQuantity: "0.0001",
+        boundVolume: "0.0001",
+      });
+    }],
+    ["unexpected timeInForce", (input) => {
+      input.order.timeInForce = "ioc";
+      input.binding = rehash({ ...input.binding, boundTimeInForce: "ioc" });
+    }],
+    ["unexpected smpType", (input) => {
+      input.order.smpType = "cancel_taker";
+      input.binding = rehash({ ...input.binding, boundSmpType: "cancel_taker" });
+    }],
+  ];
+
+  for (const [label, mutate] of cases) {
+    const input = validInput({ action: "ADD" });
+    mutate(input);
+    assert.throws(() => validateCandidateBoundOrderIntent(input), /entry order shape/i, label);
+  }
+});
+
+test("candidate-bound order validator rejects jointly forged exit order shapes", () => {
+  const cases: Array<[string, (input: PersistCandidateBoundOrderIntentInput) => void]> = [
+    ["wrong ordType", (input) => {
+      input.order.ordType = "limit";
+      input.binding = rehash({ ...input.binding, ordType: "limit" });
+    }],
+    ["zero quantity", (input) => {
+      input.order.volume = "0";
+      input.decision.intendedQuantity = "0";
+      input.binding = rehash({ ...input.binding, intendedQuantity: "0", boundVolume: "0" });
+    }],
+    ["unexpected price", (input) => {
+      input.order.price = "10000";
+      input.decision.intendedNotionalKrw = "10000";
+      input.binding = rehash({
+        ...input.binding,
+        intendedNotionalKrw: "10000",
+        boundPrice: "10000",
+      });
+    }],
+    ["unexpected timeInForce", (input) => {
+      input.order.timeInForce = "fok";
+      input.binding = rehash({ ...input.binding, boundTimeInForce: "fok" });
+    }],
+    ["unexpected smpType", (input) => {
+      input.order.smpType = "reduce";
+      input.binding = rehash({ ...input.binding, boundSmpType: "reduce" });
+    }],
+  ];
+
+  for (const [label, mutate] of cases) {
+    const input = validInput({ action: "REDUCE" });
+    mutate(input);
+    assert.throws(() => validateCandidateBoundOrderIntent(input), /exit order shape/i, label);
+  }
+});
+
 test("candidate-bound order validator rejects noncanonical decimals", () => {
   for (const value of ["01", "1.0", "1e3", "-1", "NaN", "Infinity"]) {
     const input = validInput();
@@ -169,8 +255,9 @@ test("candidate-bound order validator requires immutable request timestamps and 
 });
 
 interface FixtureOptions {
-  action?: "ENTER" | "EXIT";
+  action?: "ENTER" | "ADD" | "REDUCE" | "EXIT";
   bindingCreatedAt?: string;
+  phase?: "ACTIVE" | "DRAINING";
   requestedAt?: string;
 }
 
@@ -178,12 +265,13 @@ function validInput(options: FixtureOptions = {}): PersistCandidateBoundOrderInt
   const action = options.action ?? "ENTER";
   const bindingCreatedAt = options.bindingCreatedAt ?? "2026-08-21T00:00:00Z";
   const requestedAt = options.requestedAt ?? "2026-08-21T00:00:00.000000001Z";
-  const side: OrderRecord["side"] = action === "ENTER" ? "bid" : "ask";
-  const intendedNotionalKrw = action === "ENTER" ? "10000" : null;
-  const intendedQuantity = action === "EXIT" ? "0.0001" : null;
-  const price = action === "ENTER" ? "10000" : null;
-  const volume = action === "EXIT" ? "0.0001" : null;
-  const ordType: OrderRecord["ordType"] = action === "ENTER" ? "price" : "market";
+  const isEntry = action === "ENTER" || action === "ADD";
+  const side: OrderRecord["side"] = isEntry ? "bid" : "ask";
+  const intendedNotionalKrw = isEntry ? "10000" : null;
+  const intendedQuantity = isEntry ? null : "0.0001";
+  const price = isEntry ? "10000" : null;
+  const volume = isEntry ? null : "0.0001";
+  const ordType: OrderRecord["ordType"] = isEntry ? "price" : "market";
   const activationAt = "2026-08-20T23:59:59Z";
   const order: OrderRecord = {
     id: "order-1",
@@ -266,14 +354,14 @@ function validInput(options: FixtureOptions = {}): PersistCandidateBoundOrderInt
       market: "KRW-BTC",
       policyId: "COMBINED_CONSERVATIVE",
       policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
-      phase: "ACTIVE",
+      phase: options.phase ?? "ACTIVE",
       activationAt,
       activationEpochNs: binding.activationEpochNs,
       createdAt: "2026-08-20T23:00:00Z",
       updatedAt: "2026-08-20T23:59:59.500Z",
     },
     exactStateVersion: 7,
-    expectedPhase: "ACTIVE",
+    expectedPhase: options.phase ?? "ACTIVE",
     expectedDeploymentUpdatedAt: "2026-08-20T23:59:59.500Z",
     expectedStateVersion: 7,
   };
