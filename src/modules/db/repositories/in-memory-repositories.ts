@@ -41,7 +41,10 @@ import type {
   PersistUncertainSubmissionInput,
   TelegramInboundOffsetStore,
 } from "../interfaces.js";
-import { validateCandidateBoundOrderIntent } from "./candidate-bound-order-validation.js";
+import {
+  validateCandidateBoundOrderIntent,
+  validateCandidateBoundOrderIntentRequestShape,
+} from "./candidate-bound-order-validation.js";
 import {
   recordsEqual,
   faultPauseTransitionMatchesOccurrence,
@@ -149,7 +152,7 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   }
 
   async persistCandidateBoundOrderIntent(input: PersistCandidateBoundOrderIntentRequest): Promise<void> {
-    validateCandidateBoundRequestShape(input);
+    validateCandidateBoundOrderIntentRequestShape(input);
     if (!this.candidateBoundOrderStore) {
       throw new Error("In-memory candidate-bound order store is required.");
     }
@@ -1052,35 +1055,6 @@ function cloneRecord<T extends object>(record: T): T {
 function cloneCandidateBinding(record: CandidateExecutionBindingRecord): CandidateExecutionBindingRecord {
   return { ...record };
 }
-
-const CANDIDATE_BOUND_REQUEST_KEYS = [
-  "order",
-  "event",
-  "binding",
-  "expectedPhase",
-  "expectedDeploymentUpdatedAt",
-  "expectedStateVersion",
-] as const;
-
-function validateCandidateBoundRequestShape(input: PersistCandidateBoundOrderIntentRequest): void {
-  if (typeof input !== "object" || input === null || Object.getPrototypeOf(input) !== Object.prototype) {
-    throw new Error("Candidate-bound order persistence request must be a plain object.");
-  }
-  const keys = Reflect.ownKeys(input);
-  if (
-    keys.length !== CANDIDATE_BOUND_REQUEST_KEYS.length ||
-    keys.some((key) => typeof key !== "string" || !CANDIDATE_BOUND_REQUEST_KEYS.includes(
-      key as (typeof CANDIDATE_BOUND_REQUEST_KEYS)[number],
-    )) ||
-    keys.some((key) => {
-      const descriptor = Object.getOwnPropertyDescriptor(input, key);
-      return !descriptor || !("value" in descriptor) || descriptor.enumerable !== true;
-    })
-  ) {
-    throw new Error("Candidate-bound order persistence request must contain exactly own data properties.");
-  }
-}
-
 
 function formatFaultPauseReason(input: FaultPauseInput): string {
   return `faultId=${input.faultId}; reason=${input.reason}`;

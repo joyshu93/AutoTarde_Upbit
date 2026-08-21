@@ -9,7 +9,10 @@ import type {
 } from "../../../domain/types.js";
 import { canonicalNonNegativeDecimal } from "../../execution/candidate-evidence-decimals.js";
 import { parsePositionGuardCandidateTimestamp } from "../../strategy/position-guard-candidate-state.js";
-import type { PersistCandidateBoundOrderIntentInput } from "../interfaces.js";
+import type {
+  PersistCandidateBoundOrderIntentInput,
+  PersistCandidateBoundOrderIntentRequest,
+} from "../interfaces.js";
 import {
   validateCandidateExecutionBinding,
   validateCandidatePilotDeployment,
@@ -38,6 +41,19 @@ const DECISION_KEYS = [
   "id", "exchangeAccountId", "strategyKey", "market", "action", "status",
   "decisionBasisJson", "intendedNotionalKrw", "intendedQuantity", "referencePrice", "createdAt",
 ] as const;
+const REQUEST_KEYS = [
+  "order", "event", "binding", "expectedPhase", "expectedDeploymentUpdatedAt", "expectedStateVersion",
+] as const;
+
+export function validateCandidateBoundOrderIntentRequestShape(
+  value: PersistCandidateBoundOrderIntentRequest,
+): PersistCandidateBoundOrderIntentRequest {
+  exactOwnDataRecord(value, "candidate-bound order persistence request", REQUEST_KEYS);
+  exactOwnDataRecord(value.order, "candidate-bound order", ORDER_KEYS);
+  exactOwnDataRecord(value.event, "candidate-bound order event", EVENT_KEYS);
+  validateCandidateExecutionBinding(value.binding);
+  return value;
+}
 
 export function validateCandidateBoundOrderIntent(
   value: PersistCandidateBoundOrderIntentInput,

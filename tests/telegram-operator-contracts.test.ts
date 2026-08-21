@@ -2136,6 +2136,7 @@ function createRepositoryStub(overrides: Partial<ExecutionRepository> = {}): Exe
     },
     async updateOrder() {},
     async persistOrderIntent() {},
+    async persistCandidateBoundOrderIntent() {},
     async persistExchangeSubmission() {},
     async persistUncertainSubmission() {},
     async findOrderByIdempotencyKey() {

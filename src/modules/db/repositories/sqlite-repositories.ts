@@ -24,7 +24,11 @@ import type {
   TelegramInboundOffsetRecord,
   UserRecord,
 } from "../../../domain/types.js";
-import type { OrderSubmissionRecoveryObservationRecord } from "../../../domain/pilot-types.js";
+import type {
+  CandidateExecutionBindingRecord,
+  OrderSubmissionRecoveryObservationRecord,
+  PositionGuardPilotDeploymentRecord,
+} from "../../../domain/pilot-types.js";
 import type {
   SqliteBalanceSnapshotRow,
   SqliteExecutionStateRow,
@@ -52,6 +56,8 @@ import type {
   FaultPauseInput,
   OperatorStateStore,
   PersistCandidateProjectionFaultInput,
+  PersistCandidateBoundOrderIntentInput,
+  PersistCandidateBoundOrderIntentRequest,
   PersistExchangeSubmissionInput,
   PersistOrderIntentInput,
   PersistUncertainSubmissionInput,
@@ -64,6 +70,14 @@ import { createId } from "../../../shared/ids.js";
 import { SqliteAccountExecutionLeaseStore } from "./sqlite-account-execution-lease-store.js";
 import { SqliteCandidatePilotRepository } from "./sqlite-candidate-pilot-repository.js";
 import { withImmediateTransaction } from "./sqlite-transaction.js";
+import {
+  validateCandidateBoundOrderIntent,
+  validateCandidateBoundOrderIntentRequestShape,
+} from "./candidate-bound-order-validation.js";
+import {
+  validateCandidateExecutionBinding,
+  validateCandidatePilotDeployment,
+} from "../pilot-interfaces.js";
 import {
   faultPauseTransitionMatchesOccurrence,
   recordsEqual,
@@ -88,6 +102,51 @@ const ACTIVE_ORDER_STATUSES = new Set<OrderRecord["status"]>([
 ]);
 const ACTIVE_ORDER_STATUS_VALUES = Array.from(ACTIVE_ORDER_STATUSES);
 const ACTIVE_ORDER_STATUS_PLACEHOLDERS = ACTIVE_ORDER_STATUS_VALUES.map(() => "?").join(", ");
+
+interface SqliteCandidateDeploymentAuthorityRow {
+  id: string;
+  exchange_account_id: string;
+  pilot_id: PositionGuardPilotDeploymentRecord["pilotId"];
+  market: PositionGuardPilotDeploymentRecord["market"];
+  policy_id: PositionGuardPilotDeploymentRecord["policyId"];
+  policy_version: PositionGuardPilotDeploymentRecord["policyVersion"];
+  phase: PositionGuardPilotDeploymentRecord["phase"];
+  activation_at: string | null;
+  activation_epoch_ns: string | number | bigint | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface SqliteCandidateStateAuthorityRow {
+  state_version: number;
+}
+
+interface SqliteCandidateBindingAuthorityRow {
+  id: string;
+  deployment_id: string;
+  strategy_decision_id: string;
+  order_id: string;
+  exchange_account_id: string;
+  activation_at: string;
+  activation_epoch_ns: string | number | bigint;
+  market: CandidateExecutionBindingRecord["market"];
+  strategy_key: CandidateExecutionBindingRecord["strategyKey"];
+  policy_id: CandidateExecutionBindingRecord["policyId"];
+  policy_version: CandidateExecutionBindingRecord["policyVersion"];
+  execution_mode: CandidateExecutionBindingRecord["executionMode"];
+  ord_type: CandidateExecutionBindingRecord["ordType"];
+  action: CandidateExecutionBindingRecord["action"];
+  side: CandidateExecutionBindingRecord["side"];
+  intended_quantity_exact: string | null;
+  intended_notional_krw_exact: string | null;
+  bound_price_exact: string | null;
+  bound_volume_exact: string | null;
+  bound_time_in_force: CandidateExecutionBindingRecord["boundTimeInForce"];
+  bound_smp_type: CandidateExecutionBindingRecord["boundSmpType"];
+  material_version: CandidateExecutionBindingRecord["materialVersion"] | "LEGACY_UNVERIFIED";
+  order_material_hash: string | null;
+  created_at: string;
+}
 
 export function createSqlitePersistence(options: SqliteBootstrapOptions): SqlitePersistenceBundle {
   const handle = openSqliteDatabase(options.databasePath);
@@ -257,6 +316,73 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       // Keep validation in the transaction so malformed child input proves the order write rolls back.
       validateOrderIntentInput(input);
       this.insertOrderEvent(input.event);
+    });
+  }
+
+  async persistCandidateBoundOrderIntent(input: PersistCandidateBoundOrderIntentRequest): Promise<void> {
+    withImmediateTransaction(this.db, () => {
+      validateCandidateBoundOrderIntentRequestShape(input);
+
+      const decision = this.getStrategyDecisionByIdSync(input.binding.strategyDecisionId);
+      if (!decision) {
+        throw new Error(`Persisted candidate strategy decision ${input.binding.strategyDecisionId} is missing.`);
+      }
+      const deployment = this.getCandidateDeploymentById(input.binding.deploymentId);
+      const exactStateVersion = this.getCandidateStateVersion(input.binding.deploymentId);
+      if (!deployment || exactStateVersion === null) {
+        throw new Error(`Persisted candidate authority ${input.binding.deploymentId} is missing.`);
+      }
+
+      const aggregate: PersistCandidateBoundOrderIntentInput = {
+        order: input.order,
+        event: input.event,
+        binding: input.binding,
+        decision,
+        deployment,
+        exactStateVersion,
+        expectedPhase: input.expectedPhase,
+        expectedDeploymentUpdatedAt: input.expectedDeploymentUpdatedAt,
+        expectedStateVersion: input.expectedStateVersion,
+      };
+      validateCandidateBoundOrderIntent(aggregate);
+
+      const existingOrder = this.getOrderById(input.order.id);
+      const existingEventById = this.getOrderEventById(input.event.id);
+      const existingOrderEvents = this.getOrderEventsForOrder(input.order.id);
+      const existingBindingByOrder = this.getCandidateBindingByOrderId(input.order.id);
+      const existingBindingById = this.getCandidateBindingById(input.binding.id);
+
+      if (existingEventById && !recordsEqual(existingEventById, input.event)) {
+        throw new Error(`Conflicting candidate-bound order event ${input.event.id}.`);
+      }
+      if (existingBindingByOrder && !recordsEqual(existingBindingByOrder, input.binding)) {
+        throw new Error(`Conflicting candidate-bound binding for order ${input.order.id}.`);
+      }
+      if (existingBindingById && !recordsEqual(existingBindingById, input.binding)) {
+        throw new Error(`Conflicting candidate-bound binding id ${input.binding.id}.`);
+      }
+
+      const componentCount = Number(existingOrder !== null) +
+        Number(existingOrderEvents.length > 0 || existingEventById !== null) +
+        Number(existingBindingByOrder !== null || existingBindingById !== null);
+      if (componentCount > 0) {
+        if (
+          !existingOrder || !recordsEqual(existingOrder, input.order) ||
+          existingOrderEvents.length !== 1 || !recordsEqual(existingOrderEvents[0]!, input.event) ||
+          !existingEventById ||
+          !existingBindingByOrder || !existingBindingById ||
+          !recordsEqual(existingBindingByOrder, input.binding) ||
+          !recordsEqual(existingBindingById, input.binding)
+        ) {
+          throw new Error(`Dangling partial candidate-bound order intent ${input.order.id}.`);
+        }
+        return;
+      }
+
+      this.assertCandidateOrderUniqueness(input.order);
+      this.insertOrder(input.order);
+      this.insertOrderEvent(input.event);
+      this.insertCandidateBinding(input.binding);
     });
   }
 
@@ -1105,6 +1231,149 @@ export class SqliteExecutionRepository implements ExecutionRepository {
         `).all(exchangeAccountId, dueBefore, dueBefore) as unknown as SqliteOperatorNotificationRow[]);
 
     return rows.map(mapOperatorNotificationRow);
+  }
+
+  private getStrategyDecisionByIdSync(id: string): StrategyDecisionRecord | null {
+    const row = this.db.prepare("SELECT * FROM strategy_decisions WHERE id = ? LIMIT 1")
+      .get(id) as SqliteStrategyDecisionRow | undefined;
+    return row ? mapStrategyDecisionRow(row) : null;
+  }
+
+  private getCandidateDeploymentById(id: string): PositionGuardPilotDeploymentRecord | null {
+    const statement = this.db.prepare(`
+      SELECT id, exchange_account_id, pilot_id, market, policy_id, policy_version,
+        phase, activation_at, activation_epoch_ns, created_at, updated_at
+      FROM strategy_pilot_deployments
+      WHERE id = ?
+      LIMIT 1
+    `);
+    statement.setReadBigInts(true);
+    const row = statement.get(id) as SqliteCandidateDeploymentAuthorityRow | undefined;
+    return row ? mapCandidateDeploymentAuthorityRow(row) : null;
+  }
+
+  private getCandidateStateVersion(deploymentId: string): number | null {
+    const row = this.db.prepare(`
+      SELECT state_version
+      FROM strategy_candidate_states
+      WHERE deployment_id = ?
+      LIMIT 1
+    `).get(deploymentId) as SqliteCandidateStateAuthorityRow | undefined;
+    return row?.state_version ?? null;
+  }
+
+  private getCandidateBindingByOrderId(orderId: string): CandidateExecutionBindingRecord | null {
+    return this.getCandidateBinding("order_id", orderId);
+  }
+
+  private getCandidateBindingById(id: string): CandidateExecutionBindingRecord | null {
+    return this.getCandidateBinding("id", id);
+  }
+
+  private getCandidateBinding(
+    column: "id" | "order_id",
+    value: string,
+  ): CandidateExecutionBindingRecord | null {
+    const statement = this.db.prepare(`
+      SELECT id, deployment_id, strategy_decision_id, order_id, exchange_account_id,
+        activation_at, activation_epoch_ns, market, strategy_key, policy_id, policy_version,
+        execution_mode, ord_type, action, side, intended_quantity_exact,
+        intended_notional_krw_exact, bound_price_exact, bound_volume_exact,
+        bound_time_in_force, bound_smp_type, material_version, order_material_hash, created_at
+      FROM strategy_candidate_execution_bindings
+      WHERE ${column} = ?
+      LIMIT 1
+    `);
+    statement.setReadBigInts(true);
+    const row = statement.get(value) as SqliteCandidateBindingAuthorityRow | undefined;
+    return row ? mapCandidateBindingAuthorityRow(row) : null;
+  }
+
+  private assertCandidateOrderUniqueness(order: OrderRecord): void {
+    const identifier = this.db.prepare("SELECT id FROM orders WHERE identifier = ? LIMIT 1")
+      .get(order.identifier) as { id: string } | undefined;
+    if (identifier) {
+      throw new Error(`Conflicting duplicate order identifier ${order.identifier}.`);
+    }
+    const idempotency = this.db.prepare(`
+      SELECT id FROM orders
+      WHERE exchange_account_id = ? AND idempotency_key = ?
+      LIMIT 1
+    `).get(order.exchangeAccountId, order.idempotencyKey) as { id: string } | undefined;
+    if (idempotency) {
+      throw new Error(`Conflicting duplicate order idempotency key ${order.idempotencyKey}.`);
+    }
+  }
+
+  private insertOrder(record: OrderRecord): void {
+    this.db.prepare(`
+      INSERT INTO orders (
+        id, strategy_decision_id, exchange_account_id, market, side, ord_type,
+        volume, price, time_in_force, smp_type, identifier, idempotency_key,
+        origin, requested_at, upbit_uuid, status, execution_mode,
+        exchange_response_json, failure_code, failure_message, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      record.id,
+      record.strategyDecisionId,
+      record.exchangeAccountId,
+      record.market,
+      record.side,
+      record.ordType,
+      record.volume,
+      record.price,
+      record.timeInForce,
+      record.smpType,
+      record.identifier,
+      record.idempotencyKey,
+      record.origin,
+      record.requestedAt,
+      record.upbitUuid,
+      record.status,
+      record.executionMode,
+      record.exchangeResponseJson,
+      record.failureCode,
+      record.failureMessage,
+      record.createdAt,
+      record.updatedAt,
+    );
+  }
+
+  private insertCandidateBinding(binding: CandidateExecutionBindingRecord): void {
+    this.db.prepare(`
+      INSERT INTO strategy_candidate_execution_bindings (
+        id, deployment_id, strategy_decision_id, order_id, exchange_account_id,
+        activation_at, activation_epoch_ns, market, strategy_key, policy_id, policy_version,
+        execution_mode, ord_type, action, side, intended_quantity_exact,
+        intended_notional_krw_exact, bound_price_exact, bound_volume_exact,
+        bound_time_in_force, bound_smp_type, material_version, order_material_hash, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      binding.id,
+      binding.deploymentId,
+      binding.strategyDecisionId,
+      binding.orderId,
+      binding.exchangeAccountId,
+      binding.activationAt,
+      binding.activationEpochNs,
+      binding.market,
+      binding.strategyKey,
+      binding.policyId,
+      binding.policyVersion,
+      binding.executionMode,
+      binding.ordType,
+      binding.action,
+      binding.side,
+      binding.intendedQuantity,
+      binding.intendedNotionalKrw,
+      binding.boundPrice,
+      binding.boundVolume,
+      binding.boundTimeInForce,
+      binding.boundSmpType,
+      binding.materialVersion,
+      binding.orderMaterialHash,
+      binding.createdAt,
+    );
   }
 
   private getOrderById(id: string): OrderRecord | null {
@@ -1971,6 +2240,58 @@ function mapOrderEventRow(row: SqliteOrderEventRow): OrderEventRecord {
     payloadJson: row.payload_json,
     createdAt: row.created_at,
   };
+}
+
+function mapCandidateDeploymentAuthorityRow(
+  row: SqliteCandidateDeploymentAuthorityRow,
+): PositionGuardPilotDeploymentRecord {
+  return validateCandidatePilotDeployment({
+    id: row.id,
+    exchangeAccountId: row.exchange_account_id,
+    pilotId: row.pilot_id,
+    market: row.market,
+    policyId: row.policy_id,
+    policyVersion: row.policy_version,
+    phase: row.phase,
+    activationAt: row.activation_at,
+    activationEpochNs: row.activation_epoch_ns === null ? null : BigInt(row.activation_epoch_ns),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  });
+}
+
+function mapCandidateBindingAuthorityRow(
+  row: SqliteCandidateBindingAuthorityRow,
+): CandidateExecutionBindingRecord {
+  if (row.material_version !== "BINDING_V2" || row.order_material_hash === null) {
+    throw new Error("Legacy candidate execution binding cannot authorize an order intent retry.");
+  }
+  return validateCandidateExecutionBinding({
+    id: row.id,
+    deploymentId: row.deployment_id,
+    strategyDecisionId: row.strategy_decision_id,
+    orderId: row.order_id,
+    exchangeAccountId: row.exchange_account_id,
+    activationAt: row.activation_at,
+    activationEpochNs: BigInt(row.activation_epoch_ns),
+    market: row.market,
+    strategyKey: row.strategy_key,
+    policyId: row.policy_id,
+    policyVersion: row.policy_version,
+    executionMode: row.execution_mode,
+    ordType: row.ord_type,
+    action: row.action,
+    side: row.side,
+    intendedQuantity: row.intended_quantity_exact,
+    intendedNotionalKrw: row.intended_notional_krw_exact,
+    boundPrice: row.bound_price_exact,
+    boundVolume: row.bound_volume_exact,
+    boundTimeInForce: row.bound_time_in_force,
+    boundSmpType: row.bound_smp_type,
+    materialVersion: row.material_version,
+    orderMaterialHash: row.order_material_hash,
+    createdAt: row.created_at,
+  });
 }
 
 function mapRiskEventRow(row: SqliteRiskEventRow): RiskEventRecord {

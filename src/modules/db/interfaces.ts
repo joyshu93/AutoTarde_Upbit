@@ -119,6 +119,7 @@ export interface ExecutionRepository {
   saveOrder(record: OrderRecord): Promise<void>;
   updateOrder(record: OrderRecord): Promise<void>;
   persistOrderIntent(input: PersistOrderIntentInput): Promise<void>;
+  persistCandidateBoundOrderIntent(input: PersistCandidateBoundOrderIntentRequest): Promise<void>;
   persistExchangeSubmission(input: PersistExchangeSubmissionInput): Promise<void>;
   persistUncertainSubmission(input: PersistUncertainSubmissionInput): Promise<void>;
   findOrderByIdempotencyKey(exchangeAccountId: string, idempotencyKey: string): Promise<OrderRecord | null>;
