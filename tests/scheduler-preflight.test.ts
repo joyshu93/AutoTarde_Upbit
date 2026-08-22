@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 
-import { buildManualStrategyRunPreflight, buildStrategySchedulerStartupPreflight } from "../src/app/scheduler-preflight.js";
+import {
+  buildManualStrategyRunPreflight,
+  buildStrategySchedulerStartupPreflight,
+  getStrategyRunFreshnessThresholdMs,
+} from "../src/app/scheduler-preflight.js";
 import type { AppConfig } from "../src/app/env.js";
 import type { ExecutionStateRecord, OrderRecord, ReconciliationRunRecord } from "../src/domain/types.js";
 import { InMemoryExecutionRepository } from "../src/modules/db/repositories/in-memory-repositories.js";
@@ -173,6 +177,49 @@ test("manual strategy run preflight blocks live run even when scheduler is disab
   assert.equal(preflight.status, "BLOCK");
   assert.match(preflight.detail, /Live manual \/run blocked by active_orders/);
   assert.equal(preflight.checks.find((check) => check.name === "active_orders")?.status, "BLOCK");
+});
+
+test("strategy run freshness threshold uses the shorter configured market interval", () => {
+  assert.equal(getStrategyRunFreshnessThresholdMs(createConfig({
+    strategySchedulerBtcIntervalMs: 7_200_000,
+    strategySchedulerEthIntervalMs: 1_800_000,
+  })), 1_800_000);
+  assert.equal(getStrategyRunFreshnessThresholdMs(createConfig({
+    strategySchedulerBtcIntervalMs: 900_000,
+    strategySchedulerEthIntervalMs: 3_600_000,
+  })), 900_000);
+});
+
+test("manual and scheduler preflights share the shorter market freshness threshold", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await seedReadyPortfolio(repository);
+  const config = createConfig({
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    strategySchedulerEnabled: true,
+    strategySchedulerBtcIntervalMs: 3_600_000,
+    strategySchedulerEthIntervalMs: 1_800_000,
+  });
+  const common = {
+    config,
+    exchangeAccountId: "primary",
+    executionState: createExecutionState({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+    }),
+    repositories: repository,
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER" as const,
+    checkedAt: "2026-05-08T00:30:00.001Z",
+  };
+
+  const scheduler = await buildStrategySchedulerStartupPreflight(common);
+  const manual = await buildManualStrategyRunPreflight(common);
+
+  assert.equal(scheduler.checks.find((check) => check.name === "balance_snapshot")?.status, "BLOCK");
+  assert.equal(manual.checks.find((check) => check.name === "balance_snapshot")?.status, "BLOCK");
+  assert.match(scheduler.checks.find((check) => check.name === "balance_snapshot")?.detail ?? "", /max_age_ms=1800000/);
+  assert.match(manual.checks.find((check) => check.name === "balance_snapshot")?.detail ?? "", /max_age_ms=1800000/);
 });
 
 async function seedReadyPortfolio(

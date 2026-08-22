@@ -173,7 +173,7 @@ function buildLiveSchedulerChecks(input: {
   latestReconciliationRun: ReconciliationRunRecord | null;
   activeOrders: OrderRecord[];
 }): StrategySchedulerStartupPreflightCheck[] {
-  const maxAgeMs = getSchedulerFreshnessThresholdMs(input.config);
+  const maxAgeMs = getStrategyRunFreshnessThresholdMs(input.config);
 
   return [
     {
@@ -229,7 +229,7 @@ function buildLiveSchedulerChecks(input: {
   ];
 }
 
-function getSchedulerFreshnessThresholdMs(config: AppConfig): number {
+export function getStrategyRunFreshnessThresholdMs(config: AppConfig): number {
   return Math.min(config.strategySchedulerBtcIntervalMs, config.strategySchedulerEthIntervalMs);
 }
 
