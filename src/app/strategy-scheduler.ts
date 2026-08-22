@@ -35,6 +35,46 @@ export interface StrategySchedulerAccountRefreshResult {
 
 export type StrategySchedulerRunPreparationOwner = "SCHEDULER" | "CONTROLLER";
 
+type StrategySchedulerRunPreparationOwnerResolver = (
+  market: SupportedMarket,
+) => StrategySchedulerRunPreparationOwner;
+
+type StrategySchedulerDependencies = {
+  config: StrategySchedulerConfig;
+  controller: TelegramStrategyRunController;
+  repositories?: Pick<ExecutionRepository, "saveStrategySchedulerRun" | "updateStrategySchedulerRun">;
+  reporter?: OperatorNotificationReporter;
+  beforeRunAccountRefresh?: () => Promise<StrategySchedulerAccountRefreshResult | null>;
+  beforeRunPreflight?: () => Promise<StrategySchedulerStartupPreflight | null>;
+  resolveRunPreparationOwner?: StrategySchedulerRunPreparationOwnerResolver;
+  now?: () => string;
+  setTimer?: (callback: () => void, delayMs: number) => SchedulerTimer;
+  clearTimer?: (timer: SchedulerTimer) => void;
+};
+
+type StrategySchedulerResolverDescriptor =
+  | { kind: "ABSENT" }
+  | {
+    kind: "DATA";
+    value: unknown;
+    writable: boolean;
+    enumerable: boolean;
+    configurable: boolean;
+  }
+  | {
+    kind: "ACCESSOR";
+    get: (() => unknown) | undefined;
+    set: ((value: unknown) => void) | undefined;
+    enumerable: boolean;
+    configurable: boolean;
+  };
+
+interface StrategySchedulerRunPreparationOwnerAuthority {
+  descriptor: StrategySchedulerResolverDescriptor;
+  resolver: StrategySchedulerRunPreparationOwnerResolver | undefined;
+  initialFailure: string | null;
+}
+
 type SchedulerTimer = ReturnType<typeof setTimeout>;
 const SCHEDULER_BATCH_KEY_GRANULARITY_MS = 1_000;
 
@@ -47,21 +87,12 @@ export class StrategyScheduler {
   private accountRefreshInFlight: Promise<StrategySchedulerAccountRefreshResult | null> | null = null;
   private scheduledRunQueue: Promise<void> = Promise.resolve();
   private orderSubmittedBatchKey: string | null = null;
+  private readonly runPreparationOwnerAuthority: StrategySchedulerRunPreparationOwnerAuthority;
 
   constructor(
-    private readonly dependencies: {
-      config: StrategySchedulerConfig;
-      controller: TelegramStrategyRunController;
-      repositories?: Pick<ExecutionRepository, "saveStrategySchedulerRun" | "updateStrategySchedulerRun">;
-      reporter?: OperatorNotificationReporter;
-      beforeRunAccountRefresh?: () => Promise<StrategySchedulerAccountRefreshResult | null>;
-      beforeRunPreflight?: () => Promise<StrategySchedulerStartupPreflight | null>;
-      resolveRunPreparationOwner?: (market: SupportedMarket) => StrategySchedulerRunPreparationOwner;
-      now?: () => string;
-      setTimer?: (callback: () => void, delayMs: number) => SchedulerTimer;
-      clearTimer?: (timer: SchedulerTimer) => void;
-    },
+    private readonly dependencies: StrategySchedulerDependencies,
   ) {
+    this.runPreparationOwnerAuthority = snapshotRunPreparationOwnerAuthority(dependencies);
     this.startupPreflight = dependencies.config.startupPreflight ?? null;
     for (const market of dependencies.config.markets) {
       this.statusByMarket.set(market.market, createInitialMarketStatus(market));
@@ -417,7 +448,21 @@ export class StrategyScheduler {
   }
 
   private resolveRunPreparationOwner(market: SupportedMarket): StrategySchedulerRunPreparationOwner {
-    const resolver = this.dependencies.resolveRunPreparationOwner;
+    const authority = this.runPreparationOwnerAuthority;
+    const currentDescriptor = snapshotResolverDescriptor(this.dependencies);
+    if (!resolverDescriptorsMatch(authority.descriptor, currentDescriptor)) {
+      throw new Error("Scheduler preparation ownership resolver authority changed after scheduler construction.");
+    }
+
+    if (hasInheritedResolverAuthority(this.dependencies)) {
+      throw new Error("Scheduler preparation ownership resolver authority must not be inherited.");
+    }
+
+    if (authority.initialFailure) {
+      throw new Error(authority.initialFailure);
+    }
+
+    const resolver = authority.resolver;
     const owner = resolver ? resolver(market) : "SCHEDULER";
     if (owner === "SCHEDULER" || owner === "CONTROLLER") {
       return owner;
@@ -731,6 +776,113 @@ export class StrategyScheduler {
   private now(): string {
     return this.dependencies.now?.() ?? new Date().toISOString();
   }
+}
+
+function snapshotRunPreparationOwnerAuthority(
+  dependencies: StrategySchedulerDependencies,
+): StrategySchedulerRunPreparationOwnerAuthority {
+  const descriptor = snapshotResolverDescriptor(dependencies);
+  const inheritedAuthority = hasInheritedResolverAuthority(dependencies);
+
+  if (descriptor.kind === "ACCESSOR") {
+    return {
+      descriptor,
+      resolver: undefined,
+      initialFailure: "Scheduler preparation ownership resolver authority must be an own data property, not an accessor.",
+    };
+  }
+
+  if (inheritedAuthority) {
+    return {
+      descriptor,
+      resolver: undefined,
+      initialFailure: "Scheduler preparation ownership resolver authority must not be inherited.",
+    };
+  }
+
+  if (descriptor.kind === "DATA" && descriptor.value !== undefined && typeof descriptor.value !== "function") {
+    return {
+      descriptor,
+      resolver: undefined,
+      initialFailure: "Scheduler preparation ownership resolver authority must be a function or undefined.",
+    };
+  }
+
+  return {
+    descriptor,
+    resolver: descriptor.kind === "DATA" && typeof descriptor.value === "function"
+      ? descriptor.value as StrategySchedulerRunPreparationOwnerResolver
+      : undefined,
+    initialFailure: null,
+  };
+}
+
+function snapshotResolverDescriptor(
+  dependencies: StrategySchedulerDependencies,
+): StrategySchedulerResolverDescriptor {
+  const descriptor = Object.getOwnPropertyDescriptor(dependencies, "resolveRunPreparationOwner");
+  if (!descriptor) {
+    return { kind: "ABSENT" };
+  }
+
+  if ("value" in descriptor || "writable" in descriptor) {
+    return {
+      kind: "DATA",
+      value: descriptor.value,
+      writable: descriptor.writable === true,
+      enumerable: descriptor.enumerable === true,
+      configurable: descriptor.configurable === true,
+    };
+  }
+
+  return {
+    kind: "ACCESSOR",
+    get: descriptor.get,
+    set: descriptor.set,
+    enumerable: descriptor.enumerable === true,
+    configurable: descriptor.configurable === true,
+  };
+}
+
+function hasInheritedResolverAuthority(dependencies: StrategySchedulerDependencies): boolean {
+  let prototype = Object.getPrototypeOf(dependencies) as object | null;
+  while (prototype) {
+    if (Object.getOwnPropertyDescriptor(prototype, "resolveRunPreparationOwner")) {
+      return true;
+    }
+    prototype = Object.getPrototypeOf(prototype) as object | null;
+  }
+
+  return false;
+}
+
+function resolverDescriptorsMatch(
+  expected: StrategySchedulerResolverDescriptor,
+  actual: StrategySchedulerResolverDescriptor,
+): boolean {
+  if (expected.kind !== actual.kind) {
+    return false;
+  }
+
+  if (expected.kind === "ABSENT" || actual.kind === "ABSENT") {
+    return true;
+  }
+
+  if (expected.kind === "DATA" && actual.kind === "DATA") {
+    return expected.value === actual.value &&
+      expected.writable === actual.writable &&
+      expected.enumerable === actual.enumerable &&
+      expected.configurable === actual.configurable;
+  }
+
+  if (expected.kind === "ACCESSOR" && actual.kind === "ACCESSOR") {
+    return expected.get === actual.get &&
+      expected.set === actual.set &&
+      expected.enumerable === actual.enumerable &&
+      expected.configurable === actual.configurable;
+  }
+
+  return false;
 }
 
 function buildSchedulerNotification(input: {

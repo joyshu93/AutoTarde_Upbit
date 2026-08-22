@@ -1241,12 +1241,13 @@ test("strategy scheduler fails closed when preparation ownership resolution thro
   }
 });
 
-test("strategy scheduler fails closed when the ownership resolver accessor throws", async () => {
+test("strategy scheduler never invokes an initial ownership resolver accessor", async () => {
   const repository = new InMemoryExecutionRepository();
   const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
   let refreshCalls = 0;
   let preflightCalls = 0;
   let controllerCalls = 0;
+  let accessorCalls = 0;
   const scheduler = new StrategyScheduler({
     config: {
       enabled: true,
@@ -1262,6 +1263,7 @@ test("strategy scheduler fails closed when the ownership resolver accessor throw
       },
     }),
     get resolveRunPreparationOwner(): (market: "KRW-BTC" | "KRW-ETH") => "CONTROLLER" {
+      accessorCalls += 1;
       throw new Error("resolver accessor failed");
     },
     repositories: repository,
@@ -1277,6 +1279,56 @@ test("strategy scheduler fails closed when the ownership resolver accessor throw
     now: createNowSequence(["2026-04-20T00:00:00.000Z", "2026-04-20T00:00:02.000Z"]),
   });
 
+  assert.equal(accessorCalls, 0);
+  const result = await scheduler.runMarketNow("KRW-BTC");
+  const persisted = await repository.listStrategySchedulerRuns("primary", 5);
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(accessorCalls, 0);
+  assert.equal(refreshCalls, 0);
+  assert.equal(preflightCalls, 0);
+  assert.equal(controllerCalls, 0);
+  assert.equal(persisted[0]?.status, "FAILED");
+  assert.equal(notifications[0]?.notificationType, "SCHEDULER_RUN_FAILED");
+});
+
+test("strategy scheduler fails closed when its scheduler-owned resolver is replaced after construction", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
+  let refreshCalls = 0;
+  let preflightCalls = 0;
+  let controllerCalls = 0;
+  const dependencies: ConstructorParameters<typeof StrategyScheduler>[0] = {
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(request) {
+        controllerCalls += 1;
+        return createController().requestRun(request);
+      },
+    }),
+    resolveRunPreparationOwner: () => "SCHEDULER",
+    repositories: repository,
+    reporter: createReporter(notifications),
+    beforeRunAccountRefresh: async () => {
+      refreshCalls += 1;
+      return { status: "COMPLETED", requestedAt: "2026-04-20T00:00:00.000Z", detail: "ok" };
+    },
+    beforeRunPreflight: async () => {
+      preflightCalls += 1;
+      return { checkedAt: "2026-04-20T00:00:01.000Z", scope: "LIVE", status: "PASS", detail: "ok", checks: [] };
+    },
+    now: createNowSequence(["2026-04-20T00:00:00.000Z", "2026-04-20T00:00:02.000Z"]),
+  };
+  const scheduler = new StrategyScheduler(dependencies);
+
+  dependencies.resolveRunPreparationOwner = () => "CONTROLLER";
+
   const result = await scheduler.runMarketNow("KRW-BTC");
   const persisted = await repository.listStrategySchedulerRuns("primary", 5);
 
@@ -1285,7 +1337,102 @@ test("strategy scheduler fails closed when the ownership resolver accessor throw
   assert.equal(preflightCalls, 0);
   assert.equal(controllerCalls, 0);
   assert.equal(persisted[0]?.status, "FAILED");
+  assert.match(persisted[0]?.detail ?? "", /preparation ownership/i);
   assert.equal(notifications[0]?.notificationType, "SCHEDULER_RUN_FAILED");
+});
+
+test("strategy scheduler fails closed when an omitted resolver is added after construction", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
+  let refreshCalls = 0;
+  let preflightCalls = 0;
+  let controllerCalls = 0;
+  const dependencies: ConstructorParameters<typeof StrategyScheduler>[0] = {
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(request) {
+        controllerCalls += 1;
+        return createController().requestRun(request);
+      },
+    }),
+    repositories: repository,
+    reporter: createReporter(notifications),
+    beforeRunAccountRefresh: async () => {
+      refreshCalls += 1;
+      return { status: "COMPLETED", requestedAt: "2026-04-20T00:00:00.000Z", detail: "ok" };
+    },
+    beforeRunPreflight: async () => {
+      preflightCalls += 1;
+      return { checkedAt: "2026-04-20T00:00:01.000Z", scope: "LIVE", status: "PASS", detail: "ok", checks: [] };
+    },
+    now: createNowSequence(["2026-04-20T00:00:00.000Z", "2026-04-20T00:00:02.000Z"]),
+  };
+  const scheduler = new StrategyScheduler(dependencies);
+
+  dependencies.resolveRunPreparationOwner = () => "CONTROLLER";
+
+  const result = await scheduler.runMarketNow("KRW-BTC");
+  const persisted = await repository.listStrategySchedulerRuns("primary", 5);
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(refreshCalls, 0);
+  assert.equal(preflightCalls, 0);
+  assert.equal(controllerCalls, 0);
+  assert.equal(persisted[0]?.status, "FAILED");
+  assert.match(persisted[0]?.detail ?? "", /preparation ownership/i);
+  assert.equal(notifications[0]?.notificationType, "SCHEDULER_RUN_FAILED");
+});
+
+test("strategy scheduler fails closed when the resolver descriptor is removed after construction", async () => {
+  const repository = new InMemoryExecutionRepository();
+  let refreshCalls = 0;
+  let preflightCalls = 0;
+  let controllerCalls = 0;
+  const dependencies: ConstructorParameters<typeof StrategyScheduler>[0] = {
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(request) {
+        controllerCalls += 1;
+        return createController().requestRun(request);
+      },
+    }),
+    resolveRunPreparationOwner: () => "SCHEDULER",
+    repositories: repository,
+    beforeRunAccountRefresh: async () => {
+      refreshCalls += 1;
+      return { status: "COMPLETED", requestedAt: "2026-04-20T00:00:00.000Z", detail: "ok" };
+    },
+    beforeRunPreflight: async () => {
+      preflightCalls += 1;
+      return { checkedAt: "2026-04-20T00:00:01.000Z", scope: "LIVE", status: "PASS", detail: "ok", checks: [] };
+    },
+    now: createNowSequence(["2026-04-20T00:00:00.000Z", "2026-04-20T00:00:02.000Z"]),
+  };
+  const scheduler = new StrategyScheduler(dependencies);
+
+  delete dependencies.resolveRunPreparationOwner;
+
+  const result = await scheduler.runMarketNow("KRW-BTC");
+  const persisted = await repository.listStrategySchedulerRuns("primary", 5);
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(refreshCalls, 0);
+  assert.equal(preflightCalls, 0);
+  assert.equal(controllerCalls, 0);
+  assert.equal(persisted[0]?.status, "FAILED");
+  assert.match(persisted[0]?.detail ?? "", /preparation ownership/i);
 });
 
 test("same-market running guard skips before a second ownership resolution", async () => {

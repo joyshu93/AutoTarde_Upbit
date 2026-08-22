@@ -36,3 +36,50 @@ once after the same-market running guard, and rejects unexpected runtime output.
 - `git diff --check`
 
 All validation above is offline-only in the isolated worktree.
+
+## Review Fix: Descriptor-Safe Resolver Authority
+
+The review found that the scheduler retained the caller-supplied dependency
+object and re-read `resolveRunPreparationOwner` for every accepted run. A
+post-construction replacement could therefore change a scheduler-owned run to
+controller-owned and bypass both scheduler hooks.
+
+The constructor now snapshots the resolver's own property descriptor and, for
+an accepted own data-property resolver, its function identity without reading
+the property. This means an accessor is never invoked merely by construction.
+The accepted resolver is invoked exactly once per accepted run only after the
+current descriptor is proven unchanged.
+
+Before either preparation hook or the controller is reached, a run now fails
+through the existing persisted and reported preparation-ownership `FAILED`
+path when the authority is an accessor, inherited, initially invalid, added,
+removed, replaced, or descriptor-mutated after construction. An absent own
+property remains the explicit default `SCHEDULER` authority.
+
+### Review TDD Evidence
+
+RED: After adding the review tests, the focused scheduler suite built but
+failed four assertions against the previous implementation:
+
+- the initial resolver accessor was invoked during the accepted run;
+- replacing `SCHEDULER` with `CONTROLLER` after construction completed instead
+  of failing;
+- adding a resolver after an omitted baseline completed instead of failing;
+- deleting the original resolver completed instead of failing.
+
+GREEN: The focused scheduler suite passes all existing and review tests after
+descriptor authority snapshotting and runtime comparison.
+
+Review validation completed successfully:
+
+- `npm.cmd run typecheck`
+- `npm.cmd run build`
+- focused compiled scheduler suite through `tests/harness.ts` (29 passing)
+- `git diff --check`
+
+### Review Scope and Safety
+
+Changed only `src/app/strategy-scheduler.ts`,
+`tests/strategy-scheduler.test.ts`, and this report. No `createApp`, runtime,
+configuration, database, API, network, Telegram, script, scheduler process,
+sync, secret, push, or merge operation was performed.
