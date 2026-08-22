@@ -45,7 +45,10 @@ import {
   TelegramInboundPollingService,
 } from "../modules/telegram/inbound.js";
 import { DurableTelegramReporter } from "../modules/telegram/reporter.js";
-import type { PositionGuardPilotAbandonmentValidation } from "../domain/pilot-types.js";
+import type {
+  PositionGuardPilotAbandonmentValidation,
+  PositionGuardPolicySelection,
+} from "../domain/pilot-types.js";
 
 export interface AppServices {
   config: AppConfig;
@@ -71,7 +74,7 @@ export interface AppServices {
 export interface CreateAppOverrides {
   publicMarketDataReader?: PositionGuardPublicMarketDataReader;
   privateExchangeAdapter?: LiveExecutionAdapter;
-  loadCandidatePilotAbandonment?: () => PositionGuardPilotAbandonmentValidation;
+  afterCandidatePilotAuthorityValidated?: (authority: PositionGuardPilotAbandonmentValidation) => void;
 }
 
 export function createApp(
@@ -79,13 +82,12 @@ export function createApp(
   overrides: CreateAppOverrides = {},
 ): AppServices {
   const telegramLocale = config.telegramLocale;
-  const candidatePolicySelection = config.positionGuardPolicySelection.kind === "BTC_CANDIDATE_PILOT"
-    ? config.positionGuardPolicySelection
-    : null;
+  const candidatePolicySelection = snapshotCandidatePolicySelection(config);
   if (candidatePolicySelection) {
-    const authority = (overrides.loadCandidatePilotAbandonment ??
-      loadCheckedInPositionGuardPilotAbandonment)();
-    assertCandidatePilotAbandonmentAuthority(authority);
+    const authority = snapshotCandidatePilotAbandonmentAuthority(
+      loadCheckedInPositionGuardPilotAbandonment(),
+    );
+    overrides.afterCandidatePilotAuthorityValidated?.(authority);
   }
   const persistence = createSqlitePersistence({
     databasePath: config.databasePath,
@@ -99,6 +101,7 @@ export function createApp(
     liveExecutionGate: config.liveExecutionGate,
     killSwitchActive: config.globalKillSwitch,
   });
+  try {
   const { repositories, operatorState, accountExecutionLeases } = persistence;
 
   const strategy = new DeterministicStubStrategy();
@@ -399,6 +402,10 @@ export function createApp(
     telegramInboundPolling,
     persistence,
   };
+  } catch (error) {
+    persistence.close();
+    throw error;
+  }
 }
 
 function createCandidateRunVerifier(input: {
@@ -438,27 +445,87 @@ function createCandidateRunVerifier(input: {
   });
 }
 
-function assertCandidatePilotAbandonmentAuthority(
+function snapshotCandidatePolicySelection(
+  config: AppConfig,
+): Extract<PositionGuardPolicySelection, { kind: "BTC_CANDIDATE_PILOT" }> | null {
+  const record = exactOwnDataRecord(config.positionGuardPolicySelection, "candidate policy selection");
+  if (record.kind === "BASELINE") {
+    assertExactOwnDataValues(record, "candidate policy selection", {
+      kind: "BASELINE",
+      pilotId: null,
+    });
+    return null;
+  }
+  assertExactOwnDataValues(record, "candidate policy selection", {
+    kind: "BTC_CANDIDATE_PILOT",
+    pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+    market: "KRW-BTC",
+    policyId: "COMBINED_CONSERVATIVE",
+    policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+    liveOperatorConfirmed: true,
+  });
+  if (config.executionMode !== "LIVE") {
+    throw new Error("BTC candidate policy selection requires LIVE execution mode.");
+  }
+  return Object.freeze({
+    kind: "BTC_CANDIDATE_PILOT",
+    pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+    market: "KRW-BTC",
+    policyId: "COMBINED_CONSERVATIVE",
+    policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+    liveOperatorConfirmed: true,
+  });
+}
+
+function snapshotCandidatePilotAbandonmentAuthority(
   authority: PositionGuardPilotAbandonmentValidation,
-): void {
+): PositionGuardPilotAbandonmentValidation {
   const expected = {
     valid: true,
     experimentId: "PCS-2026-001",
     eventAt: "2026-08-21T03:08:24.756Z",
   } as const;
-  if (
-    typeof authority !== "object" || authority === null || Array.isArray(authority) ||
-    Object.getPrototypeOf(authority) !== Object.prototype ||
-    Object.keys(authority).length !== Object.keys(expected).length
-  ) {
-    throw new Error("PositionGuard candidate abandonment authority is malformed.");
-  }
+  const record = exactOwnDataRecord(authority, "PositionGuard candidate abandonment authority");
+  assertExactOwnDataValues(record, "PositionGuard candidate abandonment authority", expected);
+  return Object.freeze({ ...expected });
+}
 
-  for (const [key, value] of Object.entries(expected)) {
-    const descriptor = Object.getOwnPropertyDescriptor(authority, key);
-    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable || descriptor.value !== value) {
-      throw new Error("PositionGuard candidate abandonment authority is invalid.");
+function exactOwnDataRecord(value: unknown, label: string): Record<string, unknown> {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw new Error(`${label} must be an exact plain own-data object.`);
+  }
+  const record: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") {
+      throw new Error(`${label} must not contain symbol properties.`);
     }
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable) {
+      throw new Error(`${label} must contain enumerable own data properties only.`);
+    }
+    record[key] = descriptor.value;
+  }
+  return record;
+}
+
+function assertExactOwnDataValues(
+  record: Record<string, unknown>,
+  label: string,
+  expected: Readonly<Record<string, unknown>>,
+): void {
+  const expectedKeys = Object.keys(expected);
+  const actualKeys = Object.keys(record);
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    !actualKeys.every((key) => Object.hasOwn(expected, key)) ||
+    !expectedKeys.every((key) => record[key] === expected[key])
+  ) {
+    throw new Error(`${label} must contain exactly the approved own data values.`);
   }
 }
 

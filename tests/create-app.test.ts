@@ -28,21 +28,21 @@ test("createApp keeps dry-run adapter as the default live send path", async () =
 
 test("createApp baseline never invokes candidate authority or constructs candidate services", async () => {
   const databasePath = await createTempDatabasePath("baseline-no-candidate-graph");
-  let authorityCalls = 0;
+  let observerCalls = 0;
   let app: ReturnType<typeof createApp> | null = null;
 
   try {
     app = createApp(
       createConfig({ databasePath }),
       {
-        loadCandidatePilotAbandonment: () => {
-          authorityCalls += 1;
-          throw new Error("baseline must not load candidate authority");
+        afterCandidatePilotAuthorityValidated: () => {
+          observerCalls += 1;
+          throw new Error("baseline must not observe candidate authority");
         },
       },
     );
 
-    assert.equal(authorityCalls, 0);
+    assert.equal(observerCalls, 0);
     assert.equal(app.candidateEvidenceService, null);
   } finally {
     (app as ReturnType<typeof createApp> | null)?.persistence.close();
@@ -50,31 +50,36 @@ test("createApp baseline never invokes candidate authority or constructs candida
   }
 });
 
-test("createApp rejects candidate authority before SQLite persistence is created", async () => {
+test("createApp runs the candidate authority observer after checked-in validation and before SQLite persistence", async () => {
   const databasePath = await createTempDatabasePath("candidate-authority-before-sqlite");
-  let authorityCalls = 0;
+  let observerCalls = 0;
   let app: ReturnType<typeof createApp> | null = null;
 
   try {
-    await assert.rejects(
-      async () => {
+    assert.throws(
+      () => {
         app = createApp(
         createConfig({
           databasePath,
+          executionMode: "LIVE",
           positionGuardPolicySelection: candidatePolicySelection(),
         }),
         {
-          loadCandidatePilotAbandonment: () => {
-            authorityCalls += 1;
-            throw new Error("candidate authority fixture rejected");
+          afterCandidatePilotAuthorityValidated: (authority) => {
+            observerCalls += 1;
+            assert.equal(authority.valid, true);
+            assert.equal(authority.experimentId, "PCS-2026-001");
+            assert.equal(Object.isFrozen(authority), true);
+            assert.equal(existsSync(databasePath), false);
+            throw new Error("candidate authority observer rejected");
           },
         },
         );
       },
-      /candidate authority fixture rejected/i,
+      /candidate authority observer rejected/i,
     );
 
-    assert.equal(authorityCalls, 1);
+    assert.equal(observerCalls, 1);
     await assert.rejects(() => access(databasePath));
   } finally {
     (app as ReturnType<typeof createApp> | null)?.persistence.close();
@@ -82,27 +87,158 @@ test("createApp rejects candidate authority before SQLite persistence is created
   }
 });
 
-test("createApp rejects malformed candidate authority before SQLite persistence is created", async () => {
-  const databasePath = await createTempDatabasePath("candidate-malformed-authority-before-sqlite");
+test("createApp ignores a candidate authority observer return value after checked-in validation", async () => {
+  const databasePath = await createTempDatabasePath("candidate-authority-observer-return");
+  let app: ReturnType<typeof createApp> | null = null;
 
   try {
-    assert.throws(
-      () => createApp(
+    app = createApp(
         createConfig({
           databasePath,
+          executionMode: "LIVE",
           positionGuardPolicySelection: candidatePolicySelection(),
         }),
         {
-          loadCandidatePilotAbandonment: () => ({
+          afterCandidatePilotAuthorityValidated: () => ({
             valid: true,
             experimentId: "PCS-2026-001",
             eventAt: "tampered",
-          }) as never,
+          }),
         },
-      ),
-      /candidate abandonment authority is invalid/i,
     );
 
+    assert.notEqual(app.candidateEvidenceService, null);
+  } finally {
+    app?.persistence.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("createApp rejects malformed candidate selections before SQLite persistence is created", async () => {
+  const cases: ReadonlyArray<Readonly<{
+    label: string;
+    selection: unknown;
+    getterCalls?: () => number;
+  }>> = [
+    {
+      label: "accessor",
+      selection: createCandidateSelectionWithAccessor(),
+      getterCalls: () => candidateSelectionAccessorCalls,
+    },
+    {
+      label: "extra-property",
+      selection: { ...candidatePolicySelection(), unexpected: true },
+    },
+    {
+      label: "symbol-property",
+      selection: Object.assign(candidatePolicySelection(), { [Symbol("unexpected")]: true }),
+    },
+    {
+      label: "non-enumerable-property",
+      selection: createCandidateSelectionWithNonEnumerableProperty(),
+    },
+    {
+      label: "inherited-property",
+      selection: Object.create(candidatePolicySelection()),
+    },
+  ];
+
+  for (const entry of cases) {
+    const databasePath = await createTempDatabasePath(`candidate-selection-${entry.label}`);
+    try {
+      assert.throws(
+        () => createApp(createConfig({
+          databasePath,
+          executionMode: "LIVE",
+          positionGuardPolicySelection: entry.selection as AppConfig["positionGuardPolicySelection"],
+        })),
+        /candidate policy selection/i,
+      );
+      assert.equal(entry.getterCalls?.() ?? 0, 0);
+      await assert.rejects(() => access(databasePath));
+    } finally {
+      await cleanupTempDatabase(databasePath);
+    }
+  }
+});
+
+test("createApp rejects a valid candidate selection outside LIVE mode before SQLite persistence", async () => {
+  const databasePath = await createTempDatabasePath("candidate-selection-non-live");
+
+  try {
+    assert.throws(
+      () => createApp(createConfig({
+        databasePath,
+        executionMode: "DRY_RUN",
+        positionGuardPolicySelection: candidatePolicySelection(),
+      })),
+      /requires LIVE execution mode/i,
+    );
+    await assert.rejects(() => access(databasePath));
+  } finally {
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("createApp snapshots the validated candidate selection before services are composed", async () => {
+  const databasePath = await createTempDatabasePath("candidate-selection-snapshot");
+  const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
+  const previousSecretKey = process.env.UPBIT_SECRET_KEY;
+  const selection = candidatePolicySelection() as {
+    kind: "BTC_CANDIDATE_PILOT" | "BASELINE";
+    pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1" | null;
+    market?: "KRW-BTC";
+    policyId?: "COMBINED_CONSERVATIVE";
+    policyVersion?: "PCS-2026-001.DEPLOYMENT_READINESS_V1";
+    liveOperatorConfirmed?: true;
+  };
+  let app: ReturnType<typeof createApp> | null = null;
+  process.env.UPBIT_ACCESS_KEY = "test-access-key";
+  process.env.UPBIT_SECRET_KEY = "test-secret-key";
+
+  try {
+    app = createCandidateLiveApp({
+      databasePath,
+      selection: selection as unknown as AppConfig["positionGuardPolicySelection"],
+    });
+    await createPendingFlatCandidateDeployment(app);
+    selection.kind = "BASELINE";
+    selection.pilotId = null;
+    delete selection.market;
+    delete selection.policyId;
+    delete selection.policyVersion;
+    delete selection.liveOperatorConfirmed;
+
+    const response = await app.telegramRouter.route("/run BTC");
+    const decision = await app.repositories.getLatestStrategyDecision("primary", "KRW-BTC");
+
+    assert.match(response.text, /failed|blocked/i);
+    assert.equal(decision, null);
+  } finally {
+    app?.telegramInboundPolling.stop();
+    app?.strategyScheduler.stop();
+    app?.persistence.close();
+    restoreOptionalEnv("UPBIT_ACCESS_KEY", previousAccessKey);
+    restoreOptionalEnv("UPBIT_SECRET_KEY", previousSecretKey);
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("createApp closes SQLite persistence when candidate composition fails after bootstrap", async () => {
+  const databasePath = await createTempDatabasePath("candidate-composition-cleanup");
+
+  try {
+    assert.throws(
+      () => createApp(createConfig({
+        databasePath,
+        executionMode: "LIVE",
+        positionGuardPolicySelection: candidatePolicySelection(),
+        strategySchedulerBtcIntervalMs: Number.NaN,
+      })),
+      /candidate recovery freshnessThresholdMs/i,
+    );
+    await access(databasePath);
+    await rm(databasePath);
     await assert.rejects(() => access(databasePath));
   } finally {
     await cleanupTempDatabase(databasePath);
@@ -113,7 +249,6 @@ test("createApp wires candidate-only BTC preparation and recovery without changi
   const databasePath = await createTempDatabasePath("candidate-btc-controller-owner");
   const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
   const previousSecretKey = process.env.UPBIT_SECRET_KEY;
-  let authorityCalls = 0;
   let app: ReturnType<typeof createApp> | null = null;
   const privateAdapter = createCountingLiveExecutionAdapterFake();
   process.env.UPBIT_ACCESS_KEY = "test-access-key";
@@ -131,15 +266,12 @@ test("createApp wires candidate-only BTC preparation and recovery without changi
       {
         privateExchangeAdapter: privateAdapter.adapter,
         publicMarketDataReader: createDryRunOperatorMarketDataReader(),
-        loadCandidatePilotAbandonment: () => {
-          authorityCalls += 1;
+        afterCandidatePilotAuthorityValidated: () => {
           assert.equal(existsSync(databasePath), false);
-          return validCandidateAuthority();
         },
       },
     );
 
-    assert.equal(authorityCalls, 1);
     assert.notEqual(app.candidateEvidenceService, null);
 
     const createdAt = new Date().toISOString();
@@ -174,6 +306,58 @@ test("createApp wires candidate-only BTC preparation and recovery without changi
     assert.equal(ethResult.status, "COMPLETED");
     assert.notEqual(ethDecision, null);
     assert.equal(privateAdapter.getBalanceCallCount(), 2);
+  } finally {
+    app?.telegramInboundPolling.stop();
+    app?.strategyScheduler.stop();
+    app?.persistence.close();
+    restoreOptionalEnv("UPBIT_ACCESS_KEY", previousAccessKey);
+    restoreOptionalEnv("UPBIT_SECRET_KEY", previousSecretKey);
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("createApp routes manual candidate BTC through preparation and blocks missing deployment before decisions", async () => {
+  const databasePath = await createTempDatabasePath("candidate-manual-btc-missing-deployment");
+  const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
+  const previousSecretKey = process.env.UPBIT_SECRET_KEY;
+  let app: ReturnType<typeof createApp> | null = null;
+  process.env.UPBIT_ACCESS_KEY = "test-access-key";
+  process.env.UPBIT_SECRET_KEY = "test-secret-key";
+
+  try {
+    app = createCandidateLiveApp({ databasePath });
+    const response = await app.telegramRouter.route("/run BTC");
+    const decision = await app.repositories.getLatestStrategyDecision("primary", "KRW-BTC");
+    const orders = await app.repositories.listOrders("primary");
+
+    assert.match(response.text, /failed|blocked/i);
+    assert.equal(decision, null);
+    assert.equal(orders.length, 0);
+  } finally {
+    app?.telegramInboundPolling.stop();
+    app?.strategyScheduler.stop();
+    app?.persistence.close();
+    restoreOptionalEnv("UPBIT_ACCESS_KEY", previousAccessKey);
+    restoreOptionalEnv("UPBIT_SECRET_KEY", previousSecretKey);
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("createApp routes manual ETH through the baseline path without candidate preparation", async () => {
+  const databasePath = await createTempDatabasePath("candidate-manual-eth-baseline");
+  const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
+  const previousSecretKey = process.env.UPBIT_SECRET_KEY;
+  let app: ReturnType<typeof createApp> | null = null;
+  process.env.UPBIT_ACCESS_KEY = "test-access-key";
+  process.env.UPBIT_SECRET_KEY = "test-secret-key";
+
+  try {
+    app = createCandidateLiveApp({ databasePath });
+    const response = await app.telegramRouter.route("/run ETH");
+    const decision = await app.repositories.getLatestStrategyDecision("primary", "KRW-ETH");
+
+    assert.match(response.text, /HOLD|유지/);
+    assert.notEqual(decision, null);
   } finally {
     app?.telegramInboundPolling.stop();
     app?.strategyScheduler.stop();
@@ -427,12 +611,67 @@ function candidatePolicySelection(): AppConfig["positionGuardPolicySelection"] {
   };
 }
 
-function validCandidateAuthority() {
-  return {
-    valid: true as const,
-    experimentId: "PCS-2026-001" as const,
-    eventAt: "2026-08-21T03:08:24.756Z" as const,
-  };
+let candidateSelectionAccessorCalls = 0;
+
+function createCandidateSelectionWithAccessor(): unknown {
+  candidateSelectionAccessorCalls = 0;
+  const selection = candidatePolicySelection() as Record<string, unknown>;
+  delete selection.kind;
+  Object.defineProperty(selection, "kind", {
+    enumerable: true,
+    get() {
+      candidateSelectionAccessorCalls += 1;
+      return "BTC_CANDIDATE_PILOT";
+    },
+  });
+  return selection;
+}
+
+function createCandidateSelectionWithNonEnumerableProperty(): unknown {
+  const selection = candidatePolicySelection() as Record<string, unknown>;
+  Object.defineProperty(selection, "unexpected", {
+    enumerable: false,
+    value: true,
+  });
+  return selection;
+}
+
+function createCandidateLiveApp(input: Readonly<{
+  databasePath: string;
+  selection?: AppConfig["positionGuardPolicySelection"];
+}>): ReturnType<typeof createApp> {
+  return createApp(
+    createConfig({
+      databasePath: input.databasePath,
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      positionGuardPolicySelection: input.selection ?? candidatePolicySelection(),
+    }),
+    {
+      privateExchangeAdapter: createLiveExecutionAdapterFake(),
+      publicMarketDataReader: createDryRunOperatorMarketDataReader(),
+    },
+  );
+}
+
+async function createPendingFlatCandidateDeployment(app: ReturnType<typeof createApp>): Promise<void> {
+  const createdAt = new Date().toISOString();
+  await app.persistence.candidatePilots.createDeploymentWithInitialState({
+    deployment: {
+      id: `create-app-candidate-deployment-${Math.random().toString(16).slice(2)}`,
+      exchangeAccountId: "primary",
+      pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+      market: "KRW-BTC",
+      policyId: "COMBINED_CONSERVATIVE",
+      policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+      phase: "PENDING_FLAT",
+      activationAt: null,
+      activationEpochNs: null,
+      createdAt,
+      updatedAt: createdAt,
+    },
+    initialState: createEmptyPositionGuardCandidateState(),
+  });
 }
 
 function createLiveExecutionAdapterFake(): LiveExecutionAdapter {

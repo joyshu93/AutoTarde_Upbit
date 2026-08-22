@@ -8,30 +8,39 @@ seed a deployment, start a runtime, or activate LIVE operation.
 
 ## TDD Evidence
 
-The first focused `create-app` run was RED after the tests were added:
-
-- baseline still constructed `CandidateExecutionEvidenceService`;
-- candidate authority fixture was not invoked before SQLite creation; and
-- candidate configuration did not route BTC through candidate preparation or
-  recovery.
+The review-fix tests were added before the production fix. The RED build failed
+because the old override exposed a replacement authority loader and had no
+post-validation observer seam. The new tests also described candidate-selection
+shape rejection, immutable snapshots, post-bootstrap SQLite cleanup, and manual
+router behavior that the old composition did not provide.
 
 The final focused suite is GREEN. It proves:
 
-1. baseline does not invoke candidate authority and exposes no candidate evidence
-   service;
-2. throwing and malformed candidate authority both fail before the temporary
-   SQLite file exists;
-3. a valid candidate authority is read once before composition;
-4. a temporary candidate deployment can be recovered from `PENDING_FLAT` and
-   yields a candidate-policy BTC decision;
-5. candidate BTC performs exactly one controller-owned balance refresh, while
-   the following ETH run performs the existing scheduler-owned refresh.
+1. baseline neither observes checked-in candidate authority nor constructs the
+   candidate evidence graph;
+2. production always validates the checked-in PCS-2026-001 authority before a
+   test-only observer can observe or throw; an observer return value is ignored;
+3. candidate selection accessor, inherited, symbol, non-enumerable, and extra
+   properties are rejected before the temporary SQLite file exists, without
+   invoking an accessor;
+4. a validated candidate selection is copied and frozen before composition, so
+   mutating the caller-owned object cannot reroute a later BTC run to baseline;
+5. a post-bootstrap candidate composition failure closes the SQLite handle before
+   the original error is rethrown;
+6. scheduler BTC remains controller-owned while ETH remains scheduler-owned;
+7. manual `/run BTC` blocks before a strategy decision or order when the candidate
+   deployment is absent, while manual `/run ETH` remains on the baseline path.
 
 ## Implementation
 
-- Candidate selection loads the checked-in PCS-2026-001 abandonment authority
-  before `createSqlitePersistence`. The authority is checked again for the exact
-  expected plain-data record shape.
+- Candidate selection is validated as an exact ordinary own-data object, copied
+  into an immutable snapshot, and accepted only with `executionMode=LIVE`.
+- Candidate composition always loads the checked-in PCS-2026-001 abandonment
+  authority before `createSqlitePersistence`, validates its exact own-data shape,
+  and passes only a frozen snapshot to the optional test observer. The observer
+  cannot replace authority and its return value is ignored.
+- Any error after `createSqlitePersistence` closes the persistence bundle before
+  it is rethrown.
 - Baseline omits candidate execution repository injection, candidate evidence,
   recovery verifier, candidate BTC preparation, and scheduler ownership resolver.
 - Candidate selection injects the candidate repository into execution, adds
@@ -47,7 +56,7 @@ Completed in the isolated worktree only:
 
 ```text
 npm.cmd run build
-node --input-type=module -e "await import('./dist/tests/create-app.test.js'); ..."
+node --input-type=module -e "await import('./dist/tests/create-app.test.js'); await import('./dist/tests/candidate-btc-run-preparation.test.js'); await import('./dist/tests/strategy-run-controller.test.js'); await import('./dist/tests/strategy-scheduler.test.js'); await import('./dist/tests/position-guard-pilot-recovery.test.js');"
 npm.cmd run typecheck
 npm.cmd run build
 git diff --check
