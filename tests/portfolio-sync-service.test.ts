@@ -72,6 +72,72 @@ test("portfolio sync propagates the exact reconciliation record from the same in
   assert.equal(result.reconciliationSummary, SUMMARY);
 });
 
+test("portfolio sync preserves an explicit requested time for snapshots and reconciliation identity", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  let observedStartedAt: string | undefined;
+  const service = createService({
+    repositories,
+    async runWithRecord(_exchangeAccountId, options) {
+      observedStartedAt = options?.runIdentity?.startedAt;
+      return {
+        summary: SUMMARY,
+        reconciliationRun: {
+          ...EXACT_RUN,
+          id: options?.runIdentity?.id ?? "missing-id",
+          startedAt: options?.runIdentity?.startedAt ?? "missing-started-at",
+        },
+      };
+    },
+  });
+
+  const result = await service.run({
+    exchangeAccountId: "primary",
+    source: "SCHEDULER_PREFLIGHT",
+    requestedAt: "2026-08-22T00:00:05.123456789+09:00",
+  });
+
+  assert.equal(result.requestedAt, "2026-08-22T00:00:05.123456789+09:00");
+  assert.equal(result.balanceSnapshot.capturedAt, "2026-08-22T00:00:05.123456789+09:00");
+  assert.equal(result.positionSnapshot.capturedAt, "2026-08-22T00:00:05.123456789+09:00");
+  assert.equal(observedStartedAt, "2026-08-22T00:00:05.123456789+09:00");
+  assert.equal(result.reconciliationRun.startedAt, "2026-08-22T00:00:05.123456789+09:00");
+});
+
+test("portfolio sync rejects accessor requested time before any dependency read", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  let dependencyReads = 0;
+  const service = new PortfolioSyncService({
+    exchangeAdapter: {
+      async getBalances() {
+        dependencyReads += 1;
+        return [];
+      },
+    },
+    repositories,
+    reconciliationService: {
+      async runWithRecord() {
+        dependencyReads += 1;
+        throw new Error("not reached");
+      },
+    },
+  });
+  const input = Object.defineProperty({
+    exchangeAccountId: "primary",
+    source: "SCHEDULER_PREFLIGHT",
+  }, "requestedAt", {
+    enumerable: true,
+    get() {
+      throw new Error("requestedAt accessor must not execute");
+    },
+  });
+
+  await assert.rejects(
+    service.run(input as { exchangeAccountId: string; source: "SCHEDULER_PREFLIGHT"; requestedAt?: string }),
+    /requestedAt must be an enumerable string data property/,
+  );
+  assert.equal(dependencyReads, 0);
+});
+
 test("portfolio sync persists an ERROR reconciliation row and rethrows an exact-result failure", async () => {
   const repositories = new InMemoryExecutionRepository();
   const failure = new Error("exact reconciliation failed");

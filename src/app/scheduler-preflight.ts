@@ -20,6 +20,33 @@ const BLOCKING_RECONCILIATION_ISSUE_CODES = new Set([
   "ORDER_HISTORY_LOOKUP_FAILED",
 ]);
 
+export interface LiveStrategyRunPreflightEvaluation {
+  status: "PASS" | "WARN" | "BLOCK";
+  checks: StrategySchedulerStartupPreflightCheck[];
+}
+
+export function evaluateLiveStrategyRunPreflight(input: {
+  config: Pick<AppConfig, "strategySchedulerBtcIntervalMs" | "strategySchedulerEthIntervalMs" | "liveExecutionGate">;
+  executionState: ExecutionStateRecord;
+  exchangeBackedReadEnabled: boolean;
+  liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
+  checkedAt: string;
+  balanceSnapshot: BalanceSnapshotRecord | null;
+  positionSnapshot: PositionSnapshotRecord | null;
+  reconciliationRun: ReconciliationRunRecord | null;
+  activeOrders: readonly OrderRecord[];
+}): LiveStrategyRunPreflightEvaluation {
+  const checks = buildLiveSchedulerChecks(input);
+  return {
+    status: checks.some((check) => check.status === "BLOCK")
+      ? "BLOCK"
+      : checks.some((check) => check.status === "WARN")
+        ? "WARN"
+        : "PASS",
+    checks,
+  };
+}
+
 export async function buildStrategySchedulerStartupPreflight(input: {
   config: AppConfig;
   exchangeAccountId: string;
@@ -67,32 +94,27 @@ export async function buildStrategySchedulerStartupPreflight(input: {
     input.repositories.listReconciliationRuns(input.exchangeAccountId, 1),
   ]);
   const latestReconciliationRun = reconciliationRuns[0] ?? null;
-  const checks = buildLiveSchedulerChecks({
+  const evaluation = evaluateLiveStrategyRunPreflight({
     config: input.config,
     executionState: input.executionState,
     exchangeBackedReadEnabled: input.exchangeBackedReadEnabled,
     liveSendPath: input.liveSendPath,
     checkedAt,
-    latestBalanceSnapshot,
-    latestPositionSnapshot,
-    latestReconciliationRun,
+    balanceSnapshot: latestBalanceSnapshot,
+    positionSnapshot: latestPositionSnapshot,
+    reconciliationRun: latestReconciliationRun,
     activeOrders,
   });
-  const status = checks.some((check) => check.status === "BLOCK")
-    ? "BLOCK"
-    : checks.some((check) => check.status === "WARN")
-      ? "WARN"
-      : "PASS";
-  const blockingChecks = checks.filter((check) => check.status === "BLOCK");
+  const blockingChecks = evaluation.checks.filter((check) => check.status === "BLOCK");
 
   return {
     checkedAt,
     scope: "LIVE",
-    status,
+    status: evaluation.status,
     detail: blockingChecks.length === 0
       ? "Live scheduler startup preflight passed."
       : `Live scheduler startup blocked by ${blockingChecks.map((check) => check.name).join(",")}.`,
-    checks,
+    checks: evaluation.checks,
   };
 }
 
@@ -133,45 +155,40 @@ export async function buildManualStrategyRunPreflight(input: {
     input.repositories.listReconciliationRuns(input.exchangeAccountId, 1),
   ]);
   const latestReconciliationRun = reconciliationRuns[0] ?? null;
-  const checks = buildLiveSchedulerChecks({
+  const evaluation = evaluateLiveStrategyRunPreflight({
     config: input.config,
     executionState: input.executionState,
     exchangeBackedReadEnabled: input.exchangeBackedReadEnabled,
     liveSendPath: input.liveSendPath,
     checkedAt,
-    latestBalanceSnapshot,
-    latestPositionSnapshot,
-    latestReconciliationRun,
+    balanceSnapshot: latestBalanceSnapshot,
+    positionSnapshot: latestPositionSnapshot,
+    reconciliationRun: latestReconciliationRun,
     activeOrders,
   });
-  const status = checks.some((check) => check.status === "BLOCK")
-    ? "BLOCK"
-    : checks.some((check) => check.status === "WARN")
-      ? "WARN"
-      : "PASS";
-  const blockingChecks = checks.filter((check) => check.status === "BLOCK");
+  const blockingChecks = evaluation.checks.filter((check) => check.status === "BLOCK");
 
   return {
     checkedAt,
     scope: "LIVE",
-    status,
+    status: evaluation.status,
     detail: blockingChecks.length === 0
       ? "Live manual /run preflight passed."
       : `Live manual /run blocked by ${blockingChecks.map((check) => check.name).join(",")}.`,
-    checks,
+    checks: evaluation.checks,
   };
 }
 
 function buildLiveSchedulerChecks(input: {
-  config: AppConfig;
+  config: Pick<AppConfig, "strategySchedulerBtcIntervalMs" | "strategySchedulerEthIntervalMs" | "liveExecutionGate">;
   executionState: ExecutionStateRecord;
   exchangeBackedReadEnabled: boolean;
   liveSendPath: "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
   checkedAt: string;
-  latestBalanceSnapshot: BalanceSnapshotRecord | null;
-  latestPositionSnapshot: PositionSnapshotRecord | null;
-  latestReconciliationRun: ReconciliationRunRecord | null;
-  activeOrders: OrderRecord[];
+  balanceSnapshot: BalanceSnapshotRecord | null;
+  positionSnapshot: PositionSnapshotRecord | null;
+  reconciliationRun: ReconciliationRunRecord | null;
+  activeOrders: readonly OrderRecord[];
 }): StrategySchedulerStartupPreflightCheck[] {
   const maxAgeMs = getStrategyRunFreshnessThresholdMs(input.config);
 
@@ -204,21 +221,21 @@ function buildLiveSchedulerChecks(input: {
     },
     {
       name: "balance_snapshot",
-      status: describeTimestampFreshness(input.latestBalanceSnapshot?.capturedAt ?? null, input.checkedAt, maxAgeMs).status,
-      detail: input.latestBalanceSnapshot
-        ? `latest balance snapshot captured_at=${input.latestBalanceSnapshot.capturedAt} ` +
-          describeTimestampFreshness(input.latestBalanceSnapshot.capturedAt, input.checkedAt, maxAgeMs).detail
+      status: describeTimestampFreshness(input.balanceSnapshot?.capturedAt ?? null, input.checkedAt, maxAgeMs).status,
+      detail: input.balanceSnapshot
+        ? `latest balance snapshot captured_at=${input.balanceSnapshot.capturedAt} ` +
+          describeTimestampFreshness(input.balanceSnapshot.capturedAt, input.checkedAt, maxAgeMs).detail
         : "No balance snapshot is stored.",
     },
     {
       name: "position_snapshot",
-      status: describeTimestampFreshness(input.latestPositionSnapshot?.capturedAt ?? null, input.checkedAt, maxAgeMs).status,
-      detail: input.latestPositionSnapshot
-        ? `latest position snapshot captured_at=${input.latestPositionSnapshot.capturedAt} ` +
-          describeTimestampFreshness(input.latestPositionSnapshot.capturedAt, input.checkedAt, maxAgeMs).detail
+      status: describeTimestampFreshness(input.positionSnapshot?.capturedAt ?? null, input.checkedAt, maxAgeMs).status,
+      detail: input.positionSnapshot
+        ? `latest position snapshot captured_at=${input.positionSnapshot.capturedAt} ` +
+          describeTimestampFreshness(input.positionSnapshot.capturedAt, input.checkedAt, maxAgeMs).detail
         : "No position snapshot is stored.",
     },
-    describeLatestReconciliation(input.latestReconciliationRun, input.checkedAt, maxAgeMs),
+    describeLatestReconciliation(input.reconciliationRun, input.checkedAt, maxAgeMs),
     {
       name: "active_orders",
       status: input.activeOrders.length === 0 ? "PASS" : "BLOCK",
@@ -229,7 +246,9 @@ function buildLiveSchedulerChecks(input: {
   ];
 }
 
-export function getStrategyRunFreshnessThresholdMs(config: AppConfig): number {
+export function getStrategyRunFreshnessThresholdMs(
+  config: Pick<AppConfig, "strategySchedulerBtcIntervalMs" | "strategySchedulerEthIntervalMs">,
+): number {
   return Math.min(config.strategySchedulerBtcIntervalMs, config.strategySchedulerEthIntervalMs);
 }
 

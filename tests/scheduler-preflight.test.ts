@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   buildManualStrategyRunPreflight,
   buildStrategySchedulerStartupPreflight,
+  evaluateLiveStrategyRunPreflight,
   getStrategyRunFreshnessThresholdMs,
 } from "../src/app/scheduler-preflight.js";
 import type { AppConfig } from "../src/app/env.js";
@@ -220,6 +221,48 @@ test("manual and scheduler preflights share the shorter market freshness thresho
   assert.equal(manual.checks.find((check) => check.name === "balance_snapshot")?.status, "BLOCK");
   assert.match(scheduler.checks.find((check) => check.name === "balance_snapshot")?.detail ?? "", /max_age_ms=1800000/);
   assert.match(manual.checks.find((check) => check.name === "balance_snapshot")?.detail ?? "", /max_age_ms=1800000/);
+});
+
+test("exact-evidence evaluator uses supplied refreshed records instead of repository latest rows", async () => {
+  const evaluation = evaluateLiveStrategyRunPreflight({
+    config: createConfig({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      strategySchedulerBtcIntervalMs: 3_600_000,
+      strategySchedulerEthIntervalMs: 3_600_000,
+    }),
+    executionState: createExecutionState({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+    }),
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    checkedAt: "2026-05-08T00:30:00.000Z",
+    balanceSnapshot: {
+      id: "refresh-balance",
+      exchangeAccountId: "primary",
+      capturedAt: "2026-05-08T00:00:00.000Z",
+      source: "RECONCILIATION",
+      totalKrwValue: "10000",
+      balancesJson: "[]",
+    },
+    positionSnapshot: {
+      id: "refresh-position",
+      exchangeAccountId: "primary",
+      capturedAt: "2026-05-08T00:00:00.000Z",
+      source: "RECONCILIATION",
+      positionsJson: "[]",
+    },
+    reconciliationRun: createReconciliationRun({
+      id: "refresh-reconciliation",
+      completedAt: "2026-05-08T00:00:00.000Z",
+    }),
+    activeOrders: [],
+  });
+
+  assert.equal(evaluation.status, "PASS");
+  assert.equal(evaluation.checks.find((check) => check.name === "balance_snapshot")?.status, "PASS");
+  assert.equal(evaluation.checks.find((check) => check.name === "latest_reconciliation")?.status, "PASS");
 });
 
 async function seedReadyPortfolio(

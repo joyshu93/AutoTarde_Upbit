@@ -21,6 +21,7 @@ await import("./snapshot-service.test.js");
 await import("./portfolio-drift.test.js");
 await import("./reconciliation-service.test.js");
 await import("./portfolio-sync-service.test.js");
+await import("./candidate-btc-run-preparation.test.js");
 await import("./startup-recovery.test.js");
 await import("./runtime-lifecycle.test.js");
 await import("./sync-controller.test.js");
