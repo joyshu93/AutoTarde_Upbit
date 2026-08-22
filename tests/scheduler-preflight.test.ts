@@ -398,6 +398,16 @@ test("exact-evidence evaluator validates complete persisted reconciliation summa
   for (const reconciliationRun of cases) {
     assert.equal(evaluateLiveStrategyRunPreflight({ ...common, reconciliationRun }).status, "BLOCK");
   }
+  const completedOneNanosecondFuture = evaluateLiveStrategyRunPreflight({
+    ...common,
+    reconciliationRun: createReconciliationRun({
+      startedAt: "2026-05-08T00:00:00.000Z",
+      completedAt: "2026-05-08T00:30:00.000000001Z",
+      summaryJson: JSON.stringify(validSummary),
+    }),
+  });
+  assert.equal(completedOneNanosecondFuture.status, "BLOCK");
+  assert.match(completedOneNanosecondFuture.checks.find((check) => check.name === "latest_reconciliation")?.detail ?? "", /chronology is invalid/);
   const mixedOffsets = evaluateLiveStrategyRunPreflight({
     ...common,
     reconciliationRun: createReconciliationRun({ startedAt: "2026-05-08T09:00:00.000+09:00", completedAt: "2026-05-08T00:00:00.000Z", summaryJson: JSON.stringify(validSummary) }),

@@ -374,7 +374,7 @@ function describeLatestReconciliation(
   } catch {
     return { name: "latest_reconciliation", status: "BLOCK", detail: "latest reconciliation chronology is invalid." };
   }
-  if (startedAtEpoch > completedAtEpoch || startedAtEpoch > checkedAtEpoch) {
+  if (startedAtEpoch > completedAtEpoch || startedAtEpoch > checkedAtEpoch || completedAtEpoch > checkedAtEpoch) {
     return { name: "latest_reconciliation", status: "BLOCK", detail: "latest reconciliation chronology is invalid." };
   }
   const freshness = describeTimestampFreshness(run.completedAt, checkedAt, maxAgeMs);
