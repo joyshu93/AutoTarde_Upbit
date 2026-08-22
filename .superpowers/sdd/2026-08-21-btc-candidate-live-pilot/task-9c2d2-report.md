@@ -62,6 +62,16 @@ rg -n "POSITION_GUARD_PILOT_(ID|CONFIRMATION)|BTC_COMBINED_CONSERVATIVE_PILOT_V1
 
 - `npm.cmd run typecheck`: passed.
 - `npm.cmd run build`: passed.
+
+## Fix Round 3 TDD Evidence
+
+### RED
+
+`npx.cmd tsx -e "(async () => { await import('./tests/scheduler-preflight.test.ts'); const { runRegisteredTests } = await import('./tests/harness.ts'); await runRegisteredTests(); })()"` exited 1 because a `SUCCESS` run whose persisted summary claimed `DRIFT_DETECTED` still returned `PASS`.
+
+### GREEN
+
+The same focused scheduler suite passed 13 tests after requiring complete persisted summary identity, exact issue evidence, non-empty DRIFT, and parsed epoch chronology. `npm.cmd run typecheck` and `npm.cmd run build` passed.
 - `npm.cmd run test`: the Task 9C2d2 focused coverage passed, but the complete suite has one reproducible pre-existing, unowned failure. `prospective-shadow-commitment-cli.test` invokes `scripts/check-prospective-commitment-bundle.mjs`; esbuild cannot resolve the existing `src/research/prospective-shadow-commitment.ts` in this worktree because its parent-directory read is denied. Running that checked-in bundle verifier directly produces the same error. This task does not own the prospective-shadow source, bundle script, or test.
 - `git diff --check`: passed.
 - `.createOrder(` remains present only in `src/modules/execution/execution-service.ts`.

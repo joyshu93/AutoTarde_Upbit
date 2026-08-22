@@ -93,11 +93,14 @@ test("scheduler startup preflight treats recovered exchange history as warning, 
   await seedReadyPortfolio(repository, createReconciliationRun({
     status: "DRIFT_DETECTED",
     summaryJson: JSON.stringify({
+      source: "SCHEDULER_PREFLIGHT",
+      status: "DRIFT_DETECTED",
       issues: [
         { code: "EXCHANGE_ORDER_RECOVERED", message: "recovered" },
         { code: "TERMINAL_ORDER_RECHECKED", message: "rechecked" },
         { code: "ORDER_FILLS_BACKFILLED", message: "backfilled" },
       ],
+      candidateCount: 0, processedCount: 0, deferredCount: 0, maxOrderLookupsPerRun: 10,
     }),
   }));
 
@@ -301,7 +304,7 @@ test("exact-evidence evaluator blocks malformed DRIFT reconciliation issue evide
     reconciliationRun: createReconciliationRun({
       status: "DRIFT_DETECTED",
       completedAt: "2026-05-08T00:00:00.000Z",
-      summaryJson: JSON.stringify({ issues: [{ code: "ORDER_STATUS_RECONCILED", message: "reconciled" }] }),
+      summaryJson: JSON.stringify({ source: "SCHEDULER_PREFLIGHT", status: "DRIFT_DETECTED", issues: [{ code: "ORDER_STATUS_RECONCILED", message: "reconciled" }], candidateCount: 0, processedCount: 0, deferredCount: 0, maxOrderLookupsPerRun: 10 }),
     }),
   });
   assert.equal(validWarning.status, "WARN");
@@ -354,7 +357,7 @@ test("exact-evidence evaluator requires a valid empty SUCCESS summary and exact 
     reconciliationRun: createReconciliationRun({
       status: "DRIFT_DETECTED",
       completedAt: "2026-05-08T00:00:00.000Z",
-      summaryJson: JSON.stringify({ issues: [{ code: "ORDER_STATUS_RECONCILED", message: "reconciled" }] }),
+      summaryJson: JSON.stringify({ source: "SCHEDULER_PREFLIGHT", status: "DRIFT_DETECTED", issues: [{ code: "ORDER_STATUS_RECONCILED", message: "reconciled" }], candidateCount: 0, processedCount: 0, deferredCount: 0, maxOrderLookupsPerRun: 10 }),
     }),
   });
   assert.equal(valid.status, "WARN");
@@ -374,6 +377,32 @@ test("exact-evidence evaluator blocks contradictory RUNNING execution state", ()
   });
   assert.equal(evaluation.status, "BLOCK");
   assert.equal(evaluation.checks.find((check) => check.name === "execution_state")?.status, "BLOCK");
+});
+
+test("exact-evidence evaluator validates complete persisted reconciliation summary identity and chronology", () => {
+  const common = {
+    config: createConfig({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    executionState: createExecutionState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    exchangeBackedReadEnabled: true, liveSendPath: "LIVE_ADAPTER" as const,
+    checkedAt: "2026-05-08T00:30:00.000Z",
+    balanceSnapshot: { id: "b", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION" as const, totalKrwValue: "1", balancesJson: "[]" },
+    positionSnapshot: { id: "p", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION" as const, positionsJson: "[]" }, activeOrders: [],
+  };
+  const validSummary = { source: "SCHEDULER_PREFLIGHT", status: "SUCCESS", issues: [], candidateCount: 0, processedCount: 0, deferredCount: 0, maxOrderLookupsPerRun: 10 };
+  const cases = [
+    createReconciliationRun({ summaryJson: JSON.stringify({ ...validSummary, status: "DRIFT_DETECTED" }) }),
+    createReconciliationRun({ status: "DRIFT_DETECTED", summaryJson: JSON.stringify({ ...validSummary, status: "DRIFT_DETECTED" }) }),
+    createReconciliationRun({ summaryJson: JSON.stringify({ ...validSummary, candidateCount: "0" }) }),
+    createReconciliationRun({ startedAt: "2026-05-08T00:00:01.000Z", completedAt: "2026-05-08T00:00:00.000Z", summaryJson: JSON.stringify(validSummary) }),
+  ];
+  for (const reconciliationRun of cases) {
+    assert.equal(evaluateLiveStrategyRunPreflight({ ...common, reconciliationRun }).status, "BLOCK");
+  }
+  const mixedOffsets = evaluateLiveStrategyRunPreflight({
+    ...common,
+    reconciliationRun: createReconciliationRun({ startedAt: "2026-05-08T09:00:00.000+09:00", completedAt: "2026-05-08T00:00:00.000Z", summaryJson: JSON.stringify(validSummary) }),
+  });
+  assert.equal(mixedOffsets.status, "PASS");
 });
 
 async function seedReadyPortfolio(
@@ -464,7 +493,7 @@ function createReconciliationRun(overrides: Partial<ReconciliationRunRecord>): R
     status: "SUCCESS",
     startedAt: "2026-05-08T00:00:00.000Z",
     completedAt: "2026-05-08T00:00:00.000Z",
-    summaryJson: JSON.stringify({ issues: [] }),
+    summaryJson: JSON.stringify({ source: "SCHEDULER_PREFLIGHT", status: "SUCCESS", issues: [], candidateCount: 0, processedCount: 0, deferredCount: 0, maxOrderLookupsPerRun: 10 }),
     errorMessage: null,
     ...overrides,
   };

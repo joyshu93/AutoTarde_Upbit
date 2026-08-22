@@ -364,6 +364,19 @@ function describeLatestReconciliation(
     };
   }
 
+  let startedAtEpoch: bigint;
+  let completedAtEpoch: bigint;
+  let checkedAtEpoch: bigint;
+  try {
+    startedAtEpoch = parseCandidatePilotTimestamp(run.startedAt, "strategy run reconciliation startedAt");
+    completedAtEpoch = parseCandidatePilotTimestamp(run.completedAt ?? "", "strategy run reconciliation completedAt");
+    checkedAtEpoch = parseCandidatePilotTimestamp(checkedAt, "strategy run preflight checkedAt");
+  } catch {
+    return { name: "latest_reconciliation", status: "BLOCK", detail: "latest reconciliation chronology is invalid." };
+  }
+  if (startedAtEpoch > completedAtEpoch || startedAtEpoch > checkedAtEpoch) {
+    return { name: "latest_reconciliation", status: "BLOCK", detail: "latest reconciliation chronology is invalid." };
+  }
   const freshness = describeTimestampFreshness(run.completedAt, checkedAt, maxAgeMs);
   if (freshness.status === "BLOCK") {
     return {
@@ -374,8 +387,8 @@ function describeLatestReconciliation(
     };
   }
 
-  const issueEvidence = parseReconciliationIssues(run.summaryJson);
-  if (issueEvidence === null) {
+  const summary = parseReconciliationSummary(run.summaryJson);
+  if (summary === null || summary.status !== run.status) {
     return {
       name: "latest_reconciliation",
       status: "BLOCK",
@@ -386,13 +399,13 @@ function describeLatestReconciliation(
   }
 
   if (run.status === "SUCCESS") {
-    if (issueEvidence.length !== 0) {
+    if (summary.issues.length !== 0) {
       return {
         name: "latest_reconciliation",
         status: "BLOCK",
         detail:
           `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ` +
-          `${freshness.detail} success_issue_codes=${formatIssueCodes(issueEvidence.map((issue) => issue.code))}`,
+          `${freshness.detail} success_issue_codes=${formatIssueCodes(summary.issues.map((issue) => issue.code))}`,
       };
     }
     return {
@@ -410,7 +423,10 @@ function describeLatestReconciliation(
     };
   }
 
-  const issueCodes = issueEvidence.map((issue) => issue.code);
+  if (summary.issues.length === 0) {
+    return { name: "latest_reconciliation", status: "BLOCK", detail: "latest reconciliation DRIFT_DETECTED summary has no issues." };
+  }
+  const issueCodes = summary.issues.map((issue) => issue.code);
   const blockingIssueCodes = issueCodes.filter((code) => BLOCKING_RECONCILIATION_ISSUE_CODES.has(code));
   if (blockingIssueCodes.length > 0) {
     return {
@@ -431,7 +447,7 @@ function describeLatestReconciliation(
   };
 }
 
-function parseReconciliationIssues(rawJson: string): ReconciliationIssue[] | null {
+function parseReconciliationSummary(rawJson: string): { source: string; status: string; issues: ReconciliationIssue[] } | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawJson);
@@ -443,6 +459,20 @@ function parseReconciliationIssues(rawJson: string): ReconciliationIssue[] | nul
     return null;
   }
   const summaryDescriptors = Object.getOwnPropertyDescriptors(parsed);
+  const required = ["source", "status", "issues", "candidateCount", "processedCount", "deferredCount", "maxOrderLookupsPerRun"];
+  const keys = Reflect.ownKeys(parsed);
+  if (keys.length < required.length || keys.length > required.length + 1 || keys.some((key) => typeof key !== "string" || (key !== "historyRecovery" && !required.includes(key)))) return null;
+  for (const key of required) {
+    const descriptor = summaryDescriptors[key];
+    if (descriptor === undefined || descriptor.enumerable !== true || !("value" in descriptor)) return null;
+  }
+  if (typeof summaryDescriptors.source?.value !== "string" || !["DIRECT_RUN", "OPERATOR_SYNC", "STARTUP_RECOVERY", "SCHEDULER_PREFLIGHT"].includes(summaryDescriptors.source.value)) return null;
+  if (typeof summaryDescriptors.status?.value !== "string" || !["SUCCESS", "DRIFT_DETECTED", "ERROR"].includes(summaryDescriptors.status.value)) return null;
+  for (const key of ["candidateCount", "processedCount", "deferredCount", "maxOrderLookupsPerRun"]) {
+    const value = summaryDescriptors[key]?.value;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return null;
+  }
+  if (summaryDescriptors.historyRecovery !== undefined && (!("value" in summaryDescriptors.historyRecovery) || !isJsonData(summaryDescriptors.historyRecovery.value))) return null;
   const issuesDescriptor = summaryDescriptors.issues;
   if (issuesDescriptor === undefined || issuesDescriptor.enumerable !== true || !("value" in issuesDescriptor) || !Array.isArray(issuesDescriptor.value)) {
     return null;
@@ -479,7 +509,15 @@ function parseReconciliationIssues(rawJson: string): ReconciliationIssue[] | nul
     issues.push({ code: codeDescriptor.value as ReconciliationIssue["code"], message: messageDescriptor.value });
   }
 
-  return issues;
+  return { source: summaryDescriptors.source.value, status: summaryDescriptors.status.value, issues };
+}
+
+function isJsonData(value: unknown): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return Object.getPrototypeOf(value) === Array.prototype && value.every(isJsonData);
+  if (typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  return Reflect.ownKeys(value).every((key) => typeof key === "string" && (() => { const d = Object.getOwnPropertyDescriptor(value, key); return d !== undefined && d.enumerable === true && "value" in d && isJsonData(d.value); })());
 }
 
 function formatIssueCodes(issueCodes: string[]): string {
