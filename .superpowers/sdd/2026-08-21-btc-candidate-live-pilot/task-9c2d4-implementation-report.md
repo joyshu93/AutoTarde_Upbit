@@ -28,8 +28,11 @@ The final focused suite is GREEN. It proves:
 5. a post-bootstrap candidate composition failure closes the SQLite handle before
    the original error is rethrown;
 6. scheduler BTC remains controller-owned while ETH remains scheduler-owned;
-7. manual `/run BTC` blocks before a strategy decision or order when the candidate
-   deployment is absent, while manual `/run ETH` remains on the baseline path.
+7. manual `/run BTC` completes its exact `SCHEDULER_PREFLIGHT` refresh and then
+   blocks with `IDENTITY_MISMATCH`, before a strategy decision or order, when the
+   candidate deployment is absent;
+8. manual `/run ETH` remains on the baseline path and creates no additional
+   reconciliation run after the baseline manual preflight evidence is present.
 
 ## Implementation
 
