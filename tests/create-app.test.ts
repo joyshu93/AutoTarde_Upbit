@@ -212,8 +212,9 @@ test("createApp snapshots the validated candidate selection before services are 
     const response = await app.telegramRouter.route("/run BTC");
     const decision = await app.repositories.getLatestStrategyDecision("primary", "KRW-BTC");
 
-    assert.match(response.text, /failed|blocked/i);
-    assert.equal(decision, null);
+    assert.match(response.text, /COMPLETED|처리 완료/);
+    assert.notEqual(decision, null);
+    assert.match(decision?.decisionBasisJson ?? "", /BTC_CANDIDATE_PILOT/);
   } finally {
     app?.telegramInboundPolling.stop();
     app?.strategyScheduler.stop();
@@ -353,6 +354,10 @@ test("createApp routes manual ETH through the baseline path without candidate pr
 
   try {
     app = createCandidateLiveApp({ databasePath });
+    await app.portfolioSyncService.run({
+      exchangeAccountId: "primary",
+      source: "OPERATOR_SYNC",
+    });
     const response = await app.telegramRouter.route("/run ETH");
     const decision = await app.repositories.getLatestStrategyDecision("primary", "KRW-ETH");
 
