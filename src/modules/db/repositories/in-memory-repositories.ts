@@ -68,6 +68,11 @@ const ACTIVE_ORDER_STATUSES: ReadonlySet<OrderLifecycleStatus> = new Set([
   "CANCEL_REQUESTED",
   "RECONCILIATION_REQUIRED",
 ]);
+const CANDIDATE_SUBMISSION_BLOCKING_STATUSES: ReadonlySet<OrderLifecycleStatus> = new Set([
+  ...ACTIVE_ORDER_STATUSES,
+  "FAILED",
+  "REJECTED",
+]);
 
 export class InMemoryExecutionRepository implements ExecutionRepository {
   private readonly strategyDecisions: StrategyDecisionRecord[] = [];
@@ -318,6 +323,13 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     return order ? cloneRecord(order) : null;
   }
 
+  async findOrderById(exchangeAccountId: string, orderId: string): Promise<OrderRecord | null> {
+    const order = this.orders.find(
+      (candidate) => candidate.exchangeAccountId === exchangeAccountId && candidate.id === orderId,
+    );
+    return order ? cloneRecord(order) : null;
+  }
+
   async findOrderByReference(exchangeAccountId: string, reference: string): Promise<OrderRecord | null> {
     const order = this.orders.find(
       (candidate) =>
@@ -345,6 +357,24 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 
     return (typeof limit === "number" ? orders.slice(0, limit) : orders).map(cloneRecord);
+  }
+
+  async listCandidateSubmissionBlockingOrders(
+    exchangeAccountId: string,
+    limit: number,
+  ): Promise<OrderRecord[]> {
+    validateCandidateOrderReadLimit(limit);
+    return this.orders
+      .filter((candidate) =>
+        candidate.exchangeAccountId === exchangeAccountId &&
+        CANDIDATE_SUBMISSION_BLOCKING_STATUSES.has(candidate.status) &&
+        !(candidate.status === "FAILED" && candidate.failureCode === "ORDER_SUBMISSION_ABSENCE_CONFIRMED"),
+      )
+      .sort((left, right) =>
+        right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id),
+      )
+      .slice(0, limit)
+      .map(cloneRecord);
   }
 
   async listOrders(exchangeAccountId: string): Promise<OrderRecord[]> {
@@ -1054,6 +1084,12 @@ function cloneRecord<T extends object>(record: T): T {
 
 function cloneCandidateBinding(record: CandidateExecutionBindingRecord): CandidateExecutionBindingRecord {
   return { ...record };
+}
+
+function validateCandidateOrderReadLimit(limit: number): void {
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error("Candidate submission-blocking order read limit must be a positive safe integer.");
+  }
 }
 
 function formatFaultPauseReason(input: FaultPauseInput): string {

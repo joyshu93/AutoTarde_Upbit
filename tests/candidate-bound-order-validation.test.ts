@@ -11,6 +11,8 @@ import {
 import {
   validateCandidateBoundOrderIntent,
 } from "../src/modules/db/repositories/candidate-bound-order-validation.js";
+import * as candidateBoundOrderValidation from
+  "../src/modules/db/repositories/candidate-bound-order-validation.js";
 import { test } from "./harness.js";
 
 test("candidate-bound order validator accepts a complete BTC candidate intent", () => {
@@ -271,6 +273,142 @@ test("candidate-bound order validator requires immutable request timestamps and 
     assert.throws(() => validateCandidateBoundOrderIntent(input), Error, label);
   }
 });
+
+test("candidate final projection accepts strict matching records and preserves aggregate validation", () => {
+  const input = validFinalProjectionInput();
+
+  const projected = projectCandidateFinalBoundOrderIntent(input);
+
+  assert.equal(projected.order.status, "PERSISTED");
+  assert.doesNotThrow(() => validateCandidateBoundOrderIntent({
+    ...projected,
+    deployment: input.aggregate.deployment,
+    exactStateVersion: input.aggregate.exactStateVersion,
+    expectedPhase: input.aggregate.expectedPhase,
+    expectedDeploymentUpdatedAt: input.aggregate.expectedDeploymentUpdatedAt,
+    expectedStateVersion: input.aggregate.expectedStateVersion,
+  }));
+});
+
+test("candidate final projection rejects prototype accessor extra and missing properties without invoking accessors", () => {
+  const cases: Array<[string, (input: CandidateFinalProjectionInput) => void]> = [
+    ["prototype", (input) => {
+      input.persistedOrder = Object.assign(Object.create({ inherited: true }), input.persistedOrder) as OrderRecord;
+    }],
+    ["accessor", (input) => {
+      Object.defineProperty(input.persistedOrder, "status", {
+        enumerable: true,
+        get: () => {
+          input.accessorReads += 1;
+          return "SUBMITTING";
+        },
+      });
+    }],
+    ["extra", (input) => {
+      (input.persistedOrder as OrderRecord & { extra?: string }).extra = "forbidden";
+    }],
+    ["missing", (input) => {
+      delete (input.persistedOrder as Partial<OrderRecord>).failureMessage;
+    }],
+  ];
+
+  for (const [label, mutate] of cases) {
+    const input = validFinalProjectionInput();
+    mutate(input);
+    assert.throws(() => projectCandidateFinalBoundOrderIntent(input), /plain object|own data properties/i, label);
+    assert.equal(input.accessorReads, 0, label);
+  }
+});
+
+test("candidate final projection rejects each mutable lifecycle field mismatch before status projection", () => {
+  const cases: Array<[string, (order: OrderRecord) => void]> = [
+    ["status", (order) => { order.status = "OPEN"; }],
+    ["upbitUuid", (order) => { order.upbitUuid = "unexpected-uuid"; }],
+    ["exchangeResponseJson", (order) => { order.exchangeResponseJson = "{}"; }],
+    ["failureCode", (order) => { order.failureCode = "UNEXPECTED"; }],
+    ["failureMessage", (order) => { order.failureMessage = "unexpected"; }],
+    ["updatedAt", (order) => { order.updatedAt = "2026-08-21T00:00:00.000000002Z"; }],
+  ];
+
+  for (const [label, mutate] of cases) {
+    const input = validFinalProjectionInput();
+    mutate(input.persistedOrder);
+    assert.throws(() => projectCandidateFinalBoundOrderIntent(input), /changed|match|submitting/i, label);
+  }
+});
+
+test("candidate final projection rejects descriptor injection in event decision and binding records", () => {
+  for (const target of ["persistedEvent", "persistedDecision", "persistedBinding"] as const) {
+    const input = validFinalProjectionInput();
+    let reads = 0;
+    const key = target === "persistedEvent"
+      ? "eventType"
+      : target === "persistedDecision"
+        ? "status"
+        : "orderId";
+    const original = input[target] as unknown as Record<string, unknown>;
+    const expected = original[key];
+    Object.defineProperty(original, key, {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return expected;
+      },
+    });
+
+    assert.throws(() => projectCandidateFinalBoundOrderIntent(input), /own data properties/i, target);
+    assert.equal(reads, 0, target);
+  }
+});
+
+interface CandidateFinalProjectionInput {
+  persistedOrder: OrderRecord;
+  expectedOrder: OrderRecord;
+  persistedEvent: PersistCandidateBoundOrderIntentInput["event"];
+  expectedEvent: PersistCandidateBoundOrderIntentInput["event"];
+  persistedDecision: PersistCandidateBoundOrderIntentInput["decision"];
+  expectedDecision: PersistCandidateBoundOrderIntentInput["decision"];
+  persistedBinding: CandidateExecutionBindingRecord;
+  expectedBinding: CandidateExecutionBindingRecord;
+  aggregate: PersistCandidateBoundOrderIntentInput;
+  accessorReads: number;
+}
+
+function projectCandidateFinalBoundOrderIntent(input: CandidateFinalProjectionInput) {
+  const project = (candidateBoundOrderValidation as unknown as {
+    projectCandidateFinalBoundOrderIntent: (value: Omit<CandidateFinalProjectionInput, "aggregate" | "accessorReads">) => Pick<
+      PersistCandidateBoundOrderIntentInput,
+      "order" | "event" | "decision" | "binding"
+    >;
+  }).projectCandidateFinalBoundOrderIntent;
+  return project({
+    persistedOrder: input.persistedOrder,
+    expectedOrder: input.expectedOrder,
+    persistedEvent: input.persistedEvent,
+    expectedEvent: input.expectedEvent,
+    persistedDecision: input.persistedDecision,
+    expectedDecision: input.expectedDecision,
+    persistedBinding: input.persistedBinding,
+    expectedBinding: input.expectedBinding,
+  });
+}
+
+function validFinalProjectionInput(): CandidateFinalProjectionInput {
+  const aggregate = validInput();
+  const persistedOrder = { ...aggregate.order, status: "SUBMITTING" as const };
+  return {
+    persistedOrder,
+    expectedOrder: { ...persistedOrder },
+    persistedEvent: { ...aggregate.event },
+    expectedEvent: { ...aggregate.event },
+    persistedDecision: { ...aggregate.decision },
+    expectedDecision: { ...aggregate.decision },
+    persistedBinding: { ...aggregate.binding },
+    expectedBinding: { ...aggregate.binding },
+    aggregate,
+    accessorReads: 0,
+  };
+}
 
 interface FixtureOptions {
   action?: "ENTER" | "ADD" | "REDUCE" | "EXIT";

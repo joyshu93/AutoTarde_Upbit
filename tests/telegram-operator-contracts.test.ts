@@ -2142,10 +2142,18 @@ function createRepositoryStub(overrides: Partial<ExecutionRepository> = {}): Exe
     async findOrderByIdempotencyKey() {
       return null;
     },
+    async findOrderById(exchangeAccountId, orderId) {
+      return orders.find((order) =>
+        order.exchangeAccountId === exchangeAccountId && order.id === orderId,
+      ) ?? null;
+    },
     async findOrderByReference(_exchangeAccountId, reference) {
       return orders.find((order) => order.id === reference || order.identifier === reference) ?? null;
     },
     async listActiveOrders() {
+      return [];
+    },
+    async listCandidateSubmissionBlockingOrders() {
       return [];
     },
     async listOrders() {

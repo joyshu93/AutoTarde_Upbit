@@ -49,6 +49,10 @@ type FinalMutation =
   | "EXACT_STATE"
   | "BINDING"
   | "COMPETING_ORDER"
+  | "FAILED_COMPETING_ORDER"
+  | "REJECTED_COMPETING_ORDER"
+  | "ORDER_ID_REFERENCE_COLLISION"
+  | "HELPER_RESOLUTION_PAUSE"
   | "OPERATOR_STATE";
 
 test("bound candidate success rereads every final authority in strict order and sends exactly once", async () => {
@@ -97,6 +101,38 @@ test("a competing account active order at candidate final revalidation fault-pau
   await assertFinalCandidateFault("COMPETING_ORDER");
 });
 
+for (const scenario of ["FAILED_COMPETING_ORDER", "REJECTED_COMPETING_ORDER"] as const) {
+  test(`a potentially dispatched ${scenario.split("_")[0]} competitor fault-pauses and sends zero`, async () => {
+    await assertFinalCandidateFault(scenario);
+  });
+}
+
+test("candidate final order reread uses exact account and order id despite reference collisions", async () => {
+  const fixture = await createFixture("ORDER_ID_REFERENCE_COLLISION");
+
+  const result = await fixture.service.submitOrderFromDecision(candidateInput());
+
+  assert.equal(result.accepted, true);
+  assert.equal(fixture.adapter.createOrderCalls, 1);
+  assert.equal(fixture.repositories.referenceLookupCalls, 0);
+});
+
+test("final state read and sole send have no helper-resolution microtask seam", async () => {
+  const fixture = await createFixture("HELPER_RESOLUTION_PAUSE");
+
+  const result = await fixture.service.submitOrderFromDecision(candidateInput());
+  await Promise.resolve();
+
+  assert.equal(result.accepted, true);
+  assert.equal(fixture.adapter.createOrderCalls, 1);
+  assert.equal(fixture.adapter.systemStatusAtSend, "RUNNING");
+  assert.deepEqual(fixture.trace.slice(-3), [
+    "operatorState",
+    "createOrder",
+    "operatorStateMicrotaskPause",
+  ]);
+});
+
 test("a final operator-state race occurs after all candidate reads and sends zero", async () => {
   const fixture = await createFixture("OPERATOR_STATE");
 
@@ -126,18 +162,20 @@ test("candidate final authority keeps the sole send immediately behind the final
   );
   assert.equal((source.match(/\.createOrder\s*\(/gu) ?? []).length, 1);
 
+  const submitMethodStart = source.indexOf("async submitOrderFromDecision");
+  const submitMethodEnd = source.indexOf("private async prepareCandidateContext", submitMethodStart);
+  const submitMethod = source.slice(submitMethodStart, submitMethodEnd);
   const finalMethodStart = source.indexOf("private async assertFinalPreSendAuthority");
   const finalMethodEnd = source.indexOf("private async recordLeaseBlockedAndPause", finalMethodStart);
   const finalMethod = source.slice(finalMethodStart, finalMethodEnd);
   const orderedReads = [
-    "listActiveOrders",
-    "findOrderByReference",
+    "listCandidateSubmissionBlockingOrders",
+    "findOrderById",
     "listOrderEvents",
     "getStrategyDecisionById",
     "getDeployment",
     "getExactState",
     "getExecutionBindingForOrder",
-    "operatorState.getState",
   ];
   let cursor = -1;
   for (const marker of orderedReads) {
@@ -146,15 +184,18 @@ test("candidate final authority keeps the sole send immediately behind the final
     cursor = next;
   }
 
-  const finalStateRead = finalMethod.indexOf("await this.dependencies.operatorState.getState()");
-  assert.ok(finalStateRead >= 0);
-  const afterFinalState = finalMethod.slice(finalStateRead);
+  assert.doesNotMatch(finalMethod, /operatorState\.getState/u);
+  const helperCall = submitMethod.indexOf("await this.assertFinalPreSendAuthority");
+  const finalStateRead = submitMethod.indexOf(
+    "await this.dependencies.operatorState.getState()",
+    helperCall,
+  );
+  const sendSite = submitMethod.indexOf("this.dependencies.executionAdapter.createOrder", finalStateRead);
+  assert.ok(helperCall >= 0 && finalStateRead > helperCall && sendSite > finalStateRead);
+  const afterFinalState = submitMethod.slice(finalStateRead, sendSite);
   assert.equal((afterFinalState.match(/\bawait\b/gu) ?? []).length, 1);
   assert.doesNotMatch(afterFinalState, /\.(?:filter|map|forEach|reduce|some|every)\s*\(/u);
-
-  const callSite = source.indexOf("await this.assertFinalPreSendAuthority");
-  const sendSite = source.indexOf("this.dependencies.executionAdapter.createOrder", callSite);
-  assert.ok(callSite >= 0 && sendSite > callSite);
+  assert.doesNotMatch(afterFinalState, /assertFinalPreSendAuthority/u);
 });
 
 async function assertFinalCandidateFault(mutation: FinalMutation): Promise<void> {
@@ -193,6 +234,7 @@ async function assertCandidateFaultState(
 
 class FinalAuthorityRepository extends InMemoryExecutionRepository {
   finalReadsArmed = false;
+  referenceLookupCalls = 0;
 
   constructor(
     candidatePilots: InMemoryCandidatePilotRepository,
@@ -218,14 +260,48 @@ class FinalAuthorityRepository extends InMemoryExecutionRepository {
     return this.mutation === "COMPETING_ORDER" ? [...orders, competingOrder()] : orders;
   }
 
+  async listCandidateSubmissionBlockingOrders(
+    exchangeAccountId: string,
+    limit: number,
+  ): Promise<OrderRecord[]> {
+    const orders = await super.listActiveOrders(exchangeAccountId, undefined, limit);
+    if (!this.finalReadsArmed) return orders;
+    this.trace.push("activeOrders");
+    if (this.mutation === "COMPETING_ORDER") return [...orders, competingOrder()];
+    if (this.mutation === "FAILED_COMPETING_ORDER") {
+      return [...orders, { ...competingOrder(), status: "FAILED" }];
+    }
+    if (this.mutation === "REJECTED_COMPETING_ORDER") {
+      return [...orders, { ...competingOrder(), status: "REJECTED" }];
+    }
+    return orders;
+  }
+
+  async findOrderById(exchangeAccountId: string, orderId: string): Promise<OrderRecord | null> {
+    const order = (await super.listOrders(exchangeAccountId)).find((candidate) => candidate.id === orderId);
+    if (!this.finalReadsArmed) return order ?? null;
+    this.trace.push("order");
+    if (!order) return null;
+    if (this.mutation === "ORDER_STATUS") return { ...order, status: "OPEN" };
+    if (this.mutation === "ORDER_IMMUTABLE") return { ...order, price: "6001" };
+    if (this.mutation === "ORDER_EXCHANGE_EVIDENCE") {
+      return { ...order, upbitUuid: "unexpected-upbit-uuid" };
+    }
+    return order;
+  }
+
   override async findOrderByReference(
     exchangeAccountId: string,
     reference: string,
   ): Promise<OrderRecord | null> {
+    this.referenceLookupCalls += 1;
     const order = await super.findOrderByReference(exchangeAccountId, reference);
     if (!this.finalReadsArmed) return order;
     this.trace.push("order");
     if (!order) return null;
+    if (this.mutation === "ORDER_ID_REFERENCE_COLLISION") {
+      return { ...competingOrder(), identifier: reference };
+    }
     if (this.mutation === "ORDER_STATUS") return { ...order, status: "OPEN" };
     if (this.mutation === "ORDER_IMMUTABLE") return { ...order, price: "6001" };
     if (this.mutation === "ORDER_EXCHANGE_EVIDENCE") {
@@ -254,6 +330,8 @@ class FinalAuthorityRepository extends InMemoryExecutionRepository {
 }
 
 class TracingOperatorStateStore extends InMemoryOperatorStateStore {
+  visibleSystemStatus: ExecutionStateRecord["systemStatus"] = "RUNNING";
+
   constructor(
     initialState: ExecutionStateRecord,
     private readonly finalReadsArmed: () => boolean,
@@ -263,28 +341,42 @@ class TracingOperatorStateStore extends InMemoryOperatorStateStore {
     super(initialState);
   }
 
-  override async getState(): Promise<ExecutionStateRecord> {
-    const state = await super.getState();
-    if (!this.finalReadsArmed()) return state;
+  override getState(): Promise<ExecutionStateRecord> {
+    if (!this.finalReadsArmed()) return super.getState();
     this.trace.push("operatorState");
-    return this.mutation === "OPERATOR_STATE"
+    if (this.mutation === "HELPER_RESOLUTION_PAUSE") {
+      const state = executionState();
+      return {
+        then: (resolve: (value: ExecutionStateRecord) => unknown) => {
+          resolve(state);
+          queueMicrotask(() => {
+            this.visibleSystemStatus = "PAUSED";
+            this.trace.push("operatorStateMicrotaskPause");
+          });
+        },
+      } as unknown as Promise<ExecutionStateRecord>;
+    }
+    return super.getState().then((state) => this.mutation === "OPERATOR_STATE"
       ? { ...state, systemStatus: "PAUSED", pauseReason: "final race" }
-      : state;
+      : state);
   }
 }
 
 class TracingDryRunAdapter extends DryRunExchangeAdapter {
   createOrderCalls = 0;
+  systemStatusAtSend: ExecutionStateRecord["systemStatus"] | null = null;
 
   constructor(
     private readonly trace: string[],
     private readonly finalReadsArmed: () => boolean,
+    private readonly systemStatus: () => ExecutionStateRecord["systemStatus"],
   ) {
     super();
   }
 
   override async createOrder(request: UpbitOrderRequest) {
     this.createOrderCalls += 1;
+    this.systemStatusAtSend = this.systemStatus();
     if (this.finalReadsArmed()) this.trace.push("createOrder");
     return super.createOrder(request);
   }
@@ -302,7 +394,11 @@ async function createFixture(mutation: FinalMutation) {
   const candidatePilots = new InMemoryCandidatePilotRepository(operatorState);
   repositories = new FinalAuthorityRepository(candidatePilots, mutation, trace);
   const leases = new InMemoryAccountExecutionLeaseStore();
-  const adapter = new TracingDryRunAdapter(trace, () => repositories.finalReadsArmed);
+  const adapter = new TracingDryRunAdapter(
+    trace,
+    () => repositories.finalReadsArmed,
+    () => operatorState.visibleSystemStatus,
+  );
   await seedCandidate(candidatePilots, repositories);
 
   const service = new ExecutionService({

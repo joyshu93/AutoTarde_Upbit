@@ -7,6 +7,11 @@ Implemented final candidate authority revalidation immediately before the sole l
 aggregate and fail closed through the dedicated candidate-intent pause capability.
 Noncandidate execution retains its existing authority and lease behavior.
 
+The final review fixes additionally move the final state await into
+`submitOrderFromDecision`, add bounded active/submission-uncertain and exact-ID
+repository contracts with backend parity, and replace unsafe shallow comparison and
+spread with strict descriptor-safe projections before aggregate validation.
+
 ## Files Changed
 
 - `src/modules/execution/execution-service.ts`
@@ -89,8 +94,92 @@ ordinary recovery-fault input and APIs were not broadened.
 
 - The service-owned in-memory order, first event, READY decision, and binding are the
   reviewed immutable snapshots against which the final persisted aggregate is bound.
-- The exchange send remains inherently after the final operator-state read, but the
-  code deliberately contains no intervening await or side effect, minimizing that
-  unavoidable synchronous boundary.
+- The exchange call necessarily follows a persisted operator-state snapshot, but its
+  invocation now occurs in the same submit-method continuation with no asynchronous
+  helper-resolution, callback, report, database, timer, or promise seam.
 - No subagent was used because no multi-agent/subagent tool was available in this
   session; integration and safety review were performed locally.
+
+## Final Review Fixes
+
+### Additional Files Changed
+
+- `src/modules/db/interfaces.ts`
+- `src/modules/db/repositories/in-memory-repositories.ts`
+- `src/modules/db/repositories/sqlite-repositories.ts`
+- `src/modules/db/repositories/candidate-bound-order-validation.ts`
+- `tests/candidate-bound-order-validation.test.ts`
+- `tests/candidate-bound-order-intent-in-memory.test.ts`
+- `tests/candidate-bound-order-intent-sqlite.test.ts`
+- `tests/telegram-operator-contracts.test.ts`
+
+### Review-Fix RED
+
+After adding tests and before changing production code, `npm.cmd run build` exited
+0. The focused execution command documented above exited 1 with 5 expected failures:
+`FAILED` competitor, `REJECTED` competitor, exact-ID/reference collision,
+helper-resolution microtask seam, and caller-local static invariants. The runtime
+seam test observed `PAUSED` at send instead of `RUNNING`.
+
+The equivalent focused validator command exited 1 with 4 failures because the strict
+projection seam did not exist. The in-memory and SQLite candidate-bound repository
+commands each exited 1 with 2 failures because exact account-plus-order-ID and bounded
+candidate submission-blocking methods did not exist.
+
+### Review-Fix GREEN
+
+The same commands exited 0 after implementation:
+
+- execution candidate final authority: 16 passed, 0 failed
+- candidate bound-order validation: 20 passed, 0 failed
+- in-memory candidate-bound repository: 13 passed, 0 failed
+- SQLite candidate-bound repository: 11 passed, 0 failed
+
+The first SQLite GREEN attempt exposed SQL three-valued logic that excluded ordinary
+`FAILED` rows with a null failure code. The predicate was made explicitly null-safe;
+the same command then passed 11/11. A combined focused regression over candidate
+validation, both backends, recovery-fault persistence, execution service, send
+authority, candidate intent, and candidate final authority exited 0.
+
+### Final Contracts
+
+- Candidate final read order is bounded account submission-blocking rows, exact
+  account-plus-order-ID order, first event, persisted `READY` decision, deployment,
+  exact candidate state, binding, then final operator state.
+- Candidate blocking rows include active lifecycle states and potentially dispatched
+  `FAILED`/`REJECTED` rows. Absence-confirmed `FAILED` is excluded, and a saturated
+  101-row read fails closed against the 100-row usable ceiling.
+- Candidate self must remain present and exact `SUBMITTING`; all competitor,
+  saturation, authority, identity, and material failures retain the lease and use the
+  dedicated atomic candidate/global pause with zero sends.
+- `findOrderById(exchangeAccountId, orderId)` is exact in both backends. SQLite safely
+  reuses its private primary-ID lookup and checks account ownership. The ambiguous
+  reference API remains unchanged for consumers that explicitly want references.
+- Strict projections reject prototype, accessor, symbol, extra, missing, and
+  non-enumerable descriptor injection without invoking accessors. Every mutable order
+  lifecycle field is matched before only status is projected from `SUBMITTING` to
+  `PERSISTED`; the reviewed aggregate validator still runs unchanged.
+- The final `operatorState.getState()` await is directly in
+  `submitOrderFromDecision`, immediately followed by synchronous checks and the sole
+  `createOrder` invocation.
+- Noncandidate behavior, global `listActiveOrders` semantics, and the ordinary strict
+  recovery-fault API remain unchanged.
+
+### Final Verification
+
+- `npm.cmd run typecheck`: exit 0.
+- `npm.cmd run build`: exit 0.
+- focused RED/GREEN and combined regression commands: expected RED, then all GREEN.
+- `rg -n "\.createOrder\s*\(" src`: exactly one match at
+  `src/modules/execution/execution-service.ts:526`.
+- `git diff --check`: exit 0; only existing LF-to-CRLF warnings.
+- sandboxed `npm.cmd run test`: main harness passed through the changed tests, while
+  the isolated prospective suite reported 101/102 because esbuild was denied linked-
+  worktree source traversal.
+- authorized local `npm.cmd run test` outside that restriction: exit 0; isolated
+  prospective suite reported 102 passed, 0 failed.
+
+No network, Upbit, Telegram, operational database, scheduler, sync, live process,
+secret, local operational script, activation default, merge, push, or 9C design note
+was touched. The bounded 100-row ceiling deliberately requires operator recovery if
+the 101-row probe saturates rather than inferring safety from an incomplete set.

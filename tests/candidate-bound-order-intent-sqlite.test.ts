@@ -217,6 +217,55 @@ test("sqlite candidate-bound intent rolls back order when event or binding inser
   }
 });
 
+test("sqlite candidate authority reads use exact account and order id under reference collisions", async () => {
+  const databasePath = await createTempDatabasePath("exact-order-id");
+  const bundle = openBundle(databasePath);
+  const methods = candidateAuthorityMethods(bundle.repositories);
+  try {
+    await bundle.repositories.saveOrder(authorityOrder("reference-owner", "OPEN", {
+      identifier: "exact-order-id",
+    }));
+    await bundle.repositories.saveOrder(authorityOrder("exact-order-id", "SUBMITTING"));
+
+    assert.equal((await bundle.repositories.findOrderByReference("primary", "exact-order-id"))?.id, "exact-order-id");
+    assert.equal((await methods.findOrderById("primary", "exact-order-id"))?.id, "exact-order-id");
+    assert.equal(await methods.findOrderById("other-account", "exact-order-id"), null);
+  } finally {
+    bundle.close();
+    await cleanupDatabase(databasePath);
+  }
+});
+
+test("sqlite candidate authority query matches in-memory bounded active and uncertain statuses", async () => {
+  const databasePath = await createTempDatabasePath("blocking-orders");
+  const bundle = openBundle(databasePath);
+  const methods = candidateAuthorityMethods(bundle.repositories);
+  const blockingStatuses: OrderRecord["status"][] = [
+    "INTENT_CREATED", "PERSISTED", "SUBMITTING", "OPEN", "PARTIALLY_FILLED",
+    "CANCEL_REQUESTED", "RECONCILIATION_REQUIRED", "FAILED", "REJECTED",
+  ];
+  const excludedStatuses: OrderRecord["status"][] = ["RISK_REJECTED", "FILLED", "CANCELED"];
+  try {
+    for (const [index, status] of [...blockingStatuses, ...excludedStatuses].entries()) {
+      await bundle.repositories.saveOrder(authorityOrder(`order-${status}`, status, {
+        updatedAt: `2026-08-21T00:00:${String(index).padStart(2, "0")}.000Z`,
+      }));
+    }
+    await bundle.repositories.saveOrder(authorityOrder("order-absence-confirmed", "FAILED", {
+      failureCode: "ORDER_SUBMISSION_ABSENCE_CONFIRMED",
+    }));
+
+    const rows = await methods.listCandidateSubmissionBlockingOrders("primary", 20);
+    assert.deepEqual(new Set(rows.map((order) => order.status)), new Set(blockingStatuses));
+    assert.equal(rows.some((order) => order.id === "order-absence-confirmed"), false);
+    assert.equal((await methods.listCandidateSubmissionBlockingOrders("primary", 2)).length, 2);
+    await assert.rejects(() => methods.listCandidateSubmissionBlockingOrders("primary", 0), /limit/i);
+  } finally {
+    bundle.close();
+    await cleanupDatabase(databasePath);
+  }
+});
+
 interface FixtureOptions {
   decisionStatus?: StrategyDecisionRecord["status"];
   saveDecision?: boolean;
@@ -491,6 +540,45 @@ function rehash(
 ): CandidateExecutionBindingRecord {
   const material = { ...binding, orderMaterialHash: "" } as CandidateExecutionBindingRecord;
   return { ...material, orderMaterialHash: candidateExecutionBindingMaterialHash(material) };
+}
+
+function candidateAuthorityMethods(repository: ReturnType<typeof openBundle>["repositories"]) {
+  return repository as typeof repository & {
+    findOrderById(exchangeAccountId: string, orderId: string): Promise<OrderRecord | null>;
+    listCandidateSubmissionBlockingOrders(exchangeAccountId: string, limit: number): Promise<OrderRecord[]>;
+  };
+}
+
+function authorityOrder(
+  id: string,
+  status: OrderRecord["status"],
+  overrides: Partial<OrderRecord> = {},
+): OrderRecord {
+  return {
+    id,
+    strategyDecisionId: null,
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    side: "bid",
+    ordType: "price",
+    volume: null,
+    price: "10000",
+    timeInForce: null,
+    smpType: null,
+    identifier: `${id}-identifier`,
+    idempotencyKey: `${id}-idempotency`,
+    origin: "STRATEGY",
+    requestedAt: "2026-08-21T00:00:00.000Z",
+    upbitUuid: null,
+    status,
+    executionMode: "LIVE",
+    exchangeResponseJson: null,
+    failureCode: null,
+    failureMessage: null,
+    createdAt: "2026-08-21T00:00:00.000Z",
+    updatedAt: "2026-08-21T00:00:00.000Z",
+    ...overrides,
+  };
 }
 
 async function createTempDatabasePath(label: string): Promise<string> {

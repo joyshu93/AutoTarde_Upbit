@@ -15,7 +15,10 @@ import { createId } from "../../shared/ids.js";
 import type { ExecutionRepository, OperatorStateStore } from "../db/interfaces.js";
 import type { AccountExecutionLeaseStore, CandidatePilotRepository } from "../db/pilot-interfaces.js";
 import { validateCandidateExecutionBinding } from "../db/pilot-interfaces.js";
-import { validateCandidateBoundOrderIntent } from "../db/repositories/candidate-bound-order-validation.js";
+import {
+  projectCandidateFinalBoundOrderIntent,
+  validateCandidateBoundOrderIntent,
+} from "../db/repositories/candidate-bound-order-validation.js";
 import { ExchangeOrderSubmissionError } from "../exchange/errors.js";
 import type { ExchangeAdapter, ExecutionExchangeAdapter, UpbitOrderChance } from "../exchange/interfaces.js";
 import { evaluateRiskGuards } from "../risk/guards.js";
@@ -39,6 +42,8 @@ import type {
   SubmitOrderFromDecisionResult,
 } from "./interfaces.js";
 import { parseCandidateEvidenceTimestamp } from "./candidate-evidence-decimals.js";
+
+const CANDIDATE_FINAL_ORDER_SCAN_LIMIT = 100;
 
 export class ExecutionService {
   constructor(
@@ -485,11 +490,13 @@ export class ExecutionService {
       throw new AccountExecutionLeaseSafetyError("Account execution lease renewal is ambiguous.");
     }
 
+    let exchangeOrderPromise: ReturnType<ExecutionExchangeAdapter["createOrder"]> | undefined;
+    let createOrderInvoked = false;
+    let synchronousSubmissionError: unknown = null;
     try {
-      await this.assertFinalPreSendAuthority({
+      const authorityBlockedByOrders = await this.assertFinalPreSendAuthority({
         exchangeAccountId: input.exchangeAccountId,
         orderId: order.id,
-        initialAuthority,
         candidate: candidateContext && candidateBinding
           ? {
               authority: candidateContext.authority,
@@ -500,36 +507,23 @@ export class ExecutionService {
             }
           : null,
       });
-    } catch (error) {
-      releaseLease = false;
-      if (candidateContext && candidateBinding) {
-        await this.pauseCandidateIntentFault({
-          authority: candidateContext.authority,
-          decision: candidateContext.decision,
-          input,
-          orderId: order.id,
-          bindingId: candidateBinding.id,
-          stage: "FINAL_REVALIDATION",
-          occurredAt: order.requestedAt,
-        });
-        throw new CandidateExecutionSafetyError(
-          "Candidate final pre-send authority or intent material changed; execution is paused.",
-          error,
-        );
+      // This is the final await on the successful path. Only synchronous checks and the sole send follow.
+      const finalState = await this.dependencies.operatorState.getState();
+      const finalAuthority = selectExecutionAuthority(finalState);
+      const authorityUnchanged =
+        finalAuthority.executionMode === initialAuthority.executionMode &&
+        finalAuthority.liveExecutionGate === initialAuthority.liveExecutionGate;
+      if (
+        authorityBlockedByOrders ||
+        finalState.systemStatus !== "RUNNING" ||
+        finalState.killSwitchActive ||
+        !authorityUnchanged ||
+        !executionAdapterAcceptsAuthority(this.dependencies.executionAdapter, finalAuthority)
+      ) {
+        throw new Error("final pre-send authority is blocked");
       }
-      await this.recordLeaseBlockedAndPause({
-        input,
-        idempotencyKey,
-        market,
-        occurredAt: this.currentTimestamp(),
-        reason: "Final pre-send authority check is ambiguous or blocked; reconciliation is required before any send.",
-        orderId: order.id,
-      });
-      throw new AccountExecutionLeaseSafetyError("Final pre-send authority check failed.");
-    }
-
-    try {
-      const exchangeOrder = await this.dependencies.executionAdapter.createOrder({
+      createOrderInvoked = true;
+      exchangeOrderPromise = this.dependencies.executionAdapter.createOrder({
         market,
         side: input.side,
         ordType: input.ordType,
@@ -539,6 +533,42 @@ export class ExecutionService {
         timeInForce: null,
         smpType: null,
       });
+    } catch (error) {
+      if (createOrderInvoked) {
+        synchronousSubmissionError = error;
+      } else {
+        releaseLease = false;
+        if (candidateContext && candidateBinding) {
+          await this.pauseCandidateIntentFault({
+            authority: candidateContext.authority,
+            decision: candidateContext.decision,
+            input,
+            orderId: order.id,
+            bindingId: candidateBinding.id,
+            stage: "FINAL_REVALIDATION",
+            occurredAt: order.requestedAt,
+          });
+          throw new CandidateExecutionSafetyError(
+            "Candidate final pre-send authority or intent material changed; execution is paused.",
+            error,
+          );
+        }
+        await this.recordLeaseBlockedAndPause({
+          input,
+          idempotencyKey,
+          market,
+          occurredAt: this.currentTimestamp(),
+          reason: "Final pre-send authority check is ambiguous or blocked; reconciliation is required before any send.",
+          orderId: order.id,
+        });
+        throw new AccountExecutionLeaseSafetyError("Final pre-send authority check failed.");
+      }
+    }
+
+    try {
+      if (synchronousSubmissionError !== null) throw synchronousSubmissionError;
+      if (!exchangeOrderPromise) throw new Error("Exchange order submission did not start.");
+      const exchangeOrder = await exchangeOrderPromise;
 
       const submittedAt = this.currentTimestamp();
       let updatedOrder: OrderRecord = {
@@ -942,7 +972,6 @@ export class ExecutionService {
   private async assertFinalPreSendAuthority(input: {
     exchangeAccountId: string;
     orderId: string;
-    initialAuthority: ExecutionAuthorityTuple;
     candidate: {
       authority: CandidateExecutionAuthority;
       expectedOrder: OrderRecord;
@@ -950,8 +979,13 @@ export class ExecutionService {
       expectedDecision: StrategyDecisionRecord;
       expectedBinding: CandidateExecutionBindingRecord;
     } | null;
-  }): Promise<void> {
-    const activeOrders = await this.dependencies.repositories.listActiveOrders(input.exchangeAccountId);
+  }): Promise<boolean> {
+    const activeOrders = input.candidate
+      ? await this.dependencies.repositories.listCandidateSubmissionBlockingOrders(
+          input.exchangeAccountId,
+          CANDIDATE_FINAL_ORDER_SCAN_LIMIT + 1,
+        )
+      : await this.dependencies.repositories.listActiveOrders(input.exchangeAccountId);
     let expectedOrderIsActive = false;
     let hasCompetingOrder = false;
     for (const activeOrder of activeOrders) {
@@ -967,7 +1001,7 @@ export class ExecutionService {
       if (!candidatePilots || !this.dependencies.repositories.getStrategyDecisionById) {
         throw new Error("candidate final pre-send dependencies are unavailable");
       }
-      const persistedOrder = await this.dependencies.repositories.findOrderByReference(
+      const persistedOrder = await this.dependencies.repositories.findOrderById(
         input.exchangeAccountId,
         input.orderId,
       );
@@ -982,20 +1016,24 @@ export class ExecutionService {
       const exactState = await candidatePilots.getExactState(input.candidate.authority.deploymentId);
       const binding = await candidatePilots.getExecutionBindingForOrder(input.orderId);
       if (
+        activeOrders.length > CANDIDATE_FINAL_ORDER_SCAN_LIMIT ||
         !expectedOrderIsActive || hasCompetingOrder || !persistedOrder ||
-        events.length !== 1 || !firstEvent || !decision || !deployment || !exactState || !binding ||
-        !sameFlatRecord(persistedOrder, input.candidate.expectedOrder) ||
-        !sameFlatRecord(firstEvent, input.candidate.expectedEvent) ||
-        !sameFlatRecord(decision, input.candidate.expectedDecision) ||
-        !sameFlatRecord(binding, input.candidate.expectedBinding)
+        events.length !== 1 || !firstEvent || !decision || !deployment || !exactState || !binding
       ) {
         throw new Error("candidate final persisted authority or intent material changed");
       }
+      const projected = projectCandidateFinalBoundOrderIntent({
+        persistedOrder,
+        expectedOrder: input.candidate.expectedOrder,
+        persistedEvent: firstEvent,
+        expectedEvent: input.candidate.expectedEvent,
+        persistedDecision: decision,
+        expectedDecision: input.candidate.expectedDecision,
+        persistedBinding: binding,
+        expectedBinding: input.candidate.expectedBinding,
+      });
       validateCandidateBoundOrderIntent({
-        order: { ...persistedOrder, status: "PERSISTED" },
-        event: firstEvent,
-        binding,
-        decision,
+        ...projected,
         deployment,
         exactStateVersion: exactState.stateVersion,
         expectedPhase: input.candidate.authority.expectedPhase,
@@ -1003,24 +1041,9 @@ export class ExecutionService {
         expectedStateVersion: input.candidate.authority.expectedStateVersion,
       });
     }
-    const authorityBlockedByOrders = input.candidate
+    return input.candidate
       ? !expectedOrderIsActive || hasCompetingOrder
       : hasCompetingOrder;
-    // Keep this as the final await before createOrder so a persisted pause wins the send race.
-    const state = await this.dependencies.operatorState.getState();
-    const finalAuthority = selectExecutionAuthority(state);
-    const authorityUnchanged =
-      finalAuthority.executionMode === input.initialAuthority.executionMode &&
-      finalAuthority.liveExecutionGate === input.initialAuthority.liveExecutionGate;
-    if (
-      authorityBlockedByOrders ||
-      state.systemStatus !== "RUNNING" ||
-      state.killSwitchActive ||
-      !authorityUnchanged ||
-      !executionAdapterAcceptsAuthority(this.dependencies.executionAdapter, finalAuthority)
-    ) {
-      throw new Error("final pre-send authority is blocked");
-    }
   }
 
   private async recordLeaseBlockedAndPause(input: {
@@ -1598,18 +1621,6 @@ function deriveRequestedNotionalKrw(
 
 function nullableNumberString(value: number | null): string | null {
   return value === null ? null : String(value);
-}
-
-function sameFlatRecord<TLeft extends object, TRight extends object>(left: TLeft, right: TRight): boolean {
-  const leftKeys = Reflect.ownKeys(left);
-  const rightKeys = Reflect.ownKeys(right);
-  if (leftKeys.length !== rightKeys.length) return false;
-  const leftRecord = left as Record<PropertyKey, unknown>;
-  const rightRecord = right as Record<PropertyKey, unknown>;
-  for (const key of leftKeys) {
-    if (!Object.hasOwn(right, key) || !Object.is(leftRecord[key], rightRecord[key])) return false;
-  }
-  return true;
 }
 
 function matchesCandidateDuplicateOrder(

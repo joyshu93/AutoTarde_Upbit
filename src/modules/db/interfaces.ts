@@ -123,8 +123,10 @@ export interface ExecutionRepository {
   persistExchangeSubmission(input: PersistExchangeSubmissionInput): Promise<void>;
   persistUncertainSubmission(input: PersistUncertainSubmissionInput): Promise<void>;
   findOrderByIdempotencyKey(exchangeAccountId: string, idempotencyKey: string): Promise<OrderRecord | null>;
+  findOrderById(exchangeAccountId: string, orderId: string): Promise<OrderRecord | null>;
   findOrderByReference(exchangeAccountId: string, reference: string): Promise<OrderRecord | null>;
   listActiveOrders(exchangeAccountId: string, market?: SupportedMarket, limit?: number): Promise<OrderRecord[]>;
+  listCandidateSubmissionBlockingOrders(exchangeAccountId: string, limit: number): Promise<OrderRecord[]>;
   listOrders(exchangeAccountId: string): Promise<OrderRecord[]>;
   appendOrderEvent(record: OrderEventRecord): Promise<void>;
   listOrderEvents(orderId: string): Promise<OrderEventRecord[]>;

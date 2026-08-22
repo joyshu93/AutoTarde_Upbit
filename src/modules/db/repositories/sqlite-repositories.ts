@@ -102,6 +102,14 @@ const ACTIVE_ORDER_STATUSES = new Set<OrderRecord["status"]>([
 ]);
 const ACTIVE_ORDER_STATUS_VALUES = Array.from(ACTIVE_ORDER_STATUSES);
 const ACTIVE_ORDER_STATUS_PLACEHOLDERS = ACTIVE_ORDER_STATUS_VALUES.map(() => "?").join(", ");
+const CANDIDATE_SUBMISSION_BLOCKING_STATUSES = new Set<OrderRecord["status"]>([
+  ...ACTIVE_ORDER_STATUSES,
+  "FAILED",
+  "REJECTED",
+]);
+const CANDIDATE_SUBMISSION_BLOCKING_STATUS_VALUES = Array.from(CANDIDATE_SUBMISSION_BLOCKING_STATUSES);
+const CANDIDATE_SUBMISSION_BLOCKING_STATUS_PLACEHOLDERS =
+  CANDIDATE_SUBMISSION_BLOCKING_STATUS_VALUES.map(() => "?").join(", ");
 
 interface SqliteCandidateDeploymentAuthorityRow {
   id: string;
@@ -465,6 +473,11 @@ export class SqliteExecutionRepository implements ExecutionRepository {
     return row ? mapOrderRow(row) : null;
   }
 
+  async findOrderById(exchangeAccountId: string, orderId: string): Promise<OrderRecord | null> {
+    const order = this.getOrderById(orderId);
+    return order?.exchangeAccountId === exchangeAccountId ? order : null;
+  }
+
   async findOrderByReference(exchangeAccountId: string, reference: string): Promise<OrderRecord | null> {
     const row = this.db.prepare(`
       SELECT * FROM orders
@@ -506,6 +519,31 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       ORDER BY updated_at DESC
       ${limitClause}
     `).all(...params) as unknown as SqliteOrderRow[];
+
+    return rows.map(mapOrderRow);
+  }
+
+  async listCandidateSubmissionBlockingOrders(
+    exchangeAccountId: string,
+    limit: number,
+  ): Promise<OrderRecord[]> {
+    validateCandidateOrderReadLimit(limit);
+    const rows = this.db.prepare(`
+      SELECT * FROM orders
+      WHERE exchange_account_id = ?
+        AND status IN (${CANDIDATE_SUBMISSION_BLOCKING_STATUS_PLACEHOLDERS})
+        AND (
+          status <> 'FAILED' OR
+          failure_code IS NULL OR
+          failure_code <> 'ORDER_SUBMISSION_ABSENCE_CONFIRMED'
+        )
+      ORDER BY updated_at DESC, id DESC
+      LIMIT ?
+    `).all(
+      exchangeAccountId,
+      ...CANDIDATE_SUBMISSION_BLOCKING_STATUS_VALUES,
+      limit,
+    ) as unknown as SqliteOrderRow[];
 
     return rows.map(mapOrderRow);
   }
@@ -2438,6 +2476,12 @@ function mapTelegramInboundOffsetRow(
     lastUpdateId: row.last_update_id,
     updatedAt: row.updated_at,
   };
+}
+
+function validateCandidateOrderReadLimit(limit: number): void {
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error("Candidate submission-blocking order read limit must be a positive safe integer.");
+  }
 }
 
 function recordExecutionStateTransition(

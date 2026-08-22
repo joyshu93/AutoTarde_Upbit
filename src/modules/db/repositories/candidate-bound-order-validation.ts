@@ -44,6 +44,66 @@ const DECISION_KEYS = [
 const REQUEST_KEYS = [
   "order", "event", "binding", "expectedPhase", "expectedDeploymentUpdatedAt", "expectedStateVersion",
 ] as const;
+const FINAL_PROJECTION_KEYS = [
+  "persistedOrder", "expectedOrder", "persistedEvent", "expectedEvent",
+  "persistedDecision", "expectedDecision", "persistedBinding", "expectedBinding",
+] as const;
+
+export interface CandidateFinalBoundOrderIntentProjectionInput {
+  persistedOrder: OrderRecord;
+  expectedOrder: OrderRecord;
+  persistedEvent: OrderEventRecord;
+  expectedEvent: OrderEventRecord;
+  persistedDecision: StrategyDecisionRecord;
+  expectedDecision: StrategyDecisionRecord;
+  persistedBinding: CandidateExecutionBindingRecord;
+  expectedBinding: CandidateExecutionBindingRecord;
+}
+
+export function projectCandidateFinalBoundOrderIntent(
+  value: CandidateFinalBoundOrderIntentProjectionInput,
+): Pick<PersistCandidateBoundOrderIntentInput, "order" | "event" | "decision" | "binding"> {
+  const input = exactOwnDataRecord(value, "candidate final bound-order projection", FINAL_PROJECTION_KEYS);
+  const persistedOrder = projectRecord(input.persistedOrder, "persisted candidate final order", ORDER_KEYS) as
+    unknown as OrderRecord;
+  const expectedOrder = projectRecord(input.expectedOrder, "expected candidate final order", ORDER_KEYS) as
+    unknown as OrderRecord;
+  const persistedEvent = projectRecord(input.persistedEvent, "persisted candidate final event", EVENT_KEYS) as
+    unknown as OrderEventRecord;
+  const expectedEvent = projectRecord(input.expectedEvent, "expected candidate final event", EVENT_KEYS) as
+    unknown as OrderEventRecord;
+  const persistedDecision = projectRecord(
+    input.persistedDecision,
+    "persisted candidate final decision",
+    DECISION_KEYS,
+  ) as unknown as StrategyDecisionRecord;
+  const expectedDecision = projectRecord(
+    input.expectedDecision,
+    "expected candidate final decision",
+    DECISION_KEYS,
+  ) as unknown as StrategyDecisionRecord;
+  const persistedBinding = validateCandidateExecutionBinding(
+    input.persistedBinding as CandidateExecutionBindingRecord,
+  );
+  const expectedBinding = validateCandidateExecutionBinding(
+    input.expectedBinding as CandidateExecutionBindingRecord,
+  );
+
+  assertExactRecordMatch(persistedOrder, expectedOrder, "candidate final order");
+  assertExactRecordMatch(persistedEvent, expectedEvent, "candidate final event");
+  assertExactRecordMatch(persistedDecision, expectedDecision, "candidate final decision");
+  assertExactRecordMatch(persistedBinding, expectedBinding, "candidate final binding");
+  if (persistedOrder.status !== "SUBMITTING") {
+    throw new Error("Candidate final order must remain exactly SUBMITTING before projection.");
+  }
+
+  return {
+    order: { ...persistedOrder, status: "PERSISTED" },
+    event: persistedEvent,
+    decision: persistedDecision,
+    binding: persistedBinding,
+  };
+}
 
 export function validateCandidateBoundOrderIntentRequestShape(
   value: PersistCandidateBoundOrderIntentRequest,
@@ -309,4 +369,31 @@ function exactOwnDataRecord<const TKeys extends readonly string[]>(
     result[key as TKeys[number]] = descriptor.value;
   }
   return result;
+}
+
+function projectRecord<const TKeys extends readonly string[]>(
+  value: unknown,
+  label: string,
+  expectedKeys: TKeys,
+): Record<TKeys[number], unknown> {
+  return { ...exactOwnDataRecord(value, label, expectedKeys) };
+}
+
+function assertExactRecordMatch<TPersisted extends object, TExpected extends object>(
+  persisted: TPersisted,
+  expected: TExpected,
+  label: string,
+): void {
+  const persistedRecord = persisted as Record<PropertyKey, unknown>;
+  const expectedRecord = expected as Record<PropertyKey, unknown>;
+  const persistedKeys = Reflect.ownKeys(persisted);
+  const expectedKeys = Reflect.ownKeys(expected);
+  if (
+    persistedKeys.length !== expectedKeys.length ||
+    persistedKeys.some((key) =>
+      !Object.hasOwn(expected, key) || !Object.is(persistedRecord[key], expectedRecord[key]),
+    )
+  ) {
+    throw new Error(`${label} changed before submission.`);
+  }
 }
