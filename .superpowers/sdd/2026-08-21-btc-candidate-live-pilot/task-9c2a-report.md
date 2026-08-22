@@ -44,6 +44,15 @@ Final caller-supplied identity hardening validation:
 - `npm.cmd run build`: passed
 - `git diff --check`: passed with only Windows LF-to-CRLF checkout warnings
 
+### Independent Re-review
+
+The final fresh review found no Important or Critical findings (`CLEAN`). It independently
+confirmed the exact descriptor-safe identity projection, strict timezone-bearing timestamp
+validation, early rejection before repository or operator-state reads, generated identity
+compatibility, persistence mutation isolation, and same-ID single-row recovery after a
+persist-then-throw callback. The reviewer also passed `npm.cmd run typecheck`, all 37 focused
+reconciliation cases, all 3 portfolio-sync cases, and additional adversarial identity probes.
+
 ### Full-Suite Limitation
 
 The review-fix full suite was attempted once. The main custom-harness suite built successfully and progressed through the new tests and the broader repository tests without a reported failure. The final isolated prospective child-test command returned exit code 1, but the parent output was truncated before exposing the specific failing test or environmental cause. A direct rerun of only that prospective bundle was started to distinguish a code failure from the known child-process/sandbox limitation, then explicitly stopped at the user's request. Therefore no completed full-suite pass is claimed; focused, related, typecheck, build, and diff-check evidence is reported separately.
