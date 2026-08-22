@@ -10,6 +10,7 @@ import type {
 } from "../domain/types.js";
 import type { ExecutionRepository } from "../modules/db/interfaces.js";
 import { parseCandidatePilotTimestamp } from "../modules/db/pilot-interfaces.js";
+import type { ReconciliationIssue } from "../modules/reconciliation/interfaces.js";
 
 const BLOCKING_RECONCILIATION_ISSUE_CODES = new Set([
   "BALANCE_DRIFT_DETECTED",
@@ -19,6 +20,13 @@ const BLOCKING_RECONCILIATION_ISSUE_CODES = new Set([
   "ORDER_LOOKUP_TRANSIENT_FAILURE",
   "ORDER_LOOKUP_DEFERRED",
   "ORDER_HISTORY_LOOKUP_FAILED",
+]);
+const RECONCILIATION_ISSUE_CODES = new Set<ReconciliationIssue["code"]>([
+  "OPEN_ORDER_NEEDS_REVIEW", "ORDER_MARKED_FOR_RECOVERY", "ORDER_STATUS_RECONCILED", "ORDER_FILLS_BACKFILLED",
+  "BALANCE_DRIFT_DETECTED", "POSITION_DRIFT_DETECTED", "TERMINAL_ORDER_RECHECKED", "ORDER_REFERENCE_MISSING",
+  "ORDER_LOOKUP_TRANSIENT_FAILURE", "ORDER_LOOKUP_DEFERRED", "ORDER_IDENTIFIER_RECOVERY_UNCERTAIN",
+  "ORDER_IDENTIFIER_RECOVERED", "ORDER_SUBMISSION_ABSENCE_CONFIRMED", "CANDIDATE_EVIDENCE_PROJECTION_FAILED",
+  "CANDIDATE_EVIDENCE_PROJECTION_DEFERRED", "EXCHANGE_ORDER_RECOVERED", "ORDER_HISTORY_LOOKUP_FAILED", "DRY_RUN_ORDER_REPAIRED",
 ]);
 
 export interface LiveStrategyRunPreflightEvaluation {
@@ -302,7 +310,9 @@ function isRunnableExecutionState(state: ExecutionStateRecord): boolean {
     state.liveExecutionGate === "ENABLED" &&
     state.systemStatus === "RUNNING" &&
     !state.killSwitchActive &&
-    state.degradedReason === null;
+    state.pauseReason === null &&
+    state.degradedReason === null &&
+    state.degradedAt === null;
 }
 
 function describeExecutionState(state: ExecutionStateRecord): string {
@@ -324,8 +334,16 @@ function describeExecutionState(state: ExecutionStateRecord): string {
     blockers.push("kill_switch_active");
   }
 
+  if (state.pauseReason !== null) {
+    blockers.push(`paused:${state.pauseReason}`);
+  }
+
   if (state.degradedReason !== null) {
     blockers.push(`degraded:${state.degradedReason}`);
+  }
+
+  if (state.degradedAt !== null) {
+    blockers.push(`degraded_at:${state.degradedAt}`);
   }
 
   return blockers.length === 0
@@ -356,7 +374,27 @@ function describeLatestReconciliation(
     };
   }
 
+  const issueEvidence = parseReconciliationIssues(run.summaryJson);
+  if (issueEvidence === null) {
+    return {
+      name: "latest_reconciliation",
+      status: "BLOCK",
+      detail:
+        `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ` +
+        `${freshness.detail} issue_evidence_malformed=true`,
+    };
+  }
+
   if (run.status === "SUCCESS") {
+    if (issueEvidence.length !== 0) {
+      return {
+        name: "latest_reconciliation",
+        status: "BLOCK",
+        detail:
+          `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ` +
+          `${freshness.detail} success_issue_codes=${formatIssueCodes(issueEvidence.map((issue) => issue.code))}`,
+      };
+    }
     return {
       name: "latest_reconciliation",
       status: "PASS",
@@ -372,17 +410,7 @@ function describeLatestReconciliation(
     };
   }
 
-  const issueEvidence = parseReconciliationIssueCodes(run.summaryJson);
-  if (issueEvidence === null) {
-    return {
-      name: "latest_reconciliation",
-      status: "BLOCK",
-      detail:
-        `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ` +
-        `${freshness.detail} issue_evidence_malformed=true`,
-    };
-  }
-  const issueCodes = issueEvidence;
+  const issueCodes = issueEvidence.map((issue) => issue.code);
   const blockingIssueCodes = issueCodes.filter((code) => BLOCKING_RECONCILIATION_ISSUE_CODES.has(code));
   if (blockingIssueCodes.length > 0) {
     return {
@@ -403,7 +431,7 @@ function describeLatestReconciliation(
   };
 }
 
-function parseReconciliationIssueCodes(rawJson: string): string[] | null {
+function parseReconciliationIssues(rawJson: string): ReconciliationIssue[] | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawJson);
@@ -420,7 +448,11 @@ function parseReconciliationIssueCodes(rawJson: string): string[] | null {
     return null;
   }
 
-  const issueCodes: string[] = [];
+  const rawIssues = issuesDescriptor.value;
+  if (Object.getPrototypeOf(rawIssues) !== Array.prototype || Reflect.ownKeys(rawIssues).length !== rawIssues.length + 1) {
+    return null;
+  }
+  const issues: ReconciliationIssue[] = [];
   for (let index = 0; index < issuesDescriptor.value.length; index += 1) {
     const issue = issuesDescriptor.value[index];
     if (typeof issue !== "object" || issue === null || Object.getPrototypeOf(issue) !== Object.prototype) {
@@ -428,19 +460,26 @@ function parseReconciliationIssueCodes(rawJson: string): string[] | null {
     }
     const issueDescriptors = Object.getOwnPropertyDescriptors(issue);
     const codeDescriptor = issueDescriptors.code;
+    const messageDescriptor = issueDescriptors.message;
     if (
+      Reflect.ownKeys(issue).length !== 2 ||
       codeDescriptor === undefined ||
       codeDescriptor.enumerable !== true ||
       !("value" in codeDescriptor) ||
       typeof codeDescriptor.value !== "string" ||
-      codeDescriptor.value.trim().length === 0
+      !RECONCILIATION_ISSUE_CODES.has(codeDescriptor.value as ReconciliationIssue["code"]) ||
+      messageDescriptor === undefined ||
+      messageDescriptor.enumerable !== true ||
+      !("value" in messageDescriptor) ||
+      typeof messageDescriptor.value !== "string" ||
+      messageDescriptor.value.trim().length === 0
     ) {
       return null;
     }
-    issueCodes.push(codeDescriptor.value);
+    issues.push({ code: codeDescriptor.value as ReconciliationIssue["code"], message: messageDescriptor.value });
   }
 
-  return issueCodes;
+  return issues;
 }
 
 function formatIssueCodes(issueCodes: string[]): string {

@@ -267,25 +267,53 @@ function snapshotExecutionState(value: ExecutionStateRecord, exchangeAccountId: 
   if (stateExchangeAccountId !== exchangeAccountId) {
     throw new Error("Candidate BTC execution state exchangeAccountId must match the request.");
   }
+  const executionMode = requiredEnum(fields.executionMode, "candidate BTC execution state executionMode", ["DRY_RUN", "LIVE"]);
+  const liveExecutionGate = requiredEnum(fields.liveExecutionGate, "candidate BTC execution state liveExecutionGate", ["DISABLED", "ENABLED"]);
+  const systemStatus = requiredEnum(fields.systemStatus, "candidate BTC execution state systemStatus", ["BOOTING", "RUNNING", "PAUSED", "KILL_SWITCHED", "DEGRADED"]);
+  const killSwitchActive = requiredBoolean(fields.killSwitchActive, "candidate BTC execution state killSwitchActive");
+  const pauseReason = requiredNullableString(fields.pauseReason, "candidate BTC execution state pauseReason");
+  const degradedReason = requiredNullableString(fields.degradedReason, "candidate BTC execution state degradedReason");
+  const degradedAt = requiredNullableTimestamp(fields.degradedAt, "candidate BTC execution state degradedAt");
+  if (systemStatus === "RUNNING" && (pauseReason !== null || degradedReason !== null || degradedAt !== null)) {
+    throw new Error("Candidate BTC execution state RUNNING state must not carry pause or degraded authority.");
+  }
   return Object.freeze({
     id: requiredString(fields.id, "candidate BTC execution state id"),
     exchangeAccountId: stateExchangeAccountId,
-    executionMode: requiredEnum(fields.executionMode, "candidate BTC execution state executionMode", ["DRY_RUN", "LIVE"]),
-    liveExecutionGate: requiredEnum(fields.liveExecutionGate, "candidate BTC execution state liveExecutionGate", ["DISABLED", "ENABLED"]),
-    systemStatus: requiredEnum(fields.systemStatus, "candidate BTC execution state systemStatus", [
-      "BOOTING", "RUNNING", "PAUSED", "KILL_SWITCHED", "DEGRADED",
-    ]),
-    killSwitchActive: requiredBoolean(fields.killSwitchActive, "candidate BTC execution state killSwitchActive"),
-    pauseReason: requiredNullableString(fields.pauseReason, "candidate BTC execution state pauseReason"),
-    degradedReason: requiredNullableString(fields.degradedReason, "candidate BTC execution state degradedReason"),
-    degradedAt: requiredNullableTimestamp(fields.degradedAt, "candidate BTC execution state degradedAt"),
+    executionMode,
+    liveExecutionGate,
+    systemStatus,
+    killSwitchActive,
+    pauseReason,
+    degradedReason,
+    degradedAt,
     updatedAt: requiredTimestamp(fields.updatedAt, "candidate BTC execution state updatedAt"),
   });
 }
 
 function snapshotActiveOrders(value: readonly OrderRecord[]): readonly OrderRecord[] {
-  if (!Array.isArray(value)) throw new Error("Candidate BTC active orders must be an array.");
-  return Object.freeze(value.slice());
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new Error("Candidate BTC active orders must be a plain dense data array.");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (
+    Reflect.ownKeys(value).length !== value.length + 1 ||
+    lengthDescriptor === undefined ||
+    !("value" in lengthDescriptor) ||
+    lengthDescriptor.value !== value.length
+  ) {
+    throw new Error("Candidate BTC active orders must be a plain dense data array.");
+  }
+  const snapshot: OrderRecord[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (descriptor === undefined || descriptor.enumerable !== true || !("value" in descriptor)) {
+      throw new Error("Candidate BTC active orders must be a plain dense data array.");
+    }
+    snapshot[index] = descriptor.value as OrderRecord;
+  }
+  return Object.freeze(snapshot);
 }
 
 function assertSnapshotCorrelation(

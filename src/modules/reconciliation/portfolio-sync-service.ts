@@ -215,7 +215,7 @@ function snapshotRunInput(input: {
   }
   const descriptors = Object.getOwnPropertyDescriptors(input);
   const exchangeAccountId = requiredStringDataProperty(descriptors, "exchangeAccountId");
-  const source = requiredStringDataProperty(descriptors, "source") as ReconciliationTrigger;
+  const source = requiredReconciliationTrigger(requiredStringDataProperty(descriptors, "source"));
   const requestedAt = optionalStringDataProperty(descriptors, "requestedAt");
   if (requestedAt !== undefined) parseCandidatePilotTimestamp(requestedAt, "portfolio sync requestedAt");
 
@@ -224,6 +224,13 @@ function snapshotRunInput(input: {
     source,
     ...(requestedAt === undefined ? {} : { requestedAt }),
   });
+}
+
+function requiredReconciliationTrigger(value: string): ReconciliationTrigger {
+  if (value !== "DIRECT_RUN" && value !== "OPERATOR_SYNC" && value !== "STARTUP_RECOVERY" && value !== "SCHEDULER_PREFLIGHT") {
+    throw new Error("Portfolio sync input source is unsupported.");
+  }
+  return value;
 }
 
 function requiredStringDataProperty(descriptors: PropertyDescriptorMap, key: string): string {

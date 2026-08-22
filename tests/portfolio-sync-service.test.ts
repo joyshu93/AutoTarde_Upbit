@@ -138,6 +138,65 @@ test("portfolio sync rejects accessor requested time before any dependency read"
   assert.equal(dependencyReads, 0);
 });
 
+test("portfolio sync rejects invalid or accessor source before any dependency read", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  let dependencyReads = 0;
+  const service = new PortfolioSyncService({
+    exchangeAdapter: { async getBalances() { dependencyReads += 1; return []; } },
+    repositories,
+    reconciliationService: { async runWithRecord() { dependencyReads += 1; throw new Error("not reached"); } },
+  });
+  await assert.rejects(
+    service.run({ exchangeAccountId: "primary", source: "INVALID" as never }),
+    /source is unsupported/,
+  );
+  const accessorInput = Object.defineProperty({ exchangeAccountId: "primary" }, "source", {
+    enumerable: true,
+    get() { throw new Error("source accessor must not execute"); },
+  });
+  await assert.rejects(
+    service.run(accessorInput as { exchangeAccountId: string; source: "SCHEDULER_PREFLIGHT" }),
+    /source must be an enumerable string data property/,
+  );
+  assert.equal(dependencyReads, 0);
+});
+
+test("portfolio sync snapshots a valid source before caller mutation across an await", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  let releaseBalances!: () => void;
+  const balancesGate = new Promise<void>((resolve) => { releaseBalances = resolve; });
+  let balanceReadStarted!: () => void;
+  const balanceRead = new Promise<void>((resolve) => { balanceReadStarted = resolve; });
+  let observedSource: string | undefined;
+  const service = new PortfolioSyncService({
+    exchangeAdapter: {
+      async getBalances() {
+        balanceReadStarted();
+        await balancesGate;
+        return [];
+      },
+    },
+    repositories,
+    reconciliationService: {
+      async runWithRecord(_accountId, options) {
+        observedSource = options?.source;
+        return { summary: SUMMARY, reconciliationRun: EXACT_RUN };
+      },
+    },
+    now: () => "2026-08-22T00:00:00.000Z",
+  });
+  const input: { exchangeAccountId: string; source: "DIRECT_RUN" | "SCHEDULER_PREFLIGHT" } = {
+    exchangeAccountId: "primary",
+    source: "SCHEDULER_PREFLIGHT",
+  };
+  const pending = service.run(input);
+  await balanceRead;
+  input.source = "DIRECT_RUN";
+  releaseBalances();
+  await pending;
+  assert.equal(observedSource, "SCHEDULER_PREFLIGHT");
+});
+
 test("portfolio sync persists an ERROR reconciliation row and rethrows an exact-result failure", async () => {
   const repositories = new InMemoryExecutionRepository();
   const failure = new Error("exact reconciliation failed");

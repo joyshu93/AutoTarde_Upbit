@@ -230,6 +230,54 @@ test("candidate preparation rejects every malformed execution-state authority va
   }
 });
 
+test("candidate preparation rejects contradictory RUNNING state before active-order reads", async () => {
+  let activeOrderReads = 0;
+  const preparation = new CandidateBtcRunPreparationService({
+    config: createConfig(),
+    portfolioSync: { async run() { return createSyncResult(); } },
+    operatorState: { async getState() { return createExecutionState({ pauseReason: "operator pause", degradedAt: CHECKED_AT }); } },
+    repositories: { async listActiveOrders() { activeOrderReads += 1; return []; } },
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    now: () => CHECKED_AT,
+  });
+  await assert.rejects(
+    preparation.prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "SCHEDULER" }),
+    /RUNNING state/,
+  );
+  assert.equal(activeOrderReads, 0);
+});
+
+test("candidate preparation rejects hostile, sparse, and non-standard active-order arrays without invoking array methods or accessors", async () => {
+  const hostileSlice = [createOrder()] as OrderRecord[] & { slice?: () => OrderRecord[] };
+  let sliceCalls = 0;
+  Object.defineProperty(hostileSlice, "slice", { value: () => { sliceCalls += 1; return []; } });
+  const accessorOrders = [createOrder()];
+  let accessorCalls = 0;
+  Object.defineProperty(accessorOrders, "0", { enumerable: true, get() { accessorCalls += 1; throw new Error("must not run"); } });
+  const sparseOrders = new Array<OrderRecord>(1);
+  const prototypeOrders = [createOrder()];
+  Object.setPrototypeOf(prototypeOrders, { slice() { throw new Error("must not run"); } });
+
+  for (const orders of [hostileSlice, accessorOrders, sparseOrders, prototypeOrders]) {
+    const preparation = new CandidateBtcRunPreparationService({
+      config: createConfig(),
+      portfolioSync: { async run() { return createSyncResult(); } },
+      operatorState: { async getState() { return createExecutionState(); } },
+      repositories: { async listActiveOrders() { return orders; } },
+      exchangeBackedReadEnabled: true,
+      liveSendPath: "LIVE_ADAPTER",
+      now: () => CHECKED_AT,
+    });
+    await assert.rejects(
+      preparation.prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "TELEGRAM" }),
+      /active orders must be a plain dense data array/,
+    );
+  }
+  assert.equal(sliceCalls, 0);
+  assert.equal(accessorCalls, 0);
+});
+
 test("candidate preparation rejects reversed reconciliation chronology and blocks future completion evidence", async () => {
   const reversed = new CandidateBtcRunPreparationService({
     config: createConfig(),

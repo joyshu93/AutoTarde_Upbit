@@ -94,9 +94,9 @@ test("scheduler startup preflight treats recovered exchange history as warning, 
     status: "DRIFT_DETECTED",
     summaryJson: JSON.stringify({
       issues: [
-        { code: "EXCHANGE_ORDER_RECOVERED" },
-        { code: "TERMINAL_ORDER_RECHECKED" },
-        { code: "ORDER_FILLS_BACKFILLED" },
+        { code: "EXCHANGE_ORDER_RECOVERED", message: "recovered" },
+        { code: "TERMINAL_ORDER_RECHECKED", message: "rechecked" },
+        { code: "ORDER_FILLS_BACKFILLED", message: "backfilled" },
       ],
     }),
   }));
@@ -301,7 +301,7 @@ test("exact-evidence evaluator blocks malformed DRIFT reconciliation issue evide
     reconciliationRun: createReconciliationRun({
       status: "DRIFT_DETECTED",
       completedAt: "2026-05-08T00:00:00.000Z",
-      summaryJson: JSON.stringify({ issues: [{ code: "ORDER_STATUS_RECONCILED" }] }),
+      summaryJson: JSON.stringify({ issues: [{ code: "ORDER_STATUS_RECONCILED", message: "reconciled" }] }),
     }),
   });
   assert.equal(validWarning.status, "WARN");
@@ -318,6 +318,62 @@ test("exact-evidence evaluator blocks malformed DRIFT reconciliation issue evide
     assert.equal(malformed.status, "BLOCK");
     assert.equal(malformed.checks.find((check) => check.name === "latest_reconciliation")?.status, "BLOCK");
   }
+});
+
+test("exact-evidence evaluator requires a valid empty SUCCESS summary and exact known DRIFT issues", () => {
+  const common = {
+    config: createConfig({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    executionState: createExecutionState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER" as const,
+    checkedAt: "2026-05-08T00:30:00.000Z",
+    balanceSnapshot: { id: "balance", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION" as const, totalKrwValue: "10000", balancesJson: "[]" },
+    positionSnapshot: { id: "position", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION" as const, positionsJson: "[]" },
+    activeOrders: [],
+  };
+  for (const summaryJson of ["{}", JSON.stringify({ issues: [{ code: "BALANCE_DRIFT_DETECTED", message: "drift" }] })]) {
+    const evaluation = evaluateLiveStrategyRunPreflight({
+      ...common,
+      reconciliationRun: createReconciliationRun({ status: "SUCCESS", completedAt: "2026-05-08T00:00:00.000Z", summaryJson }),
+    });
+    assert.equal(evaluation.status, "BLOCK");
+  }
+  for (const summaryJson of [
+    JSON.stringify({ issues: [{ code: "UNKNOWN", message: "unknown" }] }),
+    JSON.stringify({ issues: [{ code: "ORDER_STATUS_RECONCILED" }] }),
+    JSON.stringify({ issues: [{ code: "ORDER_STATUS_RECONCILED", message: "ok", extra: true }] }),
+  ]) {
+    const evaluation = evaluateLiveStrategyRunPreflight({
+      ...common,
+      reconciliationRun: createReconciliationRun({ status: "DRIFT_DETECTED", completedAt: "2026-05-08T00:00:00.000Z", summaryJson }),
+    });
+    assert.equal(evaluation.status, "BLOCK");
+  }
+  const valid = evaluateLiveStrategyRunPreflight({
+    ...common,
+    reconciliationRun: createReconciliationRun({
+      status: "DRIFT_DETECTED",
+      completedAt: "2026-05-08T00:00:00.000Z",
+      summaryJson: JSON.stringify({ issues: [{ code: "ORDER_STATUS_RECONCILED", message: "reconciled" }] }),
+    }),
+  });
+  assert.equal(valid.status, "WARN");
+});
+
+test("exact-evidence evaluator blocks contradictory RUNNING execution state", () => {
+  const evaluation = evaluateLiveStrategyRunPreflight({
+    config: createConfig({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    executionState: createExecutionState({ executionMode: "LIVE", liveExecutionGate: "ENABLED", pauseReason: "paused" }),
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    checkedAt: "2026-05-08T00:30:00.000Z",
+    balanceSnapshot: { id: "balance", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION", totalKrwValue: "10000", balancesJson: "[]" },
+    positionSnapshot: { id: "position", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION", positionsJson: "[]" },
+    reconciliationRun: createReconciliationRun({ completedAt: "2026-05-08T00:00:00.000Z" }),
+    activeOrders: [],
+  });
+  assert.equal(evaluation.status, "BLOCK");
+  assert.equal(evaluation.checks.find((check) => check.name === "execution_state")?.status, "BLOCK");
 });
 
 async function seedReadyPortfolio(

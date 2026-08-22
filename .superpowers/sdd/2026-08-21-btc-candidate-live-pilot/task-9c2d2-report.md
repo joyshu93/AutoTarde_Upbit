@@ -74,3 +74,30 @@ rg -n "POSITION_GUARD_PILOT_(ID|CONFIRMATION)|BTC_COMBINED_CONSERVATIVE_PILOT_V1
 - Added the exported pure exact-evidence LIVE preflight evaluator while preserving existing scheduler/manual builders.
 - Registered the focused test in `tests/run-all.ts`.
 - Fix round 1 strictly validates execution-state authority, uses timestamp epochs for reconciliation chronology and freshness, blocks malformed `DRIFT_DETECTED` issue evidence, and snapshots/canonically correlates returned reconciliation summaries with persisted `summaryJson` evidence.
+
+## Fix Round 2 TDD Evidence
+
+### RED
+
+Focused command:
+
+```powershell
+npx.cmd tsx -e "(async () => { await import('./tests/portfolio-sync-service.test.ts'); await import('./tests/scheduler-preflight.test.ts'); await import('./tests/candidate-btc-run-preparation.test.ts'); const { runRegisteredTests } = await import('./tests/harness.ts'); await runRegisteredTests(); })()"
+```
+
+Result: exit code 1 with five expected failures. Invalid `source` reached `runWithRecord`; malformed `SUCCESS` evidence returned `PASS`; contradictory `RUNNING` state returned `PASS`; candidate preparation did not reject that contradiction before active-order reads; and hostile active-order arrays did not consistently reject without invocation.
+
+### GREEN
+
+The same focused command passed all 29 tests after implementation. `SUCCESS` now requires parseable empty exact issue evidence; `DRIFT_DETECTED` requires a dense exact known `{ code, message }` sequence; contradictory `RUNNING` pause/degraded metadata blocks or rejects before runner authority; active orders are copied only from dense own data arrays without `slice`; and portfolio source is exact-validated before dependency reads while a valid source remains detached across awaits.
+
+Round 2 verification:
+
+```powershell
+npm.cmd run typecheck
+npm.cmd run build
+git diff --cached --check
+```
+
+- `npm.cmd run typecheck`: passed.
+- `npm.cmd run build`: passed.
