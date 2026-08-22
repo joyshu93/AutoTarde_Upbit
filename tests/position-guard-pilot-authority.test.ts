@@ -80,3 +80,51 @@ test("pilot authority rejects non-enumerable required keys with unrelated enumer
 
   assert.throws(() => validatePositionGuardPilotAbandonment(nonEnumerableRecord));
 });
+
+test("pilot authority rejects accessors without invoking them", () => {
+  let getterCalls = 0;
+  const accessorRecord = { ...EXACT_ABANDONED_EVENT } as Record<string, unknown>;
+  Object.defineProperty(accessorRecord, "reason", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return EXACT_ABANDONED_EVENT.reason;
+    },
+  });
+
+  assert.throws(() => validatePositionGuardPilotAbandonment(accessorRecord));
+  assert.equal(getterCalls, 0);
+});
+
+test("pilot authority rejects symbols, extra fields, and non-plain records", () => {
+  const symbolRecord = { ...EXACT_ABANDONED_EVENT } as Record<PropertyKey, unknown>;
+  symbolRecord[Symbol("hidden")] = true;
+
+  const nullPrototypeRecord = Object.assign(Object.create(null), EXACT_ABANDONED_EVENT);
+  const customPrototypeRecord = Object.assign(
+    Object.create({ inherited: true }),
+    EXACT_ABANDONED_EVENT,
+  );
+
+  for (const event of [
+    symbolRecord,
+    { ...EXACT_ABANDONED_EVENT, extra: true },
+    nullPrototypeRecord,
+    customPrototypeRecord,
+  ]) {
+    assert.throws(() => validatePositionGuardPilotAbandonment(event));
+  }
+});
+
+test("pilot authority returns a detached frozen validation", () => {
+  const mutableEvent: Record<string, unknown> = { ...EXACT_ABANDONED_EVENT };
+  const validation = validatePositionGuardPilotAbandonment(mutableEvent);
+  mutableEvent.experimentId = "PCS-2026-999";
+
+  assert.equal(Object.isFrozen(validation), true);
+  assert.deepEqual(validation, {
+    valid: true,
+    experimentId: "PCS-2026-001",
+    eventAt: "2026-08-21T03:08:24.756Z",
+  });
+});

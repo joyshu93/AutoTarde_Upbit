@@ -34,9 +34,12 @@ function isExactAbandonedRecord(value: unknown): value is PositionGuardPilotAban
     return false;
   }
 
-  const candidate = value as Record<string, unknown>;
+  if (Object.getPrototypeOf(value) !== Object.prototype) {
+    return false;
+  }
+
   const expectedEntries = Object.entries(EXACT_ABANDONED_RECORD);
-  const candidateKeys = Reflect.ownKeys(candidate);
+  const candidateKeys = Reflect.ownKeys(value);
   if (
     candidateKeys.length !== EXACT_ABANDONED_KEYS.length
     || !candidateKeys.every(
@@ -46,7 +49,11 @@ function isExactAbandonedRecord(value: unknown): value is PositionGuardPilotAban
     return false;
   }
 
-  return expectedEntries.every(
-    ([key, expectedValue]) => Object.hasOwn(candidate, key) && candidate[key] === expectedValue,
-  );
+  return expectedEntries.every(([key, expectedValue]) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined
+      && descriptor.enumerable
+      && "value" in descriptor
+      && descriptor.value === expectedValue;
+  });
 }
