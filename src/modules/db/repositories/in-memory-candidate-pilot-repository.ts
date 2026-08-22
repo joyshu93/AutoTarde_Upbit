@@ -30,6 +30,7 @@ import {
   type AdvanceCandidatePilotStateResult,
   type ActivateCandidatePilotDeploymentInput,
   type CandidateEvidenceRecord,
+  type CandidatePilotDeploymentInitializationResult,
   type CandidatePilotRecoveryIdentity,
   type CandidatePilotRepository,
   type CreateCandidatePilotDeploymentInput,
@@ -56,17 +57,14 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
   private readonly auditEvents = new Map<string, PositionGuardPilotAuditEventRecord[]>();
   private readonly bindingsByOrderId = new Map<string, CandidateExecutionBindingRecord>();
   private recoveryFaultSerialization: Promise<void> = Promise.resolve();
+  private initializationSerialization: Promise<void> = Promise.resolve();
 
   constructor(private readonly atomicFaultPauseStore?: InMemoryAtomicFaultPauseStore) {}
 
   async createDeploymentWithInitialState(
     input: CreateCandidatePilotDeploymentInput,
   ): Promise<PositionGuardPilotDeploymentRecord> {
-    const deployment = validateCandidatePilotDeployment(input.deployment);
-    validatePositionGuardCandidateState(input.initialState);
-    if (!isPristineInitialState(input.initialState)) {
-      throw new Error("Candidate pilot deployment initial state must be pristine.");
-    }
+    const deployment = this.validateInitialDeployment(input);
     if (this.deployments.has(deployment.id)) {
       throw new Error(`Candidate pilot deployment ${deployment.id} already exists.`);
     }
@@ -75,6 +73,41 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
     )) {
       throw new Error(`Candidate pilot deployment already exists for account ${deployment.exchangeAccountId}.`);
     }
+    this.insertDeploymentWithInitialState(deployment);
+    return { ...deployment };
+  }
+
+  async initializeDeploymentWithInitialState(
+    input: CreateCandidatePilotDeploymentInput,
+  ): Promise<CandidatePilotDeploymentInitializationResult> {
+    return this.serializeInitialization(async () => {
+      const deployment = this.validateInitialDeployment(input);
+      const existing = this.deployments.get(deployment.id) ?? [...this.deployments.values()]
+        .find((candidate) =>
+          candidate.exchangeAccountId === deployment.exchangeAccountId && candidate.pilotId === deployment.pilotId,
+        );
+      if (existing) {
+        return this.bootstrapAuthority("EXISTING", existing);
+      }
+      this.insertDeploymentWithInitialState(deployment);
+      const created = this.deployments.get(deployment.id);
+      if (!created) {
+        throw new Error(`Candidate pilot deployment ${deployment.id} was not persisted.`);
+      }
+      return this.bootstrapAuthority("CREATED", created);
+    });
+  }
+
+  private validateInitialDeployment(input: CreateCandidatePilotDeploymentInput): PositionGuardPilotDeploymentRecord {
+    const deployment = validateCandidatePilotDeployment(input.deployment);
+    validatePositionGuardCandidateState(input.initialState);
+    if (!isPristineInitialState(input.initialState)) {
+      throw new Error("Candidate pilot deployment initial state must be pristine.");
+    }
+    return deployment;
+  }
+
+  private insertDeploymentWithInitialState(deployment: PositionGuardPilotDeploymentRecord): void {
     this.deployments.set(deployment.id, { ...deployment });
     this.exactStates.set(deployment.id, createExactEmptyCandidateState());
     this.evidence.set(deployment.id, []);
@@ -93,7 +126,37 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
       }),
       createdAt: deployment.createdAt,
     }]);
-    return { ...deployment };
+  }
+
+  private bootstrapAuthority(
+    outcome: CandidatePilotDeploymentInitializationResult["outcome"],
+    deployment: PositionGuardPilotDeploymentRecord,
+  ): CandidatePilotDeploymentInitializationResult {
+    const exactState = this.exactStates.get(deployment.id);
+    if (!exactState) {
+      throw new Error(`Candidate pilot deployment ${deployment.id} is missing exact state authority.`);
+    }
+    const evidenceRecords = orderedEvidence(this.evidence.get(deployment.id) ?? []).map((item) => Object.freeze({
+      evidence: Object.freeze({ ...item.record.evidence }),
+      materialHash: item.record.materialHash,
+      materialVersion: item.record.materialVersion,
+    }));
+    const auditEvents = [...(this.auditEvents.get(deployment.id) ?? [])]
+      .sort((left, right) => {
+        const leftEpoch = parsePositionGuardCandidateTimestamp(left.createdAt, "audit createdAt");
+        const rightEpoch = parsePositionGuardCandidateTimestamp(right.createdAt, "audit createdAt");
+        if (leftEpoch < rightEpoch) return -1;
+        if (leftEpoch > rightEpoch) return 1;
+        return left.id.localeCompare(right.id);
+      })
+      .map((event) => Object.freeze({ ...event }));
+    return Object.freeze({
+      outcome,
+      deployment: Object.freeze({ ...deployment }),
+      exactState: Object.freeze({ ...exactState }),
+      evidenceRecords: Object.freeze(evidenceRecords),
+      auditEvents: Object.freeze(auditEvents),
+    });
   }
 
   async getDeployment(deploymentId: string): Promise<PositionGuardPilotDeploymentRecord | null> {
@@ -504,6 +567,20 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
     const previous = this.recoveryFaultSerialization;
     let release!: () => void;
     this.recoveryFaultSerialization = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async serializeInitialization<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.initializationSerialization;
+    let release!: () => void;
+    this.initializationSerialization = new Promise<void>((resolve) => {
       release = resolve;
     });
     await previous;

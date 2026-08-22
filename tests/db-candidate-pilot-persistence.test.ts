@@ -16,6 +16,7 @@ import { test } from "./harness.js";
 import {
   advanceInput,
   initialDeploymentInput,
+  verifyAtomicDeploymentInitializationContract,
   verifyCandidatePilotRepositoryContract,
   verifyCandidatePilotIdentityValidation,
   verifyCandidateDeploymentActivationContract,
@@ -43,6 +44,72 @@ test("sqlite candidate pilot repository satisfies the common contracts", async (
   });
   await withFreshBundle("candidate-activation", async (bundle) => {
     await verifyCandidateDeploymentActivationContract(() => bundle.candidatePilots);
+  });
+  await withFreshBundle("candidate-atomic-bootstrap", async (bundle) => {
+    await verifyAtomicDeploymentInitializationContract(() => bundle.candidatePilots);
+  });
+});
+
+test("two sqlite candidate pilot connections initialize one deployment and preserve the existing authority", async () => {
+  const databasePath = await createTempDatabasePath("candidate-bootstrap-concurrency");
+  const bootstrap = createBundle(databasePath);
+  bootstrap.close();
+  const firstHandle = openSqliteDatabase(databasePath);
+  const secondHandle = openSqliteDatabase(databasePath);
+  try {
+    const first = new SqliteCandidatePilotRepository(firstHandle.db);
+    const second = new SqliteCandidatePilotRepository(secondHandle.db);
+    const input = initialDeploymentInput("candidate-bootstrap-concurrency");
+    const results = await Promise.all([
+      first.initializeDeploymentWithInitialState(input),
+      second.initializeDeploymentWithInitialState(input),
+    ]);
+
+    assert.deepEqual(results.map((result) => result.outcome).sort(), ["CREATED", "EXISTING"]);
+    assert.equal(
+      (firstHandle.db.prepare("SELECT COUNT(*) AS count FROM strategy_pilot_deployments").get() as { count: number }).count,
+      1,
+    );
+    assert.deepEqual(results[0].deployment, results[1].deployment);
+    assert.deepEqual(results[0].exactState, results[1].exactState);
+    assert.deepEqual(results[0].evidenceRecords, results[1].evidenceRecords);
+    assert.deepEqual(results[0].auditEvents, results[1].auditEvents);
+    assertDatabaseIntegrity(firstHandle.db);
+  } finally {
+    firstHandle.close();
+    secondHandle.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("sqlite candidate bootstrap rolls back every partial row when initial state persistence fails", async () => {
+  await withFreshBundle("candidate-bootstrap-rollback", async (bundle, _databasePath, db) => {
+    db.exec(`
+      CREATE TRIGGER reject_candidate_bootstrap_state
+      BEFORE INSERT ON strategy_candidate_states
+      BEGIN
+        SELECT RAISE(ABORT, 'forced candidate bootstrap failure');
+      END;
+    `);
+    const input = initialDeploymentInput("candidate-bootstrap-rollback");
+
+    await assert.rejects(
+      () => bundle.candidatePilots.initializeDeploymentWithInitialState(input),
+      /forced candidate bootstrap failure/i,
+    );
+    assert.equal(
+      (db.prepare("SELECT COUNT(*) AS count FROM strategy_pilot_deployments WHERE id = ?").get(input.deployment.id) as { count: number }).count,
+      0,
+    );
+    assert.equal(
+      (db.prepare("SELECT COUNT(*) AS count FROM strategy_candidate_states WHERE deployment_id = ?").get(input.deployment.id) as { count: number }).count,
+      0,
+    );
+    assert.equal(
+      (db.prepare("SELECT COUNT(*) AS count FROM strategy_pilot_audit_events WHERE deployment_id = ?").get(input.deployment.id) as { count: number }).count,
+      0,
+    );
+    assertDatabaseIntegrity(db);
   });
 });
 

@@ -84,6 +84,14 @@ export interface CreateCandidatePilotDeploymentInput {
   initialState: PositionGuardCandidateState;
 }
 
+export type CandidatePilotDeploymentInitializationResult = Readonly<{
+  outcome: "CREATED" | "EXISTING";
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>;
+  exactState: Readonly<ExactCandidateState>;
+  evidenceRecords: readonly Readonly<CandidateEvidenceRecord>[];
+  auditEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[];
+}>;
+
 export interface ActivateCandidatePilotDeploymentInput {
   deploymentId: string;
   expectedPhase: "PENDING_FLAT";
@@ -171,6 +179,9 @@ export interface CandidatePilotRepository {
   createDeploymentWithInitialState(
     input: CreateCandidatePilotDeploymentInput,
   ): Promise<PositionGuardPilotDeploymentRecord>;
+  initializeDeploymentWithInitialState(
+    input: CreateCandidatePilotDeploymentInput,
+  ): Promise<CandidatePilotDeploymentInitializationResult>;
   getDeployment(deploymentId: string): Promise<PositionGuardPilotDeploymentRecord | null>;
   getDeploymentForExchangeAccount(
     exchangeAccountId: string,

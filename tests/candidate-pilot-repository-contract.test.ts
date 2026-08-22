@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 
+import type { PositionGuardPilotAuditEventRecord } from "../src/domain/pilot-types.js";
 import {
   createEmptyPositionGuardCandidateState,
   parsePositionGuardCandidateTimestamp,
@@ -72,6 +73,87 @@ export function advanceInput(
     deploymentId,
     expectedStateVersion,
     evidence: candidateEvidence(evidenceId, overrides),
+  };
+}
+
+export async function verifyAtomicDeploymentInitializationContract(
+  create: CandidatePilotRepositoryFactory,
+): Promise<void> {
+  const repository = await create();
+  const input = initialDeploymentInput("deployment-atomic-bootstrap");
+
+  const created = await repository.initializeDeploymentWithInitialState(input);
+  assert.equal(created.outcome, "CREATED");
+  assert.deepEqual(created.deployment, input.deployment);
+  assert.equal(created.exactState.stateVersion, 0);
+  assert.equal(created.exactState.currentEpisodeInventoryQuantity, "0");
+  assert.deepEqual(created.evidenceRecords, []);
+  assert.deepEqual(created.auditEvents, [{
+    id: `${input.deployment.id}:created`,
+    deploymentId: input.deployment.id,
+    eventType: "DEPLOYMENT_CREATED",
+    fromPhase: null,
+    toPhase: "PENDING_FLAT",
+    stateVersion: 0,
+    payloadJson: JSON.stringify({
+      pilotId: input.deployment.pilotId,
+      market: input.deployment.market,
+      policyId: input.deployment.policyId,
+      policyVersion: input.deployment.policyVersion,
+    }),
+    createdAt: input.deployment.createdAt,
+  }]);
+  assert.equal(Object.isFrozen(created), true);
+  assert.equal(Object.isFrozen(created.deployment), true);
+  assert.equal(Object.isFrozen(created.exactState), true);
+  assert.equal(Object.isFrozen(created.evidenceRecords), true);
+  assert.equal(Object.isFrozen(created.auditEvents), true);
+  assert.equal(Object.isFrozen(created.auditEvents[0]), true);
+  const creationAudit = created.auditEvents[0];
+  assert.ok(creationAudit);
+  assert.throws(() => {
+    (created.deployment as { phase: string }).phase = "ACTIVE";
+  }, TypeError);
+  assert.throws(() => {
+    (created.auditEvents as PositionGuardPilotAuditEventRecord[]).push({
+      ...creationAudit,
+      id: "forged",
+    });
+  }, TypeError);
+
+  const restarted = await repository.initializeDeploymentWithInitialState(input);
+  assert.equal(restarted.outcome, "EXISTING");
+  assert.deepEqual(restoredAuthority(restarted), restoredAuthority(created));
+
+  const differentRequestedAuthority = initialDeploymentInput(
+    "deployment-different-deterministic-id",
+  );
+  differentRequestedAuthority.deployment.createdAt = "2026-08-22T00:00:00.000Z";
+  differentRequestedAuthority.deployment.updatedAt = "2026-08-22T00:00:00.000Z";
+  const existing = await repository.initializeDeploymentWithInitialState(differentRequestedAuthority);
+  assert.equal(existing.outcome, "EXISTING");
+  assert.deepEqual(restoredAuthority(existing), restoredAuthority(created));
+  assert.equal((await repository.getDeployment(differentRequestedAuthority.deployment.id)), null);
+
+  const accessorInput = initialDeploymentInput("deployment-accessor-rejected", "secondary");
+  const accessorId = accessorInput.deployment.id;
+  Object.defineProperty(accessorInput.deployment, "id", {
+    enumerable: true,
+    get: () => accessorId,
+  });
+  await assert.rejects(
+    () => repository.initializeDeploymentWithInitialState(accessorInput),
+    /own data properties|accessor/i,
+  );
+  assert.equal((await repository.getDeployment("deployment-accessor-rejected")), null);
+}
+
+function restoredAuthority(value: Awaited<ReturnType<CandidatePilotRepository["initializeDeploymentWithInitialState"]>>) {
+  return {
+    deployment: value.deployment,
+    exactState: value.exactState,
+    evidenceRecords: value.evidenceRecords,
+    auditEvents: value.auditEvents,
   };
 }
 
@@ -366,6 +448,10 @@ export async function verifyCandidateDeploymentActivationContract(
 
 test("in-memory candidate pilot repository satisfies the common contract", async () => {
   await verifyCandidatePilotRepositoryContract(() => new InMemoryCandidatePilotRepository());
+});
+
+test("in-memory candidate pilot repository atomically initializes a frozen deployment authority", async () => {
+  await verifyAtomicDeploymentInitializationContract(() => new InMemoryCandidatePilotRepository());
 });
 
 test("in-memory exact recovery lookup ignores an earlier foreign-account deployment", async () => {

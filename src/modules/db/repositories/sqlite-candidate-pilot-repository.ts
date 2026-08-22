@@ -36,6 +36,7 @@ import {
   type AdvanceCandidatePilotStateResult,
   type ActivateCandidatePilotDeploymentInput,
   type CandidateEvidenceRecord,
+  type CandidatePilotDeploymentInitializationResult,
   type CandidatePilotRecoveryIdentity,
   type CandidatePilotRepository,
   type CreateCandidatePilotDeploymentInput,
@@ -163,56 +164,29 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
   async createDeploymentWithInitialState(
     input: CreateCandidatePilotDeploymentInput,
   ): Promise<PositionGuardPilotDeploymentRecord> {
-    const deployment = validateCandidatePilotDeployment(input.deployment);
-    validatePositionGuardCandidateState(input.initialState);
-    if (!isPristineInitialState(input.initialState)) {
-      throw new Error("Candidate pilot deployment initial state must be pristine.");
-    }
-    const exactState = createExactEmptyCandidateState();
-    const createdAtEpochNs = parsePositionGuardCandidateTimestamp(deployment.createdAt, "deployment createdAt");
+    const bootstrap = prepareInitialDeployment(input);
     withImmediateTransaction(this.db, () => {
-      this.db.prepare(`
-        INSERT INTO strategy_pilot_deployments (
-          id, exchange_account_id, pilot_id, market, policy_id, policy_version,
-          phase, activation_at, activation_epoch_ns, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        deployment.id,
-        deployment.exchangeAccountId,
-        deployment.pilotId,
-        deployment.market,
-        deployment.policyId,
-        deployment.policyVersion,
-        deployment.phase,
-        deployment.activationAt,
-        deployment.activationEpochNs === null ? null : deployment.activationEpochNs.toString(),
-        deployment.createdAt,
-        deployment.updatedAt,
-      );
-      insertExactState(this.db, deployment.id, exactState, deployment.updatedAt);
-      this.db.prepare(`
-        INSERT INTO strategy_pilot_audit_events (
-          id, deployment_id, event_type, from_phase, to_phase, state_version,
-          payload_json, created_at, created_at_epoch_ns
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        `${deployment.id}:created`,
-        deployment.id,
-        "DEPLOYMENT_CREATED",
-        null,
-        deployment.phase,
-        0,
-        JSON.stringify({
-          pilotId: deployment.pilotId,
-          market: deployment.market,
-          policyId: deployment.policyId,
-          policyVersion: deployment.policyVersion,
-        }),
-        deployment.createdAt,
-        createdAtEpochNs,
-      );
+      insertDeploymentWithInitialState(this.db, bootstrap);
     });
-    return deployment;
+    return bootstrap.deployment;
+  }
+
+  async initializeDeploymentWithInitialState(
+    input: CreateCandidatePilotDeploymentInput,
+  ): Promise<CandidatePilotDeploymentInitializationResult> {
+    const bootstrap = prepareInitialDeployment(input);
+    return withImmediateTransaction(this.db, () => {
+      const existing = selectBootstrapExistingDeploymentRow(this.db, bootstrap.deployment);
+      if (existing) {
+        return bootstrapAuthorityFromDatabase(this.db, existing, "EXISTING");
+      }
+      insertDeploymentWithInitialState(this.db, bootstrap);
+      const created = selectDeploymentRow(this.db, bootstrap.deployment.id);
+      if (!created) {
+        throw new Error(`Candidate pilot deployment ${bootstrap.deployment.id} was not persisted.`);
+      }
+      return bootstrapAuthorityFromDatabase(this.db, created, "CREATED");
+    });
   }
 
   async getDeployment(deploymentId: string): Promise<PositionGuardPilotDeploymentRecord | null> {
@@ -339,16 +313,7 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
   }
 
   async listEvidenceRecords(deploymentId: string): Promise<Array<Readonly<CandidateEvidenceRecord>>> {
-    const rows = this.db.prepare(`
-      SELECT id, executed_at, action, entry_path, terminal_status,
-        executed_quantity, gross_quote_value_krw, confirmed_fee_krw, remaining_quantity,
-        material_hash, material_version, executed_quantity_exact, gross_quote_value_krw_exact,
-        confirmed_fee_krw_exact, remaining_quantity_exact
-      FROM strategy_candidate_execution_evidence
-      WHERE deployment_id = ?
-      ORDER BY executed_at_epoch_ns ASC, id ASC
-    `).all(deploymentId) as unknown as EvidenceRow[];
-    return rows.map(evidenceRecordFromRow);
+    return selectEvidenceRecords(this.db, deploymentId);
   }
 
   async getEvidenceRecord(
@@ -368,22 +333,7 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
   }
 
   async listAuditEvents(deploymentId: string): Promise<PositionGuardPilotAuditEventRecord[]> {
-    const rows = this.db.prepare(`
-      SELECT id, deployment_id, event_type, from_phase, to_phase, state_version, payload_json, created_at
-      FROM strategy_pilot_audit_events
-      WHERE deployment_id = ?
-      ORDER BY created_at_epoch_ns ASC, id ASC
-    `).all(deploymentId) as unknown as AuditRow[];
-    return rows.map((row) => ({
-      id: row.id,
-      deploymentId: row.deployment_id,
-      eventType: row.event_type,
-      fromPhase: row.from_phase,
-      toPhase: row.to_phase,
-      stateVersion: row.state_version,
-      payloadJson: row.payload_json,
-      createdAt: row.created_at,
-    }));
+    return selectAuditEvents(this.db, deploymentId);
   }
 
   async createExecutionBinding(input: CandidateExecutionBindingRecord): Promise<CandidateExecutionBindingRecord> {
@@ -775,6 +725,109 @@ function selectDeploymentRow(db: DatabaseSync, deploymentId: string): Deployment
   `).get(deploymentId) as DeploymentRow | undefined;
 }
 
+function prepareInitialDeployment(input: CreateCandidatePilotDeploymentInput): {
+  deployment: PositionGuardPilotDeploymentRecord;
+  exactState: Readonly<ExactCandidateState>;
+  createdAtEpochNs: bigint;
+} {
+  const deployment = validateCandidatePilotDeployment(input.deployment);
+  validatePositionGuardCandidateState(input.initialState);
+  if (!isPristineInitialState(input.initialState)) {
+    throw new Error("Candidate pilot deployment initial state must be pristine.");
+  }
+  return {
+    deployment,
+    exactState: createExactEmptyCandidateState(),
+    createdAtEpochNs: parsePositionGuardCandidateTimestamp(deployment.createdAt, "deployment createdAt"),
+  };
+}
+
+function insertDeploymentWithInitialState(
+  db: DatabaseSync,
+  bootstrap: {
+    deployment: PositionGuardPilotDeploymentRecord;
+    exactState: Readonly<ExactCandidateState>;
+    createdAtEpochNs: bigint;
+  },
+): void {
+  const { deployment } = bootstrap;
+  db.prepare(`
+    INSERT INTO strategy_pilot_deployments (
+      id, exchange_account_id, pilot_id, market, policy_id, policy_version,
+      phase, activation_at, activation_epoch_ns, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    deployment.id,
+    deployment.exchangeAccountId,
+    deployment.pilotId,
+    deployment.market,
+    deployment.policyId,
+    deployment.policyVersion,
+    deployment.phase,
+    deployment.activationAt,
+    deployment.activationEpochNs === null ? null : deployment.activationEpochNs.toString(),
+    deployment.createdAt,
+    deployment.updatedAt,
+  );
+  insertExactState(db, deployment.id, bootstrap.exactState, deployment.updatedAt);
+  insertAuditEvent(db, {
+    id: `${deployment.id}:created`,
+    deploymentId: deployment.id,
+    eventType: "DEPLOYMENT_CREATED",
+    fromPhase: null,
+    toPhase: deployment.phase,
+    stateVersion: 0,
+    payloadJson: JSON.stringify({
+      pilotId: deployment.pilotId,
+      market: deployment.market,
+      policyId: deployment.policyId,
+      policyVersion: deployment.policyVersion,
+    }),
+    createdAt: deployment.createdAt,
+  }, bootstrap.createdAtEpochNs);
+}
+
+function selectBootstrapExistingDeploymentRow(
+  db: DatabaseSync,
+  requested: PositionGuardPilotDeploymentRecord,
+): DeploymentRow | undefined {
+  const byId = selectDeploymentRow(db, requested.id);
+  if (byId) return byId;
+  return db.prepare(`
+    SELECT id, exchange_account_id, pilot_id, market, policy_id, policy_version,
+      phase, activation_at, activation_epoch_ns, created_at, updated_at
+    FROM strategy_pilot_deployments
+    WHERE exchange_account_id = ? AND pilot_id = ?
+    ORDER BY created_at ASC, id ASC
+    LIMIT 1
+  `).get(requested.exchangeAccountId, requested.pilotId) as DeploymentRow | undefined;
+}
+
+function bootstrapAuthorityFromDatabase(
+  db: DatabaseSync,
+  deploymentRow: DeploymentRow,
+  outcome: CandidatePilotDeploymentInitializationResult["outcome"],
+): CandidatePilotDeploymentInitializationResult {
+  const deployment = validateCandidatePilotDeployment(deploymentFromRow(deploymentRow));
+  const stateRow = selectStateRow(db, deployment.id);
+  if (!stateRow || stateRow.material_version !== "EXACT_V2") {
+    throw new Error(`Candidate pilot deployment ${deployment.id} is missing exact state authority.`);
+  }
+  const evidenceRecords = selectEvidenceRecords(db, deployment.id).map((record) => Object.freeze({
+    evidence: Object.freeze({ ...record.evidence }),
+    materialHash: record.materialHash,
+    materialVersion: record.materialVersion,
+  }));
+  const auditEvents = selectAuditEvents(db, deployment.id).map((event) => Object.freeze({ ...event }));
+  return Object.freeze({
+    outcome,
+    deployment: Object.freeze({ ...deployment }),
+    exactState: Object.freeze({ ...exactStateFromRow(stateRow) }),
+    evidenceRecords: Object.freeze(evidenceRecords),
+    auditEvents: Object.freeze(auditEvents),
+  });
+}
+
 function selectStateRow(db: DatabaseSync, deploymentId: string): StateRow | undefined {
   return db.prepare(`
     SELECT current_episode_add_count, current_episode_cost_basis_krw,
@@ -785,6 +838,32 @@ function selectStateRow(db: DatabaseSync, deploymentId: string): StateRow | unde
       current_episode_realized_pnl_krw_exact, last_full_exit_realized_pnl_krw_exact
     FROM strategy_candidate_states WHERE deployment_id = ?
   `).get(deploymentId) as StateRow | undefined;
+}
+
+function selectEvidenceRecords(
+  db: DatabaseSync,
+  deploymentId: string,
+): Array<Readonly<CandidateEvidenceRecord>> {
+  const rows = db.prepare(`
+    SELECT id, executed_at, action, entry_path, terminal_status,
+      executed_quantity, gross_quote_value_krw, confirmed_fee_krw, remaining_quantity,
+      material_hash, material_version, executed_quantity_exact, gross_quote_value_krw_exact,
+      confirmed_fee_krw_exact, remaining_quantity_exact
+    FROM strategy_candidate_execution_evidence
+    WHERE deployment_id = ?
+    ORDER BY executed_at_epoch_ns ASC, id ASC
+  `).all(deploymentId) as unknown as EvidenceRow[];
+  return rows.map(evidenceRecordFromRow);
+}
+
+function selectAuditEvents(db: DatabaseSync, deploymentId: string): PositionGuardPilotAuditEventRecord[] {
+  const rows = db.prepare(`
+    SELECT id, deployment_id, event_type, from_phase, to_phase, state_version, payload_json, created_at
+    FROM strategy_pilot_audit_events
+    WHERE deployment_id = ?
+    ORDER BY created_at_epoch_ns ASC, id ASC
+  `).all(deploymentId) as unknown as AuditRow[];
+  return rows.map(auditEventFromRow);
 }
 
 function selectAuditRowById(db: DatabaseSync, id: string): AuditRow | undefined {
