@@ -38,8 +38,10 @@ No `createApp` or scheduler runtime wiring was added in this task.
 
 ## Independent Review
 
-- The two reported P1 findings have focused RED/GREEN coverage and are implemented as closed in this patch.
-- Independent review confirmation remains pending before Task 9C2c is considered fully reviewed.
+- Euclid reproduced two P1 authority TOCTOU findings against the initial implementation.
+- Both findings received focused RED/GREEN coverage in commit `370edd6`.
+- Herschel independently re-reviewed the complete 9C2c range and returned CLEAN.
+- The accepted residual boundary is shallow authority capture: collaborator references are fixed, while collaborator objects remain trusted and are not deep-frozen.
 
 ## Safety
 
