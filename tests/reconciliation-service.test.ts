@@ -97,6 +97,48 @@ test("reconciliation runWithRecord returns its exact persisted record as a detac
   assert.ok(!persisted.some((record) => record.id === "mutated-return-value"));
 });
 
+test("reconciliation runWithRecord protects exact provenance from mutation during persistence", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-protected-reconciliation-record",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-08-22T00:00:00.000Z",
+  });
+  const originalSave = repositories.saveReconciliationRun.bind(repositories);
+  let mutationRejected = false;
+  repositories.saveReconciliationRun = async (record) => {
+    await originalSave(record);
+    try {
+      record.id = "mutated-during-save";
+      record.exchangeAccountId = "foreign-account";
+    } catch {
+      mutationRejected = true;
+    }
+  };
+  const service = new ReconciliationService({ repositories, operatorState });
+
+  const result = await service.runWithRecord("primary", {
+    runIdentity: {
+      id: "invocation-owned-run",
+      startedAt: "2026-08-22T00:00:00.000Z",
+    },
+  });
+  const runs = await repositories.listReconciliationRuns("primary");
+
+  assert.equal(mutationRejected, true);
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0]?.id, "invocation-owned-run");
+  assert.equal(runs[0]?.exchangeAccountId, "primary");
+  assert.deepEqual(result.reconciliationRun, runs[0]);
+});
+
 test("reconciliation run preserves the legacy summary API by delegating to the exact result", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = new InMemoryOperatorStateStore({

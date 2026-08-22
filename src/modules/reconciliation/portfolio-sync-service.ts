@@ -44,6 +44,10 @@ export class PortfolioSyncService {
     source: ReconciliationTrigger;
   }): Promise<PortfolioSyncRunResult> {
     const requestedAt = this.dependencies.now?.() ?? new Date().toISOString();
+    const reconciliationRunIdentity = Object.freeze({
+      id: createId("recon_run"),
+      startedAt: requestedAt,
+    });
 
     try {
       const previousBalanceSnapshot = await this.dependencies.repositories.getLatestBalanceSnapshot(input.exchangeAccountId);
@@ -70,6 +74,7 @@ export class PortfolioSyncService {
 
       const reconciliationResult = await this.dependencies.reconciliationService.runWithRecord(input.exchangeAccountId, {
         source: input.source,
+        runIdentity: reconciliationRunIdentity,
         portfolioSnapshots: {
           previousBalanceSnapshot,
           currentBalanceSnapshot: balanceSnapshot,
@@ -90,11 +95,11 @@ export class PortfolioSyncService {
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown portfolio sync failure.";
-      await this.dependencies.repositories.saveReconciliationRun({
-        id: createId("recon_run"),
+      await this.dependencies.repositories.updateReconciliationRun({
+        id: reconciliationRunIdentity.id,
         exchangeAccountId: input.exchangeAccountId,
         status: "ERROR",
-        startedAt: requestedAt,
+        startedAt: reconciliationRunIdentity.startedAt,
         completedAt: requestedAt,
         summaryJson: JSON.stringify({
           source: input.source,

@@ -4,6 +4,7 @@ import type { ReconciliationRunRecord } from "../src/domain/types.js";
 import { InMemoryExecutionRepository } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { PortfolioSyncService } from "../src/modules/reconciliation/portfolio-sync-service.js";
 import type { ReconciliationSummary } from "../src/modules/reconciliation/interfaces.js";
+import type { ReconciliationService } from "../src/modules/reconciliation/reconciliation-service.js";
 import { test } from "./harness.js";
 
 const SUMMARY: ReconciliationSummary = {
@@ -28,7 +29,7 @@ const EXACT_RUN: ReconciliationRunRecord = {
 
 function createService(input: {
   repositories: InMemoryExecutionRepository;
-  runWithRecord: () => Promise<{ summary: ReconciliationSummary; reconciliationRun: ReconciliationRunRecord }>;
+  runWithRecord: ReconciliationService["runWithRecord"];
 }) {
   return new PortfolioSyncService({
     exchangeAdapter: {
@@ -74,9 +75,11 @@ test("portfolio sync propagates the exact reconciliation record from the same in
 test("portfolio sync persists an ERROR reconciliation row and rethrows an exact-result failure", async () => {
   const repositories = new InMemoryExecutionRepository();
   const failure = new Error("exact reconciliation failed");
+  let receivedIdentity: { id: string; startedAt: string } | undefined;
   const service = createService({
     repositories,
-    async runWithRecord() {
+    async runWithRecord(_exchangeAccountId, options) {
+      receivedIdentity = options?.runIdentity;
       throw failure;
     },
   });
@@ -87,8 +90,47 @@ test("portfolio sync persists an ERROR reconciliation row and rethrows an exact-
   );
   const runs = await repositories.listReconciliationRuns("primary");
 
+  assert.ok(receivedIdentity);
   assert.equal(runs.length, 1);
+  assert.equal(runs[0]?.id, receivedIdentity.id);
+  assert.equal(runs[0]?.startedAt, receivedIdentity.startedAt);
   assert.equal(runs[0]?.status, "ERROR");
   assert.equal(runs[0]?.errorMessage, "exact reconciliation failed");
   assert.equal(JSON.parse(runs[0]?.summaryJson ?? "{}").source, "SCHEDULER_PREFLIGHT");
+});
+
+test("portfolio sync converts a persist-then-throw reconciliation into one ERROR row for the same invocation", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const failure = new Error("persistence callback failed after save");
+  let receivedIdentity: { id: string; startedAt: string } | undefined;
+  const service = createService({
+    repositories,
+    async runWithRecord(exchangeAccountId, options) {
+      receivedIdentity = options?.runIdentity;
+      assert.ok(receivedIdentity);
+      await repositories.saveReconciliationRun({
+        id: receivedIdentity.id,
+        exchangeAccountId,
+        status: "SUCCESS",
+        startedAt: receivedIdentity.startedAt,
+        completedAt: "2026-08-22T00:00:00.001Z",
+        summaryJson: JSON.stringify(SUMMARY),
+        errorMessage: null,
+      });
+      throw failure;
+    },
+  });
+
+  await assert.rejects(
+    service.run({ exchangeAccountId: "primary", source: "SCHEDULER_PREFLIGHT" }),
+    (error) => error === failure,
+  );
+  const runs = await repositories.listReconciliationRuns("primary");
+
+  assert.ok(receivedIdentity);
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0]?.id, receivedIdentity.id);
+  assert.equal(runs[0]?.startedAt, receivedIdentity.startedAt);
+  assert.equal(runs[0]?.status, "ERROR");
+  assert.equal(runs[0]?.errorMessage, failure.message);
 });

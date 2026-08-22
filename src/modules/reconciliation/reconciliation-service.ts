@@ -78,6 +78,22 @@ export interface ReconciliationRunResult {
   reconciliationRun: ReconciliationRunRecord;
 }
 
+export interface ReconciliationRunIdentity {
+  readonly id: string;
+  readonly startedAt: string;
+}
+
+export interface ReconciliationRunOptions {
+  source?: ReconciliationTrigger;
+  portfolioSnapshots?: {
+    previousBalanceSnapshot: BalanceSnapshotRecord | null;
+    currentBalanceSnapshot: BalanceSnapshotRecord | null;
+    previousPositionSnapshot: PositionSnapshotRecord | null;
+    currentPositionSnapshot: PositionSnapshotRecord | null;
+  };
+  runIdentity?: ReconciliationRunIdentity;
+}
+
 export class ReconciliationService {
   constructor(
     private readonly dependencies: {
@@ -248,33 +264,21 @@ export class ReconciliationService {
 
   async run(
     exchangeAccountId: string,
-    options?: {
-      source?: ReconciliationTrigger;
-      portfolioSnapshots?: {
-        previousBalanceSnapshot: BalanceSnapshotRecord | null;
-        currentBalanceSnapshot: BalanceSnapshotRecord | null;
-        previousPositionSnapshot: PositionSnapshotRecord | null;
-        currentPositionSnapshot: PositionSnapshotRecord | null;
-      };
-    },
+    options?: ReconciliationRunOptions,
   ): Promise<ReconciliationSummary> {
     return (await this.runWithRecord(exchangeAccountId, options)).summary;
   }
 
   async runWithRecord(
     exchangeAccountId: string,
-    options?: {
-      source?: ReconciliationTrigger;
-      portfolioSnapshots?: {
-        previousBalanceSnapshot: BalanceSnapshotRecord | null;
-        currentBalanceSnapshot: BalanceSnapshotRecord | null;
-        previousPositionSnapshot: PositionSnapshotRecord | null;
-        currentPositionSnapshot: PositionSnapshotRecord | null;
-      };
-    },
+    options?: ReconciliationRunOptions,
   ): Promise<ReconciliationRunResult> {
     const maxOrderLookupsPerRun = this.dependencies.maxOrderLookupsPerRun ?? 10;
-    const startedAt = new Date().toISOString();
+    const runIdentity = Object.freeze({
+      id: options?.runIdentity?.id ?? createId("recon_run"),
+      startedAt: options?.runIdentity?.startedAt ?? new Date().toISOString(),
+    });
+    const startedAt = runIdentity.startedAt;
     const [openOrders, allOrders, state] = await Promise.all([
       this.dependencies.repositories.listActiveOrders(exchangeAccountId),
       this.dependencies.repositories.listOrders(exchangeAccountId),
@@ -346,16 +350,17 @@ export class ReconciliationService {
       ...(historyRecovery.historyRecovery ? { historyRecovery: historyRecovery.historyRecovery } : {}),
     };
 
-    const reconciliationRun: ReconciliationRunRecord = {
-      id: createId("recon_run"),
+    const reconciliationRun = Object.freeze<ReconciliationRunRecord>({
+      id: runIdentity.id,
       exchangeAccountId,
       status: summary.status,
       startedAt,
       completedAt: new Date().toISOString(),
       summaryJson: JSON.stringify(summary),
       errorMessage: null,
-    };
-    await this.dependencies.repositories.saveReconciliationRun(reconciliationRun);
+    });
+    const persistenceRecord = Object.freeze<ReconciliationRunRecord>({ ...reconciliationRun });
+    await this.dependencies.repositories.saveReconciliationRun(persistenceRecord);
     if (summary.status === "DRIFT_DETECTED") {
       await this.safeReport({
         exchangeAccountId,
