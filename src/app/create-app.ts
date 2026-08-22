@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
 import { buildExecutionRiskLimits, loadAppConfig, type AppConfig } from "./env.js";
+import { CandidateBtcRunPreparationService } from "./candidate-btc-run-preparation.js";
+import { PositionGuardPilotRecovery } from "./position-guard-pilot-recovery.js";
+import { loadCheckedInPositionGuardPilotAbandonment } from "./position-guard-pilot-registry-loader.js";
 import { buildManualStrategyRunPreflight, buildStrategySchedulerStartupPreflight } from "./scheduler-preflight.js";
 import {
   createDefaultStrategySchedulerConfig,
@@ -42,13 +45,14 @@ import {
   TelegramInboundPollingService,
 } from "../modules/telegram/inbound.js";
 import { DurableTelegramReporter } from "../modules/telegram/reporter.js";
+import type { PositionGuardPilotAbandonmentValidation } from "../domain/pilot-types.js";
 
 export interface AppServices {
   config: AppConfig;
   repositories: ExecutionRepository;
   operatorState: OperatorStateStore;
   executionService: ExecutionService;
-  candidateEvidenceService: CandidateExecutionEvidenceService;
+  candidateEvidenceService: CandidateExecutionEvidenceService | null;
   reconciliationService: ReconciliationService;
   portfolioSyncService: PortfolioSyncService;
   telegramRouter: TelegramCommandRouter;
@@ -67,6 +71,7 @@ export interface AppServices {
 export interface CreateAppOverrides {
   publicMarketDataReader?: PositionGuardPublicMarketDataReader;
   privateExchangeAdapter?: LiveExecutionAdapter;
+  loadCandidatePilotAbandonment?: () => PositionGuardPilotAbandonmentValidation;
 }
 
 export function createApp(
@@ -74,6 +79,14 @@ export function createApp(
   overrides: CreateAppOverrides = {},
 ): AppServices {
   const telegramLocale = config.telegramLocale;
+  const candidatePolicySelection = config.positionGuardPolicySelection.kind === "BTC_CANDIDATE_PILOT"
+    ? config.positionGuardPolicySelection
+    : null;
+  if (candidatePolicySelection) {
+    const authority = (overrides.loadCandidatePilotAbandonment ??
+      loadCheckedInPositionGuardPilotAbandonment)();
+    assertCandidatePilotAbandonmentAuthority(authority);
+  }
   const persistence = createSqlitePersistence({
     databasePath: config.databasePath,
     exchangeAccountId: "primary",
@@ -140,6 +153,7 @@ export function createApp(
     accountExecutionLeaseMs: config.accountExecutionLeaseMs,
     operatorState,
     reporter,
+    ...(candidatePolicySelection ? { candidatePilots: persistence.candidatePilots } : {}),
   });
   const recoveryClock = {
     now: () => {
@@ -147,35 +161,43 @@ export function createApp(
       return { observedAt, observedAtEpochMs: Date.parse(observedAt) };
     },
   };
-  const candidateEvidenceService = new CandidateExecutionEvidenceService({
-    exchangeAccountId: "primary",
-    repositories,
-    pilotRepository: persistence.candidatePilots,
-    operatorState,
-    clock: {
-      now: () => {
-        const occurredAt = new Date().toISOString();
-        return { occurredAt, occurredAtEpochMs: Date.parse(occurredAt) };
-      },
-    },
-  });
+  const candidateEvidenceService = candidatePolicySelection
+    ? new CandidateExecutionEvidenceService({
+        exchangeAccountId: "primary",
+        repositories,
+        pilotRepository: persistence.candidatePilots,
+        operatorState,
+        clock: {
+          now: () => {
+            const occurredAt = new Date().toISOString();
+            return { occurredAt, occurredAtEpochMs: Date.parse(occurredAt) };
+          },
+        },
+      })
+    : null;
+  const candidateRunVerifier = candidatePolicySelection
+    ? createCandidateRunVerifier({
+        candidatePolicySelection,
+        repositories,
+        candidatePilots: persistence.candidatePilots,
+        operatorState,
+        freshnessThresholdMs: Math.min(
+          config.strategySchedulerBtcIntervalMs,
+          config.strategySchedulerEthIntervalMs,
+        ),
+      })
+    : null;
   const positionGuardRunner = new PositionGuardStrategyRunner({
     repositories,
     executionService,
     marketDataReader: publicMarketDataReader,
     config: createDefaultPositionGuardRunnerConfig("primary"),
-  });
-  const strategyRunController = new InlineTelegramStrategyRunController({
-    runner: positionGuardRunner,
-    beforeManualRunPreflight: async () =>
-      buildManualStrategyRunPreflight({
-        config,
-        exchangeAccountId: "primary",
-        executionState: await operatorState.getState(),
-        repositories,
-        exchangeBackedReadEnabled,
-        liveSendPath,
-      }),
+    ...(candidatePolicySelection && candidateRunVerifier
+      ? {
+          policySelection: candidatePolicySelection,
+          candidateRunVerifier,
+        }
+      : {}),
   });
   const reconciliationDependencies = {
     repositories,
@@ -188,7 +210,7 @@ export function createApp(
     historyRetentionAssumptionDays: config.reconciliationHistoryRetentionAssumptionDays,
     identifierRecovery: DEFAULT_IDENTIFIER_RECOVERY_POLICY,
     recoveryClock,
-    candidateEvidenceService,
+    ...(candidateEvidenceService ? { candidateEvidenceService } : {}),
     ...(exchangeBackedReadEnabled ? {
       orderReader: privateExchangeAdapter,
       orderHistoryReader: privateExchangeAdapter,
@@ -200,6 +222,33 @@ export function createApp(
     marketPriceReader: publicMarketDataReader,
     repositories,
     reconciliationService,
+  });
+  const candidateBtcRunPreparation = candidatePolicySelection
+    ? new CandidateBtcRunPreparationService({
+        config: {
+          strategySchedulerBtcIntervalMs: config.strategySchedulerBtcIntervalMs,
+          strategySchedulerEthIntervalMs: config.strategySchedulerEthIntervalMs,
+          liveExecutionGate: config.liveExecutionGate,
+        },
+        portfolioSync: portfolioSyncService,
+        operatorState,
+        repositories,
+        exchangeBackedReadEnabled,
+        liveSendPath,
+      })
+    : null;
+  const strategyRunController = new InlineTelegramStrategyRunController({
+    runner: positionGuardRunner,
+    ...(candidateBtcRunPreparation ? { candidateBtcRunPreparation } : {}),
+    beforeManualRunPreflight: async () =>
+      buildManualStrategyRunPreflight({
+        config,
+        exchangeAccountId: "primary",
+        executionState: await operatorState.getState(),
+        repositories,
+        exchangeBackedReadEnabled,
+        liveSendPath,
+      }),
   });
   const strategyScheduler = new StrategyScheduler({
     config: createDefaultStrategySchedulerConfig({
@@ -213,6 +262,12 @@ export function createApp(
     controller: strategyRunController,
     repositories,
     reporter,
+    ...(candidatePolicySelection
+      ? {
+          resolveRunPreparationOwner: (market: "KRW-BTC" | "KRW-ETH") =>
+            market === "KRW-BTC" ? "CONTROLLER" as const : "SCHEDULER" as const,
+        }
+      : {}),
     ...(config.executionMode === "LIVE" && config.strategySchedulerEnabled
       ? {
           beforeRunAccountRefresh: async () => {
@@ -344,6 +399,67 @@ export function createApp(
     telegramInboundPolling,
     persistence,
   };
+}
+
+function createCandidateRunVerifier(input: {
+  candidatePolicySelection: Extract<AppConfig["positionGuardPolicySelection"], { kind: "BTC_CANDIDATE_PILOT" }>;
+  repositories: ExecutionRepository;
+  candidatePilots: SqlitePersistenceBundle["candidatePilots"];
+  operatorState: OperatorStateStore;
+  freshnessThresholdMs: number;
+}): PositionGuardPilotRecovery {
+  const getTransitionById = input.operatorState.getTransitionById;
+  if (!getTransitionById) {
+    throw new Error("Candidate pilot recovery requires persisted execution transition lookup.");
+  }
+
+  return new PositionGuardPilotRecovery({
+    exchangeAccountId: "primary",
+    target: { kind: "CONFIGURED_ACCOUNT_PILOT" },
+    pilotId: input.candidatePolicySelection.pilotId,
+    market: input.candidatePolicySelection.market,
+    policyId: input.candidatePolicySelection.policyId,
+    policyVersion: input.candidatePolicySelection.policyVersion,
+    freshnessThresholdMs: input.freshnessThresholdMs,
+    minimumAbsenceObservations: DEFAULT_IDENTIFIER_RECOVERY_POLICY.minimumNotFoundObservations,
+    minimumAbsenceElapsedMs: DEFAULT_IDENTIFIER_RECOVERY_POLICY.minimumElapsedMs,
+    clock: {
+      now: () => {
+        const occurredAt = new Date().toISOString();
+        return { occurredAt, occurredAtEpochMs: Date.parse(occurredAt) };
+      },
+    },
+    repositories: input.repositories,
+    candidatePilots: input.candidatePilots,
+    operatorState: {
+      pauseForFault: input.operatorState.pauseForFault.bind(input.operatorState),
+      getTransitionById: getTransitionById.bind(input.operatorState),
+    },
+  });
+}
+
+function assertCandidatePilotAbandonmentAuthority(
+  authority: PositionGuardPilotAbandonmentValidation,
+): void {
+  const expected = {
+    valid: true,
+    experimentId: "PCS-2026-001",
+    eventAt: "2026-08-21T03:08:24.756Z",
+  } as const;
+  if (
+    typeof authority !== "object" || authority === null || Array.isArray(authority) ||
+    Object.getPrototypeOf(authority) !== Object.prototype ||
+    Object.keys(authority).length !== Object.keys(expected).length
+  ) {
+    throw new Error("PositionGuard candidate abandonment authority is malformed.");
+  }
+
+  for (const [key, value] of Object.entries(expected)) {
+    const descriptor = Object.getOwnPropertyDescriptor(authority, key);
+    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable || descriptor.value !== value) {
+      throw new Error("PositionGuard candidate abandonment authority is invalid.");
+    }
+  }
 }
 
 function createTelegramBotTokenRef(botToken: string): string {
