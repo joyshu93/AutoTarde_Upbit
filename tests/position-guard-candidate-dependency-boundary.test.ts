@@ -29,6 +29,15 @@ const APPROVED_PERSISTENCE_PROJECTOR_IMPORTERS = new Set([
 ]);
 const APPROVED_PERSISTENCE_PROJECTOR =
   "/src/modules/strategy/position-guard-candidate-state.ts";
+const APPROVED_RUNTIME_CANDIDATE_FILES = new Set([
+  "/src/modules/strategy/position-guard-candidate-policy.ts",
+  APPROVED_PERSISTENCE_PROJECTOR,
+]);
+const APPROVED_RUNTIME_CANDIDATE_EDGES = new Set([
+  "/src/modules/strategy/position-guard-policy-router.ts->/src/modules/strategy/position-guard-candidate-policy.ts",
+  "/src/modules/strategy/position-guard-policy-router.ts->/src/modules/strategy/position-guard-candidate-state.ts",
+  "/src/modules/strategy/position-guard-candidate-policy.ts->/src/modules/strategy/position-guard-candidate-state.ts",
+]);
 const FORBIDDEN_CANDIDATE_SOURCE_REFERENCES: readonly [RegExp, string][] = [
   [/\bprocess\.env\b/u, "runtime environment configuration"],
   [/(?:node:)?fs(?:\/promises)?\b/iu, "filesystem APIs"],
@@ -266,7 +275,7 @@ test("candidate modules recursively exclude operational, prospective, and side-e
   assert.ok(visited.size >= candidateFiles.length, "candidate dependency traversal must include every discovered candidate file");
 });
 
-test("runtime surfaces reach only the reviewed candidate persistence projector bridge", async () => {
+test("runtime surfaces reach only the reviewed runner route and persistence projector bridges", async () => {
   const candidateFiles = new Set((await discoverCandidateFiles()).map(toRepositoryPath));
   const runtimeFiles = await discoverRuntimeSurfaceFiles();
   assert.ok(runtimeFiles.length > 0, "the guard must discover runtime surface files");
@@ -274,7 +283,7 @@ test("runtime surfaces reach only the reviewed candidate persistence projector b
   await walkStaticImports(runtimeFiles, async (absoluteFile, _source, edges) => {
     const relativeFile = toRepositoryPath(absoluteFile);
     assert.equal(
-      candidateFiles.has(relativeFile) && relativeFile !== APPROVED_PERSISTENCE_PROJECTOR,
+      candidateFiles.has(relativeFile) && !APPROVED_RUNTIME_CANDIDATE_FILES.has(relativeFile),
       false,
       `${relativeFile} is a candidate module reachable from a runtime surface`,
     );
@@ -285,8 +294,11 @@ test("runtime surfaces reach only the reviewed candidate persistence projector b
       const approvedPersistenceBridge =
         APPROVED_PERSISTENCE_PROJECTOR_IMPORTERS.has(relativeFile) &&
         dependencyPath === APPROVED_PERSISTENCE_PROJECTOR;
+      const approvedRuntimeCandidateEdge = APPROVED_RUNTIME_CANDIDATE_EDGES.has(
+        `${relativeFile}->${dependencyPath}`,
+      );
       assert.equal(
-        candidateFiles.has(dependencyPath) && !approvedPersistenceBridge,
+        candidateFiles.has(dependencyPath) && !approvedPersistenceBridge && !approvedRuntimeCandidateEdge,
         false,
         `${relativeFile} directly imports candidate module ${dependencyPath}`,
       );

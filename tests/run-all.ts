@@ -46,6 +46,7 @@ await import("./position-guard-market-structure.test.js");
 await import("./position-guard-snapshot.test.js");
 await import("./position-guard-context.test.js");
 await import("./position-guard-runner.test.js");
+await import("./position-guard-candidate-runner.test.js");
 await import("./position-guard-core-strategy.test.js");
 await import("./position-guard-backtest.test.js");
 await import("./strategy-counterfactual.test.js");

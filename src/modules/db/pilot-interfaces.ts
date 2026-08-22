@@ -10,16 +10,73 @@ import type { ExecutionStateRecord, ExecutionStateTransitionRecord } from "../..
 import type { FaultPauseInput } from "./interfaces.js";
 import {
   canonicalNonNegativeDecimal,
+  canonicalSignedDecimal,
   type ExactCandidateState,
 } from "../execution/candidate-evidence-decimals.js";
 import {
   parsePositionGuardCandidateTimestamp,
+  validatePositionGuardCandidateState,
   type PositionGuardCandidateExecutionEvidence,
   type PositionGuardCandidateState,
 } from "../strategy/position-guard-candidate-state.js";
 
 export function parseCandidatePilotTimestamp(value: string, label: string): bigint {
   return parsePositionGuardCandidateTimestamp(value, label);
+}
+
+const EXACT_CANDIDATE_STATE_KEYS = [
+  "currentEpisodeAddCount",
+  "currentEpisodeCostBasisKrw",
+  "currentEpisodeInventoryQuantity",
+  "currentEpisodeRealizedPnlKrw",
+  "lastFullExitAt",
+  "lastFullExitRealizedPnlKrw",
+  "lastEntryPath",
+  "lastEvidenceAt",
+  "lastEvidenceId",
+  "stateVersion",
+] as const;
+
+export function toPositionGuardCandidateRoutingState(
+  state: Readonly<ExactCandidateState>,
+): Readonly<PositionGuardCandidateState> {
+  const exact = exactOwnDataRecord(state, "exact candidate routing state", EXACT_CANDIDATE_STATE_KEYS);
+  const result: PositionGuardCandidateState = {
+    currentEpisodeAddCount: exact.currentEpisodeAddCount as number,
+    currentEpisodeCostBasisKrw: finiteRoutingNumber(
+      canonicalNonNegativeDecimal(exact.currentEpisodeCostBasisKrw, "candidate exact cost basis"),
+      "candidate exact cost basis",
+    ),
+    currentEpisodeInventoryQuantity: finiteRoutingNumber(
+      canonicalNonNegativeDecimal(exact.currentEpisodeInventoryQuantity, "candidate exact inventory quantity"),
+      "candidate exact inventory quantity",
+    ),
+    currentEpisodeRealizedPnlKrw: finiteRoutingNumber(
+      canonicalSignedDecimal(exact.currentEpisodeRealizedPnlKrw, "candidate exact realized pnl"),
+      "candidate exact realized pnl",
+    ),
+    lastFullExitAt: exact.lastFullExitAt as string | null,
+    lastFullExitRealizedPnlKrw: exact.lastFullExitRealizedPnlKrw === null
+      ? null
+      : finiteRoutingNumber(
+          canonicalSignedDecimal(exact.lastFullExitRealizedPnlKrw, "candidate exact full-exit pnl"),
+          "candidate exact full-exit pnl",
+        ),
+    lastEntryPath: exact.lastEntryPath as PositionGuardCandidateState["lastEntryPath"],
+    lastEvidenceAt: exact.lastEvidenceAt as string | null,
+    lastEvidenceId: exact.lastEvidenceId as string | null,
+    stateVersion: exact.stateVersion as number,
+  };
+  validatePositionGuardCandidateState(result);
+  return Object.freeze(result);
+}
+
+function finiteRoutingNumber(value: string, label: string): number {
+  const result = Number(value);
+  if (!Number.isFinite(result)) {
+    throw new Error(`${label} cannot be represented as a finite routing number.`);
+  }
+  return result;
 }
 
 export interface CreateCandidatePilotDeploymentInput {

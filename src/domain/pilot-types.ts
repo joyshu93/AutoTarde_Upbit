@@ -12,6 +12,19 @@ export type PositionGuardPolicySelection =
       liveOperatorConfirmed: true;
     }>;
 
+export type PositionGuardPilotRefreshReceipt = Readonly<{
+  exchangeAccountId: string;
+  requestedAt: string;
+  balanceSnapshotId: string;
+  balanceCapturedAt: string;
+  positionSnapshotId: string;
+  positionCapturedAt: string;
+  reconciliationRunId: string;
+  reconciliationStartedAt: string;
+  reconciliationCompletedAt: string;
+  reconciliationSource: "SCHEDULER_PREFLIGHT";
+}>;
+
 export type PositionGuardPilotPhase =
   | "DISABLED"
   | "PENDING_FLAT"
