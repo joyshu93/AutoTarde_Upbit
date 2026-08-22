@@ -416,6 +416,83 @@ test("exact-evidence evaluator validates complete persisted reconciliation summa
   assert.equal(mixedOffsets.status, "PASS");
 });
 
+test("exact-evidence evaluator fully validates history recovery before PASS or WARN", () => {
+  const common = {
+    config: createConfig({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    executionState: createExecutionState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER" as const,
+    checkedAt: "2026-05-08T00:30:00.000Z",
+    balanceSnapshot: { id: "b", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION" as const, totalKrwValue: "1", balancesJson: "[]" },
+    positionSnapshot: { id: "p", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION" as const, positionsJson: "[]" },
+    activeOrders: [],
+  };
+  const valid = schedulerHistoryRecovery();
+  assert.equal(evaluateLiveStrategyRunPreflight({
+    ...common,
+    reconciliationRun: createReconciliationRun({ summaryJson: schedulerSummaryJson("SUCCESS", [], valid) }),
+  }).status, "PASS");
+
+  const malformed = [
+    { ...valid, failureMessage: 7 },
+    { ...valid, markets: valid.markets.slice(0, 1) },
+    { ...valid, stopBeforeAt: "2025-05-07T00:00:00.000Z" },
+    { ...valid, confidenceLevel: "HIGH" },
+    { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, recentClosedWindowEndAt: "2026-05-08T00:00:01.000Z" } : market) },
+    { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, openHistoryTruncated: true, openPagesScanned: 0, confidenceReason: "PAGE_LIMIT_REACHED" } : market), confidenceReason: "PAGE_LIMIT_REACHED" },
+    { ...valid, recoveredOrderCount: 3 },
+  ];
+  for (const historyRecovery of malformed) {
+    const evaluation = evaluateLiveStrategyRunPreflight({
+      ...common,
+      reconciliationRun: createReconciliationRun({ summaryJson: schedulerSummaryJson("SUCCESS", [], historyRecovery) }),
+    });
+    assert.equal(evaluation.status, "BLOCK");
+    assert.match(evaluation.checks.find((check) => check.name === "latest_reconciliation")?.detail ?? "", /issue_evidence_malformed=true/);
+  }
+});
+
+test("exact-evidence evaluator correlates failed history lookup both ways and treats valid failure as a blocking issue", () => {
+  const common = {
+    config: createConfig({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    executionState: createExecutionState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER" as const,
+    checkedAt: "2026-05-08T00:30:00.000Z",
+    balanceSnapshot: { id: "b", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION" as const, totalKrwValue: "1", balancesJson: "[]" },
+    positionSnapshot: { id: "p", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION" as const, positionsJson: "[]" },
+    activeOrders: [],
+  };
+  const lookupIssue = [{ code: "ORDER_HISTORY_LOOKUP_FAILED", message: "lookup failed" }];
+  const failed = { ...schedulerHistoryRecovery(), confidenceLevel: "FAILED", confidenceReason: "LOOKUP_FAILED", failureMessage: "", scannedSnapshotCount: 0, recoveredOrderCount: 0, markets: [] };
+  const validFailure = evaluateLiveStrategyRunPreflight({
+    ...common,
+    reconciliationRun: createReconciliationRun({
+      status: "DRIFT_DETECTED",
+      summaryJson: schedulerSummaryJson("DRIFT_DETECTED", lookupIssue, failed),
+    }),
+  });
+  assert.equal(validFailure.status, "BLOCK");
+  assert.match(validFailure.checks.find((check) => check.name === "latest_reconciliation")?.detail ?? "", /blocking_issue_codes=ORDER_HISTORY_LOOKUP_FAILED/);
+  assert.doesNotMatch(validFailure.checks.find((check) => check.name === "latest_reconciliation")?.detail ?? "", /issue_evidence_malformed/);
+
+  for (const [status, issues, historyRecovery] of [
+    ["DRIFT_DETECTED", [], failed],
+    ["DRIFT_DETECTED", lookupIssue, schedulerHistoryRecovery()],
+    ["DRIFT_DETECTED", lookupIssue, { ...failed, failureMessage: 7 }],
+  ] as const) {
+    const evaluation = evaluateLiveStrategyRunPreflight({
+      ...common,
+      reconciliationRun: createReconciliationRun({
+        status,
+        summaryJson: schedulerSummaryJson(status, issues, historyRecovery),
+      }),
+    });
+    assert.equal(evaluation.status, "BLOCK");
+    assert.match(evaluation.checks.find((check) => check.name === "latest_reconciliation")?.detail ?? "", /issue_evidence_malformed=true/);
+  }
+});
+
 async function seedReadyPortfolio(
   repository: InMemoryExecutionRepository,
   reconciliationRun: ReconciliationRunRecord = createReconciliationRun({ status: "SUCCESS" }),
@@ -507,6 +584,56 @@ function createReconciliationRun(overrides: Partial<ReconciliationRunRecord>): R
     summaryJson: JSON.stringify({ source: "SCHEDULER_PREFLIGHT", status: "SUCCESS", issues: [], candidateCount: 0, processedCount: 0, deferredCount: 0, maxOrderLookupsPerRun: 10 }),
     errorMessage: null,
     ...overrides,
+  };
+}
+
+function schedulerSummaryJson(status: "SUCCESS" | "DRIFT_DETECTED", issues: readonly unknown[], historyRecovery: unknown): string {
+  return JSON.stringify({
+    source: "SCHEDULER_PREFLIGHT",
+    status,
+    issues,
+    candidateCount: 0,
+    processedCount: 0,
+    deferredCount: 0,
+    maxOrderLookupsPerRun: 10,
+    historyRecovery,
+  });
+}
+
+function schedulerHistoryRecovery() {
+  const market = (name: "KRW-BTC" | "KRW-ETH") => ({
+    market: name,
+    recentClosedWindowStartAt: "2026-05-01T00:00:00.000Z",
+    recentClosedWindowEndAt: "2026-05-08T00:00:00.000Z",
+    archivalWindowStartAt: "2026-04-24T00:00:00.000Z",
+    archivalWindowEndAt: "2026-05-01T00:00:00.000Z",
+    nextWindowEndAt: "2026-04-24T00:00:00.000Z",
+    archiveComplete: false,
+    retentionStatus: "WITHIN_ASSUMED_RETENTION",
+    confidenceLevel: "PARTIAL",
+    confidenceReason: "ARCHIVE_IN_PROGRESS",
+    openHistoryTruncated: false,
+    recentClosedHistoryTruncated: false,
+    archivalClosedHistoryTruncated: false,
+    openPagesScanned: 1,
+    recentClosedPagesScanned: 1,
+    archivalClosedPagesScanned: 1,
+    snapshotCount: 2,
+  });
+  return {
+    closedOrderLookbackDays: 7,
+    stopBeforeDays: 365,
+    stopBeforeAt: "2025-05-08T00:00:00.000Z",
+    retentionAssumptionDays: 365,
+    retentionBoundaryAt: "2025-05-08T00:00:00.000Z",
+    retentionStatus: "WITHIN_ASSUMED_RETENTION",
+    coverageStatus: "IN_PROGRESS",
+    confidenceLevel: "PARTIAL",
+    confidenceReason: "ARCHIVE_IN_PROGRESS",
+    failureMessage: null,
+    scannedSnapshotCount: 2,
+    recoveredOrderCount: 1,
+    markets: [market("KRW-BTC"), market("KRW-ETH")],
   };
 }
 

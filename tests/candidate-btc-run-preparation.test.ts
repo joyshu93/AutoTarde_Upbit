@@ -431,6 +431,82 @@ test("candidate preparation rejects malformed history recovery even when returne
   await assert.rejects(preparation.prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "TELEGRAM" }), /historyRecovery/);
 });
 
+test("candidate preparation fully validates persisted history recovery with exact run chronology", async () => {
+  const valid = candidateHistoryRecovery();
+  assert.equal(
+    (await candidatePreparationForSummary(candidateSummary("SUCCESS", [], valid), "SUCCESS").prepare({
+      exchangeAccountId: "primary",
+      requestedAt: REQUESTED_AT,
+      requestedBy: "TELEGRAM",
+    })).status,
+    "READY",
+  );
+  const malformed = [
+    { ...valid, failureMessage: 7 },
+    { ...valid, markets: valid.markets.slice(0, 1) },
+    { ...valid, retentionBoundaryAt: "2025-08-21T00:00:00.000Z" },
+    { ...valid, confidenceLevel: "HIGH" },
+    { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, archivalWindowStartAt: "2026-08-09T00:00:00.000Z" } : market) },
+    { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, recentClosedHistoryTruncated: true, recentClosedPagesScanned: 0, confidenceReason: "PAGE_LIMIT_REACHED" } : market), confidenceReason: "PAGE_LIMIT_REACHED" },
+    { ...valid, scannedSnapshotCount: 0 },
+  ];
+  for (const historyRecovery of malformed) {
+    const summary = candidateSummary("SUCCESS", [], historyRecovery);
+    const preparation = candidatePreparationForSummary(summary, "SUCCESS");
+    await assert.rejects(
+      preparation.prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "TELEGRAM" }),
+      /historyRecovery/,
+    );
+  }
+});
+
+test("candidate preparation rejects reverse lookup-failure mismatch but returns BLOCKED for legitimate failed lookup", async () => {
+  const lookupIssues = [{ code: "ORDER_HISTORY_LOOKUP_FAILED", message: "lookup failed" }] as const;
+  const failed = { ...candidateHistoryRecovery(), confidenceLevel: "FAILED", confidenceReason: "LOOKUP_FAILED", failureMessage: "", scannedSnapshotCount: 0, recoveredOrderCount: 0, markets: [] };
+  const legitimate = candidatePreparationForSummary(candidateSummary("DRIFT_DETECTED", lookupIssues, failed), "DRIFT_DETECTED");
+  assert.deepEqual(
+    await legitimate.prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "TELEGRAM" }),
+    { status: "BLOCKED", detail: "Candidate BTC run blocked by latest_reconciliation." },
+  );
+
+  for (const summary of [
+    candidateSummary("DRIFT_DETECTED", [], failed),
+    candidateSummary("DRIFT_DETECTED", lookupIssues, candidateHistoryRecovery()),
+    candidateSummary("DRIFT_DETECTED", lookupIssues, { ...failed, failureMessage: 7 }),
+  ]) {
+    await assert.rejects(
+      candidatePreparationForSummary(summary, "DRIFT_DETECTED").prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "TELEGRAM" }),
+      /historyRecovery/,
+    );
+  }
+});
+
+test("candidate preparation rejects nested history accessors and sparse market arrays before later dependency reads", async () => {
+  let getterCalls = 0;
+  let stateReads = 0;
+  const accessor = candidateHistoryRecovery();
+  Object.defineProperty(accessor.markets[0], "snapshotCount", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return 2;
+    },
+  });
+  const sparse = candidateHistoryRecovery();
+  sparse.markets = new Array(2) as typeof sparse.markets;
+  for (const historyRecovery of [accessor, sparse]) {
+    const summary = candidateSummary("SUCCESS", [], historyRecovery);
+    const persistedSummary = candidateSummary("SUCCESS", [], candidateHistoryRecovery());
+    const preparation = candidatePreparationForSummary(summary, "SUCCESS", () => { stateReads += 1; }, persistedSummary);
+    await assert.rejects(
+      preparation.prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "TELEGRAM" }),
+      /historyRecovery/,
+    );
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(stateReads, 0);
+});
+
 test("candidate preparation snapshots caller, dependency, and exact sync-result authority across awaits without latest-row substitution", async () => {
   let releaseState!: () => void;
   const stateGate = new Promise<void>((resolve) => { releaseState = resolve; });
@@ -504,6 +580,73 @@ function createSyncResult(overrides: Partial<PortfolioSyncRunResult> = {}): Port
     },
     reconciliationRun: createReconciliationRun(),
     ...overrides,
+  };
+}
+
+function candidatePreparationForSummary(
+  summary: PortfolioSyncRunResult["reconciliationSummary"],
+  status: "SUCCESS" | "DRIFT_DETECTED",
+  onStateRead?: () => void,
+  persistedSummary: PortfolioSyncRunResult["reconciliationSummary"] = summary,
+) {
+  return new CandidateBtcRunPreparationService({
+    config: createConfig(),
+    portfolioSync: { async run() { return createSyncResult({ reconciliationSummary: summary, reconciliationRun: createReconciliationRun({ status, summaryJson: JSON.stringify(persistedSummary) }) }); } },
+    operatorState: { async getState() { onStateRead?.(); return createExecutionState(); } },
+    repositories: { async listActiveOrders() { return []; } },
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    now: () => CHECKED_AT,
+  });
+}
+
+function candidateSummary(status: "SUCCESS" | "DRIFT_DETECTED", issues: readonly unknown[], historyRecovery: unknown): PortfolioSyncRunResult["reconciliationSummary"] {
+  return {
+    source: "SCHEDULER_PREFLIGHT",
+    status,
+    issues: issues as PortfolioSyncRunResult["reconciliationSummary"]["issues"],
+    candidateCount: 0,
+    processedCount: 0,
+    deferredCount: 0,
+    maxOrderLookupsPerRun: 10,
+    historyRecovery: historyRecovery as NonNullable<PortfolioSyncRunResult["reconciliationSummary"]["historyRecovery"]>,
+  };
+}
+
+function candidateHistoryRecovery() {
+  const market = (name: "KRW-BTC" | "KRW-ETH") => ({
+    market: name,
+    recentClosedWindowStartAt: "2026-08-15T00:00:00.000Z",
+    recentClosedWindowEndAt: REQUESTED_AT,
+    archivalWindowStartAt: "2026-08-08T00:00:00.000Z",
+    archivalWindowEndAt: "2026-08-15T00:00:00.000Z",
+    nextWindowEndAt: "2026-08-08T00:00:00.000Z",
+    archiveComplete: false,
+    retentionStatus: "WITHIN_ASSUMED_RETENTION" as const,
+    confidenceLevel: "PARTIAL" as const,
+    confidenceReason: "ARCHIVE_IN_PROGRESS" as const,
+    openHistoryTruncated: false,
+    recentClosedHistoryTruncated: false,
+    archivalClosedHistoryTruncated: false,
+    openPagesScanned: 1,
+    recentClosedPagesScanned: 1,
+    archivalClosedPagesScanned: 1,
+    snapshotCount: 2,
+  });
+  return {
+    closedOrderLookbackDays: 7,
+    stopBeforeDays: 365,
+    stopBeforeAt: "2025-08-22T00:00:00.000Z",
+    retentionAssumptionDays: 365,
+    retentionBoundaryAt: "2025-08-22T00:00:00.000Z",
+    retentionStatus: "WITHIN_ASSUMED_RETENTION" as const,
+    coverageStatus: "IN_PROGRESS" as const,
+    confidenceLevel: "PARTIAL" as "PARTIAL" | "FAILED" | "HIGH",
+    confidenceReason: "ARCHIVE_IN_PROGRESS" as "ARCHIVE_IN_PROGRESS" | "LOOKUP_FAILED" | "PAGE_LIMIT_REACHED" | "ARCHIVE_COMPLETE" | "BEYOND_ASSUMED_RETENTION",
+    failureMessage: null as string | number | null,
+    scannedSnapshotCount: 2,
+    recoveredOrderCount: 1,
+    markets: [market("KRW-BTC"), market("KRW-ETH")],
   };
 }
 

@@ -388,7 +388,7 @@ function describeLatestReconciliation(
     };
   }
 
-  const summary = parseReconciliationSummary(run.summaryJson);
+  const summary = parseReconciliationSummary(run.summaryJson, run.startedAt, run.completedAt ?? checkedAt);
   if (summary === null || summary.status !== run.status) {
     return {
       name: "latest_reconciliation",
@@ -448,7 +448,11 @@ function describeLatestReconciliation(
   };
 }
 
-function parseReconciliationSummary(rawJson: string): { source: string; status: string; issues: ReconciliationIssue[] } | null {
+function parseReconciliationSummary(
+  rawJson: string,
+  runStartedAt: string,
+  completedOrCheckedAt: string,
+): { source: string; status: string; issues: ReconciliationIssue[] } | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawJson);
@@ -510,7 +514,13 @@ function parseReconciliationSummary(rawJson: string): { source: string; status: 
     issues.push({ code: codeDescriptor.value as ReconciliationIssue["code"], message: messageDescriptor.value });
   }
 
-  if (summaryDescriptors.historyRecovery !== undefined && !isStrictHistoryRecoverySummary(summaryDescriptors.historyRecovery.value, summaryDescriptors.status.value, issues.map((issue) => issue.code))) return null;
+  if (summaryDescriptors.historyRecovery !== undefined && !isStrictHistoryRecoverySummary(
+    summaryDescriptors.historyRecovery.value,
+    summaryDescriptors.status.value,
+    issues.map((issue) => issue.code),
+    runStartedAt,
+    completedOrCheckedAt,
+  )) return null;
   return { source: summaryDescriptors.source.value, status: summaryDescriptors.status.value, issues };
 }
 

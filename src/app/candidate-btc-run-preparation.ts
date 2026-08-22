@@ -236,7 +236,7 @@ function snapshotReconciliationRun(
   if ((fields.status !== "SUCCESS" && fields.status !== "DRIFT_DETECTED") || fields.errorMessage !== null) {
     throw new Error("Candidate BTC reconciliation run must be a successful or non-blocking drift exact record.");
   }
-  const persistedSummary = snapshotReconciliationSummaryJson(fields.summaryJson);
+  const persistedSummary = snapshotReconciliationSummaryJson(fields.summaryJson, startedAt, completedAt);
   if (
     reconciliationSummary.source !== "SCHEDULER_PREFLIGHT" ||
     reconciliationSummary.status !== fields.status ||
@@ -330,17 +330,29 @@ function assertSnapshotCorrelation(
   }
 }
 
-function snapshotReconciliationSummaryJson(value: unknown): CandidateReconciliationSummary {
+function snapshotReconciliationSummaryJson(
+  value: unknown,
+  runStartedAt: string,
+  completedOrCheckedAt: string,
+): CandidateReconciliationSummary {
   let parsed: unknown;
   try {
     parsed = JSON.parse(requiredString(value, "candidate BTC reconciliation run summaryJson"));
   } catch {
     throw new Error("Candidate BTC reconciliation run summaryJson must be valid JSON.");
   }
-  return snapshotReconciliationSummary(parsed, "candidate BTC reconciliation run persisted summary");
+  return snapshotReconciliationSummary(
+    parsed,
+    "candidate BTC reconciliation run persisted summary",
+    { runStartedAt, completedOrCheckedAt },
+  );
 }
 
-function snapshotReconciliationSummary(value: unknown, label: string): CandidateReconciliationSummary {
+function snapshotReconciliationSummary(
+  value: unknown,
+  label: string,
+  historyContext?: Readonly<{ runStartedAt: string; completedOrCheckedAt: string }>,
+): CandidateReconciliationSummary {
   const fields = dataRecordWithOptionalKey(value, label, [
     "source", "status", "issues", "candidateCount", "processedCount", "deferredCount", "maxOrderLookupsPerRun",
   ], "historyRecovery");
@@ -348,7 +360,17 @@ function snapshotReconciliationSummary(value: unknown, label: string): Candidate
   const status = requiredEnum(fields.status, `${label} status`, ["SUCCESS", "DRIFT_DETECTED"]);
   const issues = snapshotReconciliationIssues(fields.issues, `${label} issues`);
   const issueCodes = issues.map((issue) => (issue as Readonly<Record<string, JsonSnapshot>>).code as string);
-  if (Object.prototype.hasOwnProperty.call(fields, "historyRecovery") && !isStrictHistoryRecoverySummary(fields.historyRecovery, status, issueCodes)) {
+  if (
+    Object.prototype.hasOwnProperty.call(fields, "historyRecovery") &&
+    historyContext !== undefined &&
+    !isStrictHistoryRecoverySummary(
+      fields.historyRecovery,
+      status,
+      issueCodes,
+      historyContext.runStartedAt,
+      historyContext.completedOrCheckedAt,
+    )
+  ) {
     throw new Error(`${label} historyRecovery is invalid.`);
   }
   const snapshot: Record<string, JsonSnapshot> = {

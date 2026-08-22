@@ -127,3 +127,52 @@ git diff --cached --check
 
 - `npm.cmd run typecheck`: passed.
 - `npm.cmd run build`: passed.
+
+## Fix Round 6 TDD Evidence
+
+### RED
+
+After adding shared-validator, direct-evaluator, and candidate-path regressions, the focused harness exited 1 with seven expected contract failures. The failures showed that malformed derived fields still returned `true`, scheduler preflight returned `PASS` instead of `BLOCK`, reverse `ORDER_HISTORY_LOOKUP_FAILED` mismatches were treated as valid blocking evidence, and candidate preparation did not reject matching malformed returned/persisted summaries.
+
+Focused RED/GREEN command:
+
+```powershell
+npx.cmd tsx -e "(async () => { await import('./tests/history-recovery-validation.test.ts'); await import('./tests/scheduler-preflight.test.ts'); await import('./tests/candidate-btc-run-preparation.test.ts'); const { runRegisteredTests } = await import('./tests/harness.ts'); await runRegisteredTests(); })()"
+```
+
+### GREEN
+
+The same focused command passed all 34 tests after implementation. An expanded focused run also passed every test from:
+
+- `tests/history-recovery-validation.test.ts`
+- `tests/reconciliation-service.test.ts`
+- `tests/position-guard-pilot-recovery.test.ts`
+- `tests/scheduler-preflight.test.ts`
+- `tests/candidate-btc-run-preparation.test.ts`
+
+The shared validator now requires exact plain data, strict timestamps, producer-derived top and per-market windows, exact BTC/ETH cardinality, page/count consistency, aggregate coverage/retention/confidence/reason, and bidirectional failed-lookup correlation. It accepts valid partial normal, complete zero archival pages, complete page-limit, complete beyond-retention, and structurally valid failed lookup summaries. Scheduler parsing supplies exact run start/completion chronology. Candidate returned evidence is first snapshotted and canonically correlated, then the persisted exact summary is fully validated once exact run timestamps are available.
+
+### Verification
+
+```powershell
+npm.cmd run typecheck
+npm.cmd run build
+npm.cmd run test
+git diff --check
+node --test dist/tests/prospective-shadow-commitment-cli.test.js
+```
+
+- `npm.cmd run typecheck`: passed.
+- `npm.cmd run build`: passed.
+- `git diff --check`: passed; Git emitted only existing LF-to-CRLF working-copy notices.
+- `npm.cmd run test`: all owned and broad tests reached by the harness passed before the same pre-existing unowned prospective-shadow subgroup failure already recorded in round 5.
+- Isolated residual confirmation: `prospective-shadow-commitment-cli.test` passed 10/11. Its checked-in bundle reproducibility test invokes `scripts/check-prospective-commitment-bundle.mjs`; esbuild reports parent-directory access denied and cannot resolve the existing `src/research/prospective-shadow-commitment.ts`. No prospective-shadow source, script, or test is owned or changed by Task 9C2d2.
+- No live runtime, operational database, Upbit, Telegram, network, scheduler tick, sync command, secret, activation/default, push, merge, or operational script was used or changed.
+- No subagents were used for round 6.
+
+### Round 6 Files
+
+- Hardened `src/modules/reconciliation/history-recovery-validation.ts`.
+- Integrated exact chronology in `src/app/scheduler-preflight.ts` and `src/app/candidate-btc-run-preparation.ts`.
+- Added `tests/history-recovery-validation.test.ts` and registered it in `tests/run-all.ts`.
+- Expanded `tests/scheduler-preflight.test.ts` and `tests/candidate-btc-run-preparation.test.ts`.
