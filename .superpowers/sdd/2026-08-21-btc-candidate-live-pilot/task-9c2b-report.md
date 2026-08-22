@@ -14,6 +14,16 @@
 - Global-only fault construction no longer creates a placeholder deployment ID.
 - Recovery now uses the canonical domain `PositionGuardPilotRefreshReceipt` whose source is fixed to `SCHEDULER_PREFLIGHT`.
 
+## Independent Review Fix
+
+- The independent review found that `PositionGuardPilotRecovery` retained the caller-owned dependency object, allowing account, target, policy, and numeric verification settings to change across an `await` boundary.
+- RED reproduced an `account-A` deployment lookup followed by a mutated `account-B` global pause attempt, and showed that accessor and non-canonical constructor shapes were accepted.
+- The constructor now descriptor-safely projects an exact top-level dependency shape and an exact target discriminant before any asynchronous work.
+- Scalar identity, target, and numeric verification policies are copied into a shallow frozen authority snapshot. Collaborator references are read once into that snapshot, but the collaborator objects themselves are not frozen or mutated.
+- Fault provenance schema version 3 records the snapshotted verification policy as well as the configured identity, so deterministic fault identity cannot silently depend on later caller mutation.
+- Adversarial tests mutate every scalar policy and collaborator reference during the first awaited lookup and confirm that reads, provenance, pilot pause, and global pause remain pinned to the initial authority.
+- Accessor, extra, symbol, non-enumerable, non-plain, and malformed top-level or target inputs are rejected without invoking accessors.
+
 ## Verification
 
 - Focused in-memory, SQLite, and recovery tests: PASS.

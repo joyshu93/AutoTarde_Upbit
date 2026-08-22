@@ -201,31 +201,32 @@ const EXACT_STATE_KEYS = [
   "stateVersion",
 ] as const;
 
+const RECOVERY_DEPENDENCY_KEYS = [
+  "exchangeAccountId",
+  "target",
+  "pilotId",
+  "market",
+  "policyId",
+  "policyVersion",
+  "freshnessThresholdMs",
+  "minimumAbsenceObservations",
+  "minimumAbsenceElapsedMs",
+  "clock",
+  "repositories",
+  "candidatePilots",
+  "operatorState",
+] as const;
+
 const QUANTITY_TOLERANCE = parseCanonicalNonNegativeDecimal(
   EXACT_CANDIDATE_QUANTITY_TOLERANCE,
   "candidate recovery quantity tolerance",
 );
 
 export class PositionGuardPilotRecovery {
-  constructor(
-    private readonly dependencies: PositionGuardPilotRecoveryDependencies,
-  ) {
-    requireNonEmpty(dependencies.exchangeAccountId, "candidate recovery exchangeAccountId");
-    if (dependencies.target.kind === "EXACT_DEPLOYMENT") {
-      requireNonEmpty(dependencies.target.deploymentId, "candidate recovery deploymentId");
-    } else if (dependencies.target.kind !== "CONFIGURED_ACCOUNT_PILOT") {
-      throw new Error("Candidate recovery target is invalid.");
-    }
-    if (!Number.isSafeInteger(dependencies.freshnessThresholdMs) || dependencies.freshnessThresholdMs <= 0) {
-      throw new Error("Candidate recovery freshnessThresholdMs must be a positive safe integer.");
-    }
-    if (!Number.isSafeInteger(dependencies.minimumAbsenceObservations) ||
-      dependencies.minimumAbsenceObservations < 2) {
-      throw new Error("Candidate recovery minimumAbsenceObservations must be a safe integer of at least two.");
-    }
-    if (!Number.isSafeInteger(dependencies.minimumAbsenceElapsedMs) || dependencies.minimumAbsenceElapsedMs <= 0) {
-      throw new Error("Candidate recovery minimumAbsenceElapsedMs must be a positive safe integer.");
-    }
+  private readonly dependencies: Readonly<PositionGuardPilotRecoveryDependencies>;
+
+  constructor(dependencies: PositionGuardPilotRecoveryDependencies) {
+    this.dependencies = snapshotRecoveryDependencies(dependencies);
   }
 
   async verifyAndPrepareBtcRun(
@@ -1262,7 +1263,7 @@ function buildFaultProvenanceJson(input: {
   readback: RecoveryReadback;
 }): string {
   return canonicalJson({
-    schemaVersion: 2,
+    schemaVersion: 3,
     reasonCode: input.reasonCode,
     configuredIdentity: {
       exchangeAccountId: input.configured.exchangeAccountId,
@@ -1274,6 +1275,7 @@ function buildFaultProvenanceJson(input: {
       policyId: input.configured.policyId,
       policyVersion: input.configured.policyVersion,
     },
+    verificationPolicy: recoveryVerificationPolicyMaterial(input.configured),
     refreshReceipt: input.receipt,
     persistedAuthority: persistedAuthorityMaterial(input.readback),
   });
@@ -1289,7 +1291,7 @@ function buildReadFailureProvenanceJson(input: {
   receipt: Readonly<PositionGuardPilotRefreshReceipt>;
 }): string {
   return canonicalJson({
-    schemaVersion: 2,
+    schemaVersion: 3,
     reasonCode: input.reasonCode,
     faultKind: "PERSISTENCE_READ_FAILURE",
     readOperation: input.operation,
@@ -1305,8 +1307,19 @@ function buildReadFailureProvenanceJson(input: {
       policyId: input.configured.policyId,
       policyVersion: input.configured.policyVersion,
     },
+    verificationPolicy: recoveryVerificationPolicyMaterial(input.configured),
     refreshReceipt: input.receipt,
   });
+}
+
+function recoveryVerificationPolicyMaterial(
+  configured: PositionGuardPilotRecoveryDependencies,
+): object {
+  return {
+    freshnessThresholdMs: configured.freshnessThresholdMs,
+    minimumAbsenceObservations: configured.minimumAbsenceObservations,
+    minimumAbsenceElapsedMs: configured.minimumAbsenceElapsedMs,
+  };
 }
 
 function canonicalAuthorityJson(readback: RecoveryReadback): string {
@@ -2033,10 +2046,171 @@ function canonicalValue(value: unknown): unknown {
   return value;
 }
 
-function requireNonEmpty(value: string, label: string): void {
+function snapshotRecoveryDependencies(
+  value: PositionGuardPilotRecoveryDependencies,
+): Readonly<PositionGuardPilotRecoveryDependencies> {
+  const record = exactOwnDataRecord(value, "candidate recovery dependencies", RECOVERY_DEPENDENCY_KEYS);
+  const exchangeAccountId = requireNonEmptyString(
+    record.exchangeAccountId,
+    "candidate recovery exchangeAccountId",
+  );
+  const pilotId = requireExactString(
+    record.pilotId,
+    "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+    "candidate recovery pilotId",
+  );
+  const market = requireExactString(record.market, "KRW-BTC", "candidate recovery market");
+  const policyId = requireExactString(
+    record.policyId,
+    "COMBINED_CONSERVATIVE",
+    "candidate recovery policyId",
+  );
+  const policyVersion = requireExactString(
+    record.policyVersion,
+    "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+    "candidate recovery policyVersion",
+  );
+  const freshnessThresholdMs = requirePositiveSafeInteger(
+    record.freshnessThresholdMs,
+    "candidate recovery freshnessThresholdMs",
+  );
+  const minimumAbsenceObservations = requireSafeIntegerAtLeast(
+    record.minimumAbsenceObservations,
+    2,
+    "candidate recovery minimumAbsenceObservations",
+  );
+  const minimumAbsenceElapsedMs = requirePositiveSafeInteger(
+    record.minimumAbsenceElapsedMs,
+    "candidate recovery minimumAbsenceElapsedMs",
+  );
+
+  return Object.freeze({
+    exchangeAccountId,
+    target: snapshotRecoveryTarget(record.target),
+    pilotId,
+    market,
+    policyId,
+    policyVersion,
+    freshnessThresholdMs,
+    minimumAbsenceObservations,
+    minimumAbsenceElapsedMs,
+    clock: requireObjectReference<PositionGuardPilotRecoveryClock>(record.clock, "candidate recovery clock"),
+    repositories: requireObjectReference<RecoveryExecutionReads>(
+      record.repositories,
+      "candidate recovery repositories",
+    ),
+    candidatePilots: requireObjectReference<RecoveryCandidateRepository>(
+      record.candidatePilots,
+      "candidate recovery candidatePilots",
+    ),
+    operatorState: requireObjectReference<RecoveryOperatorState>(
+      record.operatorState,
+      "candidate recovery operatorState",
+    ),
+  });
+}
+
+function snapshotRecoveryTarget(value: unknown): PositionGuardPilotRecoveryTarget {
+  if (hasExactOwnDataShape(value, ["kind"] as const)) {
+    const record = exactOwnDataRecord(value, "candidate recovery target", ["kind"] as const);
+    if (record.kind !== "CONFIGURED_ACCOUNT_PILOT") {
+      throw new Error("Candidate recovery target is invalid.");
+    }
+    return Object.freeze({ kind: "CONFIGURED_ACCOUNT_PILOT" as const });
+  }
+  if (hasExactOwnDataShape(value, ["kind", "deploymentId"] as const)) {
+    const record = exactOwnDataRecord(
+      value,
+      "candidate recovery target",
+      ["kind", "deploymentId"] as const,
+    );
+    if (record.kind !== "EXACT_DEPLOYMENT") {
+      throw new Error("Candidate recovery target is invalid.");
+    }
+    return Object.freeze({
+      kind: "EXACT_DEPLOYMENT" as const,
+      deploymentId: requireNonEmptyString(record.deploymentId, "candidate recovery deploymentId"),
+    });
+  }
+  throw new Error(
+    "Candidate recovery target must have exactly own data properties for a supported target.",
+  );
+}
+
+function hasExactOwnDataShape<const TKeys extends readonly string[]>(
+  value: unknown,
+  expectedKeys: TKeys,
+): boolean {
+  if (!isPlainObject(value)) return false;
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.length !== expectedKeys.length) return false;
+  const expected = new Set<string>(expectedKeys);
+  return ownKeys.every((key) => {
+    if (typeof key !== "string" || !expected.has(key)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && "value" in descriptor && descriptor.enumerable;
+  });
+}
+
+function exactOwnDataRecord<const TKeys extends readonly string[]>(
+  value: unknown,
+  label: string,
+  expectedKeys: TKeys,
+): Record<TKeys[number], unknown> {
+  if (!hasExactOwnDataShape(value, expectedKeys)) {
+    throw new Error(`${label} must have exactly own data properties: ${expectedKeys.join(", ")}.`);
+  }
+  const result = {} as Record<TKeys[number], unknown>;
+  for (const key of expectedKeys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !("value" in descriptor)) {
+      throw new Error(`${label} must have exactly own data properties: ${expectedKeys.join(", ")}.`);
+    }
+    result[key as TKeys[number]] = descriptor.value;
+  }
+  return result;
+}
+
+function isPlainObject(value: unknown): value is Record<PropertyKey, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) &&
+    Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function requireNonEmptyString(value: unknown, label: string): string {
   if (typeof value !== "string" || value.trim() === "") {
     throw new Error(`${label} must be a non-empty string.`);
   }
+  return value;
+}
+
+function requireExactString<const TValue extends string>(
+  value: unknown,
+  expected: TValue,
+  label: string,
+): TValue {
+  if (value !== expected) throw new Error(`${label} must be ${expected}.`);
+  return expected;
+}
+
+function requirePositiveSafeInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) <= 0) {
+    throw new Error(`${label} must be a positive safe integer.`);
+  }
+  return value as number;
+}
+
+function requireSafeIntegerAtLeast(value: unknown, minimum: number, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < minimum) {
+    throw new Error(`${label} must be a safe integer of at least ${minimum}.`);
+  }
+  return value as number;
+}
+
+function requireObjectReference<T extends object>(value: unknown, label: string): T {
+  if (typeof value !== "object" || value === null) {
+    throw new Error(`${label} must be an object reference.`);
+  }
+  return value as T;
 }
 
 function deepFreeze<T>(value: T): Readonly<T> {

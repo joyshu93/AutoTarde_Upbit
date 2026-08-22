@@ -50,6 +50,7 @@ const NOW = "2026-08-21T00:01:00.000Z";
 const FRESHNESS_THRESHOLD_MS = 60_000;
 const MINIMUM_ABSENCE_OBSERVATIONS = 2;
 const MINIMUM_ABSENCE_ELAPSED_MS = 10_000;
+type RecoveryDependencies = ConstructorParameters<typeof PositionGuardPilotRecovery>[0];
 const DEFINITIVE_REJECTION_PAYLOAD = Object.freeze({
   kind: "DEFINITIVE_REJECTION",
   status: 400,
@@ -576,6 +577,160 @@ test("configured recovery snapshots lookup authority and pins all later reads to
   if (result.status !== "READY") return;
   assert.equal(result.deployment.id, DEPLOYMENT_ID);
   assert.equal(result.deployment.exchangeAccountId, ACCOUNT_ID);
+});
+
+test("recovery snapshots constructor authority before the first awaited lookup", async () => {
+  const fixture = await createFixture();
+  let releaseLookup!: () => void;
+  let markLookupStarted!: () => void;
+  const lookupGate = new Promise<void>((resolve) => {
+    releaseLookup = resolve;
+  });
+  const lookupStarted = new Promise<void>((resolve) => {
+    markLookupStarted = resolve;
+  });
+  const deploymentReads: string[] = [];
+  const balanceReads: string[] = [];
+  const pilotFaults: Array<Parameters<CandidatePilotRepository["pauseForRecoveryFault"]>[0]> = [];
+  const candidatePilots = overrideCandidatePilots(fixture.candidatePilots, {
+    getDeployment: async (deploymentId) => {
+      deploymentReads.push(deploymentId);
+      markLookupStarted();
+      await lookupGate;
+      return fixture.candidatePilots.getDeployment(deploymentId);
+    },
+    pauseForRecoveryFault: async (input) => {
+      pilotFaults.push(input);
+      return fixture.candidatePilots.pauseForRecoveryFault(input);
+    },
+  });
+  const repositories = overrideExecutionRepositories(fixture.repositories, {
+    getLatestBalanceSnapshot: async (exchangeAccountId) => {
+      balanceReads.push(exchangeAccountId);
+      throw new Error("forced read failure after deployment resolution");
+    },
+  });
+  const target = {
+    kind: "EXACT_DEPLOYMENT" as const,
+    deploymentId: DEPLOYMENT_ID,
+  };
+  const dependencies = recoveryDependencies(fixture, { target, candidatePilots, repositories });
+  const recovery = new PositionGuardPilotRecovery(dependencies);
+
+  const pending = recovery.verifyAndPrepareBtcRun(fixture.receipt);
+  await lookupStarted;
+  const mutable = dependencies as unknown as Record<string, unknown>;
+  mutable.exchangeAccountId = "mutated-account";
+  mutable.pilotId = "mutated-pilot";
+  mutable.market = "KRW-ETH";
+  mutable.policyId = "mutated-policy";
+  mutable.policyVersion = "mutated-version";
+  mutable.freshnessThresholdMs = 1;
+  mutable.minimumAbsenceObservations = 99;
+  mutable.minimumAbsenceElapsedMs = 1;
+  mutable.repositories = {};
+  mutable.candidatePilots = {};
+  mutable.operatorState = {};
+  mutable.clock = {};
+  target.deploymentId = "mutated-deployment";
+  releaseLookup();
+
+  const result = await pending;
+
+  assert.equal(result.status, "BLOCKED_FAULT");
+  assert.deepEqual(deploymentReads, [DEPLOYMENT_ID]);
+  assert.deepEqual(balanceReads, [ACCOUNT_ID]);
+  assert.equal(pilotFaults.length, 1);
+  assert.equal(pilotFaults[0]?.deploymentId, DEPLOYMENT_ID);
+  assert.equal(pilotFaults[0]?.exchangeAccountId, ACCOUNT_ID);
+  const provenance = pilotFaults[0]?.provenanceJson ?? "";
+  assert.match(provenance, new RegExp(ACCOUNT_ID));
+  assert.match(provenance, new RegExp(PILOT_ID));
+  assert.match(provenance, new RegExp(POLICY_VERSION.replaceAll(".", "\\.")));
+  assert.match(provenance, new RegExp(String(FRESHNESS_THRESHOLD_MS)));
+  assert.match(provenance, new RegExp(String(MINIMUM_ABSENCE_OBSERVATIONS)));
+  assert.match(provenance, new RegExp(String(MINIMUM_ABSENCE_ELAPSED_MS)));
+  assert.doesNotMatch(provenance, /mutated-/);
+  const transition = (await fixture.operatorState.listTransitions(100))
+    .find((item) => item.id === result.faultId);
+  assert.equal(transition?.exchangeAccountId, ACCOUNT_ID);
+  assert.equal(Object.isFrozen(fixture.repositories), false);
+  assert.equal(Object.isFrozen(fixture.candidatePilots), false);
+  assert.equal(Object.isFrozen(fixture.operatorState), false);
+});
+
+test("recovery constructor rejects non-canonical dependency and target shapes without invoking accessors", async () => {
+  const fixture = await createFixture();
+  const base = recoveryDependencies(fixture);
+  let accessorCalls = 0;
+  const topLevelAccessor = { ...base } as Record<string, unknown>;
+  Object.defineProperty(topLevelAccessor, "exchangeAccountId", {
+    enumerable: true,
+    get: () => {
+      accessorCalls += 1;
+      return ACCOUNT_ID;
+    },
+  });
+  assert.throws(
+    () => new PositionGuardPilotRecovery(topLevelAccessor as unknown as RecoveryDependencies),
+    /exactly own data properties/,
+  );
+  assert.equal(accessorCalls, 0);
+
+  const invalidTopLevels: object[] = [
+    { ...base, extra: true },
+    Object.defineProperty({ ...base }, "hidden", { value: true, enumerable: false }),
+    Object.assign(Object.create({ inherited: true }) as object, base),
+  ];
+  const withSymbol = { ...base } as Record<PropertyKey, unknown>;
+  withSymbol[Symbol("unexpected")] = true;
+  invalidTopLevels.push(withSymbol);
+  for (const invalid of invalidTopLevels) {
+    assert.throws(
+      () => new PositionGuardPilotRecovery(invalid as RecoveryDependencies),
+      /exactly own data properties/,
+    );
+  }
+
+  const targetAccessor = {} as Record<string, unknown>;
+  Object.defineProperty(targetAccessor, "kind", {
+    enumerable: true,
+    get: () => {
+      accessorCalls += 1;
+      return "CONFIGURED_ACCOUNT_PILOT";
+    },
+  });
+  const invalidTargets: object[] = [
+    targetAccessor,
+    { kind: "EXACT_DEPLOYMENT" },
+    { kind: "CONFIGURED_ACCOUNT_PILOT", deploymentId: DEPLOYMENT_ID },
+    { kind: "EXACT_DEPLOYMENT", deploymentId: DEPLOYMENT_ID, extra: true },
+    Object.defineProperty(
+      { kind: "EXACT_DEPLOYMENT", deploymentId: DEPLOYMENT_ID },
+      "hidden",
+      { value: true, enumerable: false },
+    ),
+    Object.assign(Object.create({ inherited: true }) as object, {
+      kind: "EXACT_DEPLOYMENT",
+      deploymentId: DEPLOYMENT_ID,
+    }),
+  ];
+  const targetWithSymbol = {
+    kind: "EXACT_DEPLOYMENT",
+    deploymentId: DEPLOYMENT_ID,
+  } as Record<PropertyKey, unknown>;
+  targetWithSymbol[Symbol("unexpected")] = true;
+  invalidTargets.push(targetWithSymbol);
+  for (const targetValue of invalidTargets) {
+    assert.throws(
+      () => new PositionGuardPilotRecovery({
+        ...base,
+        target: targetValue as PositionGuardPilotRecoveryTarget,
+      }),
+      /target|exactly own data properties/,
+    );
+  }
+  assert.equal(accessorCalls, 0);
 });
 
 test("another account's deployment is not mutated and only the target global state pauses", async () => {
@@ -1668,4 +1823,31 @@ function overrideExecutionRepositories(
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+}
+
+function recoveryDependencies(
+  fixture: RecoveryFixture,
+  overrides: Partial<RecoveryDependencies> = {},
+): RecoveryDependencies {
+  return {
+    exchangeAccountId: ACCOUNT_ID,
+    target: {
+      kind: "EXACT_DEPLOYMENT",
+      deploymentId: DEPLOYMENT_ID,
+    },
+    pilotId: PILOT_ID,
+    market: "KRW-BTC",
+    policyId: POLICY_ID,
+    policyVersion: POLICY_VERSION,
+    freshnessThresholdMs: FRESHNESS_THRESHOLD_MS,
+    minimumAbsenceObservations: MINIMUM_ABSENCE_OBSERVATIONS,
+    minimumAbsenceElapsedMs: MINIMUM_ABSENCE_ELAPSED_MS,
+    clock: {
+      now: () => ({ occurredAt: NOW, occurredAtEpochMs: Date.parse(NOW) }),
+    },
+    repositories: fixture.repositories,
+    candidatePilots: fixture.candidatePilots,
+    operatorState: fixture.operatorState,
+    ...overrides,
+  };
 }
