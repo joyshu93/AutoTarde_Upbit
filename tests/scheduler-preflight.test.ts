@@ -363,6 +363,64 @@ test("exact-evidence evaluator requires a valid empty SUCCESS summary and exact 
   assert.equal(valid.status, "WARN");
 });
 
+test("exact-evidence evaluator enforces bounded sweep arithmetic, budget, and deferred issue correlation", () => {
+  const common = {
+    config: createConfig({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    executionState: createExecutionState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER" as const,
+    checkedAt: "2026-05-08T00:30:00.000Z",
+    balanceSnapshot: { id: "b", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION" as const, totalKrwValue: "1", balancesJson: "[]" },
+    positionSnapshot: { id: "p", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION" as const, positionsJson: "[]" },
+    activeOrders: [],
+  };
+  const malformed = [
+    schedulerSummaryJson("SUCCESS", [], undefined, { candidateCount: 1 }),
+    schedulerSummaryJson("SUCCESS", [], undefined, { candidateCount: 2, processedCount: 2, maxOrderLookupsPerRun: 1 }),
+    schedulerSummaryJson("DRIFT_DETECTED", [], undefined, { candidateCount: 1, deferredCount: 1 }),
+    schedulerSummaryJson("DRIFT_DETECTED", [{ code: "ORDER_LOOKUP_DEFERRED", message: "unexpected" }], undefined),
+    schedulerSummaryJson("DRIFT_DETECTED", [
+      { code: "ORDER_LOOKUP_DEFERRED", message: "first" },
+      { code: "ORDER_LOOKUP_DEFERRED", message: "second" },
+    ], undefined, { candidateCount: 2, deferredCount: 2 }),
+  ];
+  for (const summaryJson of malformed) {
+    const evaluation = evaluateLiveStrategyRunPreflight({
+      ...common,
+      reconciliationRun: createReconciliationRun({
+        status: summaryJson.includes('"status":"SUCCESS"') ? "SUCCESS" : "DRIFT_DETECTED",
+        summaryJson,
+      }),
+    });
+    assert.equal(evaluation.status, "BLOCK");
+    assert.match(evaluation.checks.find((check) => check.name === "latest_reconciliation")?.detail ?? "", /issue_evidence_malformed=true/);
+  }
+
+  const legitimateDeferred = evaluateLiveStrategyRunPreflight({
+    ...common,
+    reconciliationRun: createReconciliationRun({
+      status: "DRIFT_DETECTED",
+      summaryJson: schedulerSummaryJson(
+        "DRIFT_DETECTED",
+        [{ code: "ORDER_LOOKUP_DEFERRED", message: "deferred" }],
+        undefined,
+        { candidateCount: 2, processedCount: 1, deferredCount: 1, maxOrderLookupsPerRun: 1 },
+      ),
+    }),
+  });
+  assert.equal(legitimateDeferred.status, "BLOCK");
+  assert.doesNotMatch(legitimateDeferred.checks.find((check) => check.name === "latest_reconciliation")?.detail ?? "", /issue_evidence_malformed/);
+
+  const projectionDeferred = evaluateLiveStrategyRunPreflight({
+    ...common,
+    reconciliationRun: createReconciliationRun({
+      status: "DRIFT_DETECTED",
+      summaryJson: schedulerSummaryJson("DRIFT_DETECTED", [{ code: "CANDIDATE_EVIDENCE_PROJECTION_DEFERRED", message: "projection deferred" }], undefined),
+    }),
+  });
+  assert.equal(projectionDeferred.status, "WARN");
+});
+
 test("exact-evidence evaluator blocks contradictory RUNNING execution state", () => {
   const evaluation = evaluateLiveStrategyRunPreflight({
     config: createConfig({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
@@ -519,6 +577,52 @@ test("exact-evidence evaluator correlates failed history lookup both ways and tr
   }
 });
 
+test("exact-evidence evaluator correlates history producer issue counts and permits unrelated issue codes", () => {
+  const common = {
+    config: createConfig({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    executionState: createExecutionState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER" as const,
+    checkedAt: "2026-05-08T00:30:00.000Z",
+    balanceSnapshot: { id: "b", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION" as const, totalKrwValue: "1", balancesJson: "[]" },
+    positionSnapshot: { id: "p", exchangeAccountId: "primary", capturedAt: "2026-05-08T00:00:00.000Z", source: "RECONCILIATION" as const, positionsJson: "[]" },
+    activeOrders: [],
+  };
+  const recovered = { ...schedulerHistoryRecovery(), recoveredOrderCount: 1 };
+  const failed = { ...schedulerHistoryRecovery(), confidenceLevel: "FAILED", confidenceReason: "LOOKUP_FAILED", failureMessage: "failed", scannedSnapshotCount: 0, recoveredOrderCount: 0, markets: [] };
+  for (const [status, issues, historyRecovery] of [
+    ["SUCCESS", [], recovered],
+    ["DRIFT_DETECTED", [{ code: "EXCHANGE_ORDER_RECOVERED", message: "extra" }], schedulerHistoryRecovery()],
+    ["DRIFT_DETECTED", [
+      { code: "ORDER_HISTORY_LOOKUP_FAILED", message: "first" },
+      { code: "ORDER_HISTORY_LOOKUP_FAILED", message: "second" },
+    ], failed],
+    ["DRIFT_DETECTED", [
+      { code: "ORDER_HISTORY_LOOKUP_FAILED", message: "failed" },
+      { code: "EXCHANGE_ORDER_RECOVERED", message: "impossible" },
+    ], failed],
+  ] as const) {
+    const evaluation = evaluateLiveStrategyRunPreflight({
+      ...common,
+      reconciliationRun: createReconciliationRun({ status, summaryJson: schedulerSummaryJson(status, issues, historyRecovery) }),
+    });
+    assert.equal(evaluation.status, "BLOCK");
+    assert.match(evaluation.checks.find((check) => check.name === "latest_reconciliation")?.detail ?? "", /issue_evidence_malformed=true/);
+  }
+
+  const legitimate = evaluateLiveStrategyRunPreflight({
+    ...common,
+    reconciliationRun: createReconciliationRun({
+      status: "DRIFT_DETECTED",
+      summaryJson: schedulerSummaryJson("DRIFT_DETECTED", [
+        { code: "EXCHANGE_ORDER_RECOVERED", message: "recovered" },
+        { code: "ORDER_FILLS_BACKFILLED", message: "fill" },
+      ], recovered),
+    }),
+  });
+  assert.equal(legitimate.status, "WARN");
+});
+
 async function seedReadyPortfolio(
   repository: InMemoryExecutionRepository,
   reconciliationRun: ReconciliationRunRecord = createReconciliationRun({ status: "SUCCESS" }),
@@ -613,15 +717,20 @@ function createReconciliationRun(overrides: Partial<ReconciliationRunRecord>): R
   };
 }
 
-function schedulerSummaryJson(status: "SUCCESS" | "DRIFT_DETECTED", issues: readonly unknown[], historyRecovery: unknown): string {
+function schedulerSummaryJson(
+  status: "SUCCESS" | "DRIFT_DETECTED",
+  issues: readonly unknown[],
+  historyRecovery: unknown,
+  counts: Partial<{ candidateCount: number; processedCount: number; deferredCount: number; maxOrderLookupsPerRun: number }> = {},
+): string {
   return JSON.stringify({
     source: "SCHEDULER_PREFLIGHT",
     status,
     issues,
-    candidateCount: 0,
-    processedCount: 0,
-    deferredCount: 0,
-    maxOrderLookupsPerRun: 10,
+    candidateCount: counts.candidateCount ?? 0,
+    processedCount: counts.processedCount ?? 0,
+    deferredCount: counts.deferredCount ?? 0,
+    maxOrderLookupsPerRun: counts.maxOrderLookupsPerRun ?? 10,
     historyRecovery,
   });
 }
@@ -658,7 +767,7 @@ function schedulerHistoryRecovery() {
     confidenceReason: "ARCHIVE_IN_PROGRESS",
     failureMessage: null,
     scannedSnapshotCount: 2,
-    recoveredOrderCount: 1,
+    recoveredOrderCount: 0,
     markets: [market("KRW-BTC"), market("KRW-ETH")],
   };
 }

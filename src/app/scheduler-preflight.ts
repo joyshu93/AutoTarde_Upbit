@@ -12,6 +12,7 @@ import type { ExecutionRepository } from "../modules/db/interfaces.js";
 import { parseCandidatePilotTimestamp } from "../modules/db/pilot-interfaces.js";
 import type { ReconciliationIssue } from "../modules/reconciliation/interfaces.js";
 import { isStrictHistoryRecoverySummary } from "../modules/reconciliation/history-recovery-validation.js";
+import { isValidBoundedReconciliationSweep } from "../modules/reconciliation/reconciliation-summary-validation.js";
 
 const BLOCKING_RECONCILIATION_ISSUE_CODES = new Set([
   "BALANCE_DRIFT_DETECTED",
@@ -473,10 +474,16 @@ function parseReconciliationSummary(
   }
   if (typeof summaryDescriptors.source?.value !== "string" || !["DIRECT_RUN", "OPERATOR_SYNC", "STARTUP_RECOVERY", "SCHEDULER_PREFLIGHT"].includes(summaryDescriptors.source.value)) return null;
   if (typeof summaryDescriptors.status?.value !== "string" || !["SUCCESS", "DRIFT_DETECTED", "ERROR"].includes(summaryDescriptors.status.value)) return null;
-  for (const key of ["candidateCount", "processedCount", "deferredCount", "maxOrderLookupsPerRun"]) {
-    const value = summaryDescriptors[key]?.value;
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return null;
-  }
+  const candidateCount = summaryDescriptors.candidateCount?.value;
+  const processedCount = summaryDescriptors.processedCount?.value;
+  const deferredCount = summaryDescriptors.deferredCount?.value;
+  const maxOrderLookupsPerRun = summaryDescriptors.maxOrderLookupsPerRun?.value;
+  if (
+    typeof candidateCount !== "number" || !Number.isSafeInteger(candidateCount) || candidateCount < 0 ||
+    typeof processedCount !== "number" || !Number.isSafeInteger(processedCount) || processedCount < 0 ||
+    typeof deferredCount !== "number" || !Number.isSafeInteger(deferredCount) || deferredCount < 0 ||
+    typeof maxOrderLookupsPerRun !== "number" || !Number.isSafeInteger(maxOrderLookupsPerRun) || maxOrderLookupsPerRun < 0
+  ) return null;
   if (summaryDescriptors.historyRecovery !== undefined && (!("value" in summaryDescriptors.historyRecovery) || !isJsonData(summaryDescriptors.historyRecovery.value))) return null;
   const issuesDescriptor = summaryDescriptors.issues;
   if (issuesDescriptor === undefined || issuesDescriptor.enumerable !== true || !("value" in issuesDescriptor) || !Array.isArray(issuesDescriptor.value)) {
@@ -513,6 +520,14 @@ function parseReconciliationSummary(
     }
     issues.push({ code: codeDescriptor.value as ReconciliationIssue["code"], message: messageDescriptor.value });
   }
+
+  if (!isValidBoundedReconciliationSweep(
+    candidateCount,
+    processedCount,
+    deferredCount,
+    maxOrderLookupsPerRun,
+    issues.map((issue) => issue.code),
+  )) return null;
 
   if (summaryDescriptors.historyRecovery !== undefined && !isStrictHistoryRecoverySummary(
     summaryDescriptors.historyRecovery.value,

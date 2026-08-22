@@ -16,6 +16,7 @@ import type { ExecutionRepository, OperatorStateStore } from "../modules/db/inte
 import { parseCandidatePilotTimestamp } from "../modules/db/pilot-interfaces.js";
 import type { PortfolioSyncRunResult, PortfolioSyncService } from "../modules/reconciliation/portfolio-sync-service.js";
 import { isStrictHistoryRecoverySummary } from "../modules/reconciliation/history-recovery-validation.js";
+import { isValidBoundedReconciliationSweep } from "../modules/reconciliation/reconciliation-summary-validation.js";
 
 type CandidateBtcRunPreparationDependencies = {
   config: Pick<AppConfig, "strategySchedulerBtcIntervalMs" | "strategySchedulerEthIntervalMs" | "liveExecutionGate">;
@@ -360,6 +361,19 @@ function snapshotReconciliationSummary(
   const status = requiredEnum(fields.status, `${label} status`, ["SUCCESS", "DRIFT_DETECTED"]);
   const issues = snapshotReconciliationIssues(fields.issues, `${label} issues`);
   const issueCodes = issues.map((issue) => (issue as Readonly<Record<string, JsonSnapshot>>).code as string);
+  const candidateCount = requiredNonNegativeSafeInteger(fields.candidateCount, `${label} candidateCount`);
+  const processedCount = requiredNonNegativeSafeInteger(fields.processedCount, `${label} processedCount`);
+  const deferredCount = requiredNonNegativeSafeInteger(fields.deferredCount, `${label} deferredCount`);
+  const maxOrderLookupsPerRun = requiredNonNegativeSafeInteger(fields.maxOrderLookupsPerRun, `${label} maxOrderLookupsPerRun`);
+  if (!isValidBoundedReconciliationSweep(
+    candidateCount,
+    processedCount,
+    deferredCount,
+    maxOrderLookupsPerRun,
+    issueCodes,
+  )) {
+    throw new Error(`${label} bounded sweep evidence is invalid.`);
+  }
   if (
     Object.prototype.hasOwnProperty.call(fields, "historyRecovery") &&
     historyContext !== undefined &&
@@ -377,10 +391,10 @@ function snapshotReconciliationSummary(
     source,
     status,
     issues,
-    candidateCount: requiredNonNegativeSafeInteger(fields.candidateCount, `${label} candidateCount`),
-    processedCount: requiredNonNegativeSafeInteger(fields.processedCount, `${label} processedCount`),
-    deferredCount: requiredNonNegativeSafeInteger(fields.deferredCount, `${label} deferredCount`),
-    maxOrderLookupsPerRun: requiredNonNegativeSafeInteger(fields.maxOrderLookupsPerRun, `${label} maxOrderLookupsPerRun`),
+    candidateCount,
+    processedCount,
+    deferredCount,
+    maxOrderLookupsPerRun,
   };
   if (Object.prototype.hasOwnProperty.call(fields, "historyRecovery")) {
     snapshot.historyRecovery = snapshotJsonValue(fields.historyRecovery, `${label} historyRecovery`);

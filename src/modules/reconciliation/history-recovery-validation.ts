@@ -58,13 +58,14 @@ export function isStrictHistoryRecoverySummary(
 
   const markets = denseDataArray(summary.markets);
   if (markets === null) return false;
-  const hasLookupFailureIssue = issueCodes.some((code) => code === "ORDER_HISTORY_LOOKUP_FAILED");
+  const lookupFailureIssueCount = countIssueCode(issueCodes, "ORDER_HISTORY_LOOKUP_FAILED");
+  const recoveredIssueCount = countIssueCode(issueCodes, "EXCHANGE_ORDER_RECOVERED");
   if (summary.confidenceLevel === "FAILED") {
     const expectedRetentionStatus = Date.parse(expectedStopBeforeAt) < Date.parse(expectedRetentionBoundaryAt)
       ? "BEYOND_ASSUMED_RETENTION"
       : "WITHIN_ASSUMED_RETENTION";
     return reconciliationStatus === "DRIFT_DETECTED" &&
-      hasLookupFailureIssue &&
+      lookupFailureIssueCount === 1 && recoveredIssueCount === 0 &&
       summary.retentionStatus === expectedRetentionStatus &&
       summary.coverageStatus === "IN_PROGRESS" &&
       summary.confidenceReason === "LOOKUP_FAILED" &&
@@ -74,7 +75,7 @@ export function isStrictHistoryRecoverySummary(
 
   if (
     (reconciliationStatus !== "SUCCESS" && reconciliationStatus !== "DRIFT_DETECTED") ||
-    hasLookupFailureIssue || summary.failureMessage !== null ||
+    lookupFailureIssueCount !== 0 || summary.failureMessage !== null ||
     !oneOf(summary.retentionStatus, ["WITHIN_ASSUMED_RETENTION", "BEYOND_ASSUMED_RETENTION"]) ||
     !oneOf(summary.coverageStatus, ["IN_PROGRESS", "COMPLETE"]) ||
     !oneOf(summary.confidenceLevel, ["HIGH", "PARTIAL"]) ||
@@ -179,7 +180,16 @@ export function isStrictHistoryRecoverySummary(
   return Number.isSafeInteger(snapshotCount) && summary.coverageStatus === expectedCoverage &&
     summary.retentionStatus === expectedRetention && summary.confidenceLevel === expectedConfidence &&
     summary.confidenceReason === expectedReason && recoveredOrderCount <= scannedSnapshotCount &&
-    scannedSnapshotCount <= snapshotCount && (scannedSnapshotCount > 0) === (snapshotCount > 0);
+    recoveredIssueCount === recoveredOrderCount && scannedSnapshotCount <= snapshotCount &&
+    (scannedSnapshotCount > 0) === (snapshotCount > 0);
+}
+
+function countIssueCode(issueCodes: readonly string[], expected: string): number {
+  let count = 0;
+  for (const code of issueCodes) {
+    if (code === expected) count += 1;
+  }
+  return count;
 }
 
 function exactDataRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {

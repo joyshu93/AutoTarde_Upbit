@@ -41,6 +41,20 @@ test("history recovery validator accepts structurally legitimate failed lookup e
   );
 });
 
+test("history recovery validator correlates producer history issue counts while allowing unrelated issues", () => {
+  const recovered = normalHistoryRecovery();
+  recovered.recoveredOrderCount = 1;
+  assert.equal(validate(recovered, "DRIFT_DETECTED", [], STARTED_AT, COMPLETED_AT), false);
+  assert.equal(validate(normalHistoryRecovery(), "DRIFT_DETECTED", ["EXCHANGE_ORDER_RECOVERED"], STARTED_AT, COMPLETED_AT), false);
+  assert.equal(validate(recovered, "DRIFT_DETECTED", ["EXCHANGE_ORDER_RECOVERED", "EXCHANGE_ORDER_RECOVERED"], STARTED_AT, COMPLETED_AT), false);
+  assert.equal(validate(recovered, "DRIFT_DETECTED", ["EXCHANGE_ORDER_RECOVERED", "ORDER_FILLS_BACKFILLED"], STARTED_AT, COMPLETED_AT), true);
+
+  const failed = failedHistoryRecovery("failed");
+  assert.equal(validate(failed, "DRIFT_DETECTED", ["ORDER_HISTORY_LOOKUP_FAILED", "ORDER_HISTORY_LOOKUP_FAILED"], STARTED_AT, COMPLETED_AT), false);
+  assert.equal(validate(failed, "DRIFT_DETECTED", ["ORDER_HISTORY_LOOKUP_FAILED", "EXCHANGE_ORDER_RECOVERED"], STARTED_AT, COMPLETED_AT), false);
+  assert.equal(validate(failed, "DRIFT_DETECTED", ["CANDIDATE_EVIDENCE_PROJECTION_DEFERRED", "ORDER_HISTORY_LOOKUP_FAILED"], STARTED_AT, COMPLETED_AT), true);
+});
+
 test("history recovery validator rejects malformed cardinality, derivations, aggregates, pages, and counts", () => {
   const malformed = [
     mutate(normalHistoryRecovery(), (history) => { history.markets.pop(); }),
@@ -182,7 +196,7 @@ function normalHistoryRecovery(): HistoryRecovery {
     confidenceReason: "ARCHIVE_IN_PROGRESS",
     failureMessage: null,
     scannedSnapshotCount: 2,
-    recoveredOrderCount: 1,
+    recoveredOrderCount: 0,
     markets: [market("KRW-BTC"), market("KRW-ETH")],
   };
 }

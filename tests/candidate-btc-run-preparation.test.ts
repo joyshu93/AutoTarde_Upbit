@@ -361,7 +361,7 @@ test("candidate preparation rejects descriptor-unsafe or conflicting reconciliat
       async run() {
         return createSyncResult({
           reconciliationRun: createReconciliationRun({
-            summaryJson: JSON.stringify({ source: "SCHEDULER_PREFLIGHT", status: "SUCCESS", issues: [], candidateCount: 1, processedCount: 0, deferredCount: 0, maxOrderLookupsPerRun: 10 }),
+            summaryJson: JSON.stringify({ source: "SCHEDULER_PREFLIGHT", status: "SUCCESS", issues: [], candidateCount: 1, processedCount: 1, deferredCount: 0, maxOrderLookupsPerRun: 10 }),
           }),
         });
       },
@@ -429,6 +429,61 @@ test("candidate preparation rejects malformed history recovery even when returne
     repositories: { async listActiveOrders() { return []; } }, exchangeBackedReadEnabled: true, liveSendPath: "LIVE_ADAPTER", now: () => CHECKED_AT,
   });
   await assert.rejects(preparation.prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "TELEGRAM" }), /historyRecovery/);
+});
+
+test("candidate preparation enforces bounded sweep arithmetic, budget, and deferred issue correlation", async () => {
+  let stateReads = 0;
+  const malformed = [
+    candidateSummary("SUCCESS", [], undefined, { candidateCount: 1 }),
+    candidateSummary("SUCCESS", [], undefined, { candidateCount: 2, processedCount: 2, maxOrderLookupsPerRun: 1 }),
+    candidateSummary("DRIFT_DETECTED", [], undefined, { candidateCount: 1, deferredCount: 1 }),
+    candidateSummary("DRIFT_DETECTED", [{ code: "ORDER_LOOKUP_DEFERRED", message: "unexpected" }], undefined),
+    candidateSummary("DRIFT_DETECTED", [
+      { code: "ORDER_LOOKUP_DEFERRED", message: "first" },
+      { code: "ORDER_LOOKUP_DEFERRED", message: "second" },
+    ], undefined, { candidateCount: 2, deferredCount: 2 }),
+  ];
+  for (const summary of malformed) {
+    if (summary.status === "ERROR") throw new Error("test fixture status must be evaluable");
+    await assert.rejects(
+      candidatePreparationForSummary(summary, summary.status, () => { stateReads += 1; }).prepare({
+        exchangeAccountId: "primary",
+        requestedAt: REQUESTED_AT,
+        requestedBy: "TELEGRAM",
+      }),
+      /reconciliationSummary/,
+    );
+  }
+  assert.equal(stateReads, 0);
+
+  const legitimateDeferred = candidateSummary(
+    "DRIFT_DETECTED",
+    [{ code: "ORDER_LOOKUP_DEFERRED", message: "deferred" }],
+    undefined,
+    { candidateCount: 2, processedCount: 1, deferredCount: 1, maxOrderLookupsPerRun: 1 },
+  );
+  assert.deepEqual(
+    await candidatePreparationForSummary(legitimateDeferred, "DRIFT_DETECTED").prepare({
+      exchangeAccountId: "primary",
+      requestedAt: REQUESTED_AT,
+      requestedBy: "TELEGRAM",
+    }),
+    { status: "BLOCKED", detail: "Candidate BTC run blocked by latest_reconciliation." },
+  );
+
+  const projectionDeferred = candidateSummary(
+    "DRIFT_DETECTED",
+    [{ code: "CANDIDATE_EVIDENCE_PROJECTION_DEFERRED", message: "projection deferred" }],
+    undefined,
+  );
+  assert.equal(
+    (await candidatePreparationForSummary(projectionDeferred, "DRIFT_DETECTED").prepare({
+      exchangeAccountId: "primary",
+      requestedAt: REQUESTED_AT,
+      requestedBy: "TELEGRAM",
+    })).status,
+    "READY",
+  );
 });
 
 test("candidate preparation fully validates persisted history recovery with exact run chronology", async () => {
@@ -518,6 +573,60 @@ test("candidate preparation rejects reverse lookup-failure mismatch but returns 
       /historyRecovery/,
     );
   }
+});
+
+test("candidate preparation correlates history producer issue counts and permits unrelated issue codes", async () => {
+  const recovered = { ...candidateHistoryRecovery(), recoveredOrderCount: 1 };
+  const failed = { ...candidateHistoryRecovery(), confidenceLevel: "FAILED" as const, confidenceReason: "LOOKUP_FAILED" as const, failureMessage: "failed", scannedSnapshotCount: 0, recoveredOrderCount: 0, markets: [] };
+  const malformed = [
+    candidateSummary("SUCCESS", [], recovered),
+    candidateSummary("DRIFT_DETECTED", [{ code: "EXCHANGE_ORDER_RECOVERED", message: "extra" }], candidateHistoryRecovery()),
+    candidateSummary("DRIFT_DETECTED", [
+      { code: "ORDER_HISTORY_LOOKUP_FAILED", message: "first" },
+      { code: "ORDER_HISTORY_LOOKUP_FAILED", message: "second" },
+    ], failed),
+    candidateSummary("DRIFT_DETECTED", [
+      { code: "ORDER_HISTORY_LOOKUP_FAILED", message: "failed" },
+      { code: "EXCHANGE_ORDER_RECOVERED", message: "impossible" },
+    ], failed),
+  ];
+  for (const summary of malformed) {
+    if (summary.status === "ERROR") throw new Error("test fixture status must be evaluable");
+    await assert.rejects(
+      candidatePreparationForSummary(summary, summary.status).prepare({
+        exchangeAccountId: "primary",
+        requestedAt: REQUESTED_AT,
+        requestedBy: "TELEGRAM",
+      }),
+      /historyRecovery/,
+    );
+  }
+
+  const legitimateRecovered = candidateSummary("DRIFT_DETECTED", [
+    { code: "EXCHANGE_ORDER_RECOVERED", message: "recovered" },
+    { code: "ORDER_FILLS_BACKFILLED", message: "fill" },
+  ], recovered);
+  assert.equal(
+    (await candidatePreparationForSummary(legitimateRecovered, "DRIFT_DETECTED").prepare({
+      exchangeAccountId: "primary",
+      requestedAt: REQUESTED_AT,
+      requestedBy: "TELEGRAM",
+    })).status,
+    "READY",
+  );
+
+  const legitimateFailed = candidateSummary("DRIFT_DETECTED", [
+    { code: "CANDIDATE_EVIDENCE_PROJECTION_DEFERRED", message: "projection deferred" },
+    { code: "ORDER_HISTORY_LOOKUP_FAILED", message: "failed" },
+  ], failed);
+  assert.deepEqual(
+    await candidatePreparationForSummary(legitimateFailed, "DRIFT_DETECTED").prepare({
+      exchangeAccountId: "primary",
+      requestedAt: REQUESTED_AT,
+      requestedBy: "TELEGRAM",
+    }),
+    { status: "BLOCKED", detail: "Candidate BTC run blocked by latest_reconciliation." },
+  );
 });
 
 test("candidate preparation rejects nested history accessors and sparse market arrays before later dependency reads", async () => {
@@ -639,17 +748,25 @@ function candidatePreparationForSummary(
   });
 }
 
-function candidateSummary(status: "SUCCESS" | "DRIFT_DETECTED", issues: readonly unknown[], historyRecovery: unknown): PortfolioSyncRunResult["reconciliationSummary"] {
-  return {
+function candidateSummary(
+  status: "SUCCESS" | "DRIFT_DETECTED",
+  issues: readonly unknown[],
+  historyRecovery: unknown,
+  counts: Partial<{ candidateCount: number; processedCount: number; deferredCount: number; maxOrderLookupsPerRun: number }> = {},
+): PortfolioSyncRunResult["reconciliationSummary"] {
+  const summary: PortfolioSyncRunResult["reconciliationSummary"] = {
     source: "SCHEDULER_PREFLIGHT",
     status,
     issues: issues as PortfolioSyncRunResult["reconciliationSummary"]["issues"],
-    candidateCount: 0,
-    processedCount: 0,
-    deferredCount: 0,
-    maxOrderLookupsPerRun: 10,
-    historyRecovery: historyRecovery as NonNullable<PortfolioSyncRunResult["reconciliationSummary"]["historyRecovery"]>,
+    candidateCount: counts.candidateCount ?? 0,
+    processedCount: counts.processedCount ?? 0,
+    deferredCount: counts.deferredCount ?? 0,
+    maxOrderLookupsPerRun: counts.maxOrderLookupsPerRun ?? 10,
   };
+  if (historyRecovery !== undefined) {
+    summary.historyRecovery = historyRecovery as NonNullable<PortfolioSyncRunResult["reconciliationSummary"]["historyRecovery"]>;
+  }
+  return summary;
 }
 
 function candidateHistoryRecovery() {
@@ -684,7 +801,7 @@ function candidateHistoryRecovery() {
     confidenceReason: "ARCHIVE_IN_PROGRESS" as "ARCHIVE_IN_PROGRESS" | "LOOKUP_FAILED" | "PAGE_LIMIT_REACHED" | "ARCHIVE_COMPLETE" | "BEYOND_ASSUMED_RETENTION",
     failureMessage: null as string | number | null,
     scannedSnapshotCount: 2,
-    recoveredOrderCount: 1,
+    recoveredOrderCount: 0,
     markets: [market("KRW-BTC"), market("KRW-ETH")],
   };
 }

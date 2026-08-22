@@ -228,3 +228,31 @@ Existing canonical `Z` fixtures and every prior derivation, page, aggregate, fai
 - Updated this task report.
 
 No runtime, operational database, API, network, Telegram, operational script, push, or merge action was used.
+
+## Fix Round 9 TDD Evidence
+
+### RED
+
+With production unchanged, focused shared-validator, direct-scheduler, and candidate fixtures were added for bounded-sweep arithmetic, lookup-budget overflow, missing/unexpected/duplicate `ORDER_LOOKUP_DEFERRED`, recovered-event under/over counts, duplicate lookup failures, and failed summaries carrying recovery events. The focused harness exited 1 with exactly five expected failures:
+
+- shared history event-count correlation was accepted;
+- direct scheduler bounded-sweep contradictions were accepted;
+- direct scheduler history event-count contradictions were accepted;
+- candidate exact-summary bounded-sweep contradictions were accepted;
+- candidate persisted history event-count contradictions were accepted.
+
+### GREEN
+
+The focused harness passed all 43 tests after adding one pure bounded-sweep validator consumed by candidate exact-summary snapshotting and direct scheduler parsing, plus exact producer event-count correlation in the strict history validator. Producer-valid controls remain accepted: one lookup-deferral issue for a positive deferred count, projection deferral without lookup deferral, normal recovery events mixed with unrelated issue codes, and one failed-lookup issue mixed with unrelated issue codes.
+
+Expanded verification passed every test loaded from `history-recovery-validation.test.ts`, `reconciliation-service.test.ts`, `position-guard-pilot-recovery.test.ts`, `scheduler-preflight.test.ts`, and `candidate-btc-run-preparation.test.ts`. Fresh `npm.cmd run typecheck`, `npm.cmd run build`, and `git diff --check` exited 0; diff-check emitted only LF-to-CRLF working-copy notices.
+
+### Round 9 Files
+
+- Added `src/modules/reconciliation/reconciliation-summary-validation.ts`.
+- Updated `src/modules/reconciliation/history-recovery-validation.ts`.
+- Updated `src/app/scheduler-preflight.ts` and `src/app/candidate-btc-run-preparation.ts`.
+- Expanded `tests/history-recovery-validation.test.ts`, `tests/scheduler-preflight.test.ts`, and `tests/candidate-btc-run-preparation.test.ts`.
+- Updated this task report.
+
+No runtime, operational database, Upbit, Telegram, network, scheduler tick, sync command, secret, default, operational script, push, or merge action was used or changed. No subagents were used.
