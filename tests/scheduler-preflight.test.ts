@@ -455,6 +455,29 @@ test("exact-evidence evaluator fully validates history recovery before PASS or W
   }
 });
 
+test("exact-evidence evaluator accepts producer-canonical history windows for an offset nanosecond run identity", () => {
+  const startedAt = "2026-08-22T09:00:00.123456789+09:00";
+  const completedAt = "2026-08-22T00:00:01.000Z";
+  const evaluation = evaluateLiveStrategyRunPreflight({
+    config: createConfig({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    executionState: createExecutionState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    checkedAt: "2026-08-22T00:00:02.000Z",
+    balanceSnapshot: { id: "b", exchangeAccountId: "primary", capturedAt: startedAt, source: "RECONCILIATION", totalKrwValue: "1", balancesJson: "[]" },
+    positionSnapshot: { id: "p", exchangeAccountId: "primary", capturedAt: startedAt, source: "RECONCILIATION", positionsJson: "[]" },
+    reconciliationRun: createReconciliationRun({
+      startedAt,
+      completedAt,
+      summaryJson: schedulerSummaryJson("SUCCESS", [], schedulerOffsetHistoryRecovery()),
+    }),
+    activeOrders: [],
+  });
+
+  assert.equal(evaluation.status, "PASS");
+  assert.equal(evaluation.checks.find((check) => check.name === "latest_reconciliation")?.status, "PASS");
+});
+
 test("exact-evidence evaluator correlates failed history lookup both ways and treats valid failure as a blocking issue", () => {
   const common = {
     config: createConfig({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
@@ -638,6 +661,20 @@ function schedulerHistoryRecovery() {
     recoveredOrderCount: 1,
     markets: [market("KRW-BTC"), market("KRW-ETH")],
   };
+}
+
+function schedulerOffsetHistoryRecovery() {
+  const history = schedulerHistoryRecovery();
+  history.stopBeforeAt = "2025-08-22T00:00:00.123Z";
+  history.retentionBoundaryAt = "2025-08-22T00:00:00.123Z";
+  for (const market of history.markets) {
+    market.recentClosedWindowStartAt = "2026-08-15T00:00:00.123Z";
+    market.recentClosedWindowEndAt = "2026-08-22T00:00:00.123Z";
+    market.archivalWindowStartAt = "2026-08-08T00:00:00.123Z";
+    market.archivalWindowEndAt = "2026-08-15T00:00:00.123Z";
+    market.nextWindowEndAt = "2026-08-08T00:00:00.123Z";
+  }
+  return history;
 }
 
 function createOrder(overrides: Partial<OrderRecord>): OrderRecord {

@@ -463,6 +463,42 @@ test("candidate preparation fully validates persisted history recovery with exac
   }
 });
 
+test("candidate preparation accepts producer-canonical history windows while preserving raw offset nanosecond request identity", async () => {
+  const requestedAt = "2026-08-22T09:00:00.123456789+09:00";
+  const completedAt = "2026-08-22T00:00:01.000Z";
+  const summary = candidateSummary("SUCCESS", [], candidateOffsetHistoryRecovery());
+  const preparation = new CandidateBtcRunPreparationService({
+    config: createConfig(),
+    portfolioSync: {
+      async run() {
+        return createSyncResult({
+          requestedAt,
+          balanceSnapshot: createBalanceSnapshot({ capturedAt: requestedAt }),
+          positionSnapshot: createPositionSnapshot({ capturedAt: requestedAt }),
+          reconciliationSummary: summary,
+          reconciliationRun: createReconciliationRun({
+            startedAt: requestedAt,
+            completedAt,
+            summaryJson: JSON.stringify(summary),
+          }),
+        });
+      },
+    },
+    operatorState: { async getState() { return createExecutionState(); } },
+    repositories: { async listActiveOrders() { return []; } },
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    now: () => "2026-08-22T00:00:02.000Z",
+  });
+
+  const result = await preparation.prepare({ exchangeAccountId: "primary", requestedAt, requestedBy: "TELEGRAM" });
+  assert.equal(result.status, "READY");
+  if (result.status === "READY") {
+    assert.equal(result.refreshReceipt.requestedAt, requestedAt);
+    assert.equal(result.refreshReceipt.reconciliationStartedAt, requestedAt);
+  }
+});
+
 test("candidate preparation rejects reverse lookup-failure mismatch but returns BLOCKED for legitimate failed lookup", async () => {
   const lookupIssues = [{ code: "ORDER_HISTORY_LOOKUP_FAILED", message: "lookup failed" }] as const;
   const failed = { ...candidateHistoryRecovery(), confidenceLevel: "FAILED", confidenceReason: "LOOKUP_FAILED", failureMessage: "", scannedSnapshotCount: 0, recoveredOrderCount: 0, markets: [] };
@@ -651,6 +687,20 @@ function candidateHistoryRecovery() {
     recoveredOrderCount: 1,
     markets: [market("KRW-BTC"), market("KRW-ETH")],
   };
+}
+
+function candidateOffsetHistoryRecovery() {
+  const history = candidateHistoryRecovery();
+  history.stopBeforeAt = "2025-08-22T00:00:00.123Z";
+  history.retentionBoundaryAt = "2025-08-22T00:00:00.123Z";
+  for (const market of history.markets) {
+    market.recentClosedWindowStartAt = "2026-08-15T00:00:00.123Z";
+    market.recentClosedWindowEndAt = "2026-08-22T00:00:00.123Z";
+    market.archivalWindowStartAt = "2026-08-08T00:00:00.123Z";
+    market.archivalWindowEndAt = "2026-08-15T00:00:00.123Z";
+    market.nextWindowEndAt = "2026-08-08T00:00:00.123Z";
+  }
+  return history;
 }
 
 function createBalanceSnapshot(overrides: Partial<BalanceSnapshotRecord> = {}): BalanceSnapshotRecord {

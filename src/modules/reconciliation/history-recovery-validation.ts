@@ -46,11 +46,12 @@ export function isStrictHistoryRecoverySummary(
     scannedSnapshotCount === null || recoveredOrderCount === null
   ) return false;
 
+  const recentEndAt = derivedTimestamp(runStartedAt, 0);
   const recentStartAt = derivedTimestamp(runStartedAt, closedOrderLookbackDays);
   const expectedStopBeforeAt = derivedTimestamp(runStartedAt, stopBeforeDays);
   const expectedRetentionBoundaryAt = derivedTimestamp(runStartedAt, retentionAssumptionDays);
   if (
-    recentStartAt === null || expectedStopBeforeAt === null || expectedRetentionBoundaryAt === null ||
+    recentEndAt === null || recentStartAt === null || expectedStopBeforeAt === null || expectedRetentionBoundaryAt === null ||
     summary.stopBeforeAt !== expectedStopBeforeAt || summary.retentionBoundaryAt !== expectedRetentionBoundaryAt ||
     !timestampsAtOrBefore([summary.stopBeforeAt, summary.retentionBoundaryAt], boundaryEpoch)
   ) return false;
@@ -146,7 +147,7 @@ export function isStrictHistoryRecoverySummary(
         retentionStatus === "WITHIN_ASSUMED_RETENTION" ? "HIGH" : "PARTIAL";
     const totalPages = openPagesScanned + recentClosedPagesScanned + archivalClosedPagesScanned;
     if (
-      market.recentClosedWindowStartAt !== recentStartAt || market.recentClosedWindowEndAt !== runStartedAt ||
+      market.recentClosedWindowStartAt !== recentStartAt || market.recentClosedWindowEndAt !== recentEndAt ||
       archivalStartMs > archivalEndMs || archivalEndMs > recentStartMs ||
       market.archivalWindowStartAt !== expectedArchivalStartAt || market.nextWindowEndAt !== market.archivalWindowStartAt ||
       market.archiveComplete !== archiveComplete || market.retentionStatus !== retentionStatus ||

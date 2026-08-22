@@ -5,6 +5,7 @@ import { test } from "./harness.js";
 
 const STARTED_AT = "2026-08-22T00:00:00.000Z";
 const COMPLETED_AT = "2026-08-22T00:00:01.000Z";
+const OFFSET_STARTED_AT = "2026-08-22T09:00:00.123456789+09:00";
 const validate = isStrictHistoryRecoverySummary as unknown as (
   value: unknown,
   reconciliationStatus: string,
@@ -24,6 +25,13 @@ test("history recovery validator accepts producer-derived normal progress varian
   for (const fixture of fixtures) {
     assert.equal(validate(fixture, "SUCCESS", [], STARTED_AT, COMPLETED_AT), true, fixture.confidenceReason);
   }
+});
+
+test("history recovery validator accepts producer-canonical windows for an offset nanosecond run identity", () => {
+  assert.equal(
+    validate(offsetNanosecondHistoryRecovery(), "SUCCESS", [], OFFSET_STARTED_AT, COMPLETED_AT),
+    true,
+  );
 });
 
 test("history recovery validator accepts structurally legitimate failed lookup evidence", () => {
@@ -197,6 +205,20 @@ function completeHistoryRecovery(): HistoryRecovery {
     market.confidenceReason = "ARCHIVE_COMPLETE";
     market.archivalClosedPagesScanned = 0;
     market.snapshotCount = 0;
+  }
+  return history;
+}
+
+function offsetNanosecondHistoryRecovery(): HistoryRecovery {
+  const history = normalHistoryRecovery();
+  history.stopBeforeAt = "2025-08-22T00:00:00.123Z";
+  history.retentionBoundaryAt = "2025-08-22T00:00:00.123Z";
+  for (const market of history.markets) {
+    market.recentClosedWindowStartAt = "2026-08-15T00:00:00.123Z";
+    market.recentClosedWindowEndAt = "2026-08-22T00:00:00.123Z";
+    market.archivalWindowStartAt = "2026-08-08T00:00:00.123Z";
+    market.archivalWindowEndAt = "2026-08-15T00:00:00.123Z";
+    market.nextWindowEndAt = "2026-08-08T00:00:00.123Z";
   }
   return history;
 }

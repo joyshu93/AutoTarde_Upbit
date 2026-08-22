@@ -204,3 +204,27 @@ Expanded verification passed every test from `history-recovery-validation.test.t
 - Updated `src/modules/reconciliation/history-recovery-validation.ts`.
 - Expanded `tests/history-recovery-validation.test.ts`, `tests/scheduler-preflight.test.ts`, and `tests/candidate-btc-run-preparation.test.ts`.
 - Updated this task report.
+
+## Fix Round 8 TDD Evidence
+
+### RED
+
+With production unchanged, offset/nanosecond producer fixtures were added using raw run/request identity `2026-08-22T09:00:00.123456789+09:00` and producer-canonical recovery timestamps ending at `2026-08-22T00:00:00.123Z`. The focused shared/scheduler/candidate harness exited 1 with exactly three expected failures:
+
+- the shared validator returned `false` for the valid producer summary;
+- direct scheduler evaluation returned `BLOCK` instead of `PASS`;
+- candidate preparation rejected the persisted summary as invalid instead of returning `READY` while preserving the raw request identity.
+
+### GREEN
+
+The same focused command passed all 38 tests after deriving the expected recent closed endpoint through the producer-equivalent `Date.parse` and UTC millisecond `toISOString` path. Raw `runStartedAt` remains subject to strict timezone parsing and exact epoch-nanosecond chronology; only the producer-generated endpoint comparison is canonicalized.
+
+Existing canonical `Z` fixtures and every prior derivation, page, aggregate, failure-correlation, strict-data, and chronology regression remain green. Expanded verification passed every test from `history-recovery-validation.test.ts`, `reconciliation-service.test.ts`, `position-guard-pilot-recovery.test.ts`, `scheduler-preflight.test.ts`, and `candidate-btc-run-preparation.test.ts`. Fresh `npm.cmd run typecheck`, `npm.cmd run build`, and `git diff --check` exited 0.
+
+### Round 8 Files
+
+- Updated `src/modules/reconciliation/history-recovery-validation.ts`.
+- Expanded `tests/history-recovery-validation.test.ts`, `tests/scheduler-preflight.test.ts`, and `tests/candidate-btc-run-preparation.test.ts`.
+- Updated this task report.
+
+No runtime, operational database, API, network, Telegram, operational script, push, or merge action was used.
