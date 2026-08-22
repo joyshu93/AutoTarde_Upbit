@@ -6,6 +6,7 @@ import type {
   OrderRecord,
   PositionSnapshot,
   PositionSnapshotRecord,
+  ReconciliationRunRecord,
   RiskEventRecord,
 } from "../../domain/types.js";
 import { SUPPORTED_MARKETS } from "../../domain/types.js";
@@ -70,6 +71,11 @@ export interface IdentifierRecoverySummary {
   outcome: IdentifierRecoveryOutcome;
   orderId: string;
   detail: string;
+}
+
+export interface ReconciliationRunResult {
+  summary: ReconciliationSummary;
+  reconciliationRun: ReconciliationRunRecord;
 }
 
 export class ReconciliationService {
@@ -252,6 +258,21 @@ export class ReconciliationService {
       };
     },
   ): Promise<ReconciliationSummary> {
+    return (await this.runWithRecord(exchangeAccountId, options)).summary;
+  }
+
+  async runWithRecord(
+    exchangeAccountId: string,
+    options?: {
+      source?: ReconciliationTrigger;
+      portfolioSnapshots?: {
+        previousBalanceSnapshot: BalanceSnapshotRecord | null;
+        currentBalanceSnapshot: BalanceSnapshotRecord | null;
+        previousPositionSnapshot: PositionSnapshotRecord | null;
+        currentPositionSnapshot: PositionSnapshotRecord | null;
+      };
+    },
+  ): Promise<ReconciliationRunResult> {
     const maxOrderLookupsPerRun = this.dependencies.maxOrderLookupsPerRun ?? 10;
     const startedAt = new Date().toISOString();
     const [openOrders, allOrders, state] = await Promise.all([
@@ -325,7 +346,7 @@ export class ReconciliationService {
       ...(historyRecovery.historyRecovery ? { historyRecovery: historyRecovery.historyRecovery } : {}),
     };
 
-    await this.dependencies.repositories.saveReconciliationRun({
+    const reconciliationRun: ReconciliationRunRecord = {
       id: createId("recon_run"),
       exchangeAccountId,
       status: summary.status,
@@ -333,7 +354,8 @@ export class ReconciliationService {
       completedAt: new Date().toISOString(),
       summaryJson: JSON.stringify(summary),
       errorMessage: null,
-    });
+    };
+    await this.dependencies.repositories.saveReconciliationRun(reconciliationRun);
     if (summary.status === "DRIFT_DETECTED") {
       await this.safeReport({
         exchangeAccountId,
@@ -349,7 +371,10 @@ export class ReconciliationService {
       });
     }
 
-    return summary;
+    return {
+      summary,
+      reconciliationRun: { ...reconciliationRun },
+    };
   }
 
   private async detectPortfolioDrift(

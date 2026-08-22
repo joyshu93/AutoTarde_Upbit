@@ -85,6 +85,18 @@ test("startup recovery runs portfolio sync and reports drift metadata", async ()
             deferredCount: 0,
             maxOrderLookupsPerRun: 10,
           },
+          reconciliationRun: {
+            id: "reconciliation-startup-recovery",
+            exchangeAccountId: "primary",
+            status: "DRIFT_DETECTED" as const,
+            startedAt: "2026-04-20T00:00:00.000Z",
+            completedAt: "2026-04-20T00:00:00.001Z",
+            summaryJson: JSON.stringify({
+              source: "STARTUP_RECOVERY",
+              status: "DRIFT_DETECTED",
+            }),
+            errorMessage: null,
+          },
         };
       },
     },

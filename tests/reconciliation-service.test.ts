@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import type { OrderRecord } from "../src/domain/types.js";
+import type { OrderRecord, ReconciliationRunRecord } from "../src/domain/types.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { ExchangeOrderLookupError } from "../src/modules/exchange/errors.js";
 import { parseCandidateEvidenceTimestamp } from "../src/modules/execution/candidate-evidence-decimals.js";
@@ -50,6 +50,76 @@ function pausedUncertainSubmissionState() {
     updatedAt: "2026-08-21T00:00:00.000Z",
   });
 }
+
+test("reconciliation runWithRecord returns its exact persisted record as a detached value", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-exact-reconciliation-record",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-08-22T00:00:00.000Z",
+  });
+  const originalSave = repositories.saveReconciliationRun.bind(repositories);
+  const ownRecords: ReconciliationRunRecord[] = [];
+  repositories.saveReconciliationRun = async (record) => {
+    ownRecords.push({ ...record });
+    await originalSave(record);
+    await originalSave({
+      id: "concurrent-newer-run",
+      exchangeAccountId: record.exchangeAccountId,
+      status: "SUCCESS",
+      startedAt: "2099-01-01T00:00:00.000Z",
+      completedAt: "2099-01-01T00:00:00.001Z",
+      summaryJson: JSON.stringify({ source: "DIRECT_RUN", status: "SUCCESS", issues: [] }),
+      errorMessage: null,
+    });
+  };
+  const service = new ReconciliationService({ repositories, operatorState });
+
+  const result = await service.runWithRecord("primary");
+  const ownRecord = ownRecords[0];
+
+  assert.ok(ownRecord);
+  assert.deepEqual(result.reconciliationRun, ownRecord);
+  assert.notEqual(result.reconciliationRun.id, "concurrent-newer-run");
+  assert.deepEqual(JSON.parse(result.reconciliationRun.summaryJson), result.summary);
+
+  const persistedId = result.reconciliationRun.id;
+  result.reconciliationRun.id = "mutated-return-value";
+  const persisted = await repositories.listReconciliationRuns("primary");
+  assert.ok(persisted.some((record) => record.id === persistedId));
+  assert.ok(!persisted.some((record) => record.id === "mutated-return-value"));
+});
+
+test("reconciliation run preserves the legacy summary API by delegating to the exact result", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-legacy-summary-api",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-08-22T00:00:00.000Z",
+  });
+  const service = new ReconciliationService({ repositories, operatorState });
+
+  const summary = await service.run("primary", { source: "SCHEDULER_PREFLIGHT" });
+  const [persisted] = await repositories.listReconciliationRuns("primary", 1);
+
+  assert.ok(persisted);
+  assert.deepEqual(summary, JSON.parse(persisted.summaryJson));
+  assert.equal(summary.source, "SCHEDULER_PREFLIGHT");
+});
 
 test("reconciliation service updates active orders from exchange state and captures fills", async () => {
   const repositories = new InMemoryExecutionRepository();

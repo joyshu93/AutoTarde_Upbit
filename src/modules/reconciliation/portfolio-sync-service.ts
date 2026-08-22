@@ -1,6 +1,7 @@
 import type {
   BalanceSnapshotRecord,
   PositionSnapshotRecord,
+  ReconciliationRunRecord,
   SupportedAsset,
 } from "../../domain/types.js";
 import type { ExecutionRepository } from "../db/interfaces.js";
@@ -24,6 +25,7 @@ export interface PortfolioSyncRunResult {
   previousBalanceSnapshot: BalanceSnapshotRecord | null;
   previousPositionSnapshot: PositionSnapshotRecord | null;
   reconciliationSummary: ReconciliationSummary;
+  reconciliationRun: ReconciliationRunRecord;
 }
 
 export class PortfolioSyncService {
@@ -32,7 +34,7 @@ export class PortfolioSyncService {
       exchangeAdapter: Pick<ExchangeAdapter, "getBalances">;
       marketPriceReader?: Pick<UpbitPublicQuotationClient, "getTickers">;
       repositories: ExecutionRepository;
-      reconciliationService: Pick<ReconciliationService, "run">;
+      reconciliationService: Pick<ReconciliationService, "runWithRecord">;
       now?: () => string;
     },
   ) {}
@@ -66,7 +68,7 @@ export class PortfolioSyncService {
       await this.dependencies.repositories.saveBalanceSnapshot(balanceSnapshot);
       await this.dependencies.repositories.savePositionSnapshot(positionSnapshot);
 
-      const reconciliationSummary = await this.dependencies.reconciliationService.run(input.exchangeAccountId, {
+      const reconciliationResult = await this.dependencies.reconciliationService.runWithRecord(input.exchangeAccountId, {
         source: input.source,
         portfolioSnapshots: {
           previousBalanceSnapshot,
@@ -83,7 +85,8 @@ export class PortfolioSyncService {
         positionSnapshot,
         previousBalanceSnapshot,
         previousPositionSnapshot,
-        reconciliationSummary,
+        reconciliationSummary: reconciliationResult.summary,
+        reconciliationRun: { ...reconciliationResult.reconciliationRun },
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown portfolio sync failure.";
