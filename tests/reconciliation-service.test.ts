@@ -139,6 +139,86 @@ test("reconciliation runWithRecord protects exact provenance from mutation durin
   assert.deepEqual(result.reconciliationRun, runs[0]);
 });
 
+test("reconciliation runWithRecord rejects malformed caller-supplied run identities before reconciliation work", async () => {
+  const symbolKey = Symbol("unexpected-run-identity-key");
+  let accessorReadCount = 0;
+  const accessorIdentity = Object.defineProperties({}, {
+    id: {
+      enumerable: true,
+      get: () => {
+        accessorReadCount += 1;
+        return "accessor-run";
+      },
+    },
+    startedAt: {
+      enumerable: true,
+      value: "2026-08-22T00:00:00.000Z",
+    },
+  });
+  const nonEnumerableIdentity = Object.defineProperties({}, {
+    id: {
+      enumerable: false,
+      value: "hidden-run",
+    },
+    startedAt: {
+      enumerable: true,
+      value: "2026-08-22T00:00:00.000Z",
+    },
+  });
+  const symbolIdentity = {
+    id: "symbol-run",
+    startedAt: "2026-08-22T00:00:00.000Z",
+    [symbolKey]: "unexpected",
+  };
+  const malformedIdentities: readonly unknown[] = [
+    { id: "", startedAt: "2026-08-22T00:00:00.000Z" },
+    { id: "timezone-less-run", startedAt: "2026-08-22T00:00:00.000" },
+    accessorIdentity,
+    Object.assign(Object.create({ inherited: true }), {
+      id: "non-plain-run",
+      startedAt: "2026-08-22T00:00:00.000Z",
+    }),
+    { id: "extra-key-run", startedAt: "2026-08-22T00:00:00.000Z", extra: true },
+    symbolIdentity,
+    nonEnumerableIdentity,
+  ];
+
+  for (const runIdentity of malformedIdentities) {
+    const repositories = new InMemoryExecutionRepository();
+    let stateReadCount = 0;
+    const operatorState = new InMemoryOperatorStateStore({
+      id: "malformed-run-identity-state",
+      exchangeAccountId: "primary",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-08-22T00:00:00.000Z",
+    });
+    operatorState.getState = async () => {
+      stateReadCount += 1;
+      throw new Error("Malformed run identity must be rejected before operator-state reads.");
+    };
+    const service = new ReconciliationService({
+      repositories,
+      operatorState,
+    });
+
+    await assert.rejects(
+      service.runWithRecord("primary", {
+        runIdentity: runIdentity as { id: string; startedAt: string },
+      }),
+      /run identity/i,
+    );
+    assert.equal(stateReadCount, 0);
+    assert.deepEqual(await repositories.listReconciliationRuns("primary"), []);
+  }
+  assert.equal(accessorReadCount, 0);
+});
+
 test("reconciliation run preserves the legacy summary API by delegating to the exact result", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = new InMemoryOperatorStateStore({

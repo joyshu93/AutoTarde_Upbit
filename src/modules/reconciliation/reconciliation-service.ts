@@ -94,6 +94,48 @@ export interface ReconciliationRunOptions {
   runIdentity?: ReconciliationRunIdentity;
 }
 
+function projectReconciliationRunIdentity(input: unknown): Readonly<ReconciliationRunIdentity> {
+  if (typeof input !== "object" || input === null || Object.getPrototypeOf(input) !== Object.prototype) {
+    throw new Error("Reconciliation run identity must be a plain object.");
+  }
+
+  const ownKeys = Reflect.ownKeys(input);
+  if (
+    ownKeys.length !== 2 ||
+    !ownKeys.includes("id") ||
+    !ownKeys.includes("startedAt") ||
+    ownKeys.some((key) => typeof key !== "string")
+  ) {
+    throw new Error("Reconciliation run identity must contain exactly id and startedAt.");
+  }
+
+  const descriptors = Object.getOwnPropertyDescriptors(input);
+  const idDescriptor = descriptors.id;
+  const startedAtDescriptor = descriptors.startedAt;
+  if (
+    !idDescriptor ||
+    !("value" in idDescriptor) ||
+    idDescriptor.enumerable !== true ||
+    !startedAtDescriptor ||
+    !("value" in startedAtDescriptor) ||
+    startedAtDescriptor.enumerable !== true
+  ) {
+    throw new Error("Reconciliation run identity fields must be enumerable own data properties.");
+  }
+
+  const id = idDescriptor.value;
+  const startedAt = startedAtDescriptor.value;
+  if (typeof id !== "string" || id.trim().length === 0) {
+    throw new Error("Reconciliation run identity id must be a non-empty string.");
+  }
+  if (typeof startedAt !== "string") {
+    throw new Error("Reconciliation run identity startedAt must be a string.");
+  }
+  parseCandidateEvidenceTimestamp(startedAt, "reconciliation run identity startedAt");
+
+  return Object.freeze({ id, startedAt });
+}
+
 export class ReconciliationService {
   constructor(
     private readonly dependencies: {
@@ -274,10 +316,12 @@ export class ReconciliationService {
     options?: ReconciliationRunOptions,
   ): Promise<ReconciliationRunResult> {
     const maxOrderLookupsPerRun = this.dependencies.maxOrderLookupsPerRun ?? 10;
-    const runIdentity = Object.freeze({
-      id: options?.runIdentity?.id ?? createId("recon_run"),
-      startedAt: options?.runIdentity?.startedAt ?? new Date().toISOString(),
-    });
+    const runIdentity = options?.runIdentity === undefined
+      ? Object.freeze({
+          id: createId("recon_run"),
+          startedAt: new Date().toISOString(),
+        })
+      : projectReconciliationRunIdentity(options.runIdentity);
     const startedAt = runIdentity.startedAt;
     const [openOrders, allOrders, state] = await Promise.all([
       this.dependencies.repositories.listActiveOrders(exchangeAccountId),
