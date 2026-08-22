@@ -46,6 +46,41 @@ test("sqlite candidate pilot repository satisfies the common contracts", async (
   });
 });
 
+test("sqlite exact recovery lookup ignores an earlier foreign-account deployment", async () => {
+  await withFreshBundle("candidate-exact-lookup", async (bundle, _databasePath, db) => {
+    db.prepare(`
+      INSERT INTO exchange_accounts (
+        id, user_id, exchange, venue_type, account_label,
+        access_key_ref, secret_key_ref, quote_currency, is_primary, created_at, updated_at
+      ) VALUES (?, ?, 'UPBIT', 'SPOT', ?, ?, ?, 'KRW', 0, ?, ?)
+    `).run(
+      "foreign-account",
+      "pilot-user",
+      "Foreign Account",
+      "secret://foreign/access",
+      "secret://foreign/secret",
+      "2026-08-21T00:00:00.000Z",
+      "2026-08-21T00:00:00.000Z",
+    );
+    await bundle.candidatePilots.createDeploymentWithInitialState(
+      initialDeploymentInput("deployment-foreign-account", "foreign-account"),
+    );
+    const target = await bundle.candidatePilots.createDeploymentWithInitialState(
+      initialDeploymentInput("deployment-target", "primary"),
+    );
+
+    const matches = await bundle.candidatePilots.findDeploymentsForRecoveryIdentity({
+      exchangeAccountId: target.exchangeAccountId,
+      pilotId: target.pilotId,
+      market: target.market,
+      policyId: target.policyId,
+      policyVersion: target.policyVersion,
+    });
+
+    assert.deepEqual(matches.map((deployment) => deployment.id), [target.id]);
+  });
+});
+
 test("sqlite candidate projection fault persistence repairs an event-written pause-missing state atomically", async () => {
   await withFreshBundle("candidate-fault-atomic", async (bundle) => {
     const state = await bundle.operatorState.getState();

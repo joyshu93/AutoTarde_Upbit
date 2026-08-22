@@ -4,6 +4,8 @@ import type {
   OrderSubmissionRecoveryObservationRecord,
   PositionGuardPilotAuditEventRecord,
   PositionGuardPilotDeploymentRecord,
+  PositionGuardPilotRecoveryTarget,
+  PositionGuardPilotRefreshReceipt,
 } from "../domain/pilot-types.js";
 import type {
   BalanceSnapshotRecord,
@@ -12,12 +14,13 @@ import type {
   PositionSnapshotRecord,
   ReconciliationRunRecord,
 } from "../domain/types.js";
-import type { ReconciliationTrigger } from "../modules/reconciliation/interfaces.js";
 import type { ExecutionRepository, OperatorStateStore } from "../modules/db/interfaces.js";
 import {
   candidateEvidenceMaterial,
   candidatePilotRecoveryFaultReason,
+  validateCandidatePilotDeployment,
   type CandidateEvidenceRecord,
+  type CandidatePilotRecoveryIdentity,
   type CandidatePilotRecoveryFaultReason,
   type CandidatePilotRepository,
   type PauseCandidatePilotForRecoveryFaultInput,
@@ -33,19 +36,6 @@ import {
   type ExactCandidateState,
   type ExactDecimal,
 } from "../modules/execution/candidate-evidence-decimals.js";
-
-export interface PositionGuardPilotRefreshReceipt {
-  exchangeAccountId: string;
-  requestedAt: string;
-  balanceSnapshotId: string;
-  balanceCapturedAt: string;
-  positionSnapshotId: string;
-  positionCapturedAt: string;
-  reconciliationRunId: string;
-  reconciliationStartedAt: string;
-  reconciliationCompletedAt: string;
-  reconciliationSource: ReconciliationTrigger;
-}
 
 export interface PositionGuardPilotRecoveryClock {
   now(): { occurredAt: string; occurredAtEpochMs: number };
@@ -85,6 +75,7 @@ type RecoveryExecutionReads = Pick<
 type RecoveryCandidateRepository = Pick<
   CandidatePilotRepository,
   | "getDeployment"
+  | "findDeploymentsForRecoveryIdentity"
   | "getExactState"
   | "listEvidenceRecords"
   | "listAuditEvents"
@@ -96,6 +87,8 @@ type RecoveryOperatorState = Pick<OperatorStateStore, "pauseForFault"> &
   Required<Pick<OperatorStateStore, "getTransitionById">>;
 
 interface RecoveryReadback {
+  resolvedDeploymentId: string | null;
+  identityMatchCount: 0 | 1 | 2 | null;
   balanceSnapshot: BalanceSnapshotRecord | null;
   positionSnapshot: PositionSnapshotRecord | null;
   reconciliationRun: ReconciliationRunRecord | null;
@@ -106,6 +99,17 @@ interface RecoveryReadback {
   auditEvents: PositionGuardPilotAuditEventRecord[];
   orderEvents: Map<string, OrderEventRecord[]>;
   orderRecoveryObservations: Map<string, OrderSubmissionRecoveryObservationRecord[]>;
+}
+
+interface PositionGuardPilotRecoveryDependencies extends CandidatePilotRecoveryIdentity {
+  target: PositionGuardPilotRecoveryTarget;
+  freshnessThresholdMs: number;
+  minimumAbsenceObservations: number;
+  minimumAbsenceElapsedMs: number;
+  clock: PositionGuardPilotRecoveryClock;
+  repositories: RecoveryExecutionReads;
+  candidatePilots: RecoveryCandidateRepository;
+  operatorState: RecoveryOperatorState;
 }
 
 interface RecoveryFault extends Error {
@@ -204,24 +208,14 @@ const QUANTITY_TOLERANCE = parseCanonicalNonNegativeDecimal(
 
 export class PositionGuardPilotRecovery {
   constructor(
-    private readonly dependencies: {
-      exchangeAccountId: string;
-      deploymentId: string;
-      pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1";
-      market: "KRW-BTC";
-      policyId: "COMBINED_CONSERVATIVE";
-      policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1";
-      freshnessThresholdMs: number;
-      minimumAbsenceObservations: number;
-      minimumAbsenceElapsedMs: number;
-      clock: PositionGuardPilotRecoveryClock;
-      repositories: RecoveryExecutionReads;
-      candidatePilots: RecoveryCandidateRepository;
-      operatorState: RecoveryOperatorState;
-    },
+    private readonly dependencies: PositionGuardPilotRecoveryDependencies,
   ) {
     requireNonEmpty(dependencies.exchangeAccountId, "candidate recovery exchangeAccountId");
-    requireNonEmpty(dependencies.deploymentId, "candidate recovery deploymentId");
+    if (dependencies.target.kind === "EXACT_DEPLOYMENT") {
+      requireNonEmpty(dependencies.target.deploymentId, "candidate recovery deploymentId");
+    } else if (dependencies.target.kind !== "CONFIGURED_ACCOUNT_PILOT") {
+      throw new Error("Candidate recovery target is invalid.");
+    }
     if (!Number.isSafeInteger(dependencies.freshnessThresholdMs) || dependencies.freshnessThresholdMs <= 0) {
       throw new Error("Candidate recovery freshnessThresholdMs must be a positive safe integer.");
     }
@@ -242,7 +236,7 @@ export class PositionGuardPilotRecovery {
     const readback = emptyRecoveryReadback();
 
     try {
-      await this.readPersistedAccountEvidence(readback, "INITIAL_AUTHORITY_READ");
+      await this.readPersistedAccountEvidence(readback, "INITIAL_AUTHORITY_READ", null);
       if (!hasEstablishedDeploymentIdentity(readback, this.dependencies)) {
         return this.blockForFault("IDENTITY_MISMATCH", receipt, readback, clock);
       }
@@ -272,15 +266,10 @@ export class PositionGuardPilotRecovery {
   private async readPersistedAccountEvidence(
     readback: RecoveryReadback,
     stage: "INITIAL_AUTHORITY_READ" | "STABLE_AUTHORITY_REREAD",
+    pinnedDeploymentId: string | null,
   ): Promise<RecoveryReadback> {
-    readback.deployment = await this.readPersistence(
-      {
-        operation: "candidatePilots.getDeployment",
-        stage: stage === "INITIAL_AUTHORITY_READ" ? "INITIAL_DEPLOYMENT_READ" : stage,
-        pauseAuthority: stage === "INITIAL_AUTHORITY_READ" ? "GLOBAL_ONLY" : "PILOT_AND_GLOBAL_ATOMIC",
-      },
-      () => this.dependencies.candidatePilots.getDeployment(this.dependencies.deploymentId),
-    );
+    await this.resolveDeployment(readback, stage, pinnedDeploymentId);
+    if (!hasEstablishedDeploymentIdentity(readback, this.dependencies)) return readback;
     const pauseAuthority = stage === "STABLE_AUTHORITY_REREAD" ||
         hasEstablishedDeploymentIdentity(readback, this.dependencies)
       ? "PILOT_AND_GLOBAL_ATOMIC"
@@ -336,21 +325,91 @@ export class PositionGuardPilotRecovery {
     return readback;
   }
 
+  private async resolveDeployment(
+    readback: RecoveryReadback,
+    stage: "INITIAL_AUTHORITY_READ" | "STABLE_AUTHORITY_REREAD",
+    pinnedDeploymentId: string | null,
+  ): Promise<void> {
+    if (stage === "STABLE_AUTHORITY_REREAD") {
+      if (pinnedDeploymentId === null) {
+        throw recoveryFault("IDENTITY_MISMATCH", "Candidate deployment identity was not resolved before reread.");
+      }
+      const deployment = await this.readPersistence(
+        {
+          operation: "candidatePilots.getDeployment",
+          stage,
+          pauseAuthority: "PILOT_AND_GLOBAL_ATOMIC",
+        },
+        () => this.dependencies.candidatePilots.getDeployment(pinnedDeploymentId),
+      );
+      readback.identityMatchCount = deployment ? 1 : 0;
+      if (!deployment) return;
+      readback.deployment = snapshotDeployment(deployment);
+      if (deploymentMatchesConfiguredIdentity(readback.deployment, this.dependencies) &&
+          readback.deployment.id === pinnedDeploymentId) {
+        readback.resolvedDeploymentId = pinnedDeploymentId;
+      }
+      return;
+    }
+
+    const target = this.dependencies.target;
+    if (target.kind === "EXACT_DEPLOYMENT") {
+      const deployment = await this.readPersistence(
+        {
+          operation: "candidatePilots.getDeployment",
+          stage: "INITIAL_DEPLOYMENT_READ",
+          pauseAuthority: "GLOBAL_ONLY",
+        },
+        () => this.dependencies.candidatePilots.getDeployment(target.deploymentId),
+      );
+      readback.identityMatchCount = deployment ? 1 : 0;
+      if (!deployment) return;
+      readback.deployment = snapshotDeployment(deployment);
+      if (deploymentMatchesConfiguredIdentity(readback.deployment, this.dependencies) &&
+          readback.deployment.id === target.deploymentId) {
+        readback.resolvedDeploymentId = readback.deployment.id;
+      }
+      return;
+    }
+
+    const matches = await this.readPersistence(
+      {
+        operation: "candidatePilots.findDeploymentsForRecoveryIdentity",
+        stage: "INITIAL_DEPLOYMENT_READ",
+        pauseAuthority: "GLOBAL_ONLY",
+      },
+      () => this.dependencies.candidatePilots.findDeploymentsForRecoveryIdentity({
+        exchangeAccountId: this.dependencies.exchangeAccountId,
+        pilotId: this.dependencies.pilotId,
+        market: this.dependencies.market,
+        policyId: this.dependencies.policyId,
+        policyVersion: this.dependencies.policyVersion,
+      }),
+    );
+    readback.identityMatchCount = matches.length === 0 ? 0 : matches.length === 1 ? 1 : 2;
+    if (matches.length !== 1) return;
+    readback.deployment = snapshotDeployment(matches[0]!);
+    if (deploymentMatchesConfiguredIdentity(readback.deployment, this.dependencies)) {
+      readback.resolvedDeploymentId = readback.deployment.id;
+    }
+  }
+
   private async readCandidateAuthority(
     readback: RecoveryReadback,
     stage: "INITIAL_AUTHORITY_READ" | "STABLE_AUTHORITY_REREAD",
   ): Promise<void> {
+    const deploymentId = requireResolvedDeploymentId(readback);
     readback.state = await this.readPersistence(
       { operation: "candidatePilots.getExactState", stage, pauseAuthority: "PILOT_AND_GLOBAL_ATOMIC" },
-      () => this.dependencies.candidatePilots.getExactState(this.dependencies.deploymentId),
+      () => this.dependencies.candidatePilots.getExactState(deploymentId),
     );
     readback.evidenceRecords = await this.readPersistence(
       { operation: "candidatePilots.listEvidenceRecords", stage, pauseAuthority: "PILOT_AND_GLOBAL_ATOMIC" },
-      () => this.dependencies.candidatePilots.listEvidenceRecords(this.dependencies.deploymentId),
+      () => this.dependencies.candidatePilots.listEvidenceRecords(deploymentId),
     );
     readback.auditEvents = await this.readPersistence(
       { operation: "candidatePilots.listAuditEvents", stage, pauseAuthority: "PILOT_AND_GLOBAL_ATOMIC" },
-      () => this.dependencies.candidatePilots.listAuditEvents(this.dependencies.deploymentId),
+      () => this.dependencies.candidatePilots.listAuditEvents(deploymentId),
     );
   }
 
@@ -370,10 +429,10 @@ export class PositionGuardPilotRecovery {
     state: Readonly<ExactCandidateState>;
     inventory: { balanceQuantity: ExactDecimal; positionQuantity: ExactDecimal };
   } {
-    if (!readback.deployment) {
+    if (!hasEstablishedDeploymentIdentity(readback, this.dependencies)) {
       throw recoveryFault("IDENTITY_MISMATCH", "Configured candidate deployment is missing.");
     }
-    this.verifyDeploymentIdentity(readback.deployment, nowEpochNanoseconds);
+    this.verifyDeploymentIdentity(readback, nowEpochNanoseconds);
     this.verifyRefreshCorrelation(receipt, readback, nowEpochNanoseconds);
     this.verifyReconciliation(receipt, readback.reconciliationRun, nowEpochNanoseconds);
     this.verifyAuditAuthority(readback.deployment, readback.auditEvents, nowEpochNanoseconds);
@@ -404,11 +463,12 @@ export class PositionGuardPilotRecovery {
   }
 
   private verifyDeploymentIdentity(
-    deployment: PositionGuardPilotDeploymentRecord,
+    readback: RecoveryReadback & { deployment: PositionGuardPilotDeploymentRecord },
     nowEpochNanoseconds: bigint,
   ): void {
+    const deployment = readback.deployment;
     if (
-      deployment.id !== this.dependencies.deploymentId ||
+      deployment.id !== readback.resolvedDeploymentId ||
       deployment.exchangeAccountId !== this.dependencies.exchangeAccountId ||
       deployment.pilotId !== this.dependencies.pilotId ||
       deployment.market !== this.dependencies.market ||
@@ -693,7 +753,7 @@ export class PositionGuardPilotRecovery {
         if (record.materialVersion !== "EXACT_V2") {
           throw new Error("Candidate evidence is not exact material V2.");
         }
-        const material = candidateEvidenceMaterial(this.dependencies.deploymentId, record.evidence);
+        const material = candidateEvidenceMaterial(requireResolvedDeploymentId(readback), record.evidence);
         if (material.epochNanoseconds > nowEpochNanoseconds) {
           throw new Error("Candidate evidence timestamp is future-dated.");
         }
@@ -787,9 +847,10 @@ export class PositionGuardPilotRecovery {
     clock: { occurredAt: string; epochNanoseconds: bigint },
   ): Promise<PositionGuardPilotRecoveryResult> {
     let activated: PositionGuardPilotDeploymentRecord | null;
+    const deploymentId = requireResolvedDeploymentId(readback);
     try {
       activated = await this.dependencies.candidatePilots.activateDeployment({
-        deploymentId: this.dependencies.deploymentId,
+        deploymentId,
         expectedPhase: "PENDING_FLAT",
         expectedUpdatedAt: readback.deployment!.updatedAt,
         activationAt: clock.occurredAt,
@@ -801,9 +862,10 @@ export class PositionGuardPilotRecovery {
     if (!activated) {
       return this.blockForFault("ACTIVATION_CAS_CONFLICT", receipt, readback, clock);
     }
+    const activatedDeployment = snapshotDeployment(activated);
     const activatedReadback = {
       ...readback,
-      deployment: activated,
+      deployment: activatedDeployment,
       auditEvents: [] as PositionGuardPilotAuditEventRecord[],
     };
     let auditEvents: PositionGuardPilotAuditEventRecord[];
@@ -814,7 +876,7 @@ export class PositionGuardPilotRecovery {
           stage: "POST_ACTIVATION_AUDIT_READ",
           pauseAuthority: "PILOT_AND_GLOBAL_ATOMIC",
         },
-        () => this.dependencies.candidatePilots.listAuditEvents(this.dependencies.deploymentId),
+        () => this.dependencies.candidatePilots.listAuditEvents(deploymentId),
       );
       activatedReadback.auditEvents = auditEvents;
     } catch (error) {
@@ -824,10 +886,10 @@ export class PositionGuardPilotRecovery {
       throw error;
     }
     try {
-      this.verifyDeploymentIdentity(activated, clock.epochNanoseconds);
-      this.verifyAuditAuthority(activated, auditEvents, clock.epochNanoseconds);
+      this.verifyDeploymentIdentity(activatedReadback, clock.epochNanoseconds);
+      this.verifyAuditAuthority(activatedDeployment, auditEvents, clock.epochNanoseconds);
       this.verifyActiveChronology(
-        activated,
+        activatedDeployment,
         readback.evidenceRecords,
         auditEvents,
         state,
@@ -928,7 +990,11 @@ export class PositionGuardPilotRecovery {
   ): Promise<PositionGuardPilotRecoveryResult> {
     const latest = emptyRecoveryReadback();
     try {
-      await this.readPersistedAccountEvidence(latest, "STABLE_AUTHORITY_REREAD");
+      await this.readPersistedAccountEvidence(
+        latest,
+        "STABLE_AUTHORITY_REREAD",
+        requireResolvedDeploymentId(baseline),
+      );
       if (!hasEstablishedDeploymentIdentity(latest, this.dependencies)) {
         throw recoveryFault("IDENTITY_MISMATCH", "Candidate deployment identity changed during recovery verification.");
       }
@@ -1021,17 +1087,19 @@ export class PositionGuardPilotRecovery {
     const faultId = `candidate-pilot-recovery:${createHash("sha256")
       .update(`${reasonCode}\n${provenanceJson}`, "utf8")
       .digest("hex")}`;
-    const fault: PauseCandidatePilotForRecoveryFaultInput = {
-      deploymentId: this.dependencies.deploymentId,
-      exchangeAccountId: this.dependencies.exchangeAccountId,
-      faultId,
-      reasonCode,
-      provenanceJson,
-      occurredAt: clock.occurredAt,
-    };
+    const faultMaterial = { reasonCode, provenanceJson } as const;
+    let occurredAt = clock.occurredAt;
 
     const deploymentIdentityEstablished = hasEstablishedDeploymentIdentity(readback, this.dependencies);
     if (deploymentIdentityEstablished) {
+      const fault: PauseCandidatePilotForRecoveryFaultInput = {
+        deploymentId: requireResolvedDeploymentId(readback),
+        exchangeAccountId: this.dependencies.exchangeAccountId,
+        faultId,
+        reasonCode,
+        provenanceJson,
+        occurredAt,
+      };
       const existing = readback.auditEvents.find((event) => event.id === faultId);
       if (existing) {
         fault.occurredAt = existing.createdAt;
@@ -1049,12 +1117,12 @@ export class PositionGuardPilotRecovery {
       } catch {
         // The deterministic pause write remains safe and idempotent when its optional readback is unavailable.
       }
-      if (existing) fault.occurredAt = existing.createdAt;
+      if (existing) occurredAt = existing.createdAt;
       await this.dependencies.operatorState.pauseForFault({
-        exchangeAccountId: fault.exchangeAccountId,
-        faultId: fault.faultId,
-        reason: candidatePilotRecoveryFaultReason(fault),
-        occurredAt: fault.occurredAt,
+        exchangeAccountId: this.dependencies.exchangeAccountId,
+        faultId,
+        reason: candidatePilotRecoveryFaultReason(faultMaterial),
+        occurredAt,
         ...(existing ? { transitionAt: existing.createdAt } : {}),
       });
     }
@@ -1135,6 +1203,8 @@ function snapshotReceipt(value: PositionGuardPilotRefreshReceipt): Readonly<Posi
 
 function emptyRecoveryReadback(): RecoveryReadback {
   return {
+    resolvedDeploymentId: null,
+    identityMatchCount: null,
     balanceSnapshot: null,
     positionSnapshot: null,
     reconciliationRun: null,
@@ -1150,22 +1220,44 @@ function emptyRecoveryReadback(): RecoveryReadback {
 
 function hasEstablishedDeploymentIdentity(
   readback: RecoveryReadback,
-  configured: { deploymentId: string; exchangeAccountId: string },
+  configured: CandidatePilotRecoveryIdentity,
 ): readback is RecoveryReadback & { deployment: PositionGuardPilotDeploymentRecord } {
-  return readback.deployment?.id === configured.deploymentId &&
-    readback.deployment.exchangeAccountId === configured.exchangeAccountId;
+  return readback.resolvedDeploymentId !== null &&
+    readback.deployment?.id === readback.resolvedDeploymentId &&
+    deploymentMatchesConfiguredIdentity(readback.deployment, configured);
+}
+
+function deploymentMatchesConfiguredIdentity(
+  deployment: PositionGuardPilotDeploymentRecord,
+  configured: CandidatePilotRecoveryIdentity,
+): boolean {
+  return deployment.exchangeAccountId === configured.exchangeAccountId &&
+    deployment.pilotId === configured.pilotId &&
+    deployment.market === configured.market &&
+    deployment.policyId === configured.policyId &&
+    deployment.policyVersion === configured.policyVersion;
+}
+
+function requireResolvedDeploymentId(readback: RecoveryReadback): string {
+  if (readback.resolvedDeploymentId === null) {
+    throw recoveryFault("IDENTITY_MISMATCH", "Candidate deployment identity is unresolved.");
+  }
+  return readback.resolvedDeploymentId;
+}
+
+function snapshotDeployment(
+  deployment: PositionGuardPilotDeploymentRecord,
+): Readonly<PositionGuardPilotDeploymentRecord> {
+  try {
+    return Object.freeze({ ...validateCandidatePilotDeployment(deployment) });
+  } catch {
+    throw recoveryFault("IDENTITY_MISMATCH", "Persisted candidate deployment identity is malformed.");
+  }
 }
 
 function buildFaultProvenanceJson(input: {
   reasonCode: CandidatePilotRecoveryFaultReason;
-  configured: {
-    exchangeAccountId: string;
-    deploymentId: string;
-    pilotId: string;
-    market: string;
-    policyId: string;
-    policyVersion: string;
-  };
+  configured: PositionGuardPilotRecoveryDependencies;
   receipt: Readonly<PositionGuardPilotRefreshReceipt>;
   readback: RecoveryReadback;
 }): string {
@@ -1174,7 +1266,9 @@ function buildFaultProvenanceJson(input: {
     reasonCode: input.reasonCode,
     configuredIdentity: {
       exchangeAccountId: input.configured.exchangeAccountId,
-      deploymentId: input.configured.deploymentId,
+      target: input.configured.target,
+      resolvedDeploymentId: input.readback.resolvedDeploymentId,
+      identityMatchCount: input.readback.identityMatchCount,
       pilotId: input.configured.pilotId,
       market: input.configured.market,
       policyId: input.configured.policyId,
@@ -1191,14 +1285,7 @@ function buildReadFailureProvenanceJson(input: {
   stage: PersistenceReadStage;
   pauseAuthority: PersistenceReadPauseAuthority;
   failureClass: string;
-  configured: {
-    exchangeAccountId: string;
-    deploymentId: string;
-    pilotId: string;
-    market: string;
-    policyId: string;
-    policyVersion: string;
-  };
+  configured: PositionGuardPilotRecoveryDependencies;
   receipt: Readonly<PositionGuardPilotRefreshReceipt>;
 }): string {
   return canonicalJson({
@@ -1211,7 +1298,8 @@ function buildReadFailureProvenanceJson(input: {
     readFailureClass: input.failureClass,
     configuredIdentity: {
       exchangeAccountId: input.configured.exchangeAccountId,
-      deploymentId: input.configured.deploymentId,
+      target: input.configured.target,
+      resolvedDeploymentId: null,
       pilotId: input.configured.pilotId,
       market: input.configured.market,
       policyId: input.configured.policyId,

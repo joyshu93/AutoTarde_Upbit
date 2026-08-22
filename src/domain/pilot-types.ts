@@ -25,6 +25,15 @@ export type PositionGuardPilotRefreshReceipt = Readonly<{
   reconciliationSource: "SCHEDULER_PREFLIGHT";
 }>;
 
+export type PositionGuardPilotRecoveryTarget =
+  | Readonly<{
+      kind: "EXACT_DEPLOYMENT";
+      deploymentId: string;
+    }>
+  | Readonly<{
+      kind: "CONFIGURED_ACCOUNT_PILOT";
+    }>;
+
 export type PositionGuardPilotPhase =
   | "DISABLED"
   | "PENDING_FLAT"

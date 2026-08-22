@@ -36,6 +36,7 @@ import {
   type AdvanceCandidatePilotStateResult,
   type ActivateCandidatePilotDeploymentInput,
   type CandidateEvidenceRecord,
+  type CandidatePilotRecoveryIdentity,
   type CandidatePilotRepository,
   type CreateCandidatePilotDeploymentInput,
   type PauseCandidateIntentFaultInput,
@@ -231,6 +232,30 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
       LIMIT 1
     `).get(exchangeAccountId) as DeploymentRow | undefined;
     return row ? deploymentFromRow(row) : null;
+  }
+
+  async findDeploymentsForRecoveryIdentity(
+    identity: CandidatePilotRecoveryIdentity,
+  ): Promise<Array<Readonly<PositionGuardPilotDeploymentRecord>>> {
+    const rows = this.db.prepare(`
+      SELECT id, exchange_account_id, pilot_id, market, policy_id, policy_version,
+        phase, activation_at, activation_epoch_ns, created_at, updated_at
+      FROM strategy_pilot_deployments
+      WHERE exchange_account_id = ?
+        AND pilot_id = ?
+        AND market = ?
+        AND policy_id = ?
+        AND policy_version = ?
+      ORDER BY created_at ASC, id ASC
+      LIMIT 2
+    `).all(
+      identity.exchangeAccountId,
+      identity.pilotId,
+      identity.market,
+      identity.policyId,
+      identity.policyVersion,
+    ) as unknown as DeploymentRow[];
+    return rows.map((row) => Object.freeze({ ...validateCandidatePilotDeployment(deploymentFromRow(row)) }));
   }
 
   async activateDeployment(

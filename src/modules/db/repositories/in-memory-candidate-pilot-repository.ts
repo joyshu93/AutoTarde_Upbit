@@ -30,6 +30,7 @@ import {
   type AdvanceCandidatePilotStateResult,
   type ActivateCandidatePilotDeploymentInput,
   type CandidateEvidenceRecord,
+  type CandidatePilotRecoveryIdentity,
   type CandidatePilotRepository,
   type CreateCandidatePilotDeploymentInput,
   type InMemoryAtomicFaultPauseStore,
@@ -107,6 +108,22 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
       .filter((candidate) => candidate.exchangeAccountId === exchangeAccountId)
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))[0];
     return deployment ? { ...deployment } : null;
+  }
+
+  async findDeploymentsForRecoveryIdentity(
+    identity: CandidatePilotRecoveryIdentity,
+  ): Promise<Array<Readonly<PositionGuardPilotDeploymentRecord>>> {
+    return [...this.deployments.values()]
+      .filter((candidate) =>
+        candidate.exchangeAccountId === identity.exchangeAccountId &&
+        candidate.pilotId === identity.pilotId &&
+        candidate.market === identity.market &&
+        candidate.policyId === identity.policyId &&
+        candidate.policyVersion === identity.policyVersion
+      )
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+      .slice(0, 2)
+      .map((deployment) => Object.freeze({ ...validateCandidatePilotDeployment(deployment) }));
   }
 
   async activateDeployment(

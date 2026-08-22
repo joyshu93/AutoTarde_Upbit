@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import type {
   OrderSubmissionRecoveryObservationRecord,
   PositionGuardPilotDeploymentRecord,
+  PositionGuardPilotRecoveryTarget,
+  PositionGuardPilotRefreshReceipt,
 } from "../src/domain/pilot-types.js";
 import type {
   BalanceSnapshotRecord,
@@ -14,7 +16,6 @@ import type {
 } from "../src/domain/types.js";
 import {
   PositionGuardPilotRecovery,
-  type PositionGuardPilotRefreshReceipt,
 } from "../src/app/position-guard-pilot-recovery.js";
 import {
   candidateEvidenceMaterial,
@@ -450,6 +451,133 @@ test("missing configured deployment pauses only the target global execution stat
     .filter((transition) => transition.id === result.faultId).length, 1);
 });
 
+test("configured account-pilot recovery resolves exactly one matching deployment", async () => {
+  const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+  const calls: string[] = [];
+  const pilots = overrideCandidatePilots(fixture.candidatePilots, {
+    findDeploymentsForRecoveryIdentity: async (identity) => {
+      calls.push(`find:${identity.exchangeAccountId}:${identity.pilotId}`);
+      return fixture.candidatePilots.findDeploymentsForRecoveryIdentity(identity);
+    },
+    getDeploymentForExchangeAccount: async () => {
+      throw new Error("configured recovery must not use account-only first-row lookup");
+    },
+  });
+
+  const result = await fixture.createConfiguredRecovery(pilots)
+    .verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "READY");
+  assert.deepEqual(calls, [`find:${ACCOUNT_ID}:${PILOT_ID}`]);
+  if (result.status !== "READY") return;
+  assert.equal(result.deployment.id, DEPLOYMENT_ID);
+});
+
+test("configured account-pilot recovery missing identity pauses globally without reading or mutating pilot authority", async () => {
+  const fixture = await createFixture();
+  let authorityReads = 0;
+  let pilotFaultWrites = 0;
+  const pilots = overrideCandidatePilots(fixture.candidatePilots, {
+    findDeploymentsForRecoveryIdentity: async () => [],
+    getExactState: async () => {
+      authorityReads += 1;
+      throw new Error("unexpected candidate authority read");
+    },
+    pauseForRecoveryFault: async (input) => {
+      pilotFaultWrites += 1;
+      return fixture.candidatePilots.pauseForRecoveryFault(input);
+    },
+  });
+
+  const result = await fixture.createConfiguredRecovery(pilots)
+    .verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "BLOCKED_FAULT");
+  if (result.status !== "BLOCKED_FAULT") return;
+  assert.equal(result.reasonCode, "IDENTITY_MISMATCH");
+  assert.equal(authorityReads, 0);
+  assert.equal(pilotFaultWrites, 0);
+  assert.equal((await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "PENDING_FLAT");
+  assert.equal((await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID))
+    .filter((event) => event.eventType === "FAULT_PAUSED").length, 0);
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("configured account-pilot recovery ambiguous identity pauses globally without candidate authority access", async () => {
+  const fixture = await createFixture();
+  const deployment = await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID);
+  assert.ok(deployment);
+  let authorityReads = 0;
+  let pilotFaultWrites = 0;
+  const pilots = overrideCandidatePilots(fixture.candidatePilots, {
+    findDeploymentsForRecoveryIdentity: async () => [
+      { ...deployment },
+      { ...deployment, id: `${DEPLOYMENT_ID}-ambiguous` },
+    ],
+    getDeployment: async () => {
+      authorityReads += 1;
+      throw new Error("unexpected exact deployment read");
+    },
+    getExactState: async () => {
+      authorityReads += 1;
+      throw new Error("unexpected candidate state read");
+    },
+    pauseForRecoveryFault: async (input) => {
+      pilotFaultWrites += 1;
+      return fixture.candidatePilots.pauseForRecoveryFault(input);
+    },
+  });
+
+  const result = await fixture.createConfiguredRecovery(pilots)
+    .verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "BLOCKED_FAULT");
+  if (result.status !== "BLOCKED_FAULT") return;
+  assert.equal(result.reasonCode, "IDENTITY_MISMATCH");
+  assert.equal(authorityReads, 0);
+  assert.equal(pilotFaultWrites, 0);
+  assert.equal((await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "PENDING_FLAT");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("configured recovery snapshots lookup authority and pins all later reads to the resolved deployment id", async () => {
+  const fixture = await createFixture();
+  const persisted = await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID);
+  assert.ok(persisted);
+  const mutableLookup = { ...persisted };
+  const deploymentReads: string[] = [];
+  const stateReads: string[] = [];
+  const activationWrites: string[] = [];
+  const pilots = overrideCandidatePilots(fixture.candidatePilots, {
+    findDeploymentsForRecoveryIdentity: async () => [mutableLookup],
+    getDeployment: async (deploymentId) => {
+      deploymentReads.push(deploymentId);
+      return fixture.candidatePilots.getDeployment(deploymentId);
+    },
+    getExactState: async (deploymentId) => {
+      stateReads.push(deploymentId);
+      mutableLookup.id = "mutated-after-lookup";
+      mutableLookup.exchangeAccountId = "mutated-account";
+      return fixture.candidatePilots.getExactState(deploymentId);
+    },
+    activateDeployment: async (input) => {
+      activationWrites.push(input.deploymentId);
+      return fixture.candidatePilots.activateDeployment(input);
+    },
+  });
+
+  const result = await fixture.createConfiguredRecovery(pilots)
+    .verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "READY");
+  assert.deepEqual(new Set(deploymentReads), new Set([DEPLOYMENT_ID]));
+  assert.deepEqual(new Set(stateReads), new Set([DEPLOYMENT_ID]));
+  assert.deepEqual(activationWrites, [DEPLOYMENT_ID]);
+  if (result.status !== "READY") return;
+  assert.equal(result.deployment.id, DEPLOYMENT_ID);
+  assert.equal(result.deployment.exchangeAccountId, ACCOUNT_ID);
+});
+
 test("another account's deployment is not mutated and only the target global state pauses", async () => {
   const fixture = await createFixture({ deploymentAccountId: "other-account" });
 
@@ -464,7 +592,7 @@ test("another account's deployment is not mutated and only the target global sta
     .filter((event) => event.eventType === "FAULT_PAUSED").length, 0);
 });
 
-test("established deployment policy identity mismatch atomically pauses pilot and global state", async () => {
+test("deployment policy identity mismatch pauses globally without mutating unestablished pilot authority", async () => {
   const fixture = await createFixture();
   const persisted = await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID);
   assert.ok(persisted);
@@ -472,7 +600,15 @@ test("established deployment policy identity mismatch atomically pauses pilot an
     getDeployment: async () => ({ ...persisted, policyVersion: "WRONG_VERSION" as typeof POLICY_VERSION }),
   }));
 
-  await expectFault(fixture, "IDENTITY_MISMATCH");
+  const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "BLOCKED_FAULT");
+  if (result.status !== "BLOCKED_FAULT") return;
+  assert.equal(result.reasonCode, "IDENTITY_MISMATCH");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "PENDING_FLAT");
+  assert.equal((await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID))
+    .filter((event) => event.eventType === "FAULT_PAUSED").length, 0);
 });
 
 test("evidence hash, material version, and exact replay mismatches fault closed", async () => {
@@ -1159,6 +1295,11 @@ interface RecoveryFixture {
       minimumAbsenceElapsedMs: number;
     },
     recoveryNow?: string,
+    target?: PositionGuardPilotRecoveryTarget,
+  ): PositionGuardPilotRecovery;
+  createConfiguredRecovery(
+    candidatePilots?: CandidatePilotRepository,
+    repositories?: ExecutionRepository,
   ): PositionGuardPilotRecovery;
 }
 
@@ -1236,10 +1377,14 @@ async function createFixture(options: FixtureOptions = {}): Promise<RecoveryFixt
       minimumAbsenceElapsedMs: options.minimumAbsenceElapsedMs ?? MINIMUM_ABSENCE_ELAPSED_MS,
     },
     recoveryNow = NOW,
+    target: PositionGuardPilotRecoveryTarget = {
+      kind: "EXACT_DEPLOYMENT",
+      deploymentId: DEPLOYMENT_ID,
+    },
   ) => {
     const dependencies = {
       exchangeAccountId: ACCOUNT_ID,
-      deploymentId: DEPLOYMENT_ID,
+      target,
       pilotId: PILOT_ID,
       market: "KRW-BTC",
       policyId: POLICY_ID,
@@ -1263,6 +1408,16 @@ async function createFixture(options: FixtureOptions = {}): Promise<RecoveryFixt
     receipt,
     recovery: createRecovery(),
     createRecovery,
+    createConfiguredRecovery: (
+      pilotRepository: CandidatePilotRepository = candidatePilots,
+      executionRepositories: ExecutionRepository = repositories,
+    ) => createRecovery(
+      pilotRepository,
+      executionRepositories,
+      undefined,
+      undefined,
+      { kind: "CONFIGURED_ACCOUNT_PILOT" },
+    ),
   };
 }
 

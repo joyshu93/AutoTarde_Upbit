@@ -82,6 +82,26 @@ export async function verifyCandidatePilotRepositoryContract(
   const input = initialDeploymentInput();
   const deployment = await repository.createDeploymentWithInitialState(input);
 
+  const exactRecoveryIdentity = {
+    exchangeAccountId: deployment.exchangeAccountId,
+    pilotId: deployment.pilotId,
+    market: deployment.market,
+    policyId: deployment.policyId,
+    policyVersion: deployment.policyVersion,
+  } as const;
+  const exactMatches = await repository.findDeploymentsForRecoveryIdentity(exactRecoveryIdentity);
+  assert.equal(exactMatches.length, 1);
+  assert.deepEqual(exactMatches[0], deployment);
+  assert.notEqual(exactMatches[0], deployment);
+  assert.equal(Object.isFrozen(exactMatches[0]), true);
+  assert.deepEqual(
+    await repository.findDeploymentsForRecoveryIdentity({
+      ...exactRecoveryIdentity,
+      exchangeAccountId: "missing-account",
+    }),
+    [],
+  );
+
   const first = await repository.advanceStateWithEvidence(
     advanceInput(deployment.id, "e1", 0),
   );
@@ -346,6 +366,26 @@ export async function verifyCandidateDeploymentActivationContract(
 
 test("in-memory candidate pilot repository satisfies the common contract", async () => {
   await verifyCandidatePilotRepositoryContract(() => new InMemoryCandidatePilotRepository());
+});
+
+test("in-memory exact recovery lookup ignores an earlier foreign-account deployment", async () => {
+  const repository = new InMemoryCandidatePilotRepository();
+  await repository.createDeploymentWithInitialState(
+    initialDeploymentInput("deployment-foreign-account", "foreign-account"),
+  );
+  const target = await repository.createDeploymentWithInitialState(
+    initialDeploymentInput("deployment-target", "primary"),
+  );
+
+  const matches = await repository.findDeploymentsForRecoveryIdentity({
+    exchangeAccountId: target.exchangeAccountId,
+    pilotId: target.pilotId,
+    market: target.market,
+    policyId: target.policyId,
+    policyVersion: target.policyVersion,
+  });
+
+  assert.deepEqual(matches.map((deployment) => deployment.id), [target.id]);
 });
 
 test("in-memory candidate pilot replay orders mixed offsets by epoch nanosecond and id", async () => {

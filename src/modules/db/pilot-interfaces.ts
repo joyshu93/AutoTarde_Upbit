@@ -159,6 +159,14 @@ export interface InMemoryAtomicFaultPauseStore {
   applyFaultPauseAtomically(input: FaultPauseInput): ExecutionStateRecord;
 }
 
+export type CandidatePilotRecoveryIdentity = Readonly<{
+  exchangeAccountId: string;
+  pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1";
+  market: "KRW-BTC";
+  policyId: "COMBINED_CONSERVATIVE";
+  policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1";
+}>;
+
 export interface CandidatePilotRepository {
   createDeploymentWithInitialState(
     input: CreateCandidatePilotDeploymentInput,
@@ -167,6 +175,9 @@ export interface CandidatePilotRepository {
   getDeploymentForExchangeAccount(
     exchangeAccountId: string,
   ): Promise<PositionGuardPilotDeploymentRecord | null>;
+  findDeploymentsForRecoveryIdentity(
+    identity: CandidatePilotRecoveryIdentity,
+  ): Promise<Array<Readonly<PositionGuardPilotDeploymentRecord>>>;
   activateDeployment(
     input: ActivateCandidatePilotDeploymentInput,
   ): Promise<PositionGuardPilotDeploymentRecord | null>;
@@ -605,7 +616,7 @@ function formatCandidatePilotUtcNanoseconds(epochNanoseconds: bigint): string {
 }
 
 export function candidatePilotRecoveryFaultReason(
-  input: PauseCandidatePilotForRecoveryFaultInput,
+  input: Pick<PauseCandidatePilotForRecoveryFaultInput, "reasonCode" | "provenanceJson">,
 ): string {
   return `candidate_pilot_recovery:${input.reasonCode}; provenance=${input.provenanceJson}`;
 }
