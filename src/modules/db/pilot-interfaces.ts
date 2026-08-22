@@ -75,7 +75,11 @@ export interface PauseCandidatePilotForRecoveryFaultInput {
   occurredAt: string;
 }
 
-export type CandidateIntentFaultStage = "DUPLICATE" | "DERIVATION" | "PERSISTENCE";
+export type CandidateIntentFaultStage =
+  | "DUPLICATE"
+  | "DERIVATION"
+  | "PERSISTENCE"
+  | "FINAL_REVALIDATION";
 
 export interface PauseCandidateIntentFaultInput extends PauseCandidatePilotForRecoveryFaultInput {
   stage: CandidateIntentFaultStage;
@@ -403,7 +407,12 @@ const CANDIDATE_INTENT_FAULT_PROVENANCE_KEYS = [
   "expectedDeploymentUpdatedAt",
   "expectedStateVersion",
 ] as const;
-const CANDIDATE_INTENT_FAULT_STAGES = ["DUPLICATE", "DERIVATION", "PERSISTENCE"] as const;
+const CANDIDATE_INTENT_FAULT_STAGES = [
+  "DUPLICATE",
+  "DERIVATION",
+  "PERSISTENCE",
+  "FINAL_REVALIDATION",
+] as const;
 
 export function validateCandidateIntentFaultInput(
   input: PauseCandidateIntentFaultInput,

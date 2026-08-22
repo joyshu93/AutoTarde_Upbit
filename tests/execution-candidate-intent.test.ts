@@ -534,12 +534,16 @@ function narrowCandidatePilots(
   candidatePilots: CandidatePilotRepository,
   transformDuplicateBinding?: (binding: CandidateExecutionBindingRecord) => CandidateExecutionBindingRecord,
 ) {
+  let bindingReadCount = 0;
   return {
     getDeployment: candidatePilots.getDeployment.bind(candidatePilots),
     getExactState: candidatePilots.getExactState.bind(candidatePilots),
     getExecutionBindingForOrder: async (orderId: string) => {
       const binding = await candidatePilots.getExecutionBindingForOrder(orderId);
-      return binding && transformDuplicateBinding ? transformDuplicateBinding(binding) : binding;
+      bindingReadCount += 1;
+      return binding && transformDuplicateBinding && bindingReadCount > 1
+        ? transformDuplicateBinding(binding)
+        : binding;
     },
     pauseForCandidateIntentFault:
       candidatePilots.pauseForCandidateIntentFault.bind(candidatePilots),

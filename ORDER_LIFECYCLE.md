@@ -102,7 +102,7 @@ The intended live path is:
 4. risk approve and run Upbit order-chance and order-test validation
 5. atomically persist `PERSISTED` plus `ORDER_PERSISTED`
 6. transition the durable order to `SUBMITTING`
-7. renew and verify lease ownership, re-read account-wide active orders, then make authoritative execution state the final awaited check before calling the tagged execution adapter exactly once with no intervening await; the `LIVE` adapter requires persisted `LIVE`/`ENABLED` both initially and finally, while the `DRY_RUN` adapter accepts any unchanged non-fully-live tuple, including `DRY_RUN`/`ENABLED` and `LIVE`/`DISABLED`
+7. renew and verify lease ownership and re-read account-wide active orders. For a candidate order, sequentially re-read the exact persisted order, first event, persisted `READY` decision, deployment, exact candidate state, and binding; require the exact expected `SUBMITTING` lifecycle and immutable intent, then project only status to `PERSISTED` and rerun the reviewed aggregate validator. Make authoritative execution state the final awaited check before calling the tagged execution adapter exactly once with no intervening await; the `LIVE` adapter requires persisted `LIVE`/`ENABLED` both initially and finally, while the `DRY_RUN` adapter accepts any unchanged non-fully-live tuple, including `DRY_RUN`/`ENABLED` and `LIVE`/`DISABLED`
 8. atomically store accepted, definitive rejection, or uncertain-submission evidence; every immediate `FILLED` result includes distinct submitted and terminal event ids plus fill evidence in the same transaction
 9. reconcile until terminal state is consistent
 

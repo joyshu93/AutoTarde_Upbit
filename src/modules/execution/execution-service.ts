@@ -15,6 +15,7 @@ import { createId } from "../../shared/ids.js";
 import type { ExecutionRepository, OperatorStateStore } from "../db/interfaces.js";
 import type { AccountExecutionLeaseStore, CandidatePilotRepository } from "../db/pilot-interfaces.js";
 import { validateCandidateExecutionBinding } from "../db/pilot-interfaces.js";
+import { validateCandidateBoundOrderIntent } from "../db/repositories/candidate-bound-order-validation.js";
 import { ExchangeOrderSubmissionError } from "../exchange/errors.js";
 import type { ExchangeAdapter, ExecutionExchangeAdapter, UpbitOrderChance } from "../exchange/interfaces.js";
 import { evaluateRiskGuards } from "../risk/guards.js";
@@ -328,6 +329,7 @@ export class ExecutionService {
     const orderId = createId("order");
     const eventId = createId("order_event");
     const bindingId = candidateContext ? createId("candidate_execution_binding") : null;
+    let candidateBinding: CandidateExecutionBindingRecord | null = null;
     let candidateTimestamps = null;
     if (candidateContext) {
       try {
@@ -400,6 +402,7 @@ export class ExecutionService {
           bindingId: bindingId!,
           createdAt: candidateTimestamps.bindingCreatedAt,
         });
+        candidateBinding = binding;
       } catch (error) {
         releaseLease = false;
         await this.pauseCandidateIntentFault({
@@ -487,9 +490,33 @@ export class ExecutionService {
         exchangeAccountId: input.exchangeAccountId,
         orderId: order.id,
         initialAuthority,
+        candidate: candidateContext && candidateBinding
+          ? {
+              authority: candidateContext.authority,
+              expectedOrder: submittingOrder,
+              expectedEvent: persistedEvent,
+              expectedDecision: candidateContext.decision,
+              expectedBinding: candidateBinding,
+            }
+          : null,
       });
-    } catch {
+    } catch (error) {
       releaseLease = false;
+      if (candidateContext && candidateBinding) {
+        await this.pauseCandidateIntentFault({
+          authority: candidateContext.authority,
+          decision: candidateContext.decision,
+          input,
+          orderId: order.id,
+          bindingId: candidateBinding.id,
+          stage: "FINAL_REVALIDATION",
+          occurredAt: order.requestedAt,
+        });
+        throw new CandidateExecutionSafetyError(
+          "Candidate final pre-send authority or intent material changed; execution is paused.",
+          error,
+        );
+      }
       await this.recordLeaseBlockedAndPause({
         input,
         idempotencyKey,
@@ -832,7 +859,7 @@ export class ExecutionService {
     input: SubmitOrderFromDecisionInput;
     orderId: string;
     bindingId: string;
-    stage: "DUPLICATE" | "DERIVATION" | "PERSISTENCE";
+    stage: "DUPLICATE" | "DERIVATION" | "PERSISTENCE" | "FINAL_REVALIDATION";
     occurredAt: string;
   }): Promise<void> {
     const candidatePilots = this.dependencies.candidatePilots;
@@ -916,17 +943,77 @@ export class ExecutionService {
     exchangeAccountId: string;
     orderId: string;
     initialAuthority: ExecutionAuthorityTuple;
+    candidate: {
+      authority: CandidateExecutionAuthority;
+      expectedOrder: OrderRecord;
+      expectedEvent: OrderEventRecord;
+      expectedDecision: StrategyDecisionRecord;
+      expectedBinding: CandidateExecutionBindingRecord;
+    } | null;
   }): Promise<void> {
     const activeOrders = await this.dependencies.repositories.listActiveOrders(input.exchangeAccountId);
+    let expectedOrderIsActive = false;
+    let hasCompetingOrder = false;
+    for (const activeOrder of activeOrders) {
+      if (activeOrder.id === input.orderId) {
+        expectedOrderIsActive = true;
+      } else {
+        hasCompetingOrder = true;
+      }
+    }
+
+    if (input.candidate) {
+      const candidatePilots = this.dependencies.candidatePilots;
+      if (!candidatePilots || !this.dependencies.repositories.getStrategyDecisionById) {
+        throw new Error("candidate final pre-send dependencies are unavailable");
+      }
+      const persistedOrder = await this.dependencies.repositories.findOrderByReference(
+        input.exchangeAccountId,
+        input.orderId,
+      );
+      const events = await this.dependencies.repositories.listOrderEvents(input.orderId);
+      const firstEvent = events[0] ?? null;
+      const getDecision = this.dependencies.repositories.getStrategyDecisionById;
+      const decision = await getDecision.call(
+        this.dependencies.repositories,
+        input.candidate.expectedDecision.id,
+      );
+      const deployment = await candidatePilots.getDeployment(input.candidate.authority.deploymentId);
+      const exactState = await candidatePilots.getExactState(input.candidate.authority.deploymentId);
+      const binding = await candidatePilots.getExecutionBindingForOrder(input.orderId);
+      if (
+        !expectedOrderIsActive || hasCompetingOrder || !persistedOrder ||
+        events.length !== 1 || !firstEvent || !decision || !deployment || !exactState || !binding ||
+        !sameFlatRecord(persistedOrder, input.candidate.expectedOrder) ||
+        !sameFlatRecord(firstEvent, input.candidate.expectedEvent) ||
+        !sameFlatRecord(decision, input.candidate.expectedDecision) ||
+        !sameFlatRecord(binding, input.candidate.expectedBinding)
+      ) {
+        throw new Error("candidate final persisted authority or intent material changed");
+      }
+      validateCandidateBoundOrderIntent({
+        order: { ...persistedOrder, status: "PERSISTED" },
+        event: firstEvent,
+        binding,
+        decision,
+        deployment,
+        exactStateVersion: exactState.stateVersion,
+        expectedPhase: input.candidate.authority.expectedPhase,
+        expectedDeploymentUpdatedAt: input.candidate.authority.expectedDeploymentUpdatedAt,
+        expectedStateVersion: input.candidate.authority.expectedStateVersion,
+      });
+    }
+    const authorityBlockedByOrders = input.candidate
+      ? !expectedOrderIsActive || hasCompetingOrder
+      : hasCompetingOrder;
     // Keep this as the final await before createOrder so a persisted pause wins the send race.
     const state = await this.dependencies.operatorState.getState();
-    const competingOrders = activeOrders.filter((order) => order.id !== input.orderId);
     const finalAuthority = selectExecutionAuthority(state);
     const authorityUnchanged =
       finalAuthority.executionMode === input.initialAuthority.executionMode &&
       finalAuthority.liveExecutionGate === input.initialAuthority.liveExecutionGate;
     if (
-      competingOrders.length > 0 ||
+      authorityBlockedByOrders ||
       state.systemStatus !== "RUNNING" ||
       state.killSwitchActive ||
       !authorityUnchanged ||
@@ -1511,6 +1598,18 @@ function deriveRequestedNotionalKrw(
 
 function nullableNumberString(value: number | null): string | null {
   return value === null ? null : String(value);
+}
+
+function sameFlatRecord<TLeft extends object, TRight extends object>(left: TLeft, right: TRight): boolean {
+  const leftKeys = Reflect.ownKeys(left);
+  const rightKeys = Reflect.ownKeys(right);
+  if (leftKeys.length !== rightKeys.length) return false;
+  const leftRecord = left as Record<PropertyKey, unknown>;
+  const rightRecord = right as Record<PropertyKey, unknown>;
+  for (const key of leftKeys) {
+    if (!Object.hasOwn(right, key) || !Object.is(leftRecord[key], rightRecord[key])) return false;
+  }
+  return true;
 }
 
 function matchesCandidateDuplicateOrder(

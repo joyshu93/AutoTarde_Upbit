@@ -312,6 +312,43 @@ test("candidate-intent fault advances exactly one nanosecond past latest chronol
   }
 });
 
+test("candidate-intent fault accepts the exact final-revalidation stage through the dedicated capability", async () => {
+  for (const factory of FACTORIES) {
+    const fixture = await factory.create(`candidate-intent-final-revalidation-${factory.name}`);
+    try {
+      const pending = await createDeployment(fixture, `deployment-final-revalidation-${factory.name}`);
+      const activationAt = addMilliseconds(pending.updatedAt, 5);
+      const deployment = await fixture.candidatePilots.activateDeployment({
+        deploymentId: pending.id,
+        expectedPhase: "PENDING_FLAT",
+        expectedUpdatedAt: pending.updatedAt,
+        activationAt,
+        activationEpochNs: parsePositionGuardCandidateTimestamp(activationAt, "activationAt"),
+      });
+      assert.ok(deployment);
+      const input = candidateIntentFaultInput(
+        deployment.id,
+        deployment.updatedAt,
+        addMilliseconds(deployment.updatedAt, 1),
+        "FINAL_REVALIDATION",
+      );
+
+      const result = await fixture.candidatePilots.pauseForCandidateIntentFault(input);
+
+      assert.equal(result.deployment.phase, "PAUSED_FAULT", factory.name);
+      assert.equal(result.executionState.systemStatus, "PAUSED", factory.name);
+      assert.equal(
+        (JSON.parse(input.provenanceJson) as { stage: string }).stage,
+        "FINAL_REVALIDATION",
+        factory.name,
+      );
+      assert.equal(input.reasonCode, "IDENTITY_MISMATCH", factory.name);
+    } finally {
+      await fixture.close();
+    }
+  }
+});
+
 test("candidate-intent fault rejects forged schema, stage, identity, and hash without mutation", async () => {
   for (const factory of FACTORIES) {
     for (const scenario of ["schema", "stage", "identity", "hash"] as const) {
@@ -442,8 +479,8 @@ function candidateIntentFaultInput(
   deploymentId: string,
   expectedDeploymentUpdatedAt: string,
   occurredAt: string,
+  stage: PauseCandidateIntentFaultInput["stage"] = "DERIVATION",
 ): PauseCandidateIntentFaultInput {
-  const stage = "DERIVATION" as const;
   const provenanceJson = JSON.stringify({
     schemaVersion: "CANDIDATE_INTENT_FAULT_V1",
     stage,
@@ -470,7 +507,7 @@ function candidateIntentFaultInput(
     orderId: "order-1",
     bindingId: "binding-1",
     faultId: candidateIntentFaultId(provenanceJson),
-    reasonCode: "IDENTITY_MISMATCH",
+    reasonCode: stage === "PERSISTENCE" ? "ACTIVATION_CAS_CONFLICT" : "IDENTITY_MISMATCH",
     provenanceJson,
     occurredAt,
   };
