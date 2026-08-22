@@ -52,6 +52,27 @@ test("history recovery validator rejects malformed cardinality, derivations, agg
   }
 });
 
+test("history recovery validator requires producer page minima for normal market rows", () => {
+  const malformed = [
+    mutate(normalHistoryRecovery(), (history) => { history.markets[0]!.openPagesScanned = 0; }),
+    mutate(normalHistoryRecovery(), (history) => { history.markets[0]!.recentClosedPagesScanned = 0; }),
+    mutate(normalHistoryRecovery(), (history) => { history.markets[0]!.archivalClosedPagesScanned = 0; }),
+    mutate(normalHistoryRecovery(), (history) => {
+      history.scannedSnapshotCount = 0;
+      history.recoveredOrderCount = 0;
+      history.markets[0]!.openPagesScanned = 0;
+      history.markets[0]!.recentClosedPagesScanned = 0;
+      history.markets[0]!.archivalClosedPagesScanned = 0;
+      history.markets[0]!.snapshotCount = 0;
+    }),
+  ];
+
+  for (const fixture of malformed) {
+    assert.equal(validate(fixture, "SUCCESS", [], STARTED_AT, COMPLETED_AT), false);
+  }
+  assert.equal(validate(completeHistoryRecovery(), "SUCCESS", [], STARTED_AT, COMPLETED_AT), true);
+});
+
 test("history recovery validator enforces failed-message and bidirectional lookup-issue correlation", () => {
   assert.equal(validate(failedHistoryRecovery(7 as never), "DRIFT_DETECTED", ["ORDER_HISTORY_LOOKUP_FAILED"], STARTED_AT, COMPLETED_AT), false);
   assert.equal(validate(failedHistoryRecovery("failed"), "SUCCESS", ["ORDER_HISTORY_LOOKUP_FAILED"], STARTED_AT, COMPLETED_AT), false);

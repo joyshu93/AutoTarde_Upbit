@@ -151,6 +151,8 @@ export function isStrictHistoryRecoverySummary(
       market.archivalWindowStartAt !== expectedArchivalStartAt || market.nextWindowEndAt !== market.archivalWindowStartAt ||
       market.archiveComplete !== archiveComplete || market.retentionStatus !== retentionStatus ||
       market.confidenceReason !== confidenceReason || market.confidenceLevel !== confidenceLevel ||
+      openPagesScanned < 1 || recentClosedPagesScanned < 1 ||
+      (!archiveComplete && archivalClosedPagesScanned < 1) ||
       (market.openHistoryTruncated && openPagesScanned === 0) ||
       (market.recentClosedHistoryTruncated && recentClosedPagesScanned === 0) ||
       (market.archivalClosedHistoryTruncated && archivalClosedPagesScanned === 0) ||

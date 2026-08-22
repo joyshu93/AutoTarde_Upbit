@@ -448,6 +448,9 @@ test("candidate preparation fully validates persisted history recovery with exac
     { ...valid, confidenceLevel: "HIGH" },
     { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, archivalWindowStartAt: "2026-08-09T00:00:00.000Z" } : market) },
     { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, recentClosedHistoryTruncated: true, recentClosedPagesScanned: 0, confidenceReason: "PAGE_LIMIT_REACHED" } : market), confidenceReason: "PAGE_LIMIT_REACHED" },
+    { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, openPagesScanned: 0 } : market) },
+    { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, recentClosedPagesScanned: 0 } : market) },
+    { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, archivalClosedPagesScanned: 0 } : market) },
     { ...valid, scannedSnapshotCount: 0 },
   ];
   for (const historyRecovery of malformed) {

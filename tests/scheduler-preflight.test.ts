@@ -440,6 +440,9 @@ test("exact-evidence evaluator fully validates history recovery before PASS or W
     { ...valid, confidenceLevel: "HIGH" },
     { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, recentClosedWindowEndAt: "2026-05-08T00:00:01.000Z" } : market) },
     { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, openHistoryTruncated: true, openPagesScanned: 0, confidenceReason: "PAGE_LIMIT_REACHED" } : market), confidenceReason: "PAGE_LIMIT_REACHED" },
+    { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, openPagesScanned: 0 } : market) },
+    { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, recentClosedPagesScanned: 0 } : market) },
+    { ...valid, markets: valid.markets.map((market, index) => index === 0 ? { ...market, archivalClosedPagesScanned: 0 } : market) },
     { ...valid, recoveredOrderCount: 3 },
   ];
   for (const historyRecovery of malformed) {

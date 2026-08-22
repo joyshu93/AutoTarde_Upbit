@@ -176,3 +176,31 @@ node --test dist/tests/prospective-shadow-commitment-cli.test.js
 - Integrated exact chronology in `src/app/scheduler-preflight.ts` and `src/app/candidate-btc-run-preparation.ts`.
 - Added `tests/history-recovery-validation.test.ts` and registered it in `tests/run-all.ts`.
 - Expanded `tests/scheduler-preflight.test.ts` and `tests/candidate-btc-run-preparation.test.ts`.
+
+## Fix Round 7 TDD Evidence
+
+### RED
+
+After adding producer page-minimum regressions without changing production code, the focused shared/scheduler/candidate harness exited 1 with exactly three failures:
+
+- the shared validator returned `true` for incomplete normal rows with zero required pages;
+- scheduler preflight returned `PASS` instead of `BLOCK`;
+- candidate preparation returned normally instead of rejecting the malformed persisted summary.
+
+### GREEN
+
+The focused command passed all 35 tests after adding only these normal-market rules:
+
+- `openPagesScanned >= 1`;
+- `recentClosedPagesScanned >= 1`;
+- `archivalClosedPagesScanned >= 1` when derived `archiveComplete` is false.
+
+The producer-valid complete checkpoint fixture continues to pass with `archiveComplete=true` and `archivalClosedPagesScanned=0`.
+
+Expanded verification passed every test from `history-recovery-validation.test.ts`, `reconciliation-service.test.ts`, `position-guard-pilot-recovery.test.ts`, `scheduler-preflight.test.ts`, and `candidate-btc-run-preparation.test.ts`. Fresh `npm.cmd run typecheck`, `npm.cmd run build`, and `git diff --check` all exited 0. No runtime, operational database, API, network, Telegram, operational script, push, or merge action was used.
+
+### Round 7 Files
+
+- Updated `src/modules/reconciliation/history-recovery-validation.ts`.
+- Expanded `tests/history-recovery-validation.test.ts`, `tests/scheduler-preflight.test.ts`, and `tests/candidate-btc-run-preparation.test.ts`.
+- Updated this task report.
