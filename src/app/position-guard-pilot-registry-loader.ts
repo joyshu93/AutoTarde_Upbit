@@ -10,7 +10,18 @@ import {
   statSync,
   type BigIntStats,
 } from "node:fs";
-import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  parse,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { PositionGuardPilotAbandonmentValidation } from "../domain/pilot-types.js";
 import { validatePositionGuardPilotAbandonment } from "../modules/strategy/position-guard-pilot-authority.js";
@@ -38,20 +49,49 @@ export type PositionGuardPilotRegistryFixtureReader = (
   registryPath: string,
 ) => Uint8Array;
 
+type PositionGuardPilotRegistryStatsStage =
+  | "OPENED_BEFORE_READ"
+  | "PATH_BEFORE_READ"
+  | "OPENED_AFTER_READ"
+  | "PATH_AFTER_READ";
+
+type PositionGuardPilotRegistryStatsProjector = (
+  stage: PositionGuardPilotRegistryStatsStage,
+  stats: BigIntStats,
+) => BigIntStats;
+
+type PositionGuardPilotRegistryLoaderTestOptions = Readonly<{
+  projectStats: PositionGuardPilotRegistryStatsProjector;
+}>;
+
 /**
  * Loads the single checked-in abandonment record without consulting Git, the network, or env.
  * A valid abandonment is historical authority evidence, never LIVE trading approval.
  */
 export function loadCheckedInPositionGuardPilotAbandonment(): PositionGuardPilotAbandonmentValidation {
-  return loadFromRepositoryRoot(process.cwd(), readOpenedRegistry);
+  const moduleFilePath = fileURLToPath(import.meta.url);
+  return loadFromRepositoryRoot(
+    projectRepositoryRootFromModuleFile(moduleFilePath),
+    readOpenedRegistry,
+    identityStatsProjector,
+  );
 }
 
 /** Test seam: the fixed relative path and production validation remain unchanged. */
 export function loadPositionGuardPilotAbandonmentFromRepositoryRootForTest(
   repositoryRoot: string,
   fixtureReader: PositionGuardPilotRegistryFixtureReader = readOpenedRegistry,
+  options: PositionGuardPilotRegistryLoaderTestOptions = {
+    projectStats: identityStatsProjector,
+  },
 ): PositionGuardPilotAbandonmentValidation {
-  return loadFromRepositoryRoot(repositoryRoot, fixtureReader);
+  return loadFromRepositoryRoot(repositoryRoot, fixtureReader, options.projectStats);
+}
+
+export function projectPositionGuardPilotRepositoryRootFromModuleFileForTest(
+  moduleFilePath: string,
+): string {
+  return projectRepositoryRootFromModuleFile(moduleFilePath);
 }
 
 export function validatePositionGuardPilotRegistryBytes(
@@ -87,6 +127,7 @@ export function validatePositionGuardPilotRegistryBytes(
 function loadFromRepositoryRoot(
   repositoryRoot: string,
   reader: PositionGuardPilotRegistryFixtureReader,
+  projectStats: PositionGuardPilotRegistryStatsProjector,
 ): PositionGuardPilotAbandonmentValidation {
   const resolvedRoot = resolve(repositoryRoot);
   assertNoSymbolicLinks(resolvedRoot);
@@ -106,23 +147,35 @@ function loadFromRepositoryRoot(
     if (!samePath(realRoot, realpathSync.native(resolvedRoot))) {
       throw new Error("PositionGuard pilot registry repository root changed while opening the file.");
     }
-    const opened = fstatSync(descriptor, { bigint: true });
+    const opened = projectStats(
+      "OPENED_BEFORE_READ",
+      fstatSync(descriptor, { bigint: true }),
+    );
     if (!opened.isFile()) {
       throw new Error("PositionGuard pilot registry must be a regular file.");
     }
     if (opened.size <= 0n || opened.size > BigInt(MAX_REGISTRY_BYTES)) {
       throw new Error("PositionGuard pilot registry file size is invalid.");
     }
-    assertStableFileIdentity(opened, statSync(registryPath, { bigint: true }));
+    assertStableFileIdentity(
+      opened,
+      projectStats("PATH_BEFORE_READ", statSync(registryPath, { bigint: true })),
+    );
 
     const bytes = Uint8Array.from(reader(descriptor, registryPath));
-    const afterRead = fstatSync(descriptor, { bigint: true });
+    const afterRead = projectStats(
+      "OPENED_AFTER_READ",
+      fstatSync(descriptor, { bigint: true }),
+    );
     assertNoSymbolicLinks(registryPath);
     if (!samePath(realRoot, realpathSync.native(resolvedRoot))) {
       throw new Error("PositionGuard pilot registry repository root changed while reading the file.");
     }
     assertStableOpenedFile(opened, afterRead);
-    assertStableFileIdentity(afterRead, statSync(registryPath, { bigint: true }));
+    assertStableFileIdentity(
+      afterRead,
+      projectStats("PATH_AFTER_READ", statSync(registryPath, { bigint: true })),
+    );
 
     const realRegistryPathAfterRead = realpathSync.native(registryPath);
     assertContainedPath(realRoot, realRegistryPathAfterRead);
@@ -138,6 +191,32 @@ function loadFromRepositoryRoot(
 
 function readOpenedRegistry(descriptor: number): Uint8Array {
   return readFileSync(descriptor);
+}
+
+function projectRepositoryRootFromModuleFile(moduleFilePath: string): string {
+  const resolvedModuleFile = resolve(moduleFilePath);
+  const extension = extname(resolvedModuleFile);
+  const appDirectory = dirname(resolvedModuleFile);
+  const sourceDirectory = dirname(appDirectory);
+  if (
+    basename(resolvedModuleFile) !== `position-guard-pilot-registry-loader${extension}`
+    || basename(appDirectory) !== "app"
+    || basename(sourceDirectory) !== "src"
+  ) {
+    throw new Error("PositionGuard pilot registry loader module path is invalid.");
+  }
+
+  if (extension === ".ts") {
+    return dirname(sourceDirectory);
+  }
+  if (extension === ".js") {
+    const distributionDirectory = dirname(sourceDirectory);
+    if (basename(distributionDirectory) !== "dist") {
+      throw new Error("PositionGuard pilot registry compiled module path is invalid.");
+    }
+    return dirname(distributionDirectory);
+  }
+  throw new Error("PositionGuard pilot registry loader module extension is invalid.");
 }
 
 function normalizeRegistryNewlines(value: string): string {
@@ -216,24 +295,70 @@ function assertContainedPath(repositoryRoot: string, targetPath: string): void {
 }
 
 function assertStableFileIdentity(opened: BigIntStats, pathStats: BigIntStats): void {
-  if (opened.dev !== pathStats.dev || opened.ino !== pathStats.ino) {
+  const openedHasIdentity = hasFileIdentity(opened);
+  const pathHasIdentity = hasFileIdentity(pathStats);
+  if (openedHasIdentity !== pathHasIdentity) {
+    throw new Error("PositionGuard pilot registry file identity availability changed.");
+  }
+  if (
+    openedHasIdentity
+    && (opened.dev !== pathStats.dev || opened.ino !== pathStats.ino)
+  ) {
     throw new Error("PositionGuard pilot registry path does not identify the opened file.");
   }
-  if (opened.dev === 0n && opened.ino === 0n) {
-    throw new Error("PositionGuard pilot registry file identity cannot be established.");
+  if (!hasStableFileMetadata(opened, pathStats)) {
+    throw new Error("PositionGuard pilot registry path metadata does not match the opened file.");
   }
 }
 
 function assertStableOpenedFile(before: BigIntStats, after: BigIntStats): void {
+  const beforeHasIdentity = hasFileIdentity(before);
+  const afterHasIdentity = hasFileIdentity(after);
   if (
-    before.dev !== after.dev
-    || before.ino !== after.ino
-    || before.size !== after.size
-    || before.mtimeNs !== after.mtimeNs
-    || before.ctimeNs !== after.ctimeNs
+    beforeHasIdentity !== afterHasIdentity
+    || (beforeHasIdentity && (before.dev !== after.dev || before.ino !== after.ino))
+    || !hasStableFileMetadata(before, after)
   ) {
     throw new Error("PositionGuard pilot registry file changed while it was being read.");
   }
+}
+
+function hasFileIdentity(stats: BigIntStats): boolean {
+  return stats.dev !== 0n || stats.ino !== 0n;
+}
+
+function hasStableFileMetadata(left: BigIntStats, right: BigIntStats): boolean {
+  return left.isFile()
+    && right.isFile()
+    && fileTypeSignature(left) === fileTypeSignature(right)
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs
+    && left.birthtimeNs === right.birthtimeNs
+    && left.mode === right.mode
+    && left.nlink === right.nlink
+    && left.uid === right.uid
+    && left.gid === right.gid
+    && left.rdev === right.rdev;
+}
+
+function fileTypeSignature(stats: BigIntStats): string {
+  return [
+    stats.isFile(),
+    stats.isDirectory(),
+    stats.isBlockDevice(),
+    stats.isCharacterDevice(),
+    stats.isSymbolicLink(),
+    stats.isFIFO(),
+    stats.isSocket(),
+  ].join(":");
+}
+
+function identityStatsProjector(
+  _stage: PositionGuardPilotRegistryStatsStage,
+  stats: BigIntStats,
+): BigIntStats {
+  return stats;
 }
 
 function samePath(left: string, right: string): boolean {

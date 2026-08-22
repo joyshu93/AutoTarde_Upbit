@@ -7,13 +7,16 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  type BigIntStats,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import {
   loadPositionGuardPilotAbandonmentFromRepositoryRootForTest,
+  projectPositionGuardPilotRepositoryRootFromModuleFileForTest,
   validatePositionGuardPilotRegistryBytes,
 } from "../src/app/position-guard-pilot-registry-loader.js";
 import { test } from "./harness.js";
@@ -27,6 +30,43 @@ const REGISTRY_RELATIVE_PATH = join(
   "prospective-shadow",
   "registry.jsonl",
 );
+
+type RegistryStatsStage =
+  | "OPENED_BEFORE_READ"
+  | "PATH_BEFORE_READ"
+  | "OPENED_AFTER_READ"
+  | "PATH_AFTER_READ";
+
+type RegistryStatsProjector = (
+  stage: RegistryStatsStage,
+  stats: BigIntStats,
+) => BigIntStats;
+
+test("registry module path projection ignores cwd for source and compiled layouts", () => {
+  const repositoryRoot = resolve("synthetic-position-guard-pilot-repository");
+  const sourceModule = join(
+    repositoryRoot,
+    "src",
+    "app",
+    "position-guard-pilot-registry-loader.ts",
+  );
+  const compiledModule = join(
+    repositoryRoot,
+    "dist",
+    "src",
+    "app",
+    "position-guard-pilot-registry-loader.js",
+  );
+
+  assert.equal(
+    projectPositionGuardPilotRepositoryRootFromModuleFileForTest(sourceModule),
+    repositoryRoot,
+  );
+  assert.equal(
+    projectPositionGuardPilotRepositoryRootFromModuleFileForTest(compiledModule),
+    repositoryRoot,
+  );
+});
 
 test("registry bytes validator accepts exact LF and whole-file CRLF bytes", () => {
   for (const text of [CANONICAL_REGISTRY, CANONICAL_REGISTRY.replaceAll("\n", "\r\n")]) {
@@ -151,6 +191,79 @@ test("registry file loader detects a path swap after opening the descriptor", ()
   });
 });
 
+test("registry file loader accepts stable canonical files when dev and ino are unavailable", () => {
+  withTemporaryRepository((repositoryRoot, registryPath) => {
+    writeFileSync(registryPath, CANONICAL_REGISTRY, "utf8");
+    const observedStages: RegistryStatsStage[] = [];
+
+    assert.deepEqual(
+      loadPositionGuardPilotAbandonmentFromRepositoryRootForTest(repositoryRoot, undefined, {
+        projectStats: (stage, stats) => {
+          observedStages.push(stage);
+          return overrideStats(stats, { dev: 0n, ino: 0n });
+        },
+      }),
+      {
+        valid: true,
+        experimentId: "PCS-2026-001",
+        eventAt: "2026-08-21T03:08:24.756Z",
+      },
+    );
+    assert.deepEqual(observedStages, [
+      "OPENED_BEFORE_READ",
+      "PATH_BEFORE_READ",
+      "OPENED_AFTER_READ",
+      "PATH_AFTER_READ",
+    ]);
+  });
+});
+
+test("registry file loader rejects partial or mismatched file identities", () => {
+  for (const projectStats of [
+    ((stage, stats) => overrideStats(
+      stats,
+      stage === "OPENED_BEFORE_READ"
+        ? { dev: 0n, ino: 0n }
+        : { dev: 11n, ino: 17n },
+    )),
+    ((stage, stats) => overrideStats(
+      stats,
+      stage === "PATH_BEFORE_READ"
+        ? { dev: 11n, ino: 19n }
+        : { dev: 11n, ino: 17n },
+    )),
+  ] satisfies RegistryStatsProjector[]) {
+    withTemporaryRepository((repositoryRoot, registryPath) => {
+      writeFileSync(registryPath, CANONICAL_REGISTRY, "utf8");
+      assert.throws(() => loadPositionGuardPilotAbandonmentFromRepositoryRootForTest(
+        repositoryRoot,
+        undefined,
+        { projectStats },
+      ));
+    });
+  }
+});
+
+test("registry fallback identity rejects a path swap with changed metadata", () => {
+  withTemporaryRepository((repositoryRoot, registryPath) => {
+    writeFileSync(registryPath, CANONICAL_REGISTRY, "utf8");
+    const originalPath = `${registryPath}.opened`;
+
+    assert.throws(() => loadPositionGuardPilotAbandonmentFromRepositoryRootForTest(
+      repositoryRoot,
+      (descriptor, openedPath) => {
+        renameSync(openedPath, originalPath);
+        writeFileSync(openedPath, CANONICAL_REGISTRY, "utf8");
+        utimesSync(openedPath, new Date(1_000), new Date(1_000));
+        return readFileSync(descriptor);
+      },
+      {
+        projectStats: (_stage, stats) => overrideStats(stats, { dev: 0n, ino: 0n }),
+      },
+    ));
+  });
+});
+
 function withTemporaryRepository(
   run: (repositoryRoot: string, registryPath: string) => void,
   options: Readonly<{ createRegistryDirectory: boolean }> = { createRegistryDirectory: true },
@@ -165,4 +278,19 @@ function withTemporaryRepository(
   } finally {
     rmSync(repositoryRoot, { force: true, recursive: true });
   }
+}
+
+function overrideStats(
+  stats: BigIntStats,
+  overrides: Readonly<Partial<Record<"dev" | "ino" | "mtimeNs", bigint>>>,
+): BigIntStats {
+  return new Proxy(stats, {
+    get(target, property) {
+      if (property in overrides) {
+        return overrides[property as keyof typeof overrides];
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
