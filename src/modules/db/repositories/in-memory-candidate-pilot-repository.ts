@@ -21,6 +21,7 @@ import {
   buildCandidatePilotRecoveryFaultAuditEvent,
   candidatePilotRecoveryFaultReason,
   resolveCandidateIntentFaultOccurrence,
+  toPositionGuardCandidateRoutingState,
   validateCandidateExecutionBinding,
   validateCandidateIntentFaultInput,
   validateCandidatePilotDeployment,
@@ -141,7 +142,7 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
 
   async getState(deploymentId: string): Promise<Readonly<PositionGuardCandidateState> | null> {
     const state = this.exactStates.get(deploymentId);
-    return state ? Object.freeze(approximateState(state)) : null;
+    return state ? toPositionGuardCandidateRoutingState(state) : null;
   }
 
   async getExactState(deploymentId: string): Promise<Readonly<ExactCandidateState> | null> {
@@ -300,7 +301,7 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
         throw new Error(`Conflicting duplicate candidate evidence ${material.evidence.evidenceId}.`);
       }
       return {
-        state: Object.freeze(approximateState(currentState)),
+        state: toPositionGuardCandidateRoutingState(currentState),
         evidence: Object.freeze({ ...material.evidence }),
         duplicate: true,
       };
@@ -342,7 +343,7 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
     this.evidence.set(input.deploymentId, nextRecords);
     this.auditEvents.set(input.deploymentId, nextAudit);
     return {
-      state: Object.freeze(approximateState(nextState)),
+      state: toPositionGuardCandidateRoutingState(nextState),
       evidence: Object.freeze({ ...material.evidence }),
       duplicate: false,
     };
@@ -520,23 +521,6 @@ function cursorAfter(records: readonly StoredEvidence[], evidenceId: string): nu
   const cursorIndex = records.findIndex((item) => item.record.evidence.evidenceId === evidenceId);
   if (cursorIndex < 0) throw new Error(`Candidate evidence cursor ${evidenceId} does not exist.`);
   return cursorIndex + 1;
-}
-
-function approximateState(state: Readonly<ExactCandidateState>): PositionGuardCandidateState {
-  const result: PositionGuardCandidateState = {
-    currentEpisodeAddCount: state.currentEpisodeAddCount,
-    currentEpisodeCostBasisKrw: Number(state.currentEpisodeCostBasisKrw),
-    currentEpisodeInventoryQuantity: Number(state.currentEpisodeInventoryQuantity),
-    currentEpisodeRealizedPnlKrw: Number(state.currentEpisodeRealizedPnlKrw),
-    lastFullExitAt: state.lastFullExitAt,
-    lastFullExitRealizedPnlKrw: state.lastFullExitRealizedPnlKrw === null ? null : Number(state.lastFullExitRealizedPnlKrw),
-    lastEntryPath: state.lastEntryPath,
-    lastEvidenceAt: state.lastEvidenceAt,
-    lastEvidenceId: state.lastEvidenceId,
-    stateVersion: state.stateVersion,
-  };
-  validatePositionGuardCandidateState(result);
-  return result;
 }
 
 function isPristineInitialState(state: PositionGuardCandidateState): boolean {

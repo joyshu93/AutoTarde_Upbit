@@ -276,6 +276,32 @@ test("only eligible ACTIVE executable routes receive exact non-order candidate a
   }
 });
 
+test("candidate authority is detached from verifier mutation during decision persistence", async () => {
+  const verification = structuredClone(readyVerification());
+  const harness = createHarness({
+    verify: () => verification,
+    duringSave: () => {
+      (verification.deployment as { id: string }).id = "mutated-after-validation";
+      (verification.activation as { activationAt: string }).activationAt = "2026-08-22T00:00:00.000Z";
+      (verification.refreshProvenance as { reconciliationRunId: string }).reconciliationRunId =
+        "mutated-reconciliation";
+    },
+  });
+
+  const result = await harness.runner.runOnce(candidateRunInput());
+  const audit = readPolicyRoute(result.strategyDecisionRecord);
+  const authority = harness.submitted[0]?.candidateAuthority;
+
+  assert.equal(verification.deployment.id, "mutated-after-validation");
+  assert.equal(audit.deploymentId, "deployment-1");
+  assert.equal(audit.activationAt, "2026-08-21T23:00:00.000Z");
+  assert.equal(audit.refreshProvenance?.reconciliationRunId, "reconciliation-1");
+  assert.ok(authority);
+  assert.equal(authority.deploymentId, audit.deploymentId);
+  assert.equal(authority.activationAt, audit.activationAt);
+  assert.equal(authority.deploymentId, "deployment-1");
+});
+
 test("PENDING_FLAT suppresses new risk and preserves risk reduction without authority", async () => {
   const cases = [
     { baseline: engineDecision("ENTER", { targetNotionalKrw: 100_000 }), effective: engineDecision("HOLD") },
@@ -422,6 +448,7 @@ type HarnessOptions = Readonly<{
   buildDecision?: () => ReturnType<typeof decisionBundle>;
   verify?: () => unknown;
   route?: (input: RouteInput) => unknown;
+  duringSave?: (record: StrategyDecisionRecord) => void;
 }>;
 
 function createHarness(options: HarnessOptions = {}) {
@@ -431,6 +458,7 @@ function createHarness(options: HarnessOptions = {}) {
     repositories: {
       async saveStrategyDecision(record: StrategyDecisionRecord) {
         saved.push(structuredClone(record));
+        options.duringSave?.(record);
       },
     },
     executionService: {

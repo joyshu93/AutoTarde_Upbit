@@ -15,11 +15,16 @@ import type {
 import { createId } from "../../shared/ids.js";
 import type { ExecutionRepository } from "../db/interfaces.js";
 import {
+  parseCandidatePilotTimestamp,
   toPositionGuardCandidateRoutingState,
   validateCandidatePilotDeployment,
   type CandidatePilotRecoveryFaultReason,
 } from "../db/pilot-interfaces.js";
-import type { ExactCandidateState } from "../execution/candidate-evidence-decimals.js";
+import {
+  canonicalNonNegativeDecimal,
+  canonicalSignedDecimal,
+  type ExactCandidateState,
+} from "../execution/candidate-evidence-decimals.js";
 import type { ExecutionService } from "../execution/execution-service.js";
 import type {
   CandidateExecutionAuthority,
@@ -193,6 +198,13 @@ export class PositionGuardStrategyRunner {
     const executionStrategyDecision = route.executionDecision === null
       ? null
       : toStrategyDecision(baselineDecision.context, route.executionDecision);
+    const candidateAuthority = executionStrategyDecision === null
+      ? undefined
+      : candidateExecutionAuthority({
+          verification,
+          route,
+          executionDecision: executionStrategyDecision,
+        });
     const policyRoute = createPolicyRouteAudit({
       selection,
       baselineDecision,
@@ -211,13 +223,6 @@ export class PositionGuardStrategyRunner {
 
     await this.dependencies.repositories.saveStrategyDecision(strategyDecisionRecord);
 
-    const candidateAuthority = executionStrategyDecision === null
-      ? undefined
-      : candidateExecutionAuthority({
-          verification,
-          route,
-          executionDecision: executionStrategyDecision,
-        });
     const orderInput = route.executionBlocked || executionStrategyDecision === null
       ? null
       : toOrderSubmissionInput({
@@ -288,13 +293,12 @@ export class PositionGuardStrategyRunner {
     if (verification.status === "BLOCKED_FAULT") {
       throw new PositionGuardCandidateRunBlockedError(verification);
     }
-    validateReadyVerification({
+    return canonicalReadyVerification({
       verification,
       selection: this.dependencies.policySelection!,
       exchangeAccountId: this.dependencies.config.exchangeAccountId,
       receipt: input.refreshReceipt,
     });
-    return verification;
   }
 
   async previewOnce(input: PositionGuardRunInput): Promise<PositionGuardPreviewResult> {
@@ -419,42 +423,187 @@ function candidateExecutionAuthority(input: {
   });
 }
 
-function validateReadyVerification(input: {
+function canonicalReadyVerification(input: {
   verification: Extract<PositionGuardRunnerPilotVerificationResult, { status: "READY" }>;
   selection: PositionGuardPolicySelection;
   exchangeAccountId: string;
   receipt: PositionGuardPilotRefreshReceipt;
-}): void {
+}): Extract<PositionGuardRunnerPilotVerificationResult, { status: "READY" }> {
   if (input.selection.kind !== "BTC_CANDIDATE_PILOT") {
     throw new Error("Candidate verification requires the exact BTC candidate selection.");
   }
-  const deployment = validateCandidatePilotDeployment(input.verification.deployment);
+  const verificationRecord = exactOwnDataRecord(
+    input.verification,
+    "verified BTC candidate authority",
+    READY_VERIFICATION_KEYS,
+    OPTIONAL_READY_VERIFICATION_KEYS,
+  );
+  if (verificationRecord.status !== "READY") {
+    throw new Error("Verified BTC candidate authority status must be READY.");
+  }
+  if (
+    Object.hasOwn(verificationRecord, "verificationOnly") &&
+    verificationRecord.verificationOnly !== true
+  ) {
+    throw new Error("Verified BTC candidate authority verificationOnly must be true when present.");
+  }
+  const deployment = Object.freeze(validateCandidatePilotDeployment(
+    verificationRecord.deployment as PositionGuardPilotDeploymentRecord,
+  ));
+  const phase = requirePilotReadyPhase(verificationRecord.phase);
+  const activation = canonicalActivation(verificationRecord.activation);
+  const state = canonicalExactCandidateState(verificationRecord.state);
+  const stateVersion = requireNonNegativeSafeInteger(
+    verificationRecord.stateVersion,
+    "verified BTC candidate stateVersion",
+  );
+  const receipt = canonicalRefreshReceipt(input.receipt, "candidate run refresh receipt");
+  const refreshProvenance = canonicalRefreshReceipt(
+    verificationRecord.refreshProvenance,
+    "verified BTC candidate refresh provenance",
+  );
   if (
     deployment.exchangeAccountId !== input.exchangeAccountId ||
-    deployment.exchangeAccountId !== input.receipt.exchangeAccountId ||
+    deployment.exchangeAccountId !== receipt.exchangeAccountId ||
     deployment.pilotId !== input.selection.pilotId ||
     deployment.market !== input.selection.market ||
     deployment.policyId !== input.selection.policyId ||
     deployment.policyVersion !== input.selection.policyVersion ||
-    deployment.phase !== input.verification.phase ||
-    input.verification.stateVersion !== input.verification.state.stateVersion
+    deployment.phase !== phase ||
+    stateVersion !== state.stateVersion
   ) {
     throw new Error("Verified BTC candidate authority does not match the configured run identity.");
   }
-  if (!sameRefreshReceipt(input.receipt, input.verification.refreshProvenance)) {
+  if (!sameRefreshReceipt(receipt, refreshProvenance)) {
     throw new Error("Verified BTC candidate refresh provenance does not match the exact run receipt.");
   }
-  if (input.verification.phase === "ACTIVE") {
+  if (phase === "ACTIVE") {
     if (
-      input.verification.activation === null ||
-      deployment.activationAt !== input.verification.activation.activationAt ||
-      deployment.activationEpochNs !== input.verification.activation.activationEpochNs
+      activation === null ||
+      deployment.activationAt !== activation.activationAt ||
+      deployment.activationEpochNs !== activation.activationEpochNs
     ) {
       throw new Error("Verified ACTIVE BTC candidate authority requires exact activation provenance.");
     }
-  } else if (input.verification.activation !== null) {
+  } else if (activation !== null) {
     throw new Error("PENDING_FLAT BTC candidate authority cannot carry activation provenance.");
   }
+  return Object.freeze({
+    status: "READY",
+    deployment,
+    phase,
+    activation,
+    state,
+    stateVersion,
+    refreshProvenance,
+  });
+}
+
+const READY_VERIFICATION_KEYS = [
+  "status",
+  "deployment",
+  "phase",
+  "activation",
+  "state",
+  "stateVersion",
+  "refreshProvenance",
+] as const;
+const OPTIONAL_READY_VERIFICATION_KEYS = ["verificationOnly"] as const;
+const EXACT_CANDIDATE_STATE_KEYS = [
+  "currentEpisodeAddCount",
+  "currentEpisodeCostBasisKrw",
+  "currentEpisodeInventoryQuantity",
+  "currentEpisodeRealizedPnlKrw",
+  "lastFullExitAt",
+  "lastFullExitRealizedPnlKrw",
+  "lastEntryPath",
+  "lastEvidenceAt",
+  "lastEvidenceId",
+  "stateVersion",
+] as const;
+
+function canonicalActivation(value: unknown): Readonly<{
+  activationAt: string;
+  activationEpochNs: bigint;
+}> | null {
+  if (value === null) return null;
+  const record = exactOwnDataRecord(value, "verified BTC candidate activation", [
+    "activationAt",
+    "activationEpochNs",
+  ] as const);
+  const activationAt = requireNonEmptyString(record.activationAt, "candidate activationAt");
+  const activationEpochNs = record.activationEpochNs;
+  if (typeof activationEpochNs !== "bigint") {
+    throw new Error("Candidate activationEpochNs must be a bigint.");
+  }
+  if (parseCandidatePilotTimestamp(activationAt, "candidate activationAt") !== activationEpochNs) {
+    throw new Error("Candidate activation epoch does not match its timestamp.");
+  }
+  return Object.freeze({ activationAt, activationEpochNs });
+}
+
+function canonicalExactCandidateState(value: unknown): Readonly<ExactCandidateState> {
+  const record = exactOwnDataRecord(value, "verified exact candidate state", EXACT_CANDIDATE_STATE_KEYS);
+  const state: ExactCandidateState = {
+    currentEpisodeAddCount: requireNonNegativeSafeInteger(
+      record.currentEpisodeAddCount,
+      "candidate currentEpisodeAddCount",
+    ),
+    currentEpisodeCostBasisKrw: canonicalNonNegativeDecimal(
+      record.currentEpisodeCostBasisKrw,
+      "candidate currentEpisodeCostBasisKrw",
+    ),
+    currentEpisodeInventoryQuantity: canonicalNonNegativeDecimal(
+      record.currentEpisodeInventoryQuantity,
+      "candidate currentEpisodeInventoryQuantity",
+    ),
+    currentEpisodeRealizedPnlKrw: canonicalSignedDecimal(
+      record.currentEpisodeRealizedPnlKrw,
+      "candidate currentEpisodeRealizedPnlKrw",
+    ),
+    lastFullExitAt: requireNullableString(record.lastFullExitAt, "candidate lastFullExitAt"),
+    lastFullExitRealizedPnlKrw: record.lastFullExitRealizedPnlKrw === null
+      ? null
+      : canonicalSignedDecimal(
+          record.lastFullExitRealizedPnlKrw,
+          "candidate lastFullExitRealizedPnlKrw",
+        ),
+    lastEntryPath: requireCandidateEntryPath(record.lastEntryPath),
+    lastEvidenceAt: requireNullableString(record.lastEvidenceAt, "candidate lastEvidenceAt"),
+    lastEvidenceId: requireNullableString(record.lastEvidenceId, "candidate lastEvidenceId"),
+    stateVersion: requireNonNegativeSafeInteger(record.stateVersion, "candidate stateVersion"),
+  };
+  toPositionGuardCandidateRoutingState(state);
+  return Object.freeze(state);
+}
+
+function canonicalRefreshReceipt(value: unknown, label: string): PositionGuardPilotRefreshReceipt {
+  const record = exactOwnDataRecord(value, label, REFRESH_RECEIPT_KEYS);
+  const receipt = {
+    exchangeAccountId: requireNonEmptyString(record.exchangeAccountId, `${label} exchangeAccountId`),
+    requestedAt: requireTimestamp(record.requestedAt, `${label} requestedAt`),
+    balanceSnapshotId: requireNonEmptyString(record.balanceSnapshotId, `${label} balanceSnapshotId`),
+    balanceCapturedAt: requireTimestamp(record.balanceCapturedAt, `${label} balanceCapturedAt`),
+    positionSnapshotId: requireNonEmptyString(record.positionSnapshotId, `${label} positionSnapshotId`),
+    positionCapturedAt: requireTimestamp(record.positionCapturedAt, `${label} positionCapturedAt`),
+    reconciliationRunId: requireNonEmptyString(
+      record.reconciliationRunId,
+      `${label} reconciliationRunId`,
+    ),
+    reconciliationStartedAt: requireTimestamp(
+      record.reconciliationStartedAt,
+      `${label} reconciliationStartedAt`,
+    ),
+    reconciliationCompletedAt: requireTimestamp(
+      record.reconciliationCompletedAt,
+      `${label} reconciliationCompletedAt`,
+    ),
+    reconciliationSource: record.reconciliationSource,
+  };
+  if (receipt.reconciliationSource !== "SCHEDULER_PREFLIGHT") {
+    throw new Error(`${label} reconciliationSource must be SCHEDULER_PREFLIGHT.`);
+  }
+  return Object.freeze(receipt as PositionGuardPilotRefreshReceipt);
 }
 
 const REFRESH_RECEIPT_KEYS = [
@@ -477,6 +626,87 @@ function sameRefreshReceipt(
   return REFRESH_RECEIPT_KEYS.every((key) => left[key] === right[key]) &&
     Reflect.ownKeys(left).length === REFRESH_RECEIPT_KEYS.length &&
     Reflect.ownKeys(right).length === REFRESH_RECEIPT_KEYS.length;
+}
+
+function exactOwnDataRecord<
+  const TRequired extends readonly string[],
+  const TOptional extends readonly string[] = readonly [],
+>(
+  value: unknown,
+  label: string,
+  requiredKeys: TRequired,
+  optionalKeys: TOptional = [] as unknown as TOptional,
+): Record<TRequired[number] | TOptional[number], unknown> {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+  ) {
+    throw new Error(`${label} must be a plain object with exactly own data properties.`);
+  }
+  const expected = new Set<string>([...requiredKeys, ...optionalKeys]);
+  const required = new Set<string>(requiredKeys);
+  const ownKeys = Reflect.ownKeys(value);
+  if (
+    ownKeys.some((key) => typeof key !== "string" || !expected.has(key)) ||
+    [...required].some((key) => !Object.hasOwn(value, key))
+  ) {
+    throw new Error(`${label} must have exactly the approved own data properties.`);
+  }
+  const result = {} as Record<TRequired[number] | TOptional[number], unknown>;
+  for (const key of ownKeys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (typeof key !== "string" || descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable) {
+      throw new Error(`${label} must have exactly the approved own data properties.`);
+    }
+    result[key as TRequired[number] | TOptional[number]] = descriptor.value;
+  }
+  return result;
+}
+
+function requirePilotReadyPhase(value: unknown): "PENDING_FLAT" | "ACTIVE" {
+  if (value !== "PENDING_FLAT" && value !== "ACTIVE") {
+    throw new Error("Verified BTC candidate phase must be PENDING_FLAT or ACTIVE.");
+  }
+  return value;
+}
+
+function requireNonNegativeSafeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative safe integer.`);
+  }
+  return value;
+}
+
+function requireNonEmptyString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${label} must be a non-empty string.`);
+  }
+  return value;
+}
+
+function requireNullableString(value: unknown, label: string): string | null {
+  return value === null ? null : requireNonEmptyString(value, label);
+}
+
+function requireTimestamp(value: unknown, label: string): string {
+  const timestamp = requireNonEmptyString(value, label);
+  parseCandidatePilotTimestamp(timestamp, label);
+  return timestamp;
+}
+
+function requireCandidateEntryPath(value: unknown): ExactCandidateState["lastEntryPath"] {
+  if (
+    value !== null &&
+    value !== "PULLBACK" &&
+    value !== "RECLAIM" &&
+    value !== "BREAKOUT_HOLD" &&
+    value !== "NONE"
+  ) {
+    throw new Error("Candidate lastEntryPath is invalid.");
+  }
+  return value;
 }
 
 export function createStrategyDecisionRecord(input: {

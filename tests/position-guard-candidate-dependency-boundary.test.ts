@@ -29,6 +29,8 @@ const APPROVED_PERSISTENCE_PROJECTOR_IMPORTERS = new Set([
 ]);
 const APPROVED_PERSISTENCE_PROJECTOR =
   "/src/modules/strategy/position-guard-candidate-state.ts";
+const APPROVED_POLICY_ROUTER = "/src/modules/strategy/position-guard-policy-router.ts";
+const APPROVED_POLICY_ROUTER_IMPORTER = "/src/modules/strategy/position-guard-runner.ts";
 const APPROVED_RUNTIME_CANDIDATE_FILES = new Set([
   "/src/modules/strategy/position-guard-candidate-policy.ts",
   APPROVED_PERSISTENCE_PROJECTOR,
@@ -249,6 +251,34 @@ test("runtime root recognition includes index and scheduler paths", () => {
   assert.equal(isRuntimeRootPath("/src/modules/strategy/position-guard-candidate-policy.ts"), false);
 });
 
+test("candidate repositories delegate routing-state conversion to the one canonical helper", async () => {
+  for (const repositoryPath of [
+    "src/modules/db/repositories/in-memory-candidate-pilot-repository.ts",
+    "src/modules/db/repositories/sqlite-candidate-pilot-repository.ts",
+  ]) {
+    const source = await readFile(path.resolve(repositoryPath), "utf8");
+    assert.match(source, /\btoPositionGuardCandidateRoutingState\b/u, repositoryPath);
+    assert.doesNotMatch(source, /\bfunction\s+approximateState\b/u, repositoryPath);
+  }
+});
+
+test("only the reviewed runner bridge may import the candidate policy router", () => {
+  const candidateFiles = new Set(APPROVED_RUNTIME_CANDIDATE_FILES);
+  assert.doesNotThrow(() => assertRuntimeCandidateImportApproved(
+    APPROVED_POLICY_ROUTER_IMPORTER,
+    APPROVED_POLICY_ROUTER,
+    candidateFiles,
+  ));
+  assert.throws(
+    () => assertRuntimeCandidateImportApproved(
+      "/src/app/create-app.ts",
+      APPROVED_POLICY_ROUTER,
+      candidateFiles,
+    ),
+    /reviewed runner bridge/i,
+  );
+});
+
 test("candidate modules recursively exclude operational, prospective, and side-effect dependencies", async () => {
   const candidateFiles = await discoverCandidateFiles();
   const candidateEntries = new Set(candidateFiles.map(toRepositoryPath));
@@ -291,17 +321,7 @@ test("runtime surfaces reach only the reviewed runner route and persistence proj
       if (!edge.specifier.startsWith(".")) continue;
       const dependency = await resolveSourceImport(absoluteFile, edge.specifier);
       const dependencyPath = toRepositoryPath(dependency);
-      const approvedPersistenceBridge =
-        APPROVED_PERSISTENCE_PROJECTOR_IMPORTERS.has(relativeFile) &&
-        dependencyPath === APPROVED_PERSISTENCE_PROJECTOR;
-      const approvedRuntimeCandidateEdge = APPROVED_RUNTIME_CANDIDATE_EDGES.has(
-        `${relativeFile}->${dependencyPath}`,
-      );
-      assert.equal(
-        candidateFiles.has(dependencyPath) && !approvedPersistenceBridge && !approvedRuntimeCandidateEdge,
-        false,
-        `${relativeFile} directly imports candidate module ${dependencyPath}`,
-      );
+      assertRuntimeCandidateImportApproved(relativeFile, dependencyPath, candidateFiles);
     }
   });
 });
@@ -513,6 +533,31 @@ function assertCandidateDependencyPathIsSafe(relativeFile: string): void {
     `${relativeFile} is a forbidden dependency of candidate preparation`,
   );
   assert.equal(relativeFile.includes("/scheduler/"), false, `${relativeFile} is a forbidden scheduler dependency`);
+}
+
+function assertRuntimeCandidateImportApproved(
+  importer: string,
+  dependency: string,
+  candidateFiles: ReadonlySet<string>,
+): void {
+  if (dependency === APPROVED_POLICY_ROUTER) {
+    assert.equal(
+      importer,
+      APPROVED_POLICY_ROUTER_IMPORTER,
+      `${importer} imports the candidate policy router outside the reviewed runner bridge`,
+    );
+  }
+  const approvedPersistenceBridge =
+    APPROVED_PERSISTENCE_PROJECTOR_IMPORTERS.has(importer) &&
+    dependency === APPROVED_PERSISTENCE_PROJECTOR;
+  const approvedRuntimeCandidateEdge = APPROVED_RUNTIME_CANDIDATE_EDGES.has(
+    `${importer}->${dependency}`,
+  );
+  assert.equal(
+    candidateFiles.has(dependency) && !approvedPersistenceBridge && !approvedRuntimeCandidateEdge,
+    false,
+    `${importer} directly imports candidate module ${dependency}`,
+  );
 }
 
 async function resolveSourceImport(importer: string, specifier: string): Promise<string> {

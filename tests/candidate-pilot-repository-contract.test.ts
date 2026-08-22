@@ -10,6 +10,7 @@ import type {
   CandidatePilotRepository,
   CreateCandidatePilotDeploymentInput,
 } from "../src/modules/db/pilot-interfaces.js";
+import { toPositionGuardCandidateRoutingState } from "../src/modules/db/pilot-interfaces.js";
 import { InMemoryCandidatePilotRepository } from
   "../src/modules/db/repositories/in-memory-candidate-pilot-repository.js";
 import {
@@ -131,6 +132,13 @@ export async function verifyCandidatePilotRepositoryContract(
   );
 
   assert.equal((await repository.getState(deployment.id))?.stateVersion, 1);
+  const exactState = await repository.getExactState(deployment.id);
+  const routingState = await repository.getState(deployment.id);
+  assert.ok(exactState);
+  assert.ok(routingState);
+  assert.deepEqual(routingState, toPositionGuardCandidateRoutingState(exactState));
+  assert.notEqual(routingState, exactState);
+  assert.equal(Object.isFrozen(routingState), true);
   assert.equal((await repository.listEvidenceAfter(deployment.id, null)).length, 1);
   assert.equal((await repository.listAuditEvents(deployment.id)).length, 2);
 

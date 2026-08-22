@@ -27,6 +27,7 @@ import {
   buildCandidatePilotRecoveryFaultAuditEvent,
   candidatePilotRecoveryFaultReason,
   resolveCandidateIntentFaultOccurrence,
+  toPositionGuardCandidateRoutingState,
   validateCandidateExecutionBinding,
   validateCandidateIntentFaultInput,
   validateCandidatePilotDeployment,
@@ -285,7 +286,7 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
     if (!row) return null;
     if (row.material_version === "EXACT_V2") {
       const exact = exactStateFromRow(row);
-      return Object.freeze(approximateState(exact));
+      return toPositionGuardCandidateRoutingState(exact);
     }
     const state = legacyStateFromRow(row);
     validatePositionGuardCandidateState(state);
@@ -449,7 +450,7 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
         if (!state) throw new Error(`Candidate state ${input.deploymentId} does not exist.`);
         return {
           state: Object.freeze(state.material_version === "EXACT_V2"
-            ? approximateState(exactStateFromRow(state))
+            ? toPositionGuardCandidateRoutingState(exactStateFromRow(state))
             : legacyStateFromRow(state)),
           evidence: Object.freeze({ ...material.evidence }),
           duplicate: true,
@@ -542,7 +543,7 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
         material.epochNanoseconds,
       );
       return {
-        state: Object.freeze(approximateState(nextState)),
+        state: toPositionGuardCandidateRoutingState(nextState),
         evidence: Object.freeze({ ...material.evidence }),
         duplicate: false,
       };
@@ -935,7 +936,7 @@ function sameAuditEvent(
 }
 
 function insertExactState(db: DatabaseSync, deploymentId: string, state: Readonly<ExactCandidateState>, updatedAt: string): void {
-  const approximate = approximateState(state);
+  const approximate = toPositionGuardCandidateRoutingState(state);
   db.prepare(`
     INSERT INTO strategy_candidate_states (
       deployment_id, current_episode_add_count, current_episode_cost_basis_krw,
@@ -973,7 +974,7 @@ function updateExactState(
   state: Readonly<ExactCandidateState>,
   updatedAt: string,
 ): { changes: number | bigint } {
-  const approximate = approximateState(state);
+  const approximate = toPositionGuardCandidateRoutingState(state);
   return db.prepare(`
     UPDATE strategy_candidate_states SET
       current_episode_add_count = ?, current_episode_cost_basis_krw = ?,
@@ -1113,23 +1114,6 @@ function evidenceRecordFromRow(row: EvidenceRow): Readonly<CandidateEvidenceReco
     materialHash: row.material_hash,
     materialVersion: row.material_version,
   });
-}
-
-function approximateState(state: Readonly<ExactCandidateState>): PositionGuardCandidateState {
-  const result: PositionGuardCandidateState = {
-    currentEpisodeAddCount: state.currentEpisodeAddCount,
-    currentEpisodeCostBasisKrw: Number(state.currentEpisodeCostBasisKrw),
-    currentEpisodeInventoryQuantity: Number(state.currentEpisodeInventoryQuantity),
-    currentEpisodeRealizedPnlKrw: Number(state.currentEpisodeRealizedPnlKrw),
-    lastFullExitAt: state.lastFullExitAt,
-    lastFullExitRealizedPnlKrw: state.lastFullExitRealizedPnlKrw === null ? null : Number(state.lastFullExitRealizedPnlKrw),
-    lastEntryPath: state.lastEntryPath,
-    lastEvidenceAt: state.lastEvidenceAt,
-    lastEvidenceId: state.lastEvidenceId,
-    stateVersion: state.stateVersion,
-  };
-  validatePositionGuardCandidateState(result);
-  return result;
 }
 
 function approximateEvidenceValues(evidence: PositionGuardCandidateExecutionEvidence): {
