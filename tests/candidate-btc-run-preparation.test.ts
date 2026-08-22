@@ -420,6 +420,17 @@ test("candidate preparation rejects descriptor-unsafe or conflicting reconciliat
   );
 });
 
+test("candidate preparation rejects malformed history recovery even when returned and persisted summaries match", async () => {
+  const summary = { ...createSyncResult().reconciliationSummary, historyRecovery: {} } as never;
+  const preparation = new CandidateBtcRunPreparationService({
+    config: createConfig(),
+    portfolioSync: { async run() { return createSyncResult({ reconciliationSummary: summary, reconciliationRun: createReconciliationRun({ summaryJson: JSON.stringify(summary) }) }); } },
+    operatorState: { async getState() { return createExecutionState(); } },
+    repositories: { async listActiveOrders() { return []; } }, exchangeBackedReadEnabled: true, liveSendPath: "LIVE_ADAPTER", now: () => CHECKED_AT,
+  });
+  await assert.rejects(preparation.prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "TELEGRAM" }), /historyRecovery/);
+});
+
 test("candidate preparation snapshots caller, dependency, and exact sync-result authority across awaits without latest-row substitution", async () => {
   let releaseState!: () => void;
   const stateGate = new Promise<void>((resolve) => { releaseState = resolve; });

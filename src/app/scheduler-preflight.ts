@@ -11,6 +11,7 @@ import type {
 import type { ExecutionRepository } from "../modules/db/interfaces.js";
 import { parseCandidatePilotTimestamp } from "../modules/db/pilot-interfaces.js";
 import type { ReconciliationIssue } from "../modules/reconciliation/interfaces.js";
+import { isStrictHistoryRecoverySummary } from "../modules/reconciliation/history-recovery-validation.js";
 
 const BLOCKING_RECONCILIATION_ISSUE_CODES = new Set([
   "BALANCE_DRIFT_DETECTED",
@@ -509,6 +510,7 @@ function parseReconciliationSummary(rawJson: string): { source: string; status: 
     issues.push({ code: codeDescriptor.value as ReconciliationIssue["code"], message: messageDescriptor.value });
   }
 
+  if (summaryDescriptors.historyRecovery !== undefined && !isStrictHistoryRecoverySummary(summaryDescriptors.historyRecovery.value, summaryDescriptors.status.value, issues.map((issue) => issue.code))) return null;
   return { source: summaryDescriptors.source.value, status: summaryDescriptors.status.value, issues };
 }
 

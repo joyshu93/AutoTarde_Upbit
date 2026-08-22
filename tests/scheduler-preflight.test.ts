@@ -394,6 +394,7 @@ test("exact-evidence evaluator validates complete persisted reconciliation summa
     createReconciliationRun({ status: "DRIFT_DETECTED", summaryJson: JSON.stringify({ ...validSummary, status: "DRIFT_DETECTED" }) }),
     createReconciliationRun({ summaryJson: JSON.stringify({ ...validSummary, candidateCount: "0" }) }),
     createReconciliationRun({ startedAt: "2026-05-08T00:00:01.000Z", completedAt: "2026-05-08T00:00:00.000Z", summaryJson: JSON.stringify(validSummary) }),
+    createReconciliationRun({ summaryJson: JSON.stringify({ ...validSummary, historyRecovery: {} }) }),
   ];
   for (const reconciliationRun of cases) {
     assert.equal(evaluateLiveStrategyRunPreflight({ ...common, reconciliationRun }).status, "BLOCK");

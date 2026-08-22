@@ -82,6 +82,12 @@ The focused scheduler suite failed when `completedAt` was one nanosecond after `
 ### GREEN
 
 The same 13-test scheduler suite passed after adding the `completedAtEpoch > checkedAtEpoch` chronology guard. `npm.cmd run typecheck` and `npm.cmd run build` passed.
+
+## Fix Round 5 TDD Evidence
+
+### RED/GREEN
+
+Focused scheduler and candidate tests initially accepted matching malformed `historyRecovery: {}` evidence. They now pass after shared strict history-recovery validation. `npm.cmd run typecheck` and `npm.cmd run build` passed.
 - `npm.cmd run test`: the Task 9C2d2 focused coverage passed, but the complete suite has one reproducible pre-existing, unowned failure. `prospective-shadow-commitment-cli.test` invokes `scripts/check-prospective-commitment-bundle.mjs`; esbuild cannot resolve the existing `src/research/prospective-shadow-commitment.ts` in this worktree because its parent-directory read is denied. Running that checked-in bundle verifier directly produces the same error. This task does not own the prospective-shadow source, bundle script, or test.
 - `git diff --check`: passed.
 - `.createOrder(` remains present only in `src/modules/execution/execution-service.ts`.

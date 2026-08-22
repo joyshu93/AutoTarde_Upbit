@@ -15,6 +15,7 @@ import type {
 import type { ExecutionRepository, OperatorStateStore } from "../modules/db/interfaces.js";
 import { parseCandidatePilotTimestamp } from "../modules/db/pilot-interfaces.js";
 import type { PortfolioSyncRunResult, PortfolioSyncService } from "../modules/reconciliation/portfolio-sync-service.js";
+import { isStrictHistoryRecoverySummary } from "../modules/reconciliation/history-recovery-validation.js";
 
 type CandidateBtcRunPreparationDependencies = {
   config: Pick<AppConfig, "strategySchedulerBtcIntervalMs" | "strategySchedulerEthIntervalMs" | "liveExecutionGate">;
@@ -346,6 +347,10 @@ function snapshotReconciliationSummary(value: unknown, label: string): Candidate
   const source = requiredEnum(fields.source, `${label} source`, ["SCHEDULER_PREFLIGHT"]);
   const status = requiredEnum(fields.status, `${label} status`, ["SUCCESS", "DRIFT_DETECTED"]);
   const issues = snapshotReconciliationIssues(fields.issues, `${label} issues`);
+  const issueCodes = issues.map((issue) => (issue as Readonly<Record<string, JsonSnapshot>>).code as string);
+  if (Object.prototype.hasOwnProperty.call(fields, "historyRecovery") && !isStrictHistoryRecoverySummary(fields.historyRecovery, status, issueCodes)) {
+    throw new Error(`${label} historyRecovery is invalid.`);
+  }
   const snapshot: Record<string, JsonSnapshot> = {
     source,
     status,
