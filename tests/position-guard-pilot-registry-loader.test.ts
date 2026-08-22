@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import {
+  closeSync,
   fstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -11,6 +13,7 @@ import {
   type BigIntStats,
   utimesSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -18,6 +21,7 @@ import { dirname, join, resolve } from "node:path";
 import {
   loadPositionGuardPilotAbandonmentFromRepositoryRootForTest,
   projectPositionGuardPilotRepositoryRootFromModuleFileForTest,
+  readBoundedPositionGuardPilotRegistryDescriptorForTest,
   validatePositionGuardPilotRegistryBytes,
 } from "../src/app/position-guard-pilot-registry-loader.js";
 import { test } from "./harness.js";
@@ -83,6 +87,42 @@ test("registry bytes validator accepts exact LF and whole-file CRLF bytes", () =
       eventAt: "2026-08-21T03:08:24.756Z",
     });
   }
+});
+
+test("production registry descriptor reader rejects growth beyond its fixed byte budget", () => {
+  withTemporaryRepository((_repositoryRoot, registryPath) => {
+    writeFileSync(registryPath, CANONICAL_REGISTRY, "utf8");
+    const descriptor = openSync(registryPath, "r+");
+    try {
+      const initialSize = fstatSync(descriptor, { bigint: true }).size;
+      assert.equal(initialSize, BigInt(Buffer.byteLength(CANONICAL_REGISTRY)));
+      const appendedBytes = Buffer.alloc(5_000, 0x61);
+      writeSync(descriptor, appendedBytes, 0, appendedBytes.byteLength, Number(initialSize));
+
+      assert.throws(
+        () => readBoundedPositionGuardPilotRegistryDescriptorForTest(descriptor),
+        /size limit/i,
+      );
+    } finally {
+      closeSync(descriptor);
+    }
+  });
+});
+
+test("production registry descriptor reader handles short reads through EOF", () => {
+  withTemporaryRepository((_repositoryRoot, registryPath) => {
+    const shortContent = Buffer.from("short registry evidence", "utf8");
+    writeFileSync(registryPath, shortContent);
+    const descriptor = openSync(registryPath, "r");
+    try {
+      assert.deepEqual(
+        readBoundedPositionGuardPilotRegistryDescriptorForTest(descriptor),
+        Uint8Array.from(shortContent),
+      );
+    } finally {
+      closeSync(descriptor);
+    }
+  });
 });
 
 test("registry bytes validator rejects malformed newline and UTF-8 encodings", () => {

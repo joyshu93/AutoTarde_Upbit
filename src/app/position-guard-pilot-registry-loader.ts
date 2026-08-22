@@ -5,7 +5,7 @@ import {
   fstatSync,
   lstatSync,
   openSync,
-  readFileSync,
+  readSync,
   realpathSync,
   statSync,
   type BigIntStats,
@@ -96,6 +96,12 @@ export function projectPositionGuardPilotRepositoryRootFromModuleFileForTest(
   moduleFilePath: string,
 ): string {
   return projectRepositoryRootFromModuleFile(moduleFilePath);
+}
+
+export function readBoundedPositionGuardPilotRegistryDescriptorForTest(
+  descriptor: number,
+): Uint8Array {
+  return readOpenedRegistry(descriptor);
 }
 
 export function validatePositionGuardPilotRegistryBytes(
@@ -290,7 +296,26 @@ function readCurrentPathRegistryEvidence(input: Readonly<{
 }
 
 function readOpenedRegistry(descriptor: number): Uint8Array {
-  return readFileSync(descriptor);
+  const bytes = Buffer.allocUnsafe(MAX_REGISTRY_BYTES + 1);
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const bytesRead = readSync(
+      descriptor,
+      bytes,
+      offset,
+      bytes.byteLength - offset,
+      offset,
+    );
+    if (bytesRead === 0) {
+      break;
+    }
+    offset += bytesRead;
+  }
+
+  if (offset > MAX_REGISTRY_BYTES) {
+    throw new Error("PositionGuard pilot registry exceeds the authority size limit.");
+  }
+  return Uint8Array.from(bytes.subarray(0, offset));
 }
 
 function projectRepositoryRootFromModuleFile(moduleFilePath: string): string {

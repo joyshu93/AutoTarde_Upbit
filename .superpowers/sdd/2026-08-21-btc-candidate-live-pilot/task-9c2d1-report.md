@@ -39,6 +39,12 @@ enable a scheduler.
   original evidence. A same-size replacement with matched fallback metadata but
   different content therefore fails closed. Both descriptors are closed on
   success and failure.
+- Production descriptor reads use a fixed `MAX_REGISTRY_BYTES + 1` buffer and
+  positional `readSync` loop. Short reads continue until EOF, the 4,097th byte
+  fails closed, and concurrent growth cannot cause an unbounded whole-file
+  allocation. The same bounded reader handles the originally opened descriptor
+  and the independently reopened current path. Fixture bytes still pass the
+  independent validator, which retains the same 4 KiB limit.
 - The test seam can replace the repository root, opened-descriptor byte reader,
   and observed stats projection; returned fixture bytes still pass the
   production byte validator and all production path operations remain fixed.
@@ -60,18 +66,22 @@ RED:
   path with different same-size content while projecting `dev=0, ino=0` and all
   compared metadata identically returned the original descriptor's authority
   instead of rejecting the replacement.
+- The third P2 regression run failed against `02accda`: no directly testable
+  bounded production descriptor reader existed, so initial-stat-followed-by-
+  growth and short-read/EOF contracts both failed before implementation.
 
 GREEN:
 
 - Initial focused authority and loader tests: 15 passed.
-- Final focused authority and loader tests: 20 passed (7 authority, 13 loader).
+- Final focused authority and loader tests: 22 passed (7 authority, 15 loader).
 - Covered exact LF/CRLF, invalid UTF-8, mixed/bare-CR newlines, missing registry,
   missing/extra/reversed/duplicated events, field and whitespace mutation,
   duplicate JSON keys, fixture-reader bypass, junction path, path swap, closed
   descriptor, source/compiled module-root projection, unavailable identity
   fallback, partial and mismatched identity rejection, fallback metadata swap,
   identical-metadata different-content path replacement, exact object
-  descriptors, and detached frozen output.
+  descriptors, bounded concurrent-growth rejection, safe short-read/EOF
+  handling, and detached frozen output.
 - `npm.cmd run typecheck`: passed.
 - `npm.cmd run build`: passed.
 - `git diff --check`: passed.
@@ -102,4 +112,7 @@ A second independent review found that the zero-identity fallback did not bind
 the originally opened content to the post-read current path target. The current
 path is now independently reopened and canonical-hash matched to the original
 descriptor. This second P2 is addressed; closure remains pending a fresh scoped
-re-review.
+re-review. A third independent review found that descriptor reads still used
+whole-file `readFileSync` after only a pre-read size check. Both production
+descriptor paths now share the fixed-budget reader. This third P2 is addressed;
+closure remains pending a fresh scoped re-review.
