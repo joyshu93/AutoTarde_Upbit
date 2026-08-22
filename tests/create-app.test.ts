@@ -330,10 +330,19 @@ test("createApp routes manual candidate BTC through preparation and blocks missi
     const response = await app.telegramRouter.route("/run BTC");
     const decision = await app.repositories.getLatestStrategyDecision("primary", "KRW-BTC");
     const orders = await app.repositories.listOrders("primary");
+    const reconciliationRuns = await app.repositories.listReconciliationRuns("primary", 5);
+    const latestBalanceSnapshot = await app.repositories.getLatestBalanceSnapshot("primary");
+    const latestPositionSnapshot = await app.repositories.getLatestPositionSnapshot("primary");
 
-    assert.match(response.text, /failed|blocked/i);
+    assert.match(response.text, /IDENTITY_MISMATCH/);
     assert.equal(decision, null);
     assert.equal(orders.length, 0);
+    assert.notEqual(latestBalanceSnapshot, null);
+    assert.notEqual(latestPositionSnapshot, null);
+    assert.equal(
+      (JSON.parse(reconciliationRuns[0]?.summaryJson ?? "{}") as { source?: string }).source,
+      "SCHEDULER_PREFLIGHT",
+    );
   } finally {
     app?.telegramInboundPolling.stop();
     app?.strategyScheduler.stop();
@@ -358,11 +367,18 @@ test("createApp routes manual ETH through the baseline path without candidate pr
       exchangeAccountId: "primary",
       source: "OPERATOR_SYNC",
     });
+    const reconciliationRunsBefore = await app.repositories.listReconciliationRuns("primary", 20);
     const response = await app.telegramRouter.route("/run ETH");
     const decision = await app.repositories.getLatestStrategyDecision("primary", "KRW-ETH");
+    const reconciliationRunsAfter = await app.repositories.listReconciliationRuns("primary", 20);
 
     assert.match(response.text, /HOLD|유지/);
     assert.notEqual(decision, null);
+    assert.equal(reconciliationRunsAfter.length, reconciliationRunsBefore.length);
+    assert.equal(
+      (JSON.parse(reconciliationRunsAfter[0]?.summaryJson ?? "{}") as { source?: string }).source,
+      "OPERATOR_SYNC",
+    );
   } finally {
     app?.telegramInboundPolling.stop();
     app?.strategyScheduler.stop();
