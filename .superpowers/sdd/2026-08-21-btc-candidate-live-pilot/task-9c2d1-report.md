@@ -114,5 +114,9 @@ path is now independently reopened and canonical-hash matched to the original
 descriptor. This second P2 is addressed; closure remains pending a fresh scoped
 re-review. A third independent review found that descriptor reads still used
 whole-file `readFileSync` after only a pre-read size check. Both production
-descriptor paths now share the fixed-budget reader. This third P2 is addressed;
-closure remains pending a fresh scoped re-review.
+descriptor paths now share the fixed-budget reader. Fresh scoped reviewer
+Peirce (`01a027d8-799f-72b2-ba93-912fbb26d4f3`) found no remaining
+correctness or fail-closed issue. The unavoidable residual risk is a
+privileged concurrent filesystem actor racing between observation points;
+all observable identity, metadata, path, symlink, and canonical-content
+divergence fails closed.
