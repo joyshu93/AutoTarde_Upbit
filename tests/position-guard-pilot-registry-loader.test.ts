@@ -6,6 +6,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   type BigIntStats,
   utimesSync,
@@ -35,7 +36,11 @@ type RegistryStatsStage =
   | "OPENED_BEFORE_READ"
   | "PATH_BEFORE_READ"
   | "OPENED_AFTER_READ"
-  | "PATH_AFTER_READ";
+  | "PATH_AFTER_READ"
+  | "CURRENT_OPENED_BEFORE_READ"
+  | "CURRENT_PATH_BEFORE_READ"
+  | "CURRENT_OPENED_AFTER_READ"
+  | "CURRENT_PATH_AFTER_READ";
 
 type RegistryStatsProjector = (
   stage: RegistryStatsStage,
@@ -214,6 +219,10 @@ test("registry file loader accepts stable canonical files when dev and ino are u
       "PATH_BEFORE_READ",
       "OPENED_AFTER_READ",
       "PATH_AFTER_READ",
+      "CURRENT_OPENED_BEFORE_READ",
+      "CURRENT_PATH_BEFORE_READ",
+      "CURRENT_OPENED_AFTER_READ",
+      "CURRENT_PATH_AFTER_READ",
     ]);
   });
 });
@@ -264,6 +273,42 @@ test("registry fallback identity rejects a path swap with changed metadata", () 
   });
 });
 
+test("registry fallback identity rejects different current-path content with identical metadata", () => {
+  withTemporaryRepository((repositoryRoot, registryPath) => {
+    writeFileSync(registryPath, CANONICAL_REGISTRY, "utf8");
+    const originalPath = `${registryPath}.opened`;
+    const originalStats = statSync(registryPath, { bigint: true });
+    const replacement = CANONICAL_REGISTRY.replace("PCS-2026-001", "PCS-2026-002");
+    assert.equal(Buffer.byteLength(replacement), Buffer.byteLength(CANONICAL_REGISTRY));
+
+    const identicalFallbackMetadata = {
+      dev: 0n,
+      ino: 0n,
+      size: originalStats.size,
+      mtimeNs: originalStats.mtimeNs,
+      ctimeNs: originalStats.ctimeNs,
+      birthtimeNs: originalStats.birthtimeNs,
+      mode: originalStats.mode,
+      nlink: originalStats.nlink,
+      uid: originalStats.uid,
+      gid: originalStats.gid,
+      rdev: originalStats.rdev,
+    } as const;
+
+    assert.throws(() => loadPositionGuardPilotAbandonmentFromRepositoryRootForTest(
+      repositoryRoot,
+      (descriptor, openedPath) => {
+        renameSync(openedPath, originalPath);
+        writeFileSync(openedPath, replacement, "utf8");
+        return readFileSync(descriptor);
+      },
+      {
+        projectStats: (_stage, stats) => overrideStats(stats, identicalFallbackMetadata),
+      },
+    ));
+  });
+});
+
 function withTemporaryRepository(
   run: (repositoryRoot: string, registryPath: string) => void,
   options: Readonly<{ createRegistryDirectory: boolean }> = { createRegistryDirectory: true },
@@ -282,7 +327,7 @@ function withTemporaryRepository(
 
 function overrideStats(
   stats: BigIntStats,
-  overrides: Readonly<Partial<Record<"dev" | "ino" | "mtimeNs", bigint>>>,
+  overrides: Readonly<Partial<Record<RegistryComparableStatsKey, bigint>>>,
 ): BigIntStats {
   return new Proxy(stats, {
     get(target, property) {
@@ -294,3 +339,16 @@ function overrideStats(
     },
   });
 }
+
+type RegistryComparableStatsKey =
+  | "dev"
+  | "ino"
+  | "size"
+  | "mtimeNs"
+  | "ctimeNs"
+  | "birthtimeNs"
+  | "mode"
+  | "nlink"
+  | "uid"
+  | "gid"
+  | "rdev";

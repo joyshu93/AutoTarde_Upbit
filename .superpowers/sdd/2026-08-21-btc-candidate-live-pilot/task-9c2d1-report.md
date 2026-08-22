@@ -32,8 +32,13 @@ enable a scheduler.
   stable regular-file type, size, mtime, ctime, birthtime, mode, link count,
   owner, group, and device metadata provide the fallback before canonical
   content validation. Partial identity availability, nonzero identity mismatch,
-  and fallback metadata changes fail closed. The descriptor is closed on success
-  and failure.
+  and fallback metadata changes fail closed. After reading the originally opened
+  descriptor, production independently reopens the current fixed path, repeats
+  symlink, containment, identity, metadata, bounded-read, and stability checks,
+  validates its canonical bytes, and compares its canonical SHA-256 with the
+  original evidence. A same-size replacement with matched fallback metadata but
+  different content therefore fails closed. Both descriptors are closed on
+  success and failure.
 - The test seam can replace the repository root, opened-descriptor byte reader,
   and observed stats projection; returned fixture bytes still pass the
   production byte validator and all production path operations remain fixed.
@@ -51,17 +56,22 @@ RED:
 - The P2 regression run failed three new tests before the fix: module-root
   projection was absent, the stats seam was not observed, and partial or
   mismatched identities were not rejected through that seam.
+- The second P2 regression test failed against `b264e44`: replacing the current
+  path with different same-size content while projecting `dev=0, ino=0` and all
+  compared metadata identically returned the original descriptor's authority
+  instead of rejecting the replacement.
 
 GREEN:
 
 - Initial focused authority and loader tests: 15 passed.
-- Final focused authority and loader tests: 19 passed (7 authority, 12 loader).
+- Final focused authority and loader tests: 20 passed (7 authority, 13 loader).
 - Covered exact LF/CRLF, invalid UTF-8, mixed/bare-CR newlines, missing registry,
   missing/extra/reversed/duplicated events, field and whitespace mutation,
   duplicate JSON keys, fixture-reader bypass, junction path, path swap, closed
   descriptor, source/compiled module-root projection, unavailable identity
   fallback, partial and mismatched identity rejection, fallback metadata swap,
-  exact object descriptors, and detached frozen output.
+  identical-metadata different-content path replacement, exact object
+  descriptors, and detached frozen output.
 - `npm.cmd run typecheck`: passed.
 - `npm.cmd run build`: passed.
 - `git diff --check`: passed.
@@ -88,4 +98,8 @@ Initial independent reviewer Ohm (`01a027ac-6e8a-7ccb-b84b-3732a2f8039c`)
 reported two P2 findings: production authority depended on `process.cwd()`, and
 normal filesystems reporting unavailable `dev/ino` identity were rejected. Both
 findings now have TDD regression coverage and implementation fixes in this task.
-Closure remains pending a fresh independent re-review.
+A second independent review found that the zero-identity fallback did not bind
+the originally opened content to the post-read current path target. The current
+path is now independently reopened and canonical-hash matched to the original
+descriptor. This second P2 is addressed; closure remains pending a fresh scoped
+re-review.

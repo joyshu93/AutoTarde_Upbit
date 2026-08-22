@@ -53,7 +53,11 @@ type PositionGuardPilotRegistryStatsStage =
   | "OPENED_BEFORE_READ"
   | "PATH_BEFORE_READ"
   | "OPENED_AFTER_READ"
-  | "PATH_AFTER_READ";
+  | "PATH_AFTER_READ"
+  | "CURRENT_OPENED_BEFORE_READ"
+  | "CURRENT_PATH_BEFORE_READ"
+  | "CURRENT_OPENED_AFTER_READ"
+  | "CURRENT_PATH_AFTER_READ";
 
 type PositionGuardPilotRegistryStatsProjector = (
   stage: PositionGuardPilotRegistryStatsStage,
@@ -97,6 +101,17 @@ export function projectPositionGuardPilotRepositoryRootFromModuleFileForTest(
 export function validatePositionGuardPilotRegistryBytes(
   bytes: Uint8Array,
 ): PositionGuardPilotAbandonmentValidation {
+  return validatePositionGuardPilotRegistryEvidence(bytes).validation;
+}
+
+type PositionGuardPilotRegistryEvidence = Readonly<{
+  canonicalSha256: string;
+  validation: PositionGuardPilotAbandonmentValidation;
+}>;
+
+function validatePositionGuardPilotRegistryEvidence(
+  bytes: Uint8Array,
+): PositionGuardPilotRegistryEvidence {
   if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength > MAX_REGISTRY_BYTES) {
     throw new Error("PositionGuard pilot registry bytes are missing or exceed the authority size limit.");
   }
@@ -121,7 +136,10 @@ export function validatePositionGuardPilotRegistryBytes(
   }
 
   const abandonment = validatePositionGuardPilotAbandonment(abandoned);
-  return Object.freeze({ ...abandonment });
+  return Object.freeze({
+    canonicalSha256: sha256,
+    validation: Object.freeze({ ...abandonment }),
+  });
 }
 
 function loadFromRepositoryRoot(
@@ -183,9 +201,91 @@ function loadFromRepositoryRoot(
       throw new Error("PositionGuard pilot registry path changed while it was being read.");
     }
 
-    return validatePositionGuardPilotRegistryBytes(bytes);
+    const openedEvidence = validatePositionGuardPilotRegistryEvidence(bytes);
+    const currentPathEvidence = readCurrentPathRegistryEvidence({
+      expectedRealRegistryPath: realRegistryPath,
+      originalAfterRead: afterRead,
+      projectStats,
+      realRoot,
+      registryPath,
+      resolvedRoot,
+    });
+    if (openedEvidence.canonicalSha256 !== currentPathEvidence.canonicalSha256) {
+      throw new Error("PositionGuard pilot registry current path content changed after opening.");
+    }
+    return openedEvidence.validation;
   } finally {
     closeSync(descriptor);
+  }
+}
+
+function readCurrentPathRegistryEvidence(input: Readonly<{
+  expectedRealRegistryPath: string;
+  originalAfterRead: BigIntStats;
+  projectStats: PositionGuardPilotRegistryStatsProjector;
+  realRoot: string;
+  registryPath: string;
+  resolvedRoot: string;
+}>): PositionGuardPilotRegistryEvidence {
+  assertNoSymbolicLinks(input.registryPath);
+  const realRegistryPathBeforeOpen = realpathSync.native(input.registryPath);
+  assertContainedPath(input.realRoot, realRegistryPathBeforeOpen);
+  if (!samePath(input.expectedRealRegistryPath, realRegistryPathBeforeOpen)) {
+    throw new Error("PositionGuard pilot registry current path changed before verification.");
+  }
+
+  const currentDescriptor = openSync(input.registryPath, constants.O_RDONLY);
+  try {
+    assertNoSymbolicLinks(input.registryPath);
+    if (!samePath(input.realRoot, realpathSync.native(input.resolvedRoot))) {
+      throw new Error("PositionGuard pilot registry repository root changed during verification.");
+    }
+
+    const currentOpened = input.projectStats(
+      "CURRENT_OPENED_BEFORE_READ",
+      fstatSync(currentDescriptor, { bigint: true }),
+    );
+    if (!currentOpened.isFile()) {
+      throw new Error("PositionGuard pilot registry current path must be a regular file.");
+    }
+    if (currentOpened.size <= 0n || currentOpened.size > BigInt(MAX_REGISTRY_BYTES)) {
+      throw new Error("PositionGuard pilot registry current path file size is invalid.");
+    }
+    assertStableFileIdentity(input.originalAfterRead, currentOpened);
+    assertStableFileIdentity(
+      currentOpened,
+      input.projectStats(
+        "CURRENT_PATH_BEFORE_READ",
+        statSync(input.registryPath, { bigint: true }),
+      ),
+    );
+
+    const currentBytes = Uint8Array.from(readOpenedRegistry(currentDescriptor));
+    const currentAfterRead = input.projectStats(
+      "CURRENT_OPENED_AFTER_READ",
+      fstatSync(currentDescriptor, { bigint: true }),
+    );
+    assertNoSymbolicLinks(input.registryPath);
+    if (!samePath(input.realRoot, realpathSync.native(input.resolvedRoot))) {
+      throw new Error("PositionGuard pilot registry repository root changed during verification.");
+    }
+    assertStableOpenedFile(currentOpened, currentAfterRead);
+    assertStableFileIdentity(
+      currentAfterRead,
+      input.projectStats(
+        "CURRENT_PATH_AFTER_READ",
+        statSync(input.registryPath, { bigint: true }),
+      ),
+    );
+
+    const realRegistryPathAfterRead = realpathSync.native(input.registryPath);
+    assertContainedPath(input.realRoot, realRegistryPathAfterRead);
+    if (!samePath(input.expectedRealRegistryPath, realRegistryPathAfterRead)) {
+      throw new Error("PositionGuard pilot registry current path changed during verification.");
+    }
+    return validatePositionGuardPilotRegistryEvidence(currentBytes);
+  } finally {
+    closeSync(currentDescriptor);
   }
 }
 
