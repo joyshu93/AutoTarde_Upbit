@@ -26,6 +26,39 @@ type CandidateBtcRunPreparationDependencies = {
   now?: () => string;
 };
 
+const RECONCILIATION_ISSUE_CODES = new Set([
+  "OPEN_ORDER_NEEDS_REVIEW",
+  "ORDER_MARKED_FOR_RECOVERY",
+  "ORDER_STATUS_RECONCILED",
+  "ORDER_FILLS_BACKFILLED",
+  "BALANCE_DRIFT_DETECTED",
+  "POSITION_DRIFT_DETECTED",
+  "TERMINAL_ORDER_RECHECKED",
+  "ORDER_REFERENCE_MISSING",
+  "ORDER_LOOKUP_TRANSIENT_FAILURE",
+  "ORDER_LOOKUP_DEFERRED",
+  "ORDER_IDENTIFIER_RECOVERY_UNCERTAIN",
+  "ORDER_IDENTIFIER_RECOVERED",
+  "ORDER_SUBMISSION_ABSENCE_CONFIRMED",
+  "CANDIDATE_EVIDENCE_PROJECTION_FAILED",
+  "CANDIDATE_EVIDENCE_PROJECTION_DEFERRED",
+  "EXCHANGE_ORDER_RECOVERED",
+  "ORDER_HISTORY_LOOKUP_FAILED",
+  "DRY_RUN_ORDER_REPAIRED",
+]);
+
+type CandidateReconciliationSummary = Readonly<{
+  source: "SCHEDULER_PREFLIGHT";
+  status: "SUCCESS" | "DRIFT_DETECTED";
+  canonicalJson: string;
+}>;
+
+interface JsonSnapshotRecord {
+  readonly [key: string]: JsonSnapshot;
+}
+
+type JsonSnapshot = null | boolean | number | string | readonly JsonSnapshot[] | JsonSnapshotRecord;
+
 export class CandidateBtcRunPreparationService implements CandidateBtcRunPreparation {
   private readonly dependencies: Readonly<CandidateBtcRunPreparationDependencies>;
 
@@ -125,7 +158,11 @@ function snapshotExactSyncEvidence(
   }
   const balanceSnapshot = snapshotBalanceSnapshot(result.balanceSnapshot, request);
   const positionSnapshot = snapshotPositionSnapshot(result.positionSnapshot, request);
-  const reconciliationRun = snapshotReconciliationRun(result.reconciliationRun, request);
+  const reconciliationSummary = snapshotReconciliationSummary(
+    result.reconciliationSummary,
+    "candidate BTC portfolio sync reconciliationSummary",
+  );
+  const reconciliationRun = snapshotReconciliationRun(result.reconciliationRun, request, reconciliationSummary);
   const refreshReceipt = Object.freeze({
     exchangeAccountId: request.exchangeAccountId,
     requestedAt: request.requestedAt,
@@ -174,29 +211,47 @@ function snapshotPositionSnapshot(value: unknown, request: Readonly<{ exchangeAc
   });
 }
 
-function snapshotReconciliationRun(value: unknown, request: Readonly<{ exchangeAccountId: string; requestedAt: string }>): ReconciliationRunRecord {
+function snapshotReconciliationRun(
+  value: unknown,
+  request: Readonly<{ exchangeAccountId: string; requestedAt: string }>,
+  reconciliationSummary: CandidateReconciliationSummary,
+): ReconciliationRunRecord {
   const fields = exactDataRecord(value, "candidate BTC reconciliation run", [
     "id", "exchangeAccountId", "status", "startedAt", "completedAt", "summaryJson", "errorMessage",
   ]);
   if (fields.exchangeAccountId !== request.exchangeAccountId) {
     throw new Error("Candidate BTC reconciliation run exchangeAccountId must match the request.");
   }
-  if (requiredTimestamp(fields.startedAt, "candidate BTC reconciliation run startedAt") !== request.requestedAt) {
+  const startedAt = requiredTimestamp(fields.startedAt, "candidate BTC reconciliation run startedAt");
+  const startedAtEpoch = parseCandidatePilotTimestamp(startedAt, "candidate BTC reconciliation run startedAt");
+  const requestedAtEpoch = parseCandidatePilotTimestamp(request.requestedAt, "candidate BTC preparation requestedAt");
+  if (startedAt !== request.requestedAt || startedAtEpoch !== requestedAtEpoch) {
     throw new Error("Candidate BTC reconciliation run startedAt must match the request.");
   }
   const completedAt = requiredTimestamp(fields.completedAt, "candidate BTC reconciliation run completedAt");
+  if (parseCandidatePilotTimestamp(completedAt, "candidate BTC reconciliation run completedAt") < startedAtEpoch) {
+    throw new Error("Candidate BTC reconciliation run completedAt must not precede its exact startedAt.");
+  }
   if ((fields.status !== "SUCCESS" && fields.status !== "DRIFT_DETECTED") || fields.errorMessage !== null) {
     throw new Error("Candidate BTC reconciliation run must be a successful or non-blocking drift exact record.");
   }
-  const summary = parseReconciliationSummary(fields.summaryJson);
-  if (summary.source !== "SCHEDULER_PREFLIGHT" || summary.status !== fields.status) {
+  const persistedSummary = snapshotReconciliationSummaryJson(fields.summaryJson);
+  if (
+    reconciliationSummary.source !== "SCHEDULER_PREFLIGHT" ||
+    reconciliationSummary.status !== fields.status ||
+    persistedSummary.source !== reconciliationSummary.source ||
+    persistedSummary.status !== reconciliationSummary.status
+  ) {
     throw new Error("Candidate BTC reconciliation run summary source or status does not match the exact record.");
+  }
+  if (persistedSummary.canonicalJson !== reconciliationSummary.canonicalJson) {
+    throw new Error("Candidate BTC reconciliation summary evidence must match the persisted reconciliation run.");
   }
   return Object.freeze({
     id: requiredString(fields.id, "candidate BTC reconciliation run id"),
     exchangeAccountId: request.exchangeAccountId,
     status: fields.status,
-    startedAt: request.requestedAt,
+    startedAt,
     completedAt,
     summaryJson: requiredString(fields.summaryJson, "candidate BTC reconciliation run summaryJson"),
     errorMessage: null,
@@ -215,13 +270,15 @@ function snapshotExecutionState(value: ExecutionStateRecord, exchangeAccountId: 
   return Object.freeze({
     id: requiredString(fields.id, "candidate BTC execution state id"),
     exchangeAccountId: stateExchangeAccountId,
-    executionMode: fields.executionMode as ExecutionStateRecord["executionMode"],
-    liveExecutionGate: fields.liveExecutionGate as ExecutionStateRecord["liveExecutionGate"],
-    systemStatus: fields.systemStatus as ExecutionStateRecord["systemStatus"],
-    killSwitchActive: fields.killSwitchActive as boolean,
-    pauseReason: fields.pauseReason as string | null,
-    degradedReason: fields.degradedReason as string | null,
-    degradedAt: fields.degradedAt as string | null,
+    executionMode: requiredEnum(fields.executionMode, "candidate BTC execution state executionMode", ["DRY_RUN", "LIVE"]),
+    liveExecutionGate: requiredEnum(fields.liveExecutionGate, "candidate BTC execution state liveExecutionGate", ["DISABLED", "ENABLED"]),
+    systemStatus: requiredEnum(fields.systemStatus, "candidate BTC execution state systemStatus", [
+      "BOOTING", "RUNNING", "PAUSED", "KILL_SWITCHED", "DEGRADED",
+    ]),
+    killSwitchActive: requiredBoolean(fields.killSwitchActive, "candidate BTC execution state killSwitchActive"),
+    pauseReason: requiredNullableString(fields.pauseReason, "candidate BTC execution state pauseReason"),
+    degradedReason: requiredNullableString(fields.degradedReason, "candidate BTC execution state degradedReason"),
+    degradedAt: requiredNullableTimestamp(fields.degradedAt, "candidate BTC execution state degradedAt"),
     updatedAt: requiredTimestamp(fields.updatedAt, "candidate BTC execution state updatedAt"),
   });
 }
@@ -244,33 +301,68 @@ function assertSnapshotCorrelation(
   }
 }
 
-function parseReconciliationSummary(value: unknown): Readonly<{ source: string; status: string }> {
+function snapshotReconciliationSummaryJson(value: unknown): CandidateReconciliationSummary {
   let parsed: unknown;
   try {
     parsed = JSON.parse(requiredString(value, "candidate BTC reconciliation run summaryJson"));
   } catch {
     throw new Error("Candidate BTC reconciliation run summaryJson must be valid JSON.");
   }
-  if (typeof parsed !== "object" || parsed === null || Object.getPrototypeOf(parsed) !== Object.prototype) {
-    throw new Error("Candidate BTC reconciliation summary must be a plain object.");
+  return snapshotReconciliationSummary(parsed, "candidate BTC reconciliation run persisted summary");
+}
+
+function snapshotReconciliationSummary(value: unknown, label: string): CandidateReconciliationSummary {
+  const fields = dataRecordWithOptionalKey(value, label, [
+    "source", "status", "issues", "candidateCount", "processedCount", "deferredCount", "maxOrderLookupsPerRun",
+  ], "historyRecovery");
+  const source = requiredEnum(fields.source, `${label} source`, ["SCHEDULER_PREFLIGHT"]);
+  const status = requiredEnum(fields.status, `${label} status`, ["SUCCESS", "DRIFT_DETECTED"]);
+  const issues = snapshotReconciliationIssues(fields.issues, `${label} issues`);
+  const snapshot: Record<string, JsonSnapshot> = {
+    source,
+    status,
+    issues,
+    candidateCount: requiredNonNegativeSafeInteger(fields.candidateCount, `${label} candidateCount`),
+    processedCount: requiredNonNegativeSafeInteger(fields.processedCount, `${label} processedCount`),
+    deferredCount: requiredNonNegativeSafeInteger(fields.deferredCount, `${label} deferredCount`),
+    maxOrderLookupsPerRun: requiredNonNegativeSafeInteger(fields.maxOrderLookupsPerRun, `${label} maxOrderLookupsPerRun`),
+  };
+  if (Object.prototype.hasOwnProperty.call(fields, "historyRecovery")) {
+    snapshot.historyRecovery = snapshotJsonValue(fields.historyRecovery, `${label} historyRecovery`);
   }
-  const descriptors = Object.getOwnPropertyDescriptors(parsed);
-  const fields = Object.freeze({
-    source: requiredSummaryDataProperty(descriptors, "source"),
-    status: requiredSummaryDataProperty(descriptors, "status"),
-  });
   return Object.freeze({
-    source: fields.source,
-    status: fields.status,
+    source,
+    status,
+    canonicalJson: canonicalizeJsonSnapshot(Object.freeze(snapshot)),
   });
 }
 
-function requiredSummaryDataProperty(descriptors: PropertyDescriptorMap, key: string): string {
-  const descriptor = descriptors[key];
-  if (descriptor === undefined || descriptor.enumerable !== true || !("value" in descriptor)) {
-    throw new Error(`Candidate BTC reconciliation summary ${key} must be an enumerable data property.`);
+function snapshotReconciliationIssues(value: unknown, label: string): readonly JsonSnapshot[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new Error(`${label} must be an array.`);
   }
-  return requiredString(descriptor.value, `candidate BTC reconciliation summary ${key}`);
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (
+    Reflect.ownKeys(value).length !== value.length + 1 ||
+    lengthDescriptor === undefined ||
+    !("value" in lengthDescriptor) ||
+    lengthDescriptor.value !== value.length
+  ) {
+    throw new Error(`${label} must be a dense data array.`);
+  }
+  const issues: JsonSnapshot[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (descriptor === undefined || descriptor.enumerable !== true || !("value" in descriptor)) {
+      throw new Error(`${label} ${index} must be an enumerable data property.`);
+    }
+    const issue = exactDataRecord(descriptor.value, `${label} ${index}`, ["code", "message"]);
+    const code = requiredEnum(issue.code, `${label} ${index} code`, [...RECONCILIATION_ISSUE_CODES]);
+    const message = requiredString(issue.message, `${label} ${index} message`);
+    issues.push(Object.freeze({ code, message }));
+  }
+  return Object.freeze(issues);
 }
 
 function exactDataRecord(value: unknown, label: string, keys: readonly string[]): Record<string, unknown> {
@@ -292,6 +384,125 @@ function exactDataRecord(value: unknown, label: string, keys: readonly string[])
     snapshot[key] = descriptor.value;
   }
   return snapshot;
+}
+
+function dataRecordWithOptionalKey(
+  value: unknown,
+  label: string,
+  requiredKeys: readonly string[],
+  optionalKey: string,
+): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error(`${label} must be a plain object.`);
+  }
+  const allowedKeys = new Set([...requiredKeys, optionalKey]);
+  const ownKeys = Reflect.ownKeys(value);
+  if (
+    ownKeys.length < requiredKeys.length ||
+    ownKeys.length > requiredKeys.length + 1 ||
+    ownKeys.some((key) => typeof key !== "string" || !allowedKeys.has(key))
+  ) {
+    throw new Error(`${label} has an invalid key set.`);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const snapshot = Object.create(null) as Record<string, unknown>;
+  for (const key of requiredKeys) {
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || descriptor.enumerable !== true || !("value" in descriptor)) {
+      throw new Error(`${label} ${key} must be an enumerable data property.`);
+    }
+    snapshot[key] = descriptor.value;
+  }
+  const optionalDescriptor = descriptors[optionalKey];
+  if (optionalDescriptor !== undefined) {
+    if (optionalDescriptor.enumerable !== true || !("value" in optionalDescriptor)) {
+      throw new Error(`${label} ${optionalKey} must be an enumerable data property.`);
+    }
+    snapshot[optionalKey] = optionalDescriptor.value;
+  }
+  return snapshot;
+}
+
+function snapshotJsonValue(value: unknown, label: string): JsonSnapshot {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error(`${label} must contain only finite JSON numbers.`);
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype) throw new Error(`${label} must be a plain array.`);
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    if (
+      Reflect.ownKeys(value).length !== value.length + 1 ||
+      lengthDescriptor === undefined ||
+      !("value" in lengthDescriptor) ||
+      lengthDescriptor.value !== value.length
+    ) {
+      throw new Error(`${label} must be a dense data array.`);
+    }
+    const snapshot: JsonSnapshot[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = descriptors[String(index)];
+      if (descriptor === undefined || descriptor.enumerable !== true || !("value" in descriptor)) {
+        throw new Error(`${label} ${index} must be an enumerable data property.`);
+      }
+      snapshot.push(snapshotJsonValue(descriptor.value, `${label} ${index}`));
+    }
+    return Object.freeze(snapshot);
+  }
+  if (typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new Error(`${label} must be JSON-compatible plain data.`);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const snapshot = Object.create(null) as Record<string, JsonSnapshot>;
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") throw new Error(`${label} must not contain symbol keys.`);
+    const descriptor = descriptors[key];
+    if (descriptor === undefined || descriptor.enumerable !== true || !("value" in descriptor)) {
+      throw new Error(`${label} ${key} must be an enumerable data property.`);
+    }
+    snapshot[key] = snapshotJsonValue(descriptor.value, `${label} ${key}`);
+  }
+  return Object.freeze(snapshot);
+}
+
+function canonicalizeJsonSnapshot(value: JsonSnapshot): string {
+  if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalizeJsonSnapshot).join(",")}]`;
+  }
+  const record = value as JsonSnapshotRecord;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalizeJsonSnapshot(record[key] as JsonSnapshot)}`).join(",")}}`;
+}
+
+function requiredEnum<const Values extends readonly string[]>(value: unknown, label: string, values: Values): Values[number] {
+  if (typeof value !== "string" || !values.includes(value)) {
+    throw new Error(`${label} is unsupported.`);
+  }
+  return value as Values[number];
+}
+
+function requiredBoolean(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`${label} must be a boolean.`);
+  return value;
+}
+
+function requiredNullableString(value: unknown, label: string): string | null {
+  return value === null ? null : requiredString(value, label);
+}
+
+function requiredNullableTimestamp(value: unknown, label: string): string | null {
+  return value === null ? null : requiredTimestamp(value, label);
+}
+
+function requiredNonNegativeSafeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative safe integer.`);
+  }
+  return value;
 }
 
 function requiredString(value: unknown, label: string): string {

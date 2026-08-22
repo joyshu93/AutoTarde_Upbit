@@ -265,6 +265,61 @@ test("exact-evidence evaluator uses supplied refreshed records instead of reposi
   assert.equal(evaluation.checks.find((check) => check.name === "latest_reconciliation")?.status, "PASS");
 });
 
+test("exact-evidence evaluator blocks malformed DRIFT reconciliation issue evidence without changing valid WARN behavior", () => {
+  const common = {
+    config: createConfig({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+    }),
+    executionState: createExecutionState({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+    }),
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER" as const,
+    checkedAt: "2026-05-08T00:30:00.000Z",
+    balanceSnapshot: {
+      id: "refresh-balance",
+      exchangeAccountId: "primary",
+      capturedAt: "2026-05-08T00:00:00.000Z",
+      source: "RECONCILIATION" as const,
+      totalKrwValue: "10000",
+      balancesJson: "[]",
+    },
+    positionSnapshot: {
+      id: "refresh-position",
+      exchangeAccountId: "primary",
+      capturedAt: "2026-05-08T00:00:00.000Z",
+      source: "RECONCILIATION" as const,
+      positionsJson: "[]",
+    },
+    activeOrders: [],
+  };
+
+  const validWarning = evaluateLiveStrategyRunPreflight({
+    ...common,
+    reconciliationRun: createReconciliationRun({
+      status: "DRIFT_DETECTED",
+      completedAt: "2026-05-08T00:00:00.000Z",
+      summaryJson: JSON.stringify({ issues: [{ code: "ORDER_STATUS_RECONCILED" }] }),
+    }),
+  });
+  assert.equal(validWarning.status, "WARN");
+
+  for (const summaryJson of ["{", JSON.stringify({ issues: [{ code: 1 }] }), JSON.stringify({})]) {
+    const malformed = evaluateLiveStrategyRunPreflight({
+      ...common,
+      reconciliationRun: createReconciliationRun({
+        status: "DRIFT_DETECTED",
+        completedAt: "2026-05-08T00:00:00.000Z",
+        summaryJson,
+      }),
+    });
+    assert.equal(malformed.status, "BLOCK");
+    assert.equal(malformed.checks.find((check) => check.name === "latest_reconciliation")?.status, "BLOCK");
+  }
+});
+
 async function seedReadyPortfolio(
   repository: InMemoryExecutionRepository,
   reconciliationRun: ReconciliationRunRecord = createReconciliationRun({ status: "SUCCESS" }),

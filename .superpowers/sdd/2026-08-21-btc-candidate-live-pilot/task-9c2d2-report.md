@@ -34,6 +34,21 @@ npx.cmd tsx -e "(async () => { await import('./tests/portfolio-sync-service.test
 
 Result: all 18 focused tests passed, including explicit requested-time preservation, accessor rejection before dependency reads, exact-record preflight evaluation, candidate refresh ordering, PASS/WARN `READY`, deterministic `BLOCKED`, and exact-evidence mismatch failure.
 
+### Fix Round 1 RED/GREEN
+
+The review regressions were added before their implementation changes. The initial focused scheduler/candidate run failed with all four expected authority gaps:
+
+```text
+'WARN' !== 'BLOCK'
+Missing expected rejection.
+Missing expected rejection.
+Missing expected rejection.
+```
+
+The first failure was malformed `DRIFT_DETECTED` issue evidence failing open to `WARN`; the three rejection failures covered cast execution-state authority, reversed reconciliation chronology, and unsafe/conflicting returned reconciliation summaries.
+
+After the fixes, the focused command above passed all 23 tests. Added adversarial coverage proves that malformed state enums/nullables and `undefined`/string/number kill switches reject before preflight; malformed issue evidence blocks; reversed chronology rejects and future completion blocks; descriptor-unsafe, mismatched, or reordered issue-code/material summary authority rejects; and request/config/dependency/sync-result mutation across awaits cannot replace the exact returned records or trigger latest-row reads.
+
 ## Verification
 
 ```powershell
@@ -58,3 +73,4 @@ rg -n "POSITION_GUARD_PILOT_(ID|CONFIRMATION)|BTC_COMBINED_CONSERVATIVE_PILOT_V1
 - Added `PortfolioSyncService.run({ requestedAt? })` with descriptor-safe input validation and pre-await dependency snapshots.
 - Added the exported pure exact-evidence LIVE preflight evaluator while preserving existing scheduler/manual builders.
 - Registered the focused test in `tests/run-all.ts`.
+- Fix round 1 strictly validates execution-state authority, uses timestamp epochs for reconciliation chronology and freshness, blocks malformed `DRIFT_DETECTED` issue evidence, and snapshots/canonically correlates returned reconciliation summaries with persisted `summaryJson` evidence.

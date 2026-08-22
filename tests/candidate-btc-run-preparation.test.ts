@@ -188,6 +188,244 @@ test("candidate preparation fails closed when refresh evidence is not exact cand
   assert.equal(stateReads, 0);
 });
 
+test("candidate preparation rejects every malformed execution-state authority value before preflight", async () => {
+  const malformedStates: Array<Partial<ExecutionStateRecord>> = [
+    { executionMode: "INVALID" as never },
+    { liveExecutionGate: undefined as never },
+    { systemStatus: 1 as never },
+    { killSwitchActive: undefined as never },
+    { killSwitchActive: "false" as never },
+    { killSwitchActive: 0 as never },
+    { pauseReason: false as never },
+    { degradedReason: 0 as never },
+    { degradedAt: "2026-08-22T00:00:00" as never },
+  ];
+
+  for (const malformedState of malformedStates) {
+    let activeOrderReads = 0;
+    const preparation = new CandidateBtcRunPreparationService({
+      config: createConfig(),
+      portfolioSync: { async run() { return createSyncResult(); } },
+      operatorState: { async getState() { return { ...createExecutionState(), ...malformedState }; } },
+      repositories: {
+        async listActiveOrders() {
+          activeOrderReads += 1;
+          return [];
+        },
+      },
+      exchangeBackedReadEnabled: true,
+      liveSendPath: "LIVE_ADAPTER",
+      now: () => CHECKED_AT,
+    });
+
+    await assert.rejects(
+      preparation.prepare({
+        exchangeAccountId: "primary",
+        requestedAt: REQUESTED_AT,
+        requestedBy: "TELEGRAM",
+      }),
+      /candidate BTC execution state/,
+    );
+    assert.equal(activeOrderReads, 0);
+  }
+});
+
+test("candidate preparation rejects reversed reconciliation chronology and blocks future completion evidence", async () => {
+  const reversed = new CandidateBtcRunPreparationService({
+    config: createConfig(),
+    portfolioSync: {
+      async run() {
+        return createSyncResult({
+          reconciliationRun: createReconciliationRun({ completedAt: "2026-08-21T23:59:59.999Z" }),
+        });
+      },
+    },
+    operatorState: { async getState() { return createExecutionState(); } },
+    repositories: { async listActiveOrders() { return []; } },
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    now: () => CHECKED_AT,
+  });
+  await assert.rejects(
+    reversed.prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "SCHEDULER" }),
+    /completedAt must not precede/,
+  );
+
+  const future = new CandidateBtcRunPreparationService({
+    config: createConfig(),
+    portfolioSync: {
+      async run() {
+        return createSyncResult({
+          reconciliationRun: createReconciliationRun({ completedAt: "2026-08-22T00:00:02.000Z" }),
+        });
+      },
+    },
+    operatorState: { async getState() { return createExecutionState(); } },
+    repositories: { async listActiveOrders() { return []; } },
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    now: () => CHECKED_AT,
+  });
+  const result = await future.prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "SCHEDULER" });
+  assert.deepEqual(result, {
+    status: "BLOCKED",
+    detail: "Candidate BTC run blocked by latest_reconciliation.",
+  });
+});
+
+test("candidate preparation rejects descriptor-unsafe or conflicting reconciliation summary authority before state reads", async () => {
+  let stateReads = 0;
+  const accessorSummary = { ...createSyncResult().reconciliationSummary } as PortfolioSyncRunResult["reconciliationSummary"];
+  Object.defineProperty(accessorSummary, "source", {
+    enumerable: true,
+    get() {
+      throw new Error("summary accessor must not run");
+    },
+  });
+
+  const preparation = new CandidateBtcRunPreparationService({
+    config: createConfig(),
+    portfolioSync: {
+      async run() {
+        return createSyncResult({
+          reconciliationSummary: accessorSummary,
+          reconciliationRun: createReconciliationRun({
+            summaryJson: JSON.stringify({ source: "SCHEDULER_PREFLIGHT", status: "SUCCESS", issues: [] }),
+          }),
+        });
+      },
+    },
+    operatorState: { async getState() { stateReads += 1; return createExecutionState(); } },
+    repositories: { async listActiveOrders() { return []; } },
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    now: () => CHECKED_AT,
+  });
+  await assert.rejects(
+    preparation.prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "TELEGRAM" }),
+    /reconciliationSummary source must be an enumerable data property/,
+  );
+  assert.equal(stateReads, 0);
+
+  const conflicting = new CandidateBtcRunPreparationService({
+    config: createConfig(),
+    portfolioSync: {
+      async run() {
+        return createSyncResult({
+          reconciliationRun: createReconciliationRun({
+            summaryJson: JSON.stringify({ source: "SCHEDULER_PREFLIGHT", status: "SUCCESS", issues: [], candidateCount: 1, processedCount: 0, deferredCount: 0, maxOrderLookupsPerRun: 10 }),
+          }),
+        });
+      },
+    },
+    operatorState: { async getState() { return createExecutionState(); } },
+    repositories: { async listActiveOrders() { return []; } },
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    now: () => CHECKED_AT,
+  });
+  await assert.rejects(
+    conflicting.prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "TELEGRAM" }),
+    /summary evidence must match/,
+  );
+
+  const issueOrderedSummary = {
+    source: "SCHEDULER_PREFLIGHT" as const,
+    status: "DRIFT_DETECTED" as const,
+    issues: [
+      { code: "ORDER_STATUS_RECONCILED" as const, message: "first material issue" },
+      { code: "EXCHANGE_ORDER_RECOVERED" as const, message: "second material issue" },
+    ],
+    candidateCount: 0,
+    processedCount: 0,
+    deferredCount: 0,
+    maxOrderLookupsPerRun: 10,
+  };
+  const reorderedMaterial = new CandidateBtcRunPreparationService({
+    config: createConfig(),
+    portfolioSync: {
+      async run() {
+        return createSyncResult({
+          reconciliationSummary: issueOrderedSummary,
+          reconciliationRun: createReconciliationRun({
+            status: "DRIFT_DETECTED",
+            summaryJson: JSON.stringify({
+              ...issueOrderedSummary,
+              issues: [
+                { code: "EXCHANGE_ORDER_RECOVERED", message: "second material issue" },
+                { code: "ORDER_STATUS_RECONCILED", message: "first material issue" },
+              ],
+            }),
+          }),
+        });
+      },
+    },
+    operatorState: { async getState() { return createExecutionState(); } },
+    repositories: { async listActiveOrders() { return []; } },
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    now: () => CHECKED_AT,
+  });
+  await assert.rejects(
+    reorderedMaterial.prepare({ exchangeAccountId: "primary", requestedAt: REQUESTED_AT, requestedBy: "TELEGRAM" }),
+    /summary evidence must match/,
+  );
+});
+
+test("candidate preparation snapshots caller, dependency, and exact sync-result authority across awaits without latest-row substitution", async () => {
+  let releaseState!: () => void;
+  const stateGate = new Promise<void>((resolve) => { releaseState = resolve; });
+  let stateReadStarted!: () => void;
+  const stateRead = new Promise<void>((resolve) => { stateReadStarted = resolve; });
+  const request = {
+    exchangeAccountId: "primary",
+    requestedAt: REQUESTED_AT,
+    requestedBy: "TELEGRAM" as const,
+  };
+  const config = createConfig();
+  const syncResult = createSyncResult();
+  const operatorState = {
+    async getState() {
+      stateReadStarted();
+      await stateGate;
+      return createExecutionState();
+    },
+  };
+  const repositories = {
+    async listActiveOrders(): Promise<OrderRecord[]> { return []; },
+    getLatestBalanceSnapshot() { throw new Error("candidate preparation must not read latest balance rows"); },
+    getLatestPositionSnapshot() { throw new Error("candidate preparation must not read latest position rows"); },
+    listReconciliationRuns() { throw new Error("candidate preparation must not read latest reconciliation rows"); },
+  };
+  const preparation = new CandidateBtcRunPreparationService({
+    config,
+    portfolioSync: { async run() { return syncResult; } },
+    operatorState,
+    repositories,
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    now: () => CHECKED_AT,
+  });
+
+  const pending = preparation.prepare(request);
+  await stateRead;
+  request.exchangeAccountId = "other";
+  request.requestedAt = "2026-08-22T01:00:00.000Z";
+  config.liveExecutionGate = "DISABLED";
+  operatorState.getState = async () => ({ ...createExecutionState(), killSwitchActive: true });
+  repositories.listActiveOrders = async () => [createOrder()];
+  syncResult.balanceSnapshot.id = "newer-balance";
+  syncResult.positionSnapshot.id = "newer-position";
+  syncResult.reconciliationRun.id = "newer-reconciliation";
+  syncResult.reconciliationSummary.candidateCount = 99;
+  releaseState();
+
+  const result = await pending;
+  assert.equal(result.status, "READY");
+  if (result.status !== "READY") throw new Error("expected READY");
+  assert.deepEqual(result.refreshReceipt, createReceipt());
+});
+
 function createSyncResult(overrides: Partial<PortfolioSyncRunResult> = {}): PortfolioSyncRunResult {
   return {
     requestedAt: REQUESTED_AT,
@@ -240,7 +478,15 @@ function createReconciliationRun(overrides: Partial<ReconciliationRunRecord> = {
     status: "SUCCESS",
     startedAt: REQUESTED_AT,
     completedAt: CHECKED_AT,
-    summaryJson: JSON.stringify({ source: "SCHEDULER_PREFLIGHT", status: "SUCCESS", issues: [] }),
+    summaryJson: JSON.stringify({
+      source: "SCHEDULER_PREFLIGHT",
+      status: "SUCCESS",
+      issues: [],
+      candidateCount: 0,
+      processedCount: 0,
+      deferredCount: 0,
+      maxOrderLookupsPerRun: 10,
+    }),
     errorMessage: null,
     ...overrides,
   };

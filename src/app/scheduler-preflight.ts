@@ -9,6 +9,7 @@ import type {
   StrategySchedulerStartupPreflightCheck,
 } from "../domain/types.js";
 import type { ExecutionRepository } from "../modules/db/interfaces.js";
+import { parseCandidatePilotTimestamp } from "../modules/db/pilot-interfaces.js";
 
 const BLOCKING_RECONCILIATION_ISSUE_CODES = new Set([
   "BALANCE_DRIFT_DETECTED",
@@ -264,15 +265,28 @@ function describeTimestampFreshness(
     };
   }
 
-  const ageMs = Date.parse(checkedAt) - Date.parse(timestamp);
-  if (!Number.isFinite(ageMs) || ageMs < 0) {
+  let ageNs: bigint;
+  try {
+    ageNs = parseCandidatePilotTimestamp(checkedAt, "strategy run preflight checkedAt") -
+      parseCandidatePilotTimestamp(timestamp, "strategy run preflight evidence timestamp");
+  } catch {
     return {
       status: "BLOCK",
       detail: "timestamp is not comparable to preflight time",
     };
   }
 
-  return ageMs <= maxAgeMs
+  if (ageNs < 0n) {
+    return {
+      status: "BLOCK",
+      detail: "timestamp is not comparable to preflight time",
+    };
+  }
+
+  const maxAgeNs = BigInt(maxAgeMs) * 1_000_000n;
+  const ageMs = Number(ageNs / 1_000_000n);
+
+  return ageNs <= maxAgeNs
     ? {
         status: "PASS",
         detail: `fresh_age_ms=${ageMs} max_age_ms=${maxAgeMs}`,
@@ -350,7 +364,25 @@ function describeLatestReconciliation(
     };
   }
 
-  const issueCodes = parseReconciliationIssueCodes(run.summaryJson);
+  if (run.status !== "DRIFT_DETECTED") {
+    return {
+      name: "latest_reconciliation",
+      status: "BLOCK",
+      detail: `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ${freshness.detail} is not eligible for live preflight.`,
+    };
+  }
+
+  const issueEvidence = parseReconciliationIssueCodes(run.summaryJson);
+  if (issueEvidence === null) {
+    return {
+      name: "latest_reconciliation",
+      status: "BLOCK",
+      detail:
+        `latest reconciliation status=${run.status} completed_at=${run.completedAt ?? "none"} ` +
+        `${freshness.detail} issue_evidence_malformed=true`,
+    };
+  }
+  const issueCodes = issueEvidence;
   const blockingIssueCodes = issueCodes.filter((code) => BLOCKING_RECONCILIATION_ISSUE_CODES.has(code));
   if (blockingIssueCodes.length > 0) {
     return {
@@ -371,22 +403,44 @@ function describeLatestReconciliation(
   };
 }
 
-function parseReconciliationIssueCodes(rawJson: string): string[] {
+function parseReconciliationIssueCodes(rawJson: string): string[] | null {
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(rawJson) as { issues?: unknown };
-    if (!Array.isArray(parsed.issues)) {
-      return [];
-    }
-
-    return parsed.issues
-      .map((issue) =>
-        issue && typeof issue === "object" && "code" in issue && typeof issue.code === "string"
-          ? issue.code
-          : null)
-      .filter((code): code is string => code !== null);
+    parsed = JSON.parse(rawJson);
   } catch {
-    return [];
+    return null;
   }
+
+  if (typeof parsed !== "object" || parsed === null || Object.getPrototypeOf(parsed) !== Object.prototype) {
+    return null;
+  }
+  const summaryDescriptors = Object.getOwnPropertyDescriptors(parsed);
+  const issuesDescriptor = summaryDescriptors.issues;
+  if (issuesDescriptor === undefined || issuesDescriptor.enumerable !== true || !("value" in issuesDescriptor) || !Array.isArray(issuesDescriptor.value)) {
+    return null;
+  }
+
+  const issueCodes: string[] = [];
+  for (let index = 0; index < issuesDescriptor.value.length; index += 1) {
+    const issue = issuesDescriptor.value[index];
+    if (typeof issue !== "object" || issue === null || Object.getPrototypeOf(issue) !== Object.prototype) {
+      return null;
+    }
+    const issueDescriptors = Object.getOwnPropertyDescriptors(issue);
+    const codeDescriptor = issueDescriptors.code;
+    if (
+      codeDescriptor === undefined ||
+      codeDescriptor.enumerable !== true ||
+      !("value" in codeDescriptor) ||
+      typeof codeDescriptor.value !== "string" ||
+      codeDescriptor.value.trim().length === 0
+    ) {
+      return null;
+    }
+    issueCodes.push(codeDescriptor.value);
+  }
+
+  return issueCodes;
 }
 
 function formatIssueCodes(issueCodes: string[]): string {
