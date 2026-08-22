@@ -24,6 +24,15 @@
 - Adversarial tests mutate every scalar policy and collaborator reference during the first awaited lookup and confirm that reads, provenance, pilot pause, and global pause remain pinned to the initial authority.
 - Accessor, extra, symbol, non-enumerable, non-plain, and malformed top-level or target inputs are rejected without invoking accessors.
 
+## Independent Re-review
+
+The fresh review found no remaining Important or Critical findings (`CLEAN`). It independently
+confirmed that constructor authority cannot change across an await, the original account owns
+all reads, provenance, and pause writes, the exact target shape is immutable, collaborator
+objects are not deep-frozen, and the exact lookup, deployment pinning, and global-only fault
+contracts remain intact. Focused recovery tests (41 cases), typecheck, build, and diff-check
+all passed in that review.
+
 ## Verification
 
 - Focused in-memory, SQLite, and recovery tests: PASS.
