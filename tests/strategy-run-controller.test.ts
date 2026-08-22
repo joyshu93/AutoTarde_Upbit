@@ -380,13 +380,147 @@ test("running guard remains held while candidate preparation is pending", async 
 
   const first = controller.requestRun(runRequest("KRW-BTC", "TELEGRAM"));
   await Promise.resolve();
-  const second = await controller.requestRun(runRequest("KRW-BTC", "SCHEDULER"));
+  const secondRequest = runRequest("KRW-BTC", "SCHEDULER") as Mutable<ReturnType<typeof runRequest>>;
+  const secondPending = controller.requestRun(secondRequest);
+  secondRequest.exchangeAccountId = "mutated-account";
+  secondRequest.market = "KRW-ETH";
+  const second = await secondPending;
   releasePreparation();
   const completed = await first;
 
   assert.equal(second.status, "ALREADY_RUNNING");
+  assert.equal(second.market, "KRW-BTC");
+  assert.match(second.detail, /primary/);
   assert.equal(completed.status, "COMPLETED");
   assert.equal(runCalls, 1);
+});
+
+test("candidate BTC run keeps constructor authority and request values while preparation awaits", async () => {
+  const trace: string[] = [];
+  let releasePreparation!: () => void;
+  let preparationStarted!: () => void;
+  const preparationGate = new Promise<void>((resolve) => {
+    releasePreparation = resolve;
+  });
+  const started = new Promise<void>((resolve) => {
+    preparationStarted = resolve;
+  });
+  let preparationCalls = 0;
+  const originalPreparation: CandidateBtcRunPreparation = {
+    async prepare(input) {
+      preparationCalls += 1;
+      trace.push(`prepare:${input.exchangeAccountId}:${input.requestedBy}:${input.requestedAt}`);
+      if (preparationCalls === 1) {
+        preparationStarted();
+        await preparationGate;
+      }
+      return {
+        status: "READY",
+        refreshReceipt: createRefreshReceiptFor(input.exchangeAccountId, input.requestedAt),
+      };
+    },
+  };
+  const dependencies: ConstructorParameters<typeof InlineTelegramStrategyRunController>[0] = {
+    runner: createRunner({
+      async runOnce(input) {
+        trace.push(`runner:${input.market}:${input.generatedAt}`);
+        return createRunResult(input.market);
+      },
+    }),
+    candidateBtcRunPreparation: originalPreparation,
+    beforeManualRunPreflight: async () => {
+      trace.push("manual-preflight:original");
+      return null;
+    },
+    now: () => REQUESTED_AT,
+  };
+  const controller = new InlineTelegramStrategyRunController(dependencies);
+  const request = runRequest("KRW-BTC", "TELEGRAM") as Mutable<ReturnType<typeof runRequest>>;
+
+  const pending = controller.requestRun(request);
+  await started;
+
+  dependencies.runner = createRunner({
+    async runOnce() {
+      trace.push("runner:mutated");
+      return createRunResult("KRW-ETH");
+    },
+  });
+  dependencies.candidateBtcRunPreparation = {
+    async prepare() {
+      trace.push("prepare:mutated");
+      return { status: "BLOCKED", detail: "mutated dependency must not be authoritative" };
+    },
+  };
+  dependencies.beforeManualRunPreflight = async () => {
+    trace.push("manual-preflight:mutated");
+    return null;
+  };
+  dependencies.now = () => "2026-04-20T00:00:30.000Z";
+  request.exchangeAccountId = "mutated-account";
+  request.market = "KRW-ETH";
+  request.requestedBy = "SCHEDULER";
+  request.requestedCommand = "SCHEDULER_TICK";
+
+  releasePreparation();
+  const first = await pending;
+  const baseline = await controller.requestRun(runRequest("KRW-ETH", "TELEGRAM"));
+  const secondCandidate = await controller.requestRun(runRequest("KRW-BTC", "SCHEDULER"));
+
+  assert.equal(first.status, "COMPLETED");
+  assert.equal(first.market, "KRW-BTC");
+  assert.equal(first.requestedAt, REQUESTED_AT);
+  assert.equal(baseline.status, "COMPLETED");
+  assert.equal(baseline.requestedAt, REQUESTED_AT);
+  assert.equal(secondCandidate.status, "COMPLETED");
+  assert.equal(secondCandidate.requestedAt, REQUESTED_AT);
+  assert.deepEqual(trace, [
+    `prepare:primary:TELEGRAM:${REQUESTED_AT}`,
+    `runner:KRW-BTC:${REQUESTED_AT}`,
+    "manual-preflight:original",
+    `runner:KRW-ETH:${REQUESTED_AT}`,
+    `prepare:primary:SCHEDULER:${REQUESTED_AT}`,
+    `runner:KRW-BTC:${REQUESTED_AT}`,
+  ]);
+});
+
+test("strategy preview keeps its entry request snapshot while runner awaits", async () => {
+  let releasePreview!: () => void;
+  let previewStarted!: () => void;
+  const previewGate = new Promise<void>((resolve) => {
+    releasePreview = resolve;
+  });
+  const started = new Promise<void>((resolve) => {
+    previewStarted = resolve;
+  });
+  const controller = new InlineTelegramStrategyRunController({
+    runner: createRunner({
+      async previewOnce(input) {
+        assert.equal(input.market, "KRW-BTC");
+        previewStarted();
+        await previewGate;
+        return createPreviewResult();
+      },
+    }),
+    now: () => REQUESTED_AT,
+  });
+  const request = {
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    requestedBy: "TELEGRAM",
+    requestedCommand: "/preview",
+  } as Mutable<Parameters<InlineTelegramStrategyRunController["requestPreview"]>[0]>;
+
+  const pending = controller.requestPreview(request);
+  await started;
+  request.exchangeAccountId = "mutated-account";
+  request.market = "KRW-ETH";
+  releasePreview();
+  const result = await pending;
+
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.market, "KRW-BTC");
+  assert.equal(result.requestedAt, REQUESTED_AT);
 });
 
 const REQUESTED_AT = "2026-04-20T00:00:00.000Z";
@@ -403,16 +537,23 @@ function runRequest(market: "KRW-BTC" | "KRW-ETH", requestedBy: "TELEGRAM" | "SC
 }
 
 function createRefreshReceipt(): PositionGuardPilotRefreshReceipt {
+  return createRefreshReceiptFor("primary", REQUESTED_AT);
+}
+
+function createRefreshReceiptFor(
+  exchangeAccountId: string,
+  requestedAt: string,
+): PositionGuardPilotRefreshReceipt {
   return {
-    exchangeAccountId: "primary",
-    requestedAt: REQUESTED_AT,
+    exchangeAccountId,
+    requestedAt,
     balanceSnapshotId: "balance-1",
-    balanceCapturedAt: REQUESTED_AT,
+    balanceCapturedAt: requestedAt,
     positionSnapshotId: "position-1",
-    positionCapturedAt: REQUESTED_AT,
+    positionCapturedAt: requestedAt,
     reconciliationRunId: "reconciliation-1",
-    reconciliationStartedAt: REQUESTED_AT,
-    reconciliationCompletedAt: REQUESTED_AT,
+    reconciliationStartedAt: requestedAt,
+    reconciliationCompletedAt: requestedAt,
     reconciliationSource: "SCHEDULER_PREFLIGHT",
   };
 }

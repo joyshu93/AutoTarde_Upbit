@@ -10,6 +10,8 @@ No `createApp` or scheduler runtime wiring was added in this task.
 - Focused controller tests failed because candidate preparation was not called, READY receipts were not passed to the runner, BLOCKED/throw paths still reached the runner, and the running guard did not cover preparation.
 - The focused preflight module failed to load because `getStrategyRunFreshnessThresholdMs` was not exported.
 - An adversarial invalid-calendar timestamp test failed because `Date.parse` normalized `2026-02-30` instead of rejecting it.
+- Independent review reproduced two authority TOCTOU failures: caller-owned controller dependencies could replace the runner after candidate preparation, and a mutable request could change BTC/account/requester values while preparation awaited.
+- The new adversarial controller tests failed as expected: the candidate run returned `FAILED` after request mutation instead of using its entry snapshot, and preview reported the mutated `KRW-ETH` market instead of its entry `KRW-BTC` market.
 
 ## GREEN
 
@@ -22,14 +24,22 @@ No `createApp` or scheduler runtime wiring was added in this task.
 - ETH and preview requests do not invoke candidate preparation.
 - The existing running guard remains held while preparation is pending.
 - Exported `getStrategyRunFreshnessThresholdMs`; both manual and scheduler preflight checks use the shortest configured BTC/ETH interval.
+- Controller construction now stores a detached frozen shallow snapshot of runner, candidate preparation, manual preflight, and clock references without freezing collaborator objects.
+- Run and preview requests now copy their supported primitive fields into frozen entry snapshots before any await; all preparation, runner, result, failure, and `ALREADY_RUNNING` paths use only those snapshots.
+- Adversarial tests mutate the caller-owned dependency container and request objects while candidate preparation or preview is pending and prove that only the original constructor authority and entry request values are observed.
 
 ## Verification
 
-- Focused controller and preflight tests: 18 passed.
+- Focused controller and preflight tests: 20 passed.
 - `npm.cmd run typecheck`: passed.
 - `npm.cmd run build`: passed.
 - `git diff --check`: passed.
 - Full suite: intentionally not run by task instruction.
+
+## Independent Review
+
+- The two reported P1 findings have focused RED/GREEN coverage and are implemented as closed in this patch.
+- Independent review confirmation remains pending before Task 9C2c is considered fully reviewed.
 
 ## Safety
 

@@ -28,32 +28,36 @@ export interface CandidateBtcRunPreparation {
   }>): Promise<CandidateBtcRunPreparationResult>;
 }
 
+type InlineTelegramStrategyRunControllerDependencies = {
+  runner: Pick<PositionGuardStrategyRunner, "runOnce" | "previewOnce">;
+  candidateBtcRunPreparation?: CandidateBtcRunPreparation;
+  beforeManualRunPreflight?: () => Promise<StrategySchedulerStartupPreflight | null>;
+  now?: () => string;
+};
+
 export class InlineTelegramStrategyRunController implements TelegramStrategyRunController {
   private running = false;
+  private readonly dependencies: Readonly<InlineTelegramStrategyRunControllerDependencies>;
 
-  constructor(
-    private readonly dependencies: {
-      runner: Pick<PositionGuardStrategyRunner, "runOnce" | "previewOnce">;
-      candidateBtcRunPreparation?: CandidateBtcRunPreparation;
-      beforeManualRunPreflight?: () => Promise<StrategySchedulerStartupPreflight | null>;
-      now?: () => string;
-    },
-  ) {}
+  constructor(dependencies: InlineTelegramStrategyRunControllerDependencies) {
+    this.dependencies = snapshotControllerDependencies(dependencies);
+  }
 
   async requestRun(request: TelegramStrategyRunRequest): Promise<TelegramStrategyRunResult> {
+    const requestSnapshot = snapshotRunRequest(request);
     const requestedAt = this.dependencies.now?.() ?? new Date().toISOString();
     if (this.running) {
       return {
         status: "ALREADY_RUNNING",
         requestedAt,
-        market: request.market,
+        market: requestSnapshot.market,
         strategyDecisionId: null,
         action: null,
         orderId: null,
         orderStatus: null,
         submissionAccepted: null,
         submissionOutcome: null,
-        detail: `A strategy run is already running for ${request.exchangeAccountId}.`,
+        detail: `A strategy run is already running for ${requestSnapshot.exchangeAccountId}.`,
       };
     }
 
@@ -61,20 +65,20 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
 
     try {
       let refreshReceipt: PositionGuardPilotRefreshReceipt | undefined;
-      const candidatePreparation = request.market === "KRW-BTC"
+      const candidatePreparation = requestSnapshot.market === "KRW-BTC"
         ? this.dependencies.candidateBtcRunPreparation
         : undefined;
 
       if (candidatePreparation) {
         const preparation = await candidatePreparation.prepare(Object.freeze({
-          exchangeAccountId: request.exchangeAccountId,
+          exchangeAccountId: requestSnapshot.exchangeAccountId,
           requestedAt,
-          requestedBy: request.requestedBy,
+          requestedBy: requestSnapshot.requestedBy,
         }));
         if (preparation.status === "BLOCKED") {
           return failedRunResult({
             requestedAt,
-            market: request.market,
+            market: requestSnapshot.market,
             detail: `Candidate BTC run blocked before decision: ${preparation.detail}`,
           });
         }
@@ -84,22 +88,22 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
 
         refreshReceipt = snapshotCandidateRefreshReceipt(
           preparation.refreshReceipt,
-          request.exchangeAccountId,
+          requestSnapshot.exchangeAccountId,
           requestedAt,
         );
-      } else if (request.requestedBy === "TELEGRAM" && this.dependencies.beforeManualRunPreflight) {
+      } else if (requestSnapshot.requestedBy === "TELEGRAM" && this.dependencies.beforeManualRunPreflight) {
         const preflight = await this.dependencies.beforeManualRunPreflight();
         if (preflight?.status === "BLOCK") {
           return failedRunResult({
             requestedAt,
-            market: request.market,
+            market: requestSnapshot.market,
             detail: buildManualRunPreflightBlockDetail(preflight),
           });
         }
       }
 
       const result = await this.dependencies.runner.runOnce({
-        market: request.market,
+        market: requestSnapshot.market,
         generatedAt: requestedAt,
         ...(refreshReceipt === undefined ? {} : { refreshReceipt }),
       });
@@ -110,7 +114,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
           ? "FAILED"
           : submissionOutcome === "DUPLICATE" ? "SKIPPED" : "COMPLETED",
         requestedAt,
-        market: request.market,
+        market: requestSnapshot.market,
         strategyDecisionId: result.strategyDecisionRecord.id,
         action: result.strategyDecision.action,
         orderId: result.submission?.order?.id ?? null,
@@ -125,7 +129,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
       return {
         status: "FAILED",
         requestedAt,
-        market: request.market,
+        market: requestSnapshot.market,
         strategyDecisionId: null,
         action: null,
         orderId: null,
@@ -140,12 +144,13 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
   }
 
   async requestPreview(request: TelegramStrategyPreviewRequest): Promise<TelegramStrategyPreviewResult> {
+    const requestSnapshot = snapshotPreviewRequest(request);
     const requestedAt = this.dependencies.now?.() ?? new Date().toISOString();
     if (this.running) {
       return {
         status: "ALREADY_RUNNING",
         requestedAt,
-        market: request.market,
+        market: requestSnapshot.market,
         action: null,
         executionDisposition: null,
         referencePrice: null,
@@ -155,7 +160,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
         orderType: null,
         orderPrice: null,
         orderVolume: null,
-        detail: `A strategy run or preview is already running for ${request.exchangeAccountId}.`,
+        detail: `A strategy run or preview is already running for ${requestSnapshot.exchangeAccountId}.`,
       };
     }
 
@@ -163,14 +168,14 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
 
     try {
       const result = await this.dependencies.runner.previewOnce({
-        market: request.market,
+        market: requestSnapshot.market,
         generatedAt: requestedAt,
       });
 
       return {
         status: "COMPLETED",
         requestedAt,
-        market: request.market,
+        market: requestSnapshot.market,
         action: result.strategyDecision.action,
         executionDisposition: result.engineDecision.executionDisposition,
         referencePrice: result.strategyDecision.referencePrice,
@@ -188,7 +193,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
       return {
         status: "FAILED",
         requestedAt,
-        market: request.market,
+        market: requestSnapshot.market,
         action: null,
         executionDisposition: null,
         referencePrice: null,
@@ -204,6 +209,41 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
       this.running = false;
     }
   }
+}
+
+function snapshotControllerDependencies(
+  dependencies: InlineTelegramStrategyRunControllerDependencies,
+): Readonly<InlineTelegramStrategyRunControllerDependencies> {
+  return Object.freeze({
+    runner: dependencies.runner,
+    ...(dependencies.candidateBtcRunPreparation === undefined
+      ? {}
+      : { candidateBtcRunPreparation: dependencies.candidateBtcRunPreparation }),
+    ...(dependencies.beforeManualRunPreflight === undefined
+      ? {}
+      : { beforeManualRunPreflight: dependencies.beforeManualRunPreflight }),
+    ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
+  });
+}
+
+function snapshotRunRequest(request: TelegramStrategyRunRequest): Readonly<TelegramStrategyRunRequest> {
+  return Object.freeze({
+    exchangeAccountId: request.exchangeAccountId,
+    market: request.market,
+    requestedBy: request.requestedBy,
+    requestedCommand: request.requestedCommand,
+  });
+}
+
+function snapshotPreviewRequest(
+  request: TelegramStrategyPreviewRequest,
+): Readonly<TelegramStrategyPreviewRequest> {
+  return Object.freeze({
+    exchangeAccountId: request.exchangeAccountId,
+    market: request.market,
+    requestedBy: request.requestedBy,
+    requestedCommand: request.requestedCommand,
+  });
 }
 
 function buildStrategyRunDetail(
