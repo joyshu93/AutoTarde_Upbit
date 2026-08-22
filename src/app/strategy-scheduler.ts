@@ -33,6 +33,8 @@ export interface StrategySchedulerAccountRefreshResult {
   detail: string;
 }
 
+export type StrategySchedulerRunPreparationOwner = "SCHEDULER" | "CONTROLLER";
+
 type SchedulerTimer = ReturnType<typeof setTimeout>;
 const SCHEDULER_BATCH_KEY_GRANULARITY_MS = 1_000;
 
@@ -54,6 +56,7 @@ export class StrategyScheduler {
       reporter?: OperatorNotificationReporter;
       beforeRunAccountRefresh?: () => Promise<StrategySchedulerAccountRefreshResult | null>;
       beforeRunPreflight?: () => Promise<StrategySchedulerStartupPreflight | null>;
+      resolveRunPreparationOwner?: (market: SupportedMarket) => StrategySchedulerRunPreparationOwner;
       now?: () => string;
       setTimer?: (callback: () => void, delayMs: number) => SchedulerTimer;
       clearTimer?: (timer: SchedulerTimer) => void;
@@ -192,7 +195,19 @@ export class StrategyScheduler {
       lastError: null,
     });
 
-    if (this.dependencies.beforeRunAccountRefresh) {
+    let preparationOwner: StrategySchedulerRunPreparationOwner;
+    try {
+      preparationOwner = this.resolveRunPreparationOwner(market);
+    } catch (error) {
+      return this.recordPreparationOwnershipFailure({
+        market,
+        config,
+        startedAt,
+        error,
+      });
+    }
+
+    if (preparationOwner === "SCHEDULER" && this.dependencies.beforeRunAccountRefresh) {
       let refresh: StrategySchedulerAccountRefreshResult | null = null;
       try {
         refresh = await this.runBeforeRunAccountRefresh();
@@ -259,7 +274,9 @@ export class StrategyScheduler {
       }
     }
 
-    const beforeRunPreflight = this.dependencies.beforeRunPreflight;
+    const beforeRunPreflight = preparationOwner === "SCHEDULER"
+      ? this.dependencies.beforeRunPreflight
+      : undefined;
     if (beforeRunPreflight) {
       let preflight: StrategySchedulerStartupPreflight | null = null;
       try {
@@ -397,6 +414,53 @@ export class StrategyScheduler {
     }
 
     return this.accountRefreshInFlight;
+  }
+
+  private resolveRunPreparationOwner(market: SupportedMarket): StrategySchedulerRunPreparationOwner {
+    const resolver = this.dependencies.resolveRunPreparationOwner;
+    const owner = resolver ? resolver(market) : "SCHEDULER";
+    if (owner === "SCHEDULER" || owner === "CONTROLLER") {
+      return owner;
+    }
+
+    throw new Error(`Unsupported scheduler preparation ownership: ${String(owner)}`);
+  }
+
+  private async recordPreparationOwnershipFailure(input: {
+    market: SupportedMarket;
+    config: StrategySchedulerMarketConfig;
+    startedAt: string;
+    error: unknown;
+  }): Promise<TelegramStrategyRunResult> {
+    const failedAt = this.now();
+    const failed = createFailedRunResult({
+      requestedAt: input.startedAt,
+      market: input.market,
+      detail: `Strategy scheduler preparation ownership failed before run: ${
+        input.error instanceof Error ? input.error.message : String(input.error)
+      }`,
+    });
+    this.applyRunResult(input.market, failed, input.startedAt, failedAt);
+    await this.persistSchedulerRun({
+      run: createSchedulerRunRecord({
+        exchangeAccountId: this.dependencies.config.exchangeAccountId,
+        market: input.market,
+        intervalMs: input.config.intervalMs,
+        runOnStart: this.dependencies.config.runOnStart,
+        status: "FAILED",
+        startedAt: input.startedAt,
+        completedAt: failedAt,
+        result: failed,
+      }),
+      update: false,
+    });
+    await this.reportSchedulerResult({
+      market: input.market,
+      result: failed,
+      intervalMs: input.config.intervalMs,
+      runOnStart: this.dependencies.config.runOnStart,
+    });
+    return failed;
   }
 
   private scheduleMarket(config: StrategySchedulerMarketConfig, delayMs: number): void {

@@ -1025,6 +1025,428 @@ test("strategy scheduler notifies when a scheduled run fails", async () => {
   assert.match(notifications[0]?.message ?? "", /ticker unavailable/);
 });
 
+test("strategy scheduler defaults preparation ownership to scheduler hooks in order", async () => {
+  const calls: string[] = [];
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(request) {
+        calls.push(`controller:${request.market}`);
+        return createController().requestRun(request);
+      },
+    }),
+    beforeRunAccountRefresh: async () => {
+      calls.push("refresh");
+      return { status: "COMPLETED", requestedAt: "2026-04-20T00:00:00.000Z", detail: "ok" };
+    },
+    beforeRunPreflight: async () => {
+      calls.push("preflight");
+      return { checkedAt: "2026-04-20T00:00:01.000Z", scope: "LIVE", status: "PASS", detail: "ok", checks: [] };
+    },
+    now: createNowSequence(["2026-04-20T00:00:00.000Z", "2026-04-20T00:00:02.000Z"]),
+  });
+
+  const result = await scheduler.runMarketNow("KRW-BTC");
+
+  assert.equal(result.status, "COMPLETED");
+  assert.deepEqual(calls, ["refresh", "preflight", "controller:KRW-BTC"]);
+});
+
+test("strategy scheduler lets controller-owned BTC skip both scheduler preparation hooks", async () => {
+  const calls: string[] = [];
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(request) {
+        calls.push(`controller:${request.market}`);
+        return createController().requestRun(request);
+      },
+    }),
+    resolveRunPreparationOwner: (market) => {
+      calls.push(`resolve:${market}`);
+      return "CONTROLLER";
+    },
+    beforeRunAccountRefresh: async () => {
+      calls.push("refresh");
+      return { status: "COMPLETED", requestedAt: "2026-04-20T00:00:00.000Z", detail: "ok" };
+    },
+    beforeRunPreflight: async () => {
+      calls.push("preflight");
+      return { checkedAt: "2026-04-20T00:00:01.000Z", scope: "LIVE", status: "PASS", detail: "ok", checks: [] };
+    },
+    now: createNowSequence(["2026-04-20T00:00:00.000Z", "2026-04-20T00:00:02.000Z"]),
+  });
+
+  const result = await scheduler.runMarketNow("KRW-BTC");
+
+  assert.equal(result.status, "COMPLETED");
+  assert.deepEqual(calls, ["resolve:KRW-BTC", "controller:KRW-BTC"]);
+});
+
+test("strategy scheduler keeps ETH scheduler-owned preparation in order", async () => {
+  const calls: string[] = [];
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [{ market: "KRW-ETH", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(request) {
+        calls.push(`controller:${request.market}`);
+        return createController().requestRun(request);
+      },
+    }),
+    resolveRunPreparationOwner: (market) => {
+      calls.push(`resolve:${market}`);
+      return "SCHEDULER";
+    },
+    beforeRunAccountRefresh: async () => {
+      calls.push("refresh");
+      return { status: "COMPLETED", requestedAt: "2026-04-20T00:00:00.000Z", detail: "ok" };
+    },
+    beforeRunPreflight: async () => {
+      calls.push("preflight");
+      return { checkedAt: "2026-04-20T00:00:01.000Z", scope: "LIVE", status: "PASS", detail: "ok", checks: [] };
+    },
+    now: createNowSequence(["2026-04-20T00:00:00.000Z", "2026-04-20T00:00:02.000Z"]),
+  });
+
+  const result = await scheduler.runMarketNow("KRW-ETH");
+
+  assert.equal(result.status, "COMPLETED");
+  assert.deepEqual(calls, ["resolve:KRW-ETH", "refresh", "preflight", "controller:KRW-ETH"]);
+});
+
+test("controller-owned BTC neither joins nor suppresses a concurrent scheduler-owned refresh", async () => {
+  let releaseRefresh: (() => void) | undefined;
+  let refreshCalls = 0;
+  const controllerCalls: string[] = [];
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [
+        { market: "KRW-BTC", intervalMs: 3_600_000 },
+        { market: "KRW-ETH", intervalMs: 3_600_000 },
+      ],
+    },
+    controller: createController({
+      async requestRun(request) {
+        controllerCalls.push(request.market);
+        return createController().requestRun(request);
+      },
+    }),
+    resolveRunPreparationOwner: (market) => market === "KRW-BTC" ? "CONTROLLER" : "SCHEDULER",
+    beforeRunAccountRefresh: async () => {
+      refreshCalls += 1;
+      await new Promise<void>((resolve) => {
+        releaseRefresh = resolve;
+      });
+      return { status: "COMPLETED", requestedAt: "2026-04-20T00:00:00.000Z", detail: "ok" };
+    },
+    beforeRunPreflight: async () => ({
+      checkedAt: "2026-04-20T00:00:01.000Z", scope: "LIVE", status: "PASS", detail: "ok", checks: [],
+    }),
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:00.100Z",
+      "2026-04-20T00:00:02.000Z",
+      "2026-04-20T00:00:02.100Z",
+    ]),
+  });
+
+  const ethRun = scheduler.runMarketNow("KRW-ETH");
+  await waitForMicrotasks();
+  const btcRun = scheduler.runMarketNow("KRW-BTC");
+  await waitForMicrotasks();
+
+  assert.equal(refreshCalls, 1);
+  assert.deepEqual(controllerCalls, ["KRW-BTC"]);
+  const release = releaseRefresh;
+  assert.ok(release);
+  release();
+
+  const results = await Promise.all([ethRun, btcRun]);
+  assert.deepEqual(results.map((result) => result.status), ["COMPLETED", "COMPLETED"]);
+  assert.deepEqual(controllerCalls.sort(), ["KRW-BTC", "KRW-ETH"]);
+});
+
+test("strategy scheduler fails closed when preparation ownership resolution throws or returns invalid data", async () => {
+  for (const resolver of [
+    () => {
+      throw new Error("resolver failed");
+    },
+    () => "UNSUPPORTED_OWNER",
+  ]) {
+    const repository = new InMemoryExecutionRepository();
+    let refreshCalls = 0;
+    let preflightCalls = 0;
+    let controllerCalls = 0;
+    const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
+    const scheduler = new StrategyScheduler({
+      config: {
+        enabled: true,
+        runOnStart: false,
+        exchangeAccountId: "primary",
+        liveSendPath: "LIVE_ADAPTER",
+        markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+      },
+      controller: createController({
+        async requestRun(request) {
+          controllerCalls += 1;
+          return createController().requestRun(request);
+        },
+      }),
+      resolveRunPreparationOwner: resolver as unknown as (market: "KRW-BTC" | "KRW-ETH") => "SCHEDULER" | "CONTROLLER",
+      repositories: repository,
+      reporter: createReporter(notifications),
+      beforeRunAccountRefresh: async () => {
+        refreshCalls += 1;
+        return { status: "COMPLETED", requestedAt: "2026-04-20T00:00:00.000Z", detail: "ok" };
+      },
+      beforeRunPreflight: async () => {
+        preflightCalls += 1;
+        return { checkedAt: "2026-04-20T00:00:01.000Z", scope: "LIVE", status: "PASS", detail: "ok", checks: [] };
+      },
+      now: createNowSequence(["2026-04-20T00:00:00.000Z", "2026-04-20T00:00:02.000Z"]),
+    });
+
+    const result = await scheduler.runMarketNow("KRW-BTC");
+    const persisted = await repository.listStrategySchedulerRuns("primary", 5);
+
+    assert.equal(result.status, "FAILED");
+    assert.equal(refreshCalls, 0);
+    assert.equal(preflightCalls, 0);
+    assert.equal(controllerCalls, 0);
+    assert.equal(persisted[0]?.status, "FAILED");
+    assert.match(persisted[0]?.detail ?? "", /preparation ownership/i);
+    assert.equal(notifications[0]?.notificationType, "SCHEDULER_RUN_FAILED");
+  }
+});
+
+test("strategy scheduler fails closed when the ownership resolver accessor throws", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
+  let refreshCalls = 0;
+  let preflightCalls = 0;
+  let controllerCalls = 0;
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(request) {
+        controllerCalls += 1;
+        return createController().requestRun(request);
+      },
+    }),
+    get resolveRunPreparationOwner(): (market: "KRW-BTC" | "KRW-ETH") => "CONTROLLER" {
+      throw new Error("resolver accessor failed");
+    },
+    repositories: repository,
+    reporter: createReporter(notifications),
+    beforeRunAccountRefresh: async () => {
+      refreshCalls += 1;
+      return { status: "COMPLETED", requestedAt: "2026-04-20T00:00:00.000Z", detail: "ok" };
+    },
+    beforeRunPreflight: async () => {
+      preflightCalls += 1;
+      return { checkedAt: "2026-04-20T00:00:01.000Z", scope: "LIVE", status: "PASS", detail: "ok", checks: [] };
+    },
+    now: createNowSequence(["2026-04-20T00:00:00.000Z", "2026-04-20T00:00:02.000Z"]),
+  });
+
+  const result = await scheduler.runMarketNow("KRW-BTC");
+  const persisted = await repository.listStrategySchedulerRuns("primary", 5);
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(refreshCalls, 0);
+  assert.equal(preflightCalls, 0);
+  assert.equal(controllerCalls, 0);
+  assert.equal(persisted[0]?.status, "FAILED");
+  assert.equal(notifications[0]?.notificationType, "SCHEDULER_RUN_FAILED");
+});
+
+test("same-market running guard skips before a second ownership resolution", async () => {
+  let releaseController: (() => void) | undefined;
+  let resolverCalls = 0;
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(request) {
+        await new Promise<void>((resolve) => {
+          releaseController = resolve;
+        });
+        return createController().requestRun(request);
+      },
+    }),
+    resolveRunPreparationOwner: () => {
+      resolverCalls += 1;
+      return "CONTROLLER";
+    },
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:00.100Z",
+      "2026-04-20T00:00:02.000Z",
+    ]),
+  });
+
+  const first = scheduler.runMarketNow("KRW-BTC");
+  await waitForMicrotasks();
+  const second = await scheduler.runMarketNow("KRW-BTC");
+
+  assert.equal(second.status, "ALREADY_RUNNING");
+  assert.equal(resolverCalls, 1);
+  const release = releaseController;
+  assert.ok(release);
+  release();
+  await first;
+});
+
+test("same-batch order deferral skips ETH before its preparation ownership resolves", async () => {
+  const scheduledCallbacks: Array<() => void> = [];
+  const resolvedMarkets: string[] = [];
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [
+        { market: "KRW-BTC", intervalMs: 3_600_000 },
+        { market: "KRW-ETH", intervalMs: 3_600_000 },
+      ],
+    },
+    controller: createController({
+      async requestRun(request) {
+        return {
+          ...(await createController().requestRun(request)),
+          orderId: "order-btc",
+          orderStatus: "OPEN",
+          submissionAccepted: true,
+          action: "ENTER",
+        };
+      },
+    }),
+    resolveRunPreparationOwner: (market) => {
+      resolvedMarkets.push(market);
+      return "CONTROLLER";
+    },
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T01:00:00.000Z",
+      "2026-04-20T01:00:00.010Z",
+      "2026-04-20T01:00:01.000Z",
+      "2026-04-20T01:00:02.000Z",
+    ]),
+    setTimer: (callback) => {
+      scheduledCallbacks.push(callback);
+      const timer = setTimeout(callback, 0);
+      clearTimeout(timer);
+      return timer;
+    },
+  });
+
+  scheduler.start();
+  scheduledCallbacks[0]?.();
+  scheduledCallbacks[1]?.();
+  await waitForMicrotasks();
+  await waitForMicrotasks();
+  await waitForMicrotasks();
+
+  assert.deepEqual(resolvedMarkets, ["KRW-BTC"]);
+  assert.equal(scheduler.getStatus().markets[1]?.lastStatus, "SKIPPED");
+});
+
+test("run-on-start resolves ownership per market sequentially before later timers", async () => {
+  const calls: string[] = [];
+  const scheduledDelays: number[] = [];
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: true,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      markets: [
+        { market: "KRW-BTC", intervalMs: 1_800_000 },
+        { market: "KRW-ETH", intervalMs: 2_700_000 },
+      ],
+    },
+    controller: createController({
+      async requestRun(request) {
+        calls.push(`controller:${request.market}`);
+        return createController().requestRun(request);
+      },
+    }),
+    resolveRunPreparationOwner: (market) => {
+      calls.push(`resolve:${market}`);
+      return market === "KRW-BTC" ? "CONTROLLER" : "SCHEDULER";
+    },
+    beforeRunAccountRefresh: async () => {
+      calls.push("refresh");
+      return { status: "COMPLETED", requestedAt: "2026-04-20T00:00:00.000Z", detail: "ok" };
+    },
+    beforeRunPreflight: async () => {
+      calls.push("preflight");
+      return { checkedAt: "2026-04-20T00:00:01.000Z", scope: "LIVE", status: "PASS", detail: "ok", checks: [] };
+    },
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:01.000Z",
+      "2026-04-20T00:00:02.000Z",
+      "2026-04-20T00:00:03.000Z",
+    ]),
+    setTimer: (callback, delayMs) => {
+      scheduledDelays.push(delayMs);
+      const timer = setTimeout(callback, 0);
+      clearTimeout(timer);
+      return timer;
+    },
+  });
+
+  scheduler.start();
+  await waitForMicrotasks();
+  await waitForMicrotasks();
+
+  assert.deepEqual(calls, [
+    "resolve:KRW-BTC",
+    "controller:KRW-BTC",
+    "resolve:KRW-ETH",
+    "refresh",
+    "preflight",
+    "controller:KRW-ETH",
+  ]);
+  assert.deepEqual(scheduledDelays, [1_800_000, 2_700_000]);
+});
+
 function createController(
   overrides: Partial<TelegramStrategyRunController> = {},
 ): TelegramStrategyRunController {
