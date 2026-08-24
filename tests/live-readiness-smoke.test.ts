@@ -89,6 +89,67 @@ test("live readiness smoke preserves candidate initialization failure when every
   ]);
 });
 
+test("live readiness smoke preserves a continuation read failure when one cleanup step throws", async () => {
+  const events: string[] = [];
+  const originalError = new Error("balance_snapshot_failed");
+
+  await assert.rejects(
+    () => runLiveReadinessSmoke(() => createSmokeApp(events, {
+      async initialize() {
+        events.push("initializer:start");
+        await Promise.resolve();
+        events.push("initializer:complete");
+      },
+    }, ["telegram"], { read: "balance_snapshot", error: originalError })),
+    (error) => error === originalError,
+  );
+
+  assert.deepEqual(events, [
+    "initializer:start",
+    "initializer:complete",
+    "operator_state",
+    "active_orders",
+    "balance_snapshot",
+    "position_snapshot",
+    "reconciliation_runs",
+    "telegram:stop",
+    "scheduler:stop",
+    "persistence:close",
+  ]);
+});
+
+test("live readiness smoke preserves a continuation read failure when every cleanup step throws", async () => {
+  const events: string[] = [];
+  const originalError = new Error("balance_snapshot_failed");
+
+  await assert.rejects(
+    () => runLiveReadinessSmoke(() => createSmokeApp(events, {
+      async initialize() {
+        events.push("initializer:start");
+        await Promise.resolve();
+        events.push("initializer:complete");
+      },
+    }, ["telegram", "scheduler", "persistence"], {
+      read: "balance_snapshot",
+      error: originalError,
+    })),
+    (error) => error === originalError,
+  );
+
+  assert.deepEqual(events, [
+    "initializer:start",
+    "initializer:complete",
+    "operator_state",
+    "active_orders",
+    "balance_snapshot",
+    "position_snapshot",
+    "reconciliation_runs",
+    "telegram:stop",
+    "scheduler:stop",
+    "persistence:close",
+  ]);
+});
+
 test("live readiness smoke rejects successful result when one cleanup step fails", async () => {
   const events: string[] = [];
 
@@ -350,6 +411,7 @@ function createSmokeApp(
   events: string[],
   candidatePilotInitializer: CandidatePilotInitializer,
   failingCleanupSteps: readonly CleanupStep[] = [],
+  persistedReadFailure: PersistedReadFailure | null = null,
 ): AppServices {
   return {
     candidatePilotInitializer: candidatePilotInitializer as AppServices["candidatePilotInitializer"],
@@ -362,6 +424,7 @@ function createSmokeApp(
     operatorState: {
       async getState() {
         events.push("operator_state");
+        throwPersistedReadFailure("operator_state", persistedReadFailure);
         return createExecutionState({
           executionMode: "LIVE",
           liveExecutionGate: "ENABLED",
@@ -371,18 +434,22 @@ function createSmokeApp(
     repositories: {
       async listActiveOrders() {
         events.push("active_orders");
+        throwPersistedReadFailure("active_orders", persistedReadFailure);
         return [];
       },
       async getLatestBalanceSnapshot() {
         events.push("balance_snapshot");
+        throwPersistedReadFailure("balance_snapshot", persistedReadFailure);
         return null;
       },
       async getLatestPositionSnapshot() {
         events.push("position_snapshot");
+        throwPersistedReadFailure("position_snapshot", persistedReadFailure);
         return null;
       },
       async listReconciliationRuns() {
         events.push("reconciliation_runs");
+        throwPersistedReadFailure("reconciliation_runs", persistedReadFailure);
         return [];
       },
     } as never,
@@ -416,9 +483,22 @@ function createSmokeApp(
 }
 
 type CleanupStep = "telegram" | "scheduler" | "persistence";
+type PersistedRead =
+  | "operator_state"
+  | "active_orders"
+  | "balance_snapshot"
+  | "position_snapshot"
+  | "reconciliation_runs";
+type PersistedReadFailure = { readonly read: PersistedRead; readonly error: Error };
 
 function throwWhenRequested(step: CleanupStep, failingCleanupSteps: readonly CleanupStep[]): void {
   if (failingCleanupSteps.includes(step)) {
     throw new Error(`${step}_cleanup_failed`);
+  }
+}
+
+function throwPersistedReadFailure(read: PersistedRead, failure: PersistedReadFailure | null): void {
+  if (failure?.read === read) {
+    throw failure.error;
   }
 }
