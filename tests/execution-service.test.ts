@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import type { ExecutionStateRecord } from "../src/domain/types.js";
+import type { ExecutionStateRecord, OrderRecord } from "../src/domain/types.js";
 import { ExecutionService } from "../src/modules/execution/execution-service.js";
 import type { SubmissionOutcome, SubmitOrderFromDecisionResult } from "../src/modules/execution/interfaces.js";
 import {
@@ -100,6 +100,83 @@ test("submission outcomes require an explicit discriminant", () => {
 
   assert.equal(outcomes.length, 6);
   assert.equal(result.outcome, "SIMULATED_FILLED");
+});
+
+test("baseline final send requires its own exact persisted SUBMITTING intent", async () => {
+  for (const mutation of ["MISSING", "TERMINAL", "IMMUTABLE"] as const) {
+    const operatorState = new InMemoryOperatorStateStore({
+      id: `baseline-final-state-${mutation}`,
+      exchangeAccountId: "primary",
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-04-20T00:00:00.000Z",
+    });
+    const repositories = new BaselineFinalAuthorityRepository(mutation);
+    await repositories.saveBalanceSnapshot({
+      id: `baseline-final-balance-${mutation}`,
+      exchangeAccountId: "primary",
+      capturedAt: "2026-04-20T00:00:00.000Z",
+      source: "EXCHANGE_POLL",
+      totalKrwValue: "10000000",
+      balancesJson: "[]",
+    });
+    await repositories.savePositionSnapshot({
+      id: `baseline-final-position-${mutation}`,
+      exchangeAccountId: "primary",
+      capturedAt: "2026-04-20T00:00:00.000Z",
+      source: "EXCHANGE_POLL",
+      positionsJson: "[]",
+    });
+    const adapter = countingLiveAdapter();
+    const service = new ExecutionService({
+      riskLimits: {
+        maxAllocationByAsset: { BTC: 0.6, ETH: 0.6 },
+        totalExposureCap: 0.75,
+        stalePriceThresholdMs: 30_000,
+        minimumOrderValueKrw: 5_000,
+      },
+      executionAdapter: adapter.adapter,
+      validationAdapter: adapter.adapter,
+      repositories,
+      accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
+      accountExecutionLeaseMs: 30_000,
+      operatorState,
+      now: () => "2026-04-20T00:00:20.000Z",
+    });
+
+    await assert.rejects(
+      () => service.submitOrderFromDecision({
+        exchangeAccountId: "primary",
+        strategyDecisionId: `baseline-final-decision-${mutation}`,
+        referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
+        decision: {
+          strategyKey: "deterministic.stub.v1",
+          market: "KRW-BTC",
+          action: "ENTER",
+          reasonCodes: ["BASELINE_FINAL_AUTHORITY_TEST"],
+          referencePrice: 100_000_000,
+          requestedNotionalKrw: 100_000,
+          requestedQuantity: 0.001,
+          metadata: {},
+        },
+        side: "bid",
+        ordType: "limit",
+        price: "100000000",
+        volume: "0.001",
+      }),
+      /final pre-send authority|lease/i,
+      mutation,
+    );
+
+    assert.equal(adapter.createOrderCalls(), 0, mutation);
+    assert.equal((await operatorState.getState()).systemStatus, "PAUSED", mutation);
+    assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING", mutation);
+  }
 });
 
 test("execution service persists a dry-run order and blocks duplicate idempotent submissions", async () => {
@@ -942,6 +1019,66 @@ test("execution service records lifecycle evidence from the live execution adapt
   assert.equal(events.some((event) => event.eventType === "ORDER_FILLED"), false);
   assert.equal(fills.length, 0);
 });
+
+class BaselineFinalAuthorityRepository extends InMemoryExecutionRepository {
+  private finalReadsArmed = false;
+
+  constructor(private readonly mutation: "MISSING" | "TERMINAL" | "IMMUTABLE") {
+    super();
+  }
+
+  override async updateOrder(record: OrderRecord): Promise<void> {
+    await super.updateOrder(record);
+    if (record.status === "SUBMITTING") this.finalReadsArmed = true;
+  }
+
+  override async listActiveOrders(
+    exchangeAccountId: string,
+    market?: "KRW-BTC" | "KRW-ETH",
+    limit?: number,
+  ): Promise<OrderRecord[]> {
+    const orders = await super.listActiveOrders(exchangeAccountId, market, limit);
+    if (!this.finalReadsArmed) return orders;
+    if (this.mutation === "MISSING") return [];
+    return orders.map((order) => this.mutation === "TERMINAL"
+      ? { ...order, status: "FILLED" }
+      : { ...order, price: "99999999" });
+  }
+
+  override async findOrderById(exchangeAccountId: string, orderId: string): Promise<OrderRecord | null> {
+    const order = await super.findOrderById(exchangeAccountId, orderId);
+    if (!this.finalReadsArmed || !order) return order;
+    if (this.mutation === "MISSING") return null;
+    return this.mutation === "TERMINAL"
+      ? { ...order, status: "FILLED" }
+      : { ...order, price: "99999999" };
+  }
+}
+
+function countingLiveAdapter(): Readonly<{
+  adapter: ExecutionExchangeAdapter;
+  createOrderCalls(): number;
+}> {
+  const baseAdapter = new DryRunExchangeAdapter();
+  let calls = 0;
+  return {
+    adapter: {
+      sendPath: "LIVE_ADAPTER",
+      getBalances: baseAdapter.getBalances.bind(baseAdapter),
+      getOrderChance: baseAdapter.getOrderChance.bind(baseAdapter),
+      testOrder: baseAdapter.testOrder.bind(baseAdapter),
+      async createOrder(request) {
+        calls += 1;
+        return baseAdapter.createOrder(request);
+      },
+      cancelOrder: baseAdapter.cancelOrder.bind(baseAdapter),
+      getOrder: baseAdapter.getOrder.bind(baseAdapter),
+      listOpenOrders: baseAdapter.listOpenOrders.bind(baseAdapter),
+      listClosedOrders: baseAdapter.listClosedOrders.bind(baseAdapter),
+    },
+    createOrderCalls: () => calls,
+  };
+}
 
 function createLiveExecutionAdapter(): ExecutionExchangeAdapter {
   const baseAdapter = new DryRunExchangeAdapter();

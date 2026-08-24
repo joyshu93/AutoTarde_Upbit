@@ -50,6 +50,8 @@ export interface ExchangeOrderSnapshot {
   state: string;
   price: string | null;
   volume: string | null;
+  timeInForce?: TimeInForce | null;
+  smpType?: UpbitSelfMatchPrevention | null;
   remainingVolume: string | null;
   executedVolume: string | null;
   paidFee: string | null;
@@ -157,17 +159,19 @@ export class DryRunExchangeAdapter implements DryRunExecutionAdapter {
         side: "bid",
         ordType: "limit",
         state: "cancel",
-    price: null,
-    volume: null,
-    remainingVolume: null,
-    executedVolume: null,
-    paidFee: null,
-    createdAt: new Date().toISOString(),
-    fills: [],
-    raw: { mode: "DRY_RUN" },
-  },
-  reason: null,
-};
+        price: null,
+        volume: null,
+        timeInForce: null,
+        smpType: null,
+        remainingVolume: null,
+        executedVolume: null,
+        paidFee: null,
+        createdAt: new Date().toISOString(),
+        fills: [],
+        raw: { mode: "DRY_RUN" },
+      },
+      reason: null,
+    };
   }
 
   async getOrder(query: { uuid?: string; identifier?: string }): Promise<ExchangeOrderSnapshot | null> {
@@ -184,6 +188,8 @@ export class DryRunExchangeAdapter implements DryRunExecutionAdapter {
       state: "wait",
       price: "0",
       volume: "0",
+      timeInForce: null,
+      smpType: null,
       remainingVolume: "0",
       executedVolume: "0",
       paidFee: "0",
@@ -212,6 +218,8 @@ function buildDryRunSnapshot(request: UpbitOrderRequest, state: string): Exchang
     state,
     price: request.price,
     volume: request.volume,
+    timeInForce: request.timeInForce,
+    smpType: request.smpType,
     remainingVolume: request.volume,
     executedVolume: "0",
     paidFee: "0",

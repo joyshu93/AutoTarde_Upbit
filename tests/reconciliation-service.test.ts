@@ -2240,6 +2240,178 @@ test("submission recovery uses a persisted UUID before identifier fallback and n
   assert.deepEqual(observations.map((observation) => observation.outcome), ["FOUND"]);
 });
 
+test("submission recovery accepts canonical Upbit market-ask decimal normalization", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = pausedUncertainSubmissionState();
+  const order = uncertainSubmissionOrder({
+    id: "market-ask-normalization",
+    side: "ask",
+    ordType: "market",
+    price: null,
+    volume: "0.1",
+    identifier: "market-ask-normalization-identifier",
+  });
+  await repositories.saveOrder(order);
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: {
+      async getOrder() {
+        return {
+          uuid: "market-ask-normalization-uuid",
+          identifier: order.identifier,
+          market: order.market,
+          side: "ask" as const,
+          ordType: "market" as const,
+          state: "done",
+          price: null,
+          volume: "0.10000000",
+          remainingVolume: "0",
+          executedVolume: "0.10000000",
+          paidFee: "0",
+          createdAt: order.requestedAt,
+          fills: [],
+          raw: { state: "done" },
+        };
+      },
+    },
+    recoveryClock: {
+      now: () => ({ observedAt: "2026-08-21T00:00:02.000Z", observedAtEpochMs: 1_787_270_402_000 }),
+    },
+  });
+
+  const result = await reconciliation.recoverOrderByIdentifier(order);
+
+  assert.equal(result.outcome, "RECOVERED");
+  assert.equal((await repositories.findOrderByReference("primary", order.id))?.status, "FILLED");
+});
+
+test("submission recovery rejects foreign or immutable-material-mismatched snapshots without importing fills", async () => {
+  const mutations: ReadonlyArray<Readonly<{
+    label: string;
+    mutate(snapshot: Record<string, unknown>): void;
+  }>> = [
+    { label: "uuid", mutate: (snapshot) => { snapshot.uuid = "foreign-uuid"; } },
+    { label: "identifier", mutate: (snapshot) => { snapshot.identifier = "foreign-identifier"; } },
+    { label: "market", mutate: (snapshot) => { snapshot.market = "KRW-ETH"; } },
+    { label: "side", mutate: (snapshot) => { snapshot.side = "ask"; } },
+    { label: "ordType", mutate: (snapshot) => { snapshot.ordType = "limit"; } },
+    { label: "price", mutate: (snapshot) => { snapshot.price = "9999999"; } },
+    { label: "volume", mutate: (snapshot) => { snapshot.volume = "0.1"; } },
+    { label: "timeInForce", mutate: (snapshot) => { snapshot.timeInForce = "ioc"; } },
+    { label: "smpType", mutate: (snapshot) => { snapshot.smpType = "reduce"; } },
+  ];
+
+  for (const mutation of mutations) {
+    const repositories = new InMemoryExecutionRepository();
+    const operatorState = pausedUncertainSubmissionState();
+    const order = uncertainSubmissionOrder({
+      id: `snapshot-binding-${mutation.label}`,
+      upbitUuid: `uuid-${mutation.label}`,
+      identifier: `identifier-${mutation.label}`,
+      idempotencyKey: `identifier-${mutation.label}`,
+    });
+    await repositories.saveOrder(order);
+    const snapshot: Record<string, unknown> = {
+      uuid: order.upbitUuid,
+      identifier: order.identifier,
+      market: order.market,
+      side: order.side,
+      ordType: order.ordType,
+      state: "done",
+      price: order.price,
+      volume: order.volume,
+      timeInForce: order.timeInForce,
+      smpType: order.smpType,
+      remainingVolume: "0",
+      executedVolume: "0.1",
+      paidFee: "500",
+      createdAt: order.requestedAt,
+      fills: [{
+        tradeUuid: `foreign-fill-${mutation.label}`,
+        side: order.side,
+        price: "100000000",
+        volume: "0.1",
+        funds: "10000000",
+        fee: "500",
+        createdAt: "2026-08-21T00:00:01.000Z",
+        raw: {},
+      }],
+      raw: { state: "done" },
+    };
+    mutation.mutate(snapshot);
+    const reconciliation = new ReconciliationService({
+      repositories,
+      operatorState,
+      orderReader: { async getOrder() { return snapshot as never; } },
+      recoveryClock: {
+        now: () => ({
+          observedAt: "2026-08-21T00:00:02.000Z",
+          observedAtEpochMs: 1_787_270_402_000,
+        }),
+      },
+    });
+
+    const result = await reconciliation.recoverOrderByIdentifier(order);
+
+    assert.equal(result.outcome, "TRANSIENT_FAILURE", mutation.label);
+    assert.equal((await repositories.findOrderByReference("primary", order.id))?.status, order.status, mutation.label);
+    assert.deepEqual(await repositories.listFills(order.id), [], mutation.label);
+    assert.deepEqual(
+      (await repositories.listOrderSubmissionRecoveryObservations(order.id)).map((entry) => entry.outcome),
+      ["TRANSIENT_FAILURE"],
+      mutation.label,
+    );
+  }
+});
+
+test("submission recovery rejects accessor-backed snapshots without invoking hostile getters", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = pausedUncertainSubmissionState();
+  const order = uncertainSubmissionOrder({ id: "snapshot-accessor", upbitUuid: "snapshot-accessor-uuid" });
+  await repositories.saveOrder(order);
+  let getterCalls = 0;
+  const snapshot = {
+    uuid: order.upbitUuid,
+    identifier: order.identifier,
+    market: order.market,
+    side: order.side,
+    ordType: order.ordType,
+    state: "done",
+    price: order.price,
+    volume: order.volume,
+    timeInForce: order.timeInForce,
+    smpType: order.smpType,
+    remainingVolume: "0",
+    executedVolume: "0.1",
+    paidFee: "500",
+    createdAt: order.requestedAt,
+    fills: [],
+    raw: {},
+  } as Record<string, unknown>;
+  Object.defineProperty(snapshot, "uuid", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      throw new Error("hostile snapshot getter invoked");
+    },
+  });
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: { async getOrder() { return snapshot as never; } },
+    recoveryClock: {
+      now: () => ({ observedAt: "2026-08-21T00:00:02.000Z", observedAtEpochMs: 1_787_270_402_000 }),
+    },
+  });
+
+  const result = await reconciliation.recoverOrderByIdentifier(order);
+
+  assert.equal(result.outcome, "TRANSIENT_FAILURE");
+  assert.equal(getterCalls, 0);
+  assert.deepEqual(await repositories.listFills(order.id), []);
+});
+
 test("recovered terminal projection failures persist a fault marker and pause execution", async () => {
   const operatorState = new InMemoryOperatorStateStore({
     id: "state-recovered-projection-failure",

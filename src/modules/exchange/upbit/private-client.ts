@@ -1,4 +1,9 @@
-import type { ExchangeBalance, SupportedMarket } from "../../../domain/types.js";
+import type {
+  ExchangeBalance,
+  SupportedMarket,
+  TimeInForce,
+  UpbitSelfMatchPrevention,
+} from "../../../domain/types.js";
 import { ExchangeOrderLookupError, ExchangeOrderSubmissionError } from "../errors.js";
 import type {
   CancelOrderResult,
@@ -42,6 +47,8 @@ interface UpbitOrderResponse {
   state: string;
   price?: string | null;
   volume?: string | null;
+  time_in_force?: TimeInForce | null;
+  smp_type?: UpbitSelfMatchPrevention | null;
   remaining_volume?: string | null;
   executed_volume?: string | null;
   paid_fee?: string | null;
@@ -385,6 +392,10 @@ function isValidOrderSubmissionResponse(response: unknown): response is UpbitOrd
     isOptionalStringOrNull(response.identifier) &&
     isOptionalStringOrNull(response.price) &&
     isOptionalStringOrNull(response.volume) &&
+    (response.time_in_force === undefined || response.time_in_force === null ||
+      response.time_in_force === "ioc" || response.time_in_force === "fok" || response.time_in_force === "post_only") &&
+    (response.smp_type === undefined || response.smp_type === null ||
+      response.smp_type === "cancel_maker" || response.smp_type === "cancel_taker" || response.smp_type === "reduce") &&
     isOptionalStringOrNull(response.remaining_volume) &&
     isOptionalStringOrNull(response.executed_volume) &&
     isOptionalStringOrNull(response.paid_fee) &&
@@ -455,6 +466,8 @@ function mapOrderResponse(response: UpbitOrderResponse): ExchangeOrderSnapshot {
     state: response.state,
     price: response.price ?? null,
     volume: response.volume ?? null,
+    timeInForce: response.time_in_force ?? null,
+    smpType: response.smp_type ?? null,
     remainingVolume: response.remaining_volume ?? null,
     executedVolume: response.executed_volume ?? null,
     paidFee: response.paid_fee ?? null,

@@ -45,6 +45,35 @@ import { parseCandidateEvidenceTimestamp } from "./candidate-evidence-decimals.j
 
 const CANDIDATE_FINAL_ORDER_SCAN_LIMIT = 100;
 
+const EXACT_ORDER_RECORD_FIELDS = Object.freeze([
+  "id",
+  "strategyDecisionId",
+  "exchangeAccountId",
+  "market",
+  "side",
+  "ordType",
+  "volume",
+  "price",
+  "timeInForce",
+  "smpType",
+  "identifier",
+  "idempotencyKey",
+  "origin",
+  "requestedAt",
+  "upbitUuid",
+  "status",
+  "executionMode",
+  "exchangeResponseJson",
+  "failureCode",
+  "failureMessage",
+  "createdAt",
+  "updatedAt",
+] as const satisfies readonly (keyof OrderRecord)[]);
+
+function sameOrderRecord(left: OrderRecord, right: OrderRecord): boolean {
+  return EXACT_ORDER_RECORD_FIELDS.every((field) => left[field] === right[field]);
+}
+
 export class ExecutionService {
   constructor(
     private readonly dependencies: {
@@ -497,6 +526,7 @@ export class ExecutionService {
       const authorityBlockedByOrders = await this.assertFinalPreSendAuthority({
         exchangeAccountId: input.exchangeAccountId,
         orderId: order.id,
+        expectedOrder: submittingOrder,
         candidate: candidateContext && candidateBinding
           ? {
               authority: candidateContext.authority,
@@ -972,6 +1002,7 @@ export class ExecutionService {
   private async assertFinalPreSendAuthority(input: {
     exchangeAccountId: string;
     orderId: string;
+    expectedOrder: OrderRecord;
     candidate: {
       authority: CandidateExecutionAuthority;
       expectedOrder: OrderRecord;
@@ -990,10 +1021,26 @@ export class ExecutionService {
     let hasCompetingOrder = false;
     for (const activeOrder of activeOrders) {
       if (activeOrder.id === input.orderId) {
+        if (expectedOrderIsActive || !sameOrderRecord(activeOrder, input.expectedOrder)) {
+          throw new Error("final persisted order scan is ambiguous or mutated");
+        }
         expectedOrderIsActive = true;
       } else {
         hasCompetingOrder = true;
       }
+    }
+
+    const persistedOrder = await this.dependencies.repositories.findOrderById(
+      input.exchangeAccountId,
+      input.orderId,
+    );
+    if (
+      !expectedOrderIsActive ||
+      !persistedOrder ||
+      persistedOrder.status !== "SUBMITTING" ||
+      !sameOrderRecord(persistedOrder, input.expectedOrder)
+    ) {
+      throw new Error("final persisted SUBMITTING order authority changed");
     }
 
     if (input.candidate) {
@@ -1001,10 +1048,6 @@ export class ExecutionService {
       if (!candidatePilots || !this.dependencies.repositories.getStrategyDecisionById) {
         throw new Error("candidate final pre-send dependencies are unavailable");
       }
-      const persistedOrder = await this.dependencies.repositories.findOrderById(
-        input.exchangeAccountId,
-        input.orderId,
-      );
       const events = await this.dependencies.repositories.listOrderEvents(input.orderId);
       const firstEvent = events[0] ?? null;
       const getDecision = this.dependencies.repositories.getStrategyDecisionById;
@@ -1017,7 +1060,7 @@ export class ExecutionService {
       const binding = await candidatePilots.getExecutionBindingForOrder(input.orderId);
       if (
         activeOrders.length > CANDIDATE_FINAL_ORDER_SCAN_LIMIT ||
-        !expectedOrderIsActive || hasCompetingOrder || !persistedOrder ||
+        hasCompetingOrder ||
         events.length !== 1 || !firstEvent || !decision || !deployment || !exactState || !binding
       ) {
         throw new Error("candidate final persisted authority or intent material changed");
@@ -1041,9 +1084,7 @@ export class ExecutionService {
         expectedStateVersion: input.candidate.authority.expectedStateVersion,
       });
     }
-    return input.candidate
-      ? !expectedOrderIsActive || hasCompetingOrder
-      : hasCompetingOrder;
+    return hasCompetingOrder;
   }
 
   private async recordLeaseBlockedAndPause(input: {

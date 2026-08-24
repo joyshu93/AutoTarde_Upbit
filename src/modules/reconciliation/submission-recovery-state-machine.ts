@@ -23,6 +23,7 @@ export function evaluateBoundedAbsence(
   observations: readonly OrderSubmissionRecoveryObservationRecord[],
   policy: BoundedAbsencePolicy,
 ): BoundedAbsenceEvaluation {
+  const hasDurableFoundEvidence = observations.some((observation) => observation.outcome === "FOUND");
   const absence = observations
     .filter((observation) => observation.outcome === "NOT_FOUND")
     .sort((left, right) => left.observedAtEpochMs - right.observedAtEpochMs ||
@@ -33,6 +34,9 @@ export function evaluateBoundedAbsence(
   return {
     notFoundObservationCount: absence.length,
     elapsedMs,
-    confirmed: absence.length >= policy.minimumNotFoundObservations && elapsedMs >= policy.minimumElapsedMs,
+    confirmed:
+      !hasDurableFoundEvidence &&
+      absence.length >= policy.minimumNotFoundObservations &&
+      elapsedMs >= policy.minimumElapsedMs,
   };
 }

@@ -24,6 +24,10 @@ import {
   isPotentiallyDispatchedRecoveryStatus,
 } from "./submission-recovery-state-machine.js";
 import {
+  bindExchangeOrderSnapshot,
+  ExchangeOrderSnapshotBindingError,
+} from "./exchange-order-snapshot-binding.js";
+import {
   DEFAULT_MAX_TERMINAL_CANDIDATE_PROJECTIONS_PER_RUN,
   TerminalCandidateProjectionSweep,
 } from "./terminal-candidate-sweep.js";
@@ -188,13 +192,24 @@ export class ReconciliationService {
       for (const query of queries) {
         const candidate = await this.dependencies.orderReader.getOrder(query);
         if (candidate) {
-          snapshot = candidate;
+          snapshot = bindExchangeOrderSnapshot({ candidate, query, order });
           matchedQuery = query;
           break;
         }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown identifier recovery lookup failure.";
+      if (error instanceof ExchangeOrderSnapshotBindingError) {
+        await this.recordRecoveryObservation(order, "TRANSIENT_FAILURE", now, {
+          attemptedQueries: queries,
+          reasonCode: "EXCHANGE_SNAPSHOT_BINDING_MISMATCH",
+        });
+        return {
+          outcome: "TRANSIENT_FAILURE",
+          orderId: order.id,
+          detail: "Exchange snapshot binding validation failed; manual reconciliation is required.",
+        };
+      }
       if (isTypedTransientLookupError(error)) {
         await this.recordRecoveryObservation(order, "TRANSIENT_FAILURE", now, {
           attemptedQueries: queries,
@@ -981,10 +996,12 @@ export class ReconciliationService {
 
     let snapshot: ExchangeOrderSnapshot | null;
     try {
-      snapshot = await this.dependencies.orderReader.getOrder({
+      const query = {
         ...(order.upbitUuid ? { uuid: order.upbitUuid } : {}),
         ...(order.identifier ? { identifier: order.identifier } : {}),
-      });
+      };
+      const candidate = await this.dependencies.orderReader.getOrder(query);
+      snapshot = candidate ? bindExchangeOrderSnapshot({ candidate, query, order }) : null;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown reconciliation query failure.";
       if (isTypedTransientLookupError(error)) {
@@ -1050,10 +1067,12 @@ export class ReconciliationService {
 
     let snapshot: ExchangeOrderSnapshot | null;
     try {
-      snapshot = await this.dependencies.orderReader.getOrder({
+      const query = {
         ...(order.upbitUuid ? { uuid: order.upbitUuid } : {}),
         ...(order.identifier ? { identifier: order.identifier } : {}),
-      });
+      };
+      const candidate = await this.dependencies.orderReader.getOrder(query);
+      snapshot = candidate ? bindExchangeOrderSnapshot({ candidate, query, order }) : null;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown terminal reconciliation query failure.";
       if (isTypedTransientLookupError(error)) {
