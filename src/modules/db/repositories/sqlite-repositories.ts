@@ -60,6 +60,8 @@ import type {
   PersistCandidateBoundOrderIntentRequest,
   PersistExchangeSubmissionInput,
   PersistOrderIntentInput,
+  PersistReconciledExchangeSnapshotInput,
+  PersistReconciledExchangeSnapshotResult,
   PersistUncertainSubmissionInput,
   TelegramInboundOffsetStore,
 } from "../interfaces.js";
@@ -82,11 +84,14 @@ import {
   faultPauseTransitionMatchesOccurrence,
   recordsEqual,
   normalizeFillFeeProvenance,
+  resolveImmutableFillReplay,
   validateExchangeSubmissionInput,
   validateExchangeSubmissionCompletion,
   validateFaultPauseInput,
   validateFaultPauseTimestamp,
   validateOrderIntentInput,
+  validateFillForOrder,
+  validateReconciledExchangeSnapshotInput,
   validateUncertainSubmissionCompletion,
   validateUncertainSubmissionInput,
 } from "./atomic-lifecycle-validation.js";
@@ -429,7 +434,51 @@ export class SqliteExecutionRepository implements ExecutionRepository {
       this.upsertOrder(normalizedInput.order);
       this.insertOrderEvent(normalizedInput.event);
       if (normalizedInput.terminalEvent) this.insertOrderEvent(normalizedInput.terminalEvent);
-      normalizedInput.fills.forEach((fill) => this.upsertFill(fill));
+      normalizedInput.fills.forEach((fill) => this.insertFill(fill));
+    });
+  }
+
+  async persistReconciledExchangeSnapshot(
+    input: PersistReconciledExchangeSnapshotInput,
+  ): Promise<PersistReconciledExchangeSnapshotResult> {
+    return withImmediateTransaction(this.db, () => {
+      const normalizedInput = {
+        ...input,
+        fills: input.fills.map(normalizeFillFeeProvenance),
+      };
+      validateReconciledExchangeSnapshotInput(normalizedInput);
+      const currentOrder = this.getOrderById(normalizedInput.order.id);
+      if (!currentOrder) {
+        throw new Error(`Cannot persist reconciliation for missing order ${normalizedInput.order.id}.`);
+      }
+      if (!recordsEqual(currentOrder, normalizedInput.expectedOrder)) {
+        throw new Error(`Reconciliation expected order ${normalizedInput.order.id} changed concurrently.`);
+      }
+
+      const existingEvent = normalizedInput.event
+        ? this.getOrderEventById(normalizedInput.event.id)
+        : null;
+      if (normalizedInput.event) {
+        assertNoConflictingRecord(existingEvent, normalizedInput.event, "reconciliation order event");
+      }
+      const fillResolutions = normalizedInput.fills.map((fill) => ({
+        fill,
+        resolution: resolveImmutableFillReplay(this.getFillByIdentity(fill), fill),
+      }));
+      const insertedFills = fillResolutions
+        .filter(({ resolution }) => resolution === "INSERT")
+        .map(({ fill }) => fill);
+      const orderChanged = !recordsEqual(currentOrder, normalizedInput.order);
+      const eventInserted = normalizedInput.event !== null && existingEvent === null;
+
+      this.upsertOrder(normalizedInput.order);
+      if (eventInserted) this.insertOrderEvent(normalizedInput.event!);
+      insertedFills.forEach((fill) => this.insertFill(fill));
+
+      return {
+        outcome: orderChanged || eventInserted || insertedFills.length > 0 ? "APPLIED" : "DUPLICATE",
+        insertedFillCount: insertedFills.length,
+      };
     });
   }
 
@@ -577,28 +626,25 @@ export class SqliteExecutionRepository implements ExecutionRepository {
   }
 
   async saveFill(record: FillRecord): Promise<void> {
-    this.upsertFill(normalizeFillFeeProvenance(record));
+    withImmediateTransaction(this.db, () => {
+      const normalizedRecord = normalizeFillFeeProvenance(record);
+      const order = this.getOrderById(normalizedRecord.orderId);
+      if (!order) throw new Error(`Cannot persist fill for missing order ${normalizedRecord.orderId}.`);
+      validateFillForOrder(order, normalizedRecord);
+      const existing = this.getFillByIdentity(normalizedRecord);
+      if (resolveImmutableFillReplay(existing, normalizedRecord) === "INSERT") {
+        this.insertFill(normalizedRecord);
+      }
+    });
   }
 
-  private upsertFill(record: FillRecord): void {
+  private insertFill(record: FillRecord): void {
     this.db.prepare(`
       INSERT INTO fills (
         id, order_id, exchange_fill_id, market, side, price, volume,
         fee_currency, fee_amount, fee_provenance, execution_timestamp_provenance,
         execution_epoch_ns, filled_at, raw_payload_json
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(order_id, exchange_fill_id) DO UPDATE SET
-        market = excluded.market,
-        side = excluded.side,
-        price = excluded.price,
-        volume = excluded.volume,
-        fee_currency = excluded.fee_currency,
-        fee_amount = excluded.fee_amount,
-        fee_provenance = excluded.fee_provenance,
-        execution_timestamp_provenance = excluded.execution_timestamp_provenance,
-        execution_epoch_ns = excluded.execution_epoch_ns,
-        filled_at = excluded.filled_at,
-        raw_payload_json = excluded.raw_payload_json
     `).run(
       record.id,
       record.orderId,

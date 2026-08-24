@@ -989,7 +989,7 @@ export class ReconciliationService {
         return [await this.markOrderForRecovery(order, reconciledAt, "Exchange order snapshot could not be found.")];
       }
 
-      return this.applyExchangeSnapshot(order, snapshot, reconciledAt);
+      return await this.applyExchangeSnapshot(order, snapshot, reconciledAt);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown reconciliation query failure.";
       if (isTypedTransientLookupError(error)) {
@@ -1099,8 +1099,6 @@ export class ReconciliationService {
     reconciledAt: string,
   ): Promise<ReconciliationSummary["issues"]> {
     const issues: ReconciliationSummary["issues"] = [];
-    const existingFills = await this.dependencies.repositories.listFills(order.id);
-    const existingFillIds = new Set(existingFills.map((fill) => fill.exchangeFillId));
     const nextStatus = mapExchangeOrderToLifecycleStatus(snapshot);
 
     const nextOrder: OrderRecord = {
@@ -1111,17 +1109,16 @@ export class ReconciliationService {
       updatedAt: reconciledAt,
     };
 
-    if (
+    const orderChanged =
       nextOrder.status !== order.status ||
       nextOrder.upbitUuid !== order.upbitUuid ||
-      nextOrder.exchangeResponseJson !== order.exchangeResponseJson
-    ) {
-      await this.dependencies.repositories.updateOrder(nextOrder);
-      await this.dependencies.repositories.appendOrderEvent({
+      nextOrder.exchangeResponseJson !== order.exchangeResponseJson;
+    const reconciliationEvent = orderChanged
+      ? {
         id: createId("order_event"),
         orderId: order.id,
         eventType: "RECONCILIATION_STATUS_UPDATED",
-        eventSource: "RECONCILIATION",
+        eventSource: "RECONCILIATION" as const,
         payloadJson: JSON.stringify({
           previousStatus: order.status,
           nextStatus,
@@ -1130,8 +1127,20 @@ export class ReconciliationService {
           remainingVolume: snapshot.remainingVolume,
         }),
         createdAt: reconciledAt,
-      });
+      }
+      : null;
+    const persistSnapshot = this.dependencies.repositories.persistReconciledExchangeSnapshot;
+    if (!persistSnapshot) {
+      throw new Error("Atomic reconciled exchange snapshot persistence is unavailable.");
+    }
+    const persistence = await persistSnapshot.call(this.dependencies.repositories, {
+      expectedOrder: order,
+      order: orderChanged ? nextOrder : order,
+      event: reconciliationEvent,
+      fills: buildFillRecords(order, snapshot),
+    });
 
+    if (orderChanged) {
       if (nextStatus !== order.status) {
         issues.push({
           code: "ORDER_STATUS_RECONCILED",
@@ -1140,19 +1149,10 @@ export class ReconciliationService {
       }
     }
 
-    let newFillCount = 0;
-    for (const fillRecord of buildFillRecords(order, snapshot)) {
-      if (!existingFillIds.has(fillRecord.exchangeFillId)) {
-        newFillCount += 1;
-        existingFillIds.add(fillRecord.exchangeFillId);
-      }
-      await this.dependencies.repositories.saveFill(fillRecord);
-    }
-
-    if (newFillCount > 0) {
+    if (persistence.insertedFillCount > 0) {
       issues.push({
         code: "ORDER_FILLS_BACKFILLED",
-        message: `Backfilled ${newFillCount} fill(s) for order ${order.id} from exchange snapshot.`,
+        message: `Backfilled ${persistence.insertedFillCount} fill(s) for order ${order.id} from exchange snapshot.`,
       });
     }
 

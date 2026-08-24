@@ -9,6 +9,7 @@ import type {
   FaultPauseInput,
   PersistExchangeSubmissionInput,
   PersistOrderIntentInput,
+  PersistReconciledExchangeSnapshotInput,
   PersistUncertainSubmissionInput,
 } from "../interfaces.js";
 
@@ -182,6 +183,68 @@ export function normalizeFillFeeProvenance(record: FillRecord): FillRecord {
   };
 }
 
+export function validateReconciledExchangeSnapshotInput(
+  input: PersistReconciledExchangeSnapshotInput,
+): void {
+  validateOrderIdentity(input.expectedOrder, input.order);
+  const orderChanged = !recordsEqual(input.expectedOrder, input.order);
+  if (orderChanged !== (input.event !== null)) {
+    throw new Error("Reconciled order changes require exactly one reconciliation event.");
+  }
+  if (
+    input.event &&
+    (
+      input.event.orderId !== input.order.id ||
+      input.event.eventType !== "RECONCILIATION_STATUS_UPDATED" ||
+      input.event.eventSource !== "RECONCILIATION"
+    )
+  ) {
+    throw new Error(`Reconciliation event ${input.event.id} is invalid for order ${input.order.id}.`);
+  }
+
+  const ids = new Set<string>();
+  const exchangeIdentities = new Set<string>();
+  for (const fill of input.fills) {
+    validateFillForOrder(input.order, fill);
+    const exchangeIdentity = fillExchangeIdentity(fill);
+    if (ids.has(fill.id) || exchangeIdentities.has(exchangeIdentity)) {
+      throw new Error(`Duplicate fill identity ${fill.id} in reconciled order ${input.order.id}.`);
+    }
+    ids.add(fill.id);
+    exchangeIdentities.add(exchangeIdentity);
+  }
+}
+
+export function validateFillForOrder(order: OrderRecord, fill: FillRecord): void {
+  if (fill.orderId !== order.id || fill.market !== order.market || fill.side !== order.side) {
+    throw new Error(`Fill ${fill.id} identity does not match order ${order.id}.`);
+  }
+  validateExactDecimal(fill.price, "fill price", false);
+  validateExactDecimal(fill.volume, "fill volume", false);
+  if (fill.feeAmount !== null) {
+    validateExactDecimal(fill.feeAmount, "fill fee amount", true);
+  }
+  if (fill.executionEpochNs !== null && fill.executionEpochNs !== undefined && !/^\d+$/.test(fill.executionEpochNs)) {
+    throw new Error(`Fill ${fill.id} executionEpochNs must be an exact non-negative integer string.`);
+  }
+}
+
+export function resolveImmutableFillReplay(
+  existing: FillRecord | null | undefined,
+  next: FillRecord,
+): "INSERT" | "PRESERVE" {
+  if (!existing) return "INSERT";
+  if (fillExchangeIdentity(existing) !== fillExchangeIdentity(next) || existing.id === next.id && existing.orderId !== next.orderId) {
+    throw new Error(`Conflicting fill identity ${next.id}.`);
+  }
+  const { id: _existingId, ...existingMaterial } = existing;
+  const { id: _nextId, ...nextMaterial } = next;
+  if (!recordsEqual(existingMaterial, nextMaterial)) {
+    throw new Error(`Conflicting duplicate fill ${next.exchangeFillId}.`);
+  }
+  return "PRESERVE";
+}
+
 export function recordsEqual<T extends object>(left: T, right: T): boolean {
   const leftRecord = left as Record<string, unknown>;
   const rightRecord = right as Record<string, unknown>;
@@ -204,6 +267,19 @@ function recordsEqualSet<T extends object>(left: T[], right: T[], identity: (rec
 
 function fillIdentity(fill: FillRecord): string {
   return `${fill.id}\u0000${fill.orderId}\u0000${fill.exchangeFillId}`;
+}
+
+function fillExchangeIdentity(fill: FillRecord): string {
+  return `${fill.orderId}\u0000${fill.exchangeFillId}`;
+}
+
+function validateExactDecimal(value: string, label: string, allowZero: boolean): void {
+  if (!/^\d+(?:\.\d+)?$/.test(value)) {
+    throw new Error(`${label} must be a plain non-negative decimal string.`);
+  }
+  if (!allowZero && !/[1-9]/.test(value)) {
+    throw new Error(`${label} must be greater than zero.`);
+  }
 }
 
 function validateOrderEvent(order: OrderRecord, event: OrderEventRecord, type: string, source: OrderEventRecord["eventSource"]): void {

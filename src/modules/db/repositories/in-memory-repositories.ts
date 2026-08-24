@@ -39,6 +39,8 @@ import type {
   PersistCandidateBoundOrderIntentInput,
   PersistCandidateBoundOrderIntentRequest,
   PersistOrderIntentInput,
+  PersistReconciledExchangeSnapshotInput,
+  PersistReconciledExchangeSnapshotResult,
   PersistUncertainSubmissionInput,
   TelegramInboundOffsetStore,
 } from "../interfaces.js";
@@ -56,12 +58,15 @@ import {
   recordsEqual,
   faultPauseTransitionMatchesOccurrence,
   normalizeFillFeeProvenance,
+  resolveImmutableFillReplay,
   validateExchangeSubmissionInput,
   validateFaultPauseInput,
   validateFaultPauseTimestamp,
   validateExchangeSubmissionCompletion,
   validateNewOrderUniqueness,
   validateOrderIntentInput,
+  validateFillForOrder,
+  validateReconciledExchangeSnapshotInput,
   validateUncertainSubmissionCompletion,
   validateUncertainSubmissionInput,
 } from "./atomic-lifecycle-validation.js";
@@ -289,6 +294,50 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     this.fills = nextFills;
   }
 
+  async persistReconciledExchangeSnapshot(
+    input: PersistReconciledExchangeSnapshotInput,
+  ): Promise<PersistReconciledExchangeSnapshotResult> {
+    const normalizedInput = {
+      ...input,
+      fills: input.fills.map(normalizeFillFeeProvenance),
+    };
+    validateReconciledExchangeSnapshotInput(normalizedInput);
+    const currentOrder = this.orders.find((candidate) => candidate.id === normalizedInput.order.id);
+    if (!currentOrder) {
+      throw new Error(`Cannot persist reconciliation for missing order ${normalizedInput.order.id}.`);
+    }
+    if (!recordsEqual(currentOrder, normalizedInput.expectedOrder)) {
+      throw new Error(`Reconciliation expected order ${normalizedInput.order.id} changed concurrently.`);
+    }
+
+    const existingEvent = normalizedInput.event
+      ? this.orderEvents.find((candidate) => candidate.id === normalizedInput.event!.id)
+      : undefined;
+    if (normalizedInput.event) {
+      assertNoConflictingRecord(existingEvent, normalizedInput.event, "reconciliation order event");
+    }
+    const fillResolutions = normalizedInput.fills.map((fill) => {
+      const existing = findStoredFill(this.fills, fill);
+      return { fill, resolution: resolveImmutableFillReplay(existing, fill) };
+    });
+    const insertedFills = fillResolutions
+      .filter(({ resolution }) => resolution === "INSERT")
+      .map(({ fill }) => cloneRecord(fill));
+    const orderChanged = !recordsEqual(currentOrder, normalizedInput.order);
+    const eventInserted = normalizedInput.event !== null && existingEvent === undefined;
+
+    this.orders = this.orders.map((candidate) =>
+      candidate.id === normalizedInput.order.id ? cloneRecord(normalizedInput.order) : candidate,
+    );
+    if (eventInserted) this.orderEvents = [...this.orderEvents, cloneRecord(normalizedInput.event!)];
+    if (insertedFills.length > 0) this.fills = [...this.fills, ...insertedFills];
+
+    return {
+      outcome: orderChanged || eventInserted || insertedFills.length > 0 ? "APPLIED" : "DUPLICATE",
+      insertedFillCount: insertedFills.length,
+    };
+  }
+
   async persistUncertainSubmission(input: PersistUncertainSubmissionInput): Promise<void> {
     validateUncertainSubmissionInput(input);
     const existingOrder = this.orders.find((candidate) => candidate.id === input.order.id);
@@ -401,15 +450,13 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
 
   async saveFill(record: FillRecord): Promise<void> {
     const normalizedRecord = normalizeFillFeeProvenance(record);
-    const index = this.fills.findIndex(
-      (candidate) => candidate.orderId === normalizedRecord.orderId && candidate.exchangeFillId === normalizedRecord.exchangeFillId,
-    );
-    if (index === -1) {
+    const order = this.orders.find((candidate) => candidate.id === normalizedRecord.orderId);
+    if (!order) throw new Error(`Cannot persist fill for missing order ${normalizedRecord.orderId}.`);
+    validateFillForOrder(order, normalizedRecord);
+    const existing = findStoredFill(this.fills, normalizedRecord);
+    if (resolveImmutableFillReplay(existing, normalizedRecord) === "INSERT") {
       this.fills.push(cloneRecord(normalizedRecord));
-      return;
     }
-
-    this.fills[index] = cloneRecord(normalizedRecord);
   }
 
   async listFills(orderId?: string): Promise<FillRecord[]> {
@@ -1100,10 +1147,12 @@ function assertNoConflictingRecord<T extends { id: string }>(
 }
 
 function findStoredFill(fills: FillRecord[], fill: FillRecord): FillRecord | undefined {
-  return fills.find(
+  const matches = fills.filter(
     (candidate) => candidate.id === fill.id ||
       (candidate.orderId === fill.orderId && candidate.exchangeFillId === fill.exchangeFillId),
   );
+  if (matches.length > 1) throw new Error(`Conflicting fill identity ${fill.id}.`);
+  return matches[0];
 }
 
 function cloneRecord<T extends object>(record: T): T {

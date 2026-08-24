@@ -77,6 +77,18 @@ export interface PersistExchangeSubmissionInput {
   terminalEvent?: OrderEventRecord;
 }
 
+export interface PersistReconciledExchangeSnapshotInput {
+  expectedOrder: OrderRecord;
+  order: OrderRecord;
+  event: OrderEventRecord | null;
+  fills: FillRecord[];
+}
+
+export interface PersistReconciledExchangeSnapshotResult {
+  outcome: "APPLIED" | "DUPLICATE";
+  insertedFillCount: number;
+}
+
 export interface PersistUncertainSubmissionInput {
   order: OrderRecord;
   event: OrderEventRecord;
@@ -121,6 +133,9 @@ export interface ExecutionRepository {
   persistOrderIntent(input: PersistOrderIntentInput): Promise<void>;
   persistCandidateBoundOrderIntent(input: PersistCandidateBoundOrderIntentRequest): Promise<void>;
   persistExchangeSubmission(input: PersistExchangeSubmissionInput): Promise<void>;
+  persistReconciledExchangeSnapshot?(
+    input: PersistReconciledExchangeSnapshotInput,
+  ): Promise<PersistReconciledExchangeSnapshotResult>;
   persistUncertainSubmission(input: PersistUncertainSubmissionInput): Promise<void>;
   findOrderByIdempotencyKey(exchangeAccountId: string, idempotencyKey: string): Promise<OrderRecord | null>;
   findOrderById(exchangeAccountId: string, orderId: string): Promise<OrderRecord | null>;

@@ -23,6 +23,7 @@ import {
 } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { openSqliteDatabase } from "../src/modules/db/repositories/sqlite-database.js";
 import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
+import { ReconciliationService } from "../src/modules/reconciliation/reconciliation-service.js";
 import {
   fromSqliteBoolean,
   parseJson,
@@ -179,6 +180,270 @@ test("sqlite atomic lifecycle writes roll back conflicts and fault pauses stay s
       (await bundle.operatorState.listTransitions()).filter((transition) => transition.command === "AUTOMATIC_PAUSE").length,
       4,
     );
+  } finally {
+    bundle.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("sqlite reconciliation aggregate rolls back a fill-prefix failure and completes after restart", async () => {
+  const databasePath = await createTempDatabasePath("atomic-reconciliation-restart");
+  const bootstrap = {
+    databasePath,
+    exchangeAccountId: "primary",
+    userId: "operator",
+    userTelegramId: "telegram-user",
+    userDisplayName: "Operator",
+    accessKeyRef: "ENV:UPBIT_ACCESS_KEY",
+    secretKeyRef: "ENV:UPBIT_SECRET_KEY",
+    executionMode: "LIVE" as const,
+    liveExecutionGate: "ENABLED" as const,
+    killSwitchActive: false,
+  };
+  const original = createOrderRecord({
+    id: "atomic-reconciliation-order",
+    status: "OPEN",
+    executionMode: "LIVE",
+    upbitUuid: "atomic-reconciliation-uuid",
+    exchangeResponseJson: JSON.stringify({ state: "wait" }),
+    updatedAt: "2026-08-21T00:00:00.000Z",
+  });
+  const terminal = {
+    ...original,
+    status: "FILLED" as const,
+    exchangeResponseJson: JSON.stringify({ state: "done", executed_volume: "0.003" }),
+    updatedAt: "2026-08-21T00:01:00.000Z",
+  };
+  const event: OrderEventRecord = {
+    id: "atomic-reconciliation-event",
+    orderId: original.id,
+    eventType: "RECONCILIATION_STATUS_UPDATED",
+    eventSource: "RECONCILIATION",
+    payloadJson: JSON.stringify({ previousStatus: "OPEN", nextStatus: "FILLED" }),
+    createdAt: terminal.updatedAt,
+  };
+  const fills: FillRecord[] = [
+    {
+      ...createFill(original.id, "atomic-reconciliation-fill-local-1"),
+      exchangeFillId: "atomic-reconciliation-fill-1",
+      volume: "0.001",
+      feeProvenance: "EXCHANGE_FILL_CONFIRMED",
+      executionTimestampProvenance: "EXCHANGE_FILL_CONFIRMED",
+      executionEpochNs: "1787270460000000000",
+      rawPayloadJson: JSON.stringify({ trade_uuid: "atomic-reconciliation-fill-1" }),
+    },
+    {
+      ...createFill(original.id, "atomic-reconciliation-fill-local-2"),
+      exchangeFillId: "atomic-reconciliation-fill-2",
+      volume: "0.002",
+      feeProvenance: "EXCHANGE_FILL_CONFIRMED",
+      executionTimestampProvenance: "EXCHANGE_FILL_CONFIRMED",
+      executionEpochNs: "1787270461000000000",
+      filledAt: "2026-08-21T00:01:01.000Z",
+      rawPayloadJson: JSON.stringify({ trade_uuid: "atomic-reconciliation-fill-2" }),
+    },
+  ];
+
+  let first = createSqlitePersistence(bootstrap);
+  try {
+    await first.repositories.saveOrder(original);
+    const injector = new DatabaseSync(databasePath);
+    try {
+      injector.exec(`
+        CREATE TRIGGER fail_second_reconciliation_fill
+        BEFORE INSERT ON fills
+        WHEN NEW.exchange_fill_id = 'atomic-reconciliation-fill-2'
+        BEGIN
+          SELECT RAISE(ABORT, 'injected failure after fill prefix');
+        END;
+      `);
+    } finally {
+      injector.close();
+    }
+
+    const persistSnapshot = first.repositories.persistReconciledExchangeSnapshot;
+    assert.ok(persistSnapshot);
+    await assert.rejects(persistSnapshot.call(first.repositories, {
+      expectedOrder: original,
+      order: terminal,
+      event,
+      fills,
+    }), /injected failure after fill prefix/);
+    assert.deepEqual(await first.repositories.findOrderById("primary", original.id), original);
+    assert.deepEqual(await first.repositories.listOrderEvents(original.id), []);
+    assert.deepEqual(await first.repositories.listFills(original.id), []);
+  } finally {
+    first.close();
+  }
+
+  const triggerCleanup = new DatabaseSync(databasePath);
+  try {
+    triggerCleanup.exec("DROP TRIGGER fail_second_reconciliation_fill;");
+  } finally {
+    triggerCleanup.close();
+  }
+
+  first = createSqlitePersistence(bootstrap);
+  try {
+    const persistSnapshot = first.repositories.persistReconciledExchangeSnapshot;
+    assert.ok(persistSnapshot);
+    const result = await persistSnapshot.call(first.repositories, {
+      expectedOrder: original,
+      order: terminal,
+      event,
+      fills,
+    });
+    assert.deepEqual(result, { outcome: "APPLIED", insertedFillCount: 2 });
+    assert.deepEqual(await first.repositories.findOrderById("primary", original.id), terminal);
+    assert.deepEqual(await first.repositories.listOrderEvents(original.id), [event]);
+    assert.deepEqual(
+      (await first.repositories.listFills(original.id)).sort((left, right) => left.id.localeCompare(right.id)),
+      [...fills].sort((left, right) => left.id.localeCompare(right.id)),
+    );
+  } finally {
+    first.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("reconciliation stays lookup-eligible after atomic fill failure and projects evidence only after restart completion", async () => {
+  const databasePath = await createTempDatabasePath("reconciliation-fault-restart");
+  const bootstrap = {
+    databasePath,
+    exchangeAccountId: "primary",
+    userId: "operator",
+    userTelegramId: "telegram-user",
+    userDisplayName: "Operator",
+    accessKeyRef: "ENV:UPBIT_ACCESS_KEY",
+    secretKeyRef: "ENV:UPBIT_SECRET_KEY",
+    executionMode: "LIVE" as const,
+    liveExecutionGate: "ENABLED" as const,
+    killSwitchActive: false,
+  };
+  const order = createOrderRecord({
+    id: "reconciliation-fault-order",
+    status: "OPEN",
+    executionMode: "LIVE",
+    upbitUuid: "reconciliation-fault-uuid",
+    exchangeResponseJson: JSON.stringify({ state: "wait" }),
+  });
+  const snapshot = {
+    uuid: "reconciliation-fault-uuid",
+    identifier: order.identifier,
+    market: "KRW-BTC" as const,
+    side: "bid" as const,
+    ordType: "limit" as const,
+    state: "done" as const,
+    price: order.price,
+    volume: order.volume,
+    remainingVolume: "0",
+    executedVolume: "0.003",
+    paidFee: "750",
+    createdAt: order.createdAt,
+    fills: [
+      {
+        tradeUuid: "reconciliation-service-fill-1",
+        side: "bid" as const,
+        price: "500000",
+        volume: "0.001",
+        funds: "500",
+        fee: "250",
+        createdAt: "2026-08-21T00:01:00.000Z",
+        raw: { trade_uuid: "reconciliation-service-fill-1" },
+      },
+      {
+        tradeUuid: "reconciliation-service-fill-2",
+        side: "bid" as const,
+        price: "500000",
+        volume: "0.002",
+        funds: "1000",
+        fee: "500",
+        createdAt: "2026-08-21T00:01:01.000Z",
+        raw: { trade_uuid: "reconciliation-service-fill-2" },
+      },
+    ],
+    raw: { state: "done", executed_volume: "0.003" },
+  };
+  const projectedOrderIds: string[] = [];
+  const projector = {
+    async processTerminalOrder(orderId: string) {
+      projectedOrderIds.push(orderId);
+      return { outcome: "ADVANCED" as const, orderId, detail: "projected complete aggregate" };
+    },
+  };
+
+  let bundle = createSqlitePersistence(bootstrap);
+  try {
+    await bundle.repositories.saveOrder(order);
+    const injector = new DatabaseSync(databasePath);
+    try {
+      injector.exec(`
+        CREATE TRIGGER fail_reconciliation_service_second_fill
+        BEFORE INSERT ON fills
+        WHEN NEW.exchange_fill_id = 'reconciliation-service-fill-2'
+        BEGIN
+          SELECT RAISE(ABORT, 'injected service failure after fill prefix');
+        END;
+      `);
+    } finally {
+      injector.close();
+    }
+    const service = new ReconciliationService({
+      repositories: bundle.repositories,
+      operatorState: bundle.operatorState,
+      orderReader: { async getOrder() { return snapshot; } },
+      candidateEvidenceService: projector,
+    });
+    await service.run("primary", {
+      runIdentity: {
+        id: "reconciliation-fault-run-1",
+        startedAt: "2026-08-21T00:02:00.000Z",
+      },
+    });
+
+    const failedOrder = await bundle.repositories.findOrderById("primary", order.id);
+    assert.equal(failedOrder?.status, "RECONCILIATION_REQUIRED");
+    assert.equal(failedOrder?.exchangeResponseJson, order.exchangeResponseJson);
+    assert.deepEqual(await bundle.repositories.listFills(order.id), []);
+    assert.deepEqual(projectedOrderIds, []);
+  } finally {
+    bundle.close();
+  }
+
+  const triggerCleanup = new DatabaseSync(databasePath);
+  try {
+    triggerCleanup.exec("DROP TRIGGER fail_reconciliation_service_second_fill;");
+  } finally {
+    triggerCleanup.close();
+  }
+
+  bundle = createSqlitePersistence(bootstrap);
+  try {
+    const restarted = new ReconciliationService({
+      repositories: bundle.repositories,
+      operatorState: bundle.operatorState,
+      orderReader: { async getOrder() { return snapshot; } },
+      candidateEvidenceService: projector,
+      recoveryClock: {
+        now: () => ({
+          observedAt: "2026-08-21T00:03:00.000Z",
+          observedAtEpochMs: Date.parse("2026-08-21T00:03:00.000Z"),
+        }),
+      },
+    });
+    await restarted.run("primary", {
+      runIdentity: {
+        id: "reconciliation-fault-run-2",
+        startedAt: "2026-08-21T00:03:00.000Z",
+      },
+    });
+
+    assert.equal((await bundle.repositories.findOrderById("primary", order.id))?.status, "FILLED");
+    assert.deepEqual(
+      (await bundle.repositories.listFills(order.id)).map((fill) => fill.exchangeFillId).sort(),
+      ["reconciliation-service-fill-1", "reconciliation-service-fill-2"],
+    );
+    assert.deepEqual(projectedOrderIds, [order.id]);
   } finally {
     bundle.close();
     await cleanupTempDatabase(databasePath);
@@ -1632,6 +1897,111 @@ async function assertAtomicLifecycleContract(repository: ExecutionRepository): P
     event: createOrderEvent(extraRiskOrder.id, "extra-risk-event", "RECONCILIATION_RECOVERY_REQUIRED"),
     riskEvent: createRiskEvent(extraRiskOrder.id, "extra-risk-incoming"),
   }));
+
+  const reconciledOrder = createOrderRecord({
+    id: "atomic-reconciled-parity-order",
+    status: "OPEN",
+    executionMode: "LIVE",
+    upbitUuid: "atomic-reconciled-parity-uuid",
+    exchangeResponseJson: JSON.stringify({ state: "wait" }),
+  });
+  await repository.saveOrder(reconciledOrder);
+  const reconciledTerminal = {
+    ...reconciledOrder,
+    status: "FILLED" as const,
+    exchangeResponseJson: JSON.stringify({ state: "done" }),
+    updatedAt: "2026-08-21T00:02:00.000Z",
+  };
+  const reconciledEvent: OrderEventRecord = {
+    id: "atomic-reconciled-parity-event",
+    orderId: reconciledOrder.id,
+    eventType: "RECONCILIATION_STATUS_UPDATED",
+    eventSource: "RECONCILIATION",
+    payloadJson: JSON.stringify({ previousStatus: "OPEN", nextStatus: "FILLED" }),
+    createdAt: reconciledTerminal.updatedAt,
+  };
+  const reconciledFills = [
+    {
+      ...createFill(reconciledOrder.id, "atomic-reconciled-parity-fill-1"),
+      exchangeFillId: "atomic-reconciled-parity-exchange-fill-1",
+    },
+    {
+      ...createFill(reconciledOrder.id, "atomic-reconciled-parity-fill-2"),
+      exchangeFillId: "atomic-reconciled-parity-exchange-fill-2",
+      volume: "0.002",
+    },
+  ];
+  const persistReconciledSnapshot = repository.persistReconciledExchangeSnapshot;
+  assert.ok(persistReconciledSnapshot);
+  assert.deepEqual(await persistReconciledSnapshot.call(repository, {
+    expectedOrder: reconciledOrder,
+    order: reconciledTerminal,
+    event: reconciledEvent,
+    fills: reconciledFills,
+  }), { outcome: "APPLIED", insertedFillCount: 2 });
+  const completeAggregate = {
+    order: await repository.findOrderById("primary", reconciledOrder.id),
+    events: await repository.listOrderEvents(reconciledOrder.id),
+    fills: await repository.listFills(reconciledOrder.id),
+  };
+  assert.deepEqual(await persistReconciledSnapshot.call(repository, {
+    expectedOrder: reconciledTerminal,
+    order: reconciledTerminal,
+    event: null,
+    fills: reconciledFills.map((fill, index) => ({ ...fill, id: `replayed-local-fill-${index}` })),
+  }), { outcome: "DUPLICATE", insertedFillCount: 0 });
+  assert.deepEqual({
+    order: await repository.findOrderById("primary", reconciledOrder.id),
+    events: await repository.listOrderEvents(reconciledOrder.id),
+    fills: await repository.listFills(reconciledOrder.id),
+  }, completeAggregate);
+  await assert.rejects(persistReconciledSnapshot.call(repository, {
+    expectedOrder: reconciledTerminal,
+    order: reconciledTerminal,
+    event: null,
+    fills: [{ ...reconciledFills[0]!, id: "conflicting-replay-fill", price: "500000.0" }],
+  }));
+  assert.deepEqual({
+    order: await repository.findOrderById("primary", reconciledOrder.id),
+    events: await repository.listOrderEvents(reconciledOrder.id),
+    fills: await repository.listFills(reconciledOrder.id),
+  }, completeAggregate);
+
+  const immutableFillOrder = createOrderRecord({ id: "immutable-fill-order", status: "PERSISTED" });
+  await repository.persistOrderIntent({
+    order: immutableFillOrder,
+    event: createOrderEvent(immutableFillOrder.id, "immutable-fill-intent", "ORDER_PERSISTED"),
+  });
+  const immutableFill = {
+    ...createFill(immutableFillOrder.id, "immutable-fill-original"),
+    exchangeFillId: "immutable-exchange-fill",
+    feeProvenance: "EXCHANGE_FILL_CONFIRMED" as const,
+    executionTimestampProvenance: "EXCHANGE_FILL_CONFIRMED" as const,
+    executionEpochNs: "1787270402000000000",
+    rawPayloadJson: JSON.stringify({ uuid: "immutable-exchange-fill", price: "500000", volume: "0.001" }),
+  };
+  await repository.saveFill(immutableFill);
+  await repository.saveFill({ ...immutableFill, id: "immutable-fill-replay-local-id" });
+  assert.deepEqual(await repository.listFills(immutableFillOrder.id), [immutableFill]);
+
+  const conflictingFillMutations: FillRecord[] = [
+    { ...immutableFill, id: "immutable-fill-price-conflict", price: "500000.0" },
+    { ...immutableFill, id: "immutable-fill-volume-conflict", volume: "0.0010" },
+    { ...immutableFill, id: "immutable-fill-market-conflict", market: "KRW-ETH" },
+    { ...immutableFill, id: "immutable-fill-side-conflict", side: "ask" },
+    { ...immutableFill, id: "immutable-fill-raw-conflict", rawPayloadJson: JSON.stringify({ changed: true }) },
+  ];
+  for (const conflictingFill of conflictingFillMutations) {
+    await assert.rejects(repository.saveFill(conflictingFill));
+    assert.deepEqual(await repository.listFills(immutableFillOrder.id), [immutableFill]);
+  }
+
+  await assert.rejects(repository.saveFill({
+    ...immutableFill,
+    orderId: extraFillOrder.id,
+    exchangeFillId: "different-exchange-fill",
+  }));
+  assert.deepEqual(await repository.listFills(immutableFillOrder.id), [immutableFill]);
 
   const invalidOrder = createOrderRecord({ id: "invalid-atomic-order", status: "PERSISTED" });
   await assert.rejects(
