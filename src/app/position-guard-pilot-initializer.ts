@@ -544,15 +544,36 @@ function assertRetainedLifecycleAuthority(
   }
 
   const faultEvents = auditEvents.filter((event) => event.eventType === "FAULT_PAUSED");
+  const rollbackEvents = auditEvents.filter((event) => event.eventType === "ROLLBACK_STARTED");
   if (deployment.phase === "ACTIVE") {
-    if (faultEvents.length !== 0) {
-      throw new Error("ACTIVE PositionGuard pilot must not contain fault-pause authority.");
+    if (faultEvents.length !== 0 || rollbackEvents.length !== 0) {
+      throw new Error("ACTIVE PositionGuard pilot must not contain fault-pause or rollback authority.");
     }
   } else {
-    assertCanonicalFaultAudit(deployment, exactState, evidenceRecords, faultEvents);
+    const expectedFaultFromPhase = rollbackEvents.length === 0
+      ? deployment.activationAt === null ? "PENDING_FLAT" : "ACTIVE"
+      : "DRAINING";
+    assertCanonicalFaultAudit(
+      deployment,
+      exactState,
+      evidenceRecords,
+      faultEvents,
+      expectedFaultFromPhase,
+    );
+    if (rollbackEvents.length !== 0) {
+      assertCanonicalRollbackStartedAudit(
+        deployment,
+        exactState,
+        evidenceRecords,
+        auditEvents,
+        rollbackEvents,
+        faultEvents[0]!,
+      );
+    }
   }
 
-  const expectedAuditCount = 1 + activationEvents.length + stateEvents.length + faultEvents.length;
+  const expectedAuditCount = 1 + activationEvents.length + stateEvents.length +
+    rollbackEvents.length + faultEvents.length;
   if (auditEvents.length !== expectedAuditCount) {
     throw new Error("PositionGuard pilot lifecycle contains unsupported audit authority.");
   }
@@ -563,12 +584,12 @@ function assertCanonicalFaultAudit(
   exactState: Readonly<ExactCandidateState>,
   evidenceRecords: readonly Readonly<CandidateEvidenceRecord>[],
   faultEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+  expectedFromPhase: "PENDING_FLAT" | "ACTIVE" | "DRAINING",
 ): void {
   if (faultEvents.length !== 1) {
     throw new Error("PAUSED_FAULT PositionGuard pilot requires exactly one canonical fault audit.");
   }
   const fault = faultEvents[0]!;
-  const expectedFromPhase = deployment.activationAt === null ? "PENDING_FLAT" : "ACTIVE";
   if (
     fault.fromPhase !== expectedFromPhase ||
     fault.toPhase !== "PAUSED_FAULT" ||
@@ -603,6 +624,65 @@ function assertCanonicalFaultAudit(
     faultAt < strictTimestamp(latestEvidence.evidence.executedAt, "persisted evidence executedAt")
   ) {
     throw new Error("PositionGuard pilot fault audit precedes exact evidence chronology.");
+  }
+}
+
+function assertCanonicalRollbackStartedAudit(
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  exactState: Readonly<ExactCandidateState>,
+  evidenceRecords: readonly Readonly<CandidateEvidenceRecord>[],
+  auditEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+  rollbackEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+  faultEvent: Readonly<PositionGuardPilotAuditEventRecord>,
+): void {
+  if (
+    rollbackEvents.length !== 1 ||
+    deployment.activationAt === null ||
+    deployment.activationEpochNs === null
+  ) {
+    throw new Error("DRAINING fault restart requires exactly one canonical rollback-start audit.");
+  }
+  const rollback = rollbackEvents[0]!;
+  const payload = parseExactJsonObject(
+    rollback.payloadJson,
+    "PositionGuard pilot canonical rollback audit payload",
+    ["transitionAt"] as const,
+  );
+  if (typeof payload.transitionAt !== "string") {
+    throw new Error("PositionGuard pilot canonical rollback audit payload is invalid.");
+  }
+  const transitionAtEpochNs = strictTimestamp(
+    payload.transitionAt,
+    "persisted rollback transitionAt",
+  );
+  const expectedRollback = {
+    id: `${deployment.id}:rollback_started:${transitionAtEpochNs.toString()}`,
+    deploymentId: deployment.id,
+    eventType: "ROLLBACK_STARTED",
+    fromPhase: "ACTIVE",
+    toPhase: "DRAINING",
+    stateVersion: exactState.stateVersion,
+    payloadJson: JSON.stringify({ transitionAt: payload.transitionAt }),
+    createdAt: payload.transitionAt,
+  } as const;
+  if (!recordsEqual(rollback, expectedRollback, AUDIT_KEYS)) {
+    throw new Error("PositionGuard pilot canonical rollback-start audit is invalid.");
+  }
+
+  const rollbackAt = strictTimestamp(rollback.createdAt, "persisted rollback audit createdAt");
+  const faultAt = strictTimestamp(faultEvent.createdAt, "persisted fault audit createdAt");
+  const activationAt = strictTimestamp(deployment.activationAt, "persisted deployment activationAt");
+  const latestEvidence = evidenceRecords.at(-1);
+  if (
+    rollbackAt < activationAt ||
+    rollbackAt > faultAt ||
+    (latestEvidence !== undefined && rollbackAt < strictTimestamp(
+      latestEvidence.evidence.executedAt,
+      "persisted evidence executedAt",
+    )) ||
+    auditEvents.indexOf(rollback) >= auditEvents.indexOf(faultEvent)
+  ) {
+    throw new Error("PositionGuard pilot rollback-start audit violates exact lifecycle chronology.");
   }
 }
 

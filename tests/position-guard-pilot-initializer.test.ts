@@ -31,6 +31,8 @@ import { test } from "./harness.js";
 
 const NOW = "2026-08-24T00:00:00.000000001Z";
 const CREATED_AT = "2026-08-23T23:59:59.000000001Z";
+const ROLLBACK_STARTED_AT = "2026-08-23T23:59:59.850000001Z";
+const ROLLBACK_STARTED_EPOCH_NS = "1787529599850000001";
 const IDENTITY: PositionGuardPilotInitializerIdentity = {
   exchangeAccountId: "primary",
   pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
@@ -214,6 +216,149 @@ test("candidate initializer rejects malformed ACTIVE and PAUSED_FAULT lifecycle 
   for (const authority of cases) {
     const fixture = createFixture({ result: authority });
     await assert.rejects(() => fixture.initializer.initialize(), /activation|fault|lifecycle|audit/i);
+  }
+});
+
+test("candidate initializer restarts PAUSED_FAULT authority faulted from canonical DRAINING rollback", async () => {
+  const authority = pausedFaultFromDrainingAuthority();
+  const fixture = createFixture({ result: authority });
+
+  const result = await fixture.initializer.initialize();
+
+  assert.equal(result.deployment.phase, "PAUSED_FAULT");
+  assert.deepEqual(
+    result.auditEvents.map((event) => event.eventType),
+    ["DEPLOYMENT_CREATED", "PHASE_TRANSITION", "STATE_ADVANCED", "ROLLBACK_STARTED", "FAULT_PAUSED"],
+  );
+  assert.deepEqual(result.exactState, authority.exactState);
+});
+
+test("candidate initializer rejects forged DRAINING rollback restart authority", async () => {
+  const cases: Array<Readonly<{
+    name: string;
+    mutate(authority: ReturnType<typeof pausedFaultFromDrainingAuthority>): void;
+  }>> = [
+    {
+      name: "missing rollback",
+      mutate(authority) {
+        authority.auditEvents = authority.auditEvents.filter((event) => event.eventType !== "ROLLBACK_STARTED");
+      },
+    },
+    {
+      name: "duplicate rollback",
+      mutate(authority) {
+        const rollback = rollbackStartedAudit(authority.deployment, authority.exactState.stateVersion);
+        authority.auditEvents.splice(-1, 0, { ...rollback, id: `${rollback.id}:duplicate` });
+      },
+    },
+    {
+      name: "forged rollback id",
+      mutate(authority) {
+        rollbackEvent(authority).id = `${authority.deployment.id}:rollback_started:forged`;
+      },
+    },
+    {
+      name: "wrong rollback source phase",
+      mutate(authority) {
+        rollbackEvent(authority).fromPhase = "PENDING_FLAT";
+      },
+    },
+    {
+      name: "wrong rollback target phase",
+      mutate(authority) {
+        rollbackEvent(authority).toPhase = "PAUSED_FAULT";
+      },
+    },
+    {
+      name: "wrong rollback state version",
+      mutate(authority) {
+        rollbackEvent(authority).stateVersion = 0;
+      },
+    },
+    {
+      name: "wrong rollback payload",
+      mutate(authority) {
+        rollbackEvent(authority).payloadJson = JSON.stringify({ transitionAt: CREATED_AT });
+      },
+    },
+    {
+      name: "non-canonical rollback payload",
+      mutate(authority) {
+        rollbackEvent(authority).payloadJson = `{ "transitionAt": "${ROLLBACK_STARTED_AT}" }`;
+      },
+    },
+    {
+      name: "rollback createdAt differs from transitionAt",
+      mutate(authority) {
+        rollbackEvent(authority).createdAt = "2026-08-23T23:59:59.860000001Z";
+      },
+    },
+    {
+      name: "rollback precedes candidate evidence",
+      mutate(authority) {
+        const rollback = rollbackEvent(authority);
+        rollback.createdAt = "2026-08-23T23:59:59.700000001Z";
+        rollback.payloadJson = JSON.stringify({ transitionAt: rollback.createdAt });
+        rollback.id = `${authority.deployment.id}:rollback_started:1787529599700000001`;
+      },
+    },
+    {
+      name: "rollback follows fault",
+      mutate(authority) {
+        const rollback = rollbackEvent(authority);
+        rollback.createdAt = "2026-08-23T23:59:59.950000001Z";
+        rollback.payloadJson = JSON.stringify({ transitionAt: rollback.createdAt });
+        rollback.id = `${authority.deployment.id}:rollback_started:1787529599950000001`;
+      },
+    },
+    {
+      name: "wrong rollback deployment identity",
+      mutate(authority) {
+        rollbackEvent(authority).deploymentId = "foreign-deployment";
+      },
+    },
+    {
+      name: "fault does not originate from DRAINING",
+      mutate(authority) {
+        faultEvent(authority).fromPhase = "ACTIVE";
+      },
+    },
+    {
+      name: "fault uses wrong state version",
+      mutate(authority) {
+        faultEvent(authority).stateVersion = 0;
+      },
+    },
+    {
+      name: "fault timestamp differs from deployment update",
+      mutate(authority) {
+        faultEvent(authority).createdAt = "2026-08-23T23:59:59.910000001Z";
+      },
+    },
+    {
+      name: "unsupported rollback completion audit",
+      mutate(authority) {
+        const rollback = rollbackEvent(authority);
+        authority.auditEvents.splice(-1, 0, {
+          ...rollback,
+          id: `${authority.deployment.id}:rollback_completed:${ROLLBACK_STARTED_EPOCH_NS}`,
+          eventType: "ROLLBACK_COMPLETED",
+          fromPhase: "DRAINING",
+          toPhase: "DISABLED",
+        });
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    const authority = pausedFaultFromDrainingAuthority();
+    testCase.mutate(authority);
+    const fixture = createFixture({ result: authority });
+    await assert.rejects(
+      () => fixture.initializer.initialize(),
+      /rollback|fault|audit|chronology|identity|stateVersion/i,
+      testCase.name,
+    );
   }
 });
 
@@ -637,6 +782,55 @@ function stateAdvancedAudit(
     }),
     createdAt: material.evidence.executedAt,
   };
+}
+
+function pausedFaultFromDrainingAuthority(): ReturnType<typeof mutableAuthority> {
+  const authority = mutableAuthority(validAuthority({
+    outcome: "EXISTING",
+    createdAt: CREATED_AT,
+    phase: "PAUSED_FAULT",
+    activationAt: "2026-08-23T23:59:59.500000001Z",
+    evidence: executedEnterEvidence(),
+  }));
+  faultEvent(authority).fromPhase = "DRAINING";
+  authority.auditEvents.splice(
+    -1,
+    0,
+    rollbackStartedAudit(authority.deployment, authority.exactState.stateVersion),
+  );
+  return authority;
+}
+
+function rollbackStartedAudit(
+  deployment: PositionGuardPilotDeploymentRecord,
+  stateVersion: number,
+): PositionGuardPilotAuditEventRecord {
+  return {
+    id: `${deployment.id}:rollback_started:${ROLLBACK_STARTED_EPOCH_NS}`,
+    deploymentId: deployment.id,
+    eventType: "ROLLBACK_STARTED",
+    fromPhase: "ACTIVE",
+    toPhase: "DRAINING",
+    stateVersion,
+    payloadJson: JSON.stringify({ transitionAt: ROLLBACK_STARTED_AT }),
+    createdAt: ROLLBACK_STARTED_AT,
+  };
+}
+
+function rollbackEvent(
+  authority: ReturnType<typeof mutableAuthority>,
+): PositionGuardPilotAuditEventRecord {
+  const event = authority.auditEvents.find((candidate) => candidate.eventType === "ROLLBACK_STARTED");
+  if (event === undefined) throw new Error("test rollback event is missing");
+  return event;
+}
+
+function faultEvent(
+  authority: ReturnType<typeof mutableAuthority>,
+): PositionGuardPilotAuditEventRecord {
+  const event = authority.auditEvents.find((candidate) => candidate.eventType === "FAULT_PAUSED");
+  if (event === undefined) throw new Error("test fault event is missing");
+  return event;
 }
 
 function creationAudit(deployment: PositionGuardPilotDeploymentRecord): PositionGuardPilotAuditEventRecord {
