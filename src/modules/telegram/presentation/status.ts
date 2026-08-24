@@ -10,17 +10,23 @@ import type { TelegramLocale } from "./locale.js";
 
 export type LiveSendPath = "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
 
-export type PilotVisibilityCheck = "VERIFIED_BY_ROUTE" | "UNAVAILABLE";
+export type PilotVisibilityCheck =
+  | "VERIFIED_CURRENT"
+  | "VERIFIED_BY_ROUTE"
+  | "BLOCKED_UNAVAILABLE"
+  | "BLOCKED_NON_FLAT"
+  | "UNAVAILABLE";
 
 export interface BtcCandidatePilotVisibility {
   readonly deploymentId?: string | null;
   readonly pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1";
-  readonly phase: PositionGuardPilotPhase;
+  readonly phase: PositionGuardPilotPhase | null;
   readonly policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1";
   readonly stateVersion: number | null;
   readonly activationAt?: string | null;
   readonly lastEvidenceAt: string | null;
   readonly lastEvidenceId: string | null;
+  readonly currentAuthorityCheck: PilotVisibilityCheck;
   readonly exactFlatCheck: PilotVisibilityCheck;
   readonly replayCheck: PilotVisibilityCheck;
   readonly leaseCheck: PilotVisibilityCheck;
@@ -133,12 +139,13 @@ export function formatPilotTechnicalVisibility(
   return [
     `btc_pilot_id: ${pilot.pilotId}`,
     `btc_pilot_deployment_id: ${pilot.deploymentId ?? "none"}`,
-    `btc_pilot_phase: ${pilot.phase}`,
+    `btc_pilot_phase: ${pilot.phase ?? "unavailable"}`,
     `btc_pilot_policy_version: ${pilot.policyVersion}`,
     `btc_pilot_state_version: ${pilot.stateVersion ?? "none"}`,
     `btc_pilot_activation_at: ${pilot.activationAt ?? "none"}`,
     `btc_pilot_last_evidence_at: ${pilot.lastEvidenceAt ?? "unavailable"}`,
     `btc_pilot_last_evidence_id: ${pilot.lastEvidenceId ?? "unavailable"}`,
+    `btc_pilot_current_authority_check: ${pilot.currentAuthorityCheck}`,
     `btc_pilot_exact_flat_check: ${pilot.exactFlatCheck}`,
     `btc_pilot_replay_check: ${pilot.replayCheck}`,
     `btc_pilot_lease_check: ${pilot.leaseCheck}`,
@@ -163,6 +170,25 @@ export function describePilot(
       : ["BTC candidate pilot: no persisted candidate decision", "ETH policy: existing baseline strategy (BASELINE)"];
   }
 
+  if (pilot.phase === null) {
+    const outcome = pilot.latestOutcome === null
+      ? localizedNone(locale)
+      : `${describeAction(pilot.latestOutcome.action, locale)} · ${pilot.latestOutcome.reasonCode}`;
+    return locale === "ko-KR"
+      ? [
+          "BTC 후보 파일럿 현재 상태: 확인 불가 (차단)",
+          `현재 권위 검증: ${pilot.currentAuthorityCheck}`,
+          `최근 BTC 후보 결과(과거 기록): ${outcome}`,
+          "ETH 정책: 기존 기준 전략 (BASELINE)",
+        ]
+      : [
+          "BTC candidate pilot current state: unavailable (blocked)",
+          `Current authority check: ${pilot.currentAuthorityCheck}`,
+          `Latest BTC candidate outcome (historical record): ${outcome}`,
+          "ETH policy: existing baseline strategy (BASELINE)",
+        ];
+  }
+
   const outcome = pilot.latestOutcome === null
     ? localizedNone(locale)
     : locale === "ko-KR"
@@ -179,7 +205,7 @@ export function describePilot(
         `정책 버전: ${pilot.policyVersion}`,
         `상태 버전: ${pilot.stateVersion ?? "없음"}`,
         `마지막 증거: ${lastEvidence}`,
-        `검증 상태: exact_flat=${pilot.exactFlatCheck}, replay=${pilot.replayCheck}, lease=${pilot.leaseCheck}, reconciliation=${pilot.reconciliationCheck}`,
+        `검증 상태: authority=${pilot.currentAuthorityCheck}, exact_flat=${pilot.exactFlatCheck}, replay=${pilot.replayCheck}, lease=${pilot.leaseCheck}, reconciliation=${pilot.reconciliationCheck}`,
         `최근 BTC 후보 결과: ${outcome}`,
         "ETH 정책: 기존 기준 전략 (BASELINE)",
       ]
@@ -189,7 +215,7 @@ export function describePilot(
         `Policy version: ${pilot.policyVersion}`,
         `State version: ${pilot.stateVersion ?? "none"}`,
         `Last evidence: ${lastEvidence}`,
-        `Checks: exact_flat=${pilot.exactFlatCheck}, replay=${pilot.replayCheck}, lease=${pilot.leaseCheck}, reconciliation=${pilot.reconciliationCheck}`,
+        `Checks: authority=${pilot.currentAuthorityCheck}, exact_flat=${pilot.exactFlatCheck}, replay=${pilot.replayCheck}, lease=${pilot.leaseCheck}, reconciliation=${pilot.reconciliationCheck}`,
         `Latest BTC candidate outcome: ${outcome}`,
         "ETH policy: existing baseline strategy (BASELINE)",
       ];

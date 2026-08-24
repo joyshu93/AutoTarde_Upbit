@@ -468,6 +468,87 @@ test("delivery service marks pending notifications as sent after successful Tele
   assert.equal(pendingNotifications.length, 0);
 });
 
+test("delivery sends default Korean candidate-pilot push text instead of raw English notification text", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const sentMessages: string[] = [];
+  await repositories.saveOperatorNotification(createNotification({
+    id: "operator-notification-pilot-korean",
+    notificationType: "POSITION_GUARD_PILOT_ROLLBACK_STARTED",
+    severity: "WARN",
+    title: "Candidate pilot rollback started",
+    message: "The candidate pilot entered DRAINING.",
+    payloadJson: JSON.stringify({
+      deploymentId: "deployment-pilot-1",
+      phase: "DRAINING",
+      stateVersion: 5,
+    }),
+    createdAt: "2026-08-21T03:30:00.000Z",
+  }));
+  const deliveryService = new OperatorNotificationDeliveryService({
+    repositories,
+    client: {
+      async sendMessage(input) {
+        sentMessages.push(input.text);
+      },
+    },
+    operatorChatId: "chat-1",
+    now: () => "2026-08-21T03:31:00.000Z",
+  });
+
+  await deliveryService.deliverPending("primary", 1);
+
+  assert.equal(sentMessages.length, 1);
+  assert.match(sentMessages[0] ?? "", /BTC 후보 파일럿 롤백 시작/u);
+  assert.match(sentMessages[0] ?? "", /알림 코드: POSITION_GUARD_PILOT_ROLLBACK_STARTED/u);
+  assert.match(sentMessages[0] ?? "", /배포 ID: deployment-pilot-1/u);
+  assert.match(sentMessages[0] ?? "", /현재 단계: DRAINING/u);
+  assert.doesNotMatch(sentMessages[0] ?? "", /Candidate pilot rollback started/u);
+  assert.doesNotMatch(sentMessages[0] ?? "", /The candidate pilot entered DRAINING/u);
+});
+
+test("delivery honors en-US for candidate-pilot push text and preserves technical identifiers", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const sentMessages: string[] = [];
+  await repositories.saveOperatorNotification(createNotification({
+    id: "operator-notification-pilot-english",
+    notificationType: "POSITION_GUARD_PILOT_FAULT_PAUSED",
+    severity: "ERROR",
+    title: "Raw title must not be delivered",
+    message: "Raw message must not be delivered",
+    payloadJson: JSON.stringify({
+      deploymentId: "deployment-pilot-2",
+      phase: "PAUSED_FAULT",
+      reasonCode: "UNCERTAIN_ORDER",
+      faultId: "fault-pilot-2",
+    }),
+    createdAt: "2026-08-21T03:30:00.000Z",
+  }));
+  const dependencies = {
+    repositories,
+    client: {
+      async sendMessage(input: { text: string }) {
+        sentMessages.push(input.text);
+      },
+    },
+    operatorChatId: "chat-1",
+    locale: "en-US" as const,
+    now: () => "2026-08-21T03:31:00.000Z",
+  };
+  const deliveryService = new OperatorNotificationDeliveryService(
+    dependencies as unknown as ConstructorParameters<typeof OperatorNotificationDeliveryService>[0],
+  );
+
+  await deliveryService.deliverPending("primary", 1);
+
+  assert.equal(sentMessages.length, 1);
+  assert.match(sentMessages[0] ?? "", /BTC candidate pilot fault paused/u);
+  assert.match(sentMessages[0] ?? "", /Notification code: POSITION_GUARD_PILOT_FAULT_PAUSED/u);
+  assert.match(sentMessages[0] ?? "", /Deployment ID: deployment-pilot-2/u);
+  assert.match(sentMessages[0] ?? "", /Fault ID: fault-pilot-2/u);
+  assert.doesNotMatch(sentMessages[0] ?? "", /Raw title must not be delivered/u);
+  assert.doesNotMatch(sentMessages[0] ?? "", /Raw message must not be delivered/u);
+});
+
 test("delivery service runs a follow-up pass when kicked during an in-flight run", async () => {
   const repositories = new InMemoryExecutionRepository();
   const sentMessages: Array<{ chatId: string; text: string }> = [];

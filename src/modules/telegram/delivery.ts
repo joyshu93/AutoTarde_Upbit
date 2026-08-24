@@ -12,6 +12,11 @@ import type {
   TelegramMessageSendResult,
   TelegramSendMessageInput,
 } from "./interfaces.js";
+import { formatOperatorNotificationPushPresentation } from "./presentation/alerts.js";
+import {
+  normalizeTelegramLocale,
+  type TelegramLocale,
+} from "./presentation/locale.js";
 
 const DEFAULT_TELEGRAM_API_BASE_URL = "https://api.telegram.org";
 const DEFAULT_TELEGRAM_DELIVERY_TIMEOUT_MS = 5_000;
@@ -213,6 +218,7 @@ export class OperatorNotificationDeliveryService {
       maxBackoffMs?: number;
       leaseDurationMs?: number;
       workerName?: string;
+      locale?: TelegramLocale;
     },
   ) {}
 
@@ -413,7 +419,7 @@ export class OperatorNotificationDeliveryService {
     try {
       await this.dependencies.client?.sendMessage({
         chatId: this.dependencies.operatorChatId ?? "",
-        text: formatOperatorNotificationDeliveryText(record),
+        text: formatOperatorNotificationDeliveryText(record, this.dependencies.locale),
       });
 
       const deliveredRecord: OperatorNotificationRecord = {
@@ -730,15 +736,21 @@ function mergeDeliverySummaries(
 }
 
 export function formatOperatorNotificationDeliveryText(
-  record: Pick<OperatorNotificationRecord, "severity" | "notificationType" | "title" | "message" | "createdAt">,
+  record: Pick<
+    OperatorNotificationRecord,
+    "id" | "severity" | "notificationType" | "title" | "message" | "payloadJson" | "createdAt"
+  >,
+  locale?: TelegramLocale,
 ): string {
+  const normalizedLocale = normalizeTelegramLocale(locale);
+  const pilotPresentation = formatOperatorNotificationPushPresentation(record, normalizedLocale);
   return truncateText(
-    [
-      `[${record.severity}] ${record.notificationType}`,
-      record.title,
-      record.message,
-      `created_at: ${record.createdAt}`,
-    ].join("\n"),
+    pilotPresentation ?? [
+        `[${record.severity}] ${record.notificationType}`,
+        record.title,
+        record.message,
+        `created_at: ${record.createdAt}`,
+      ].join("\n"),
     MAX_DELIVERY_TEXT_LENGTH,
   );
 }

@@ -76,9 +76,26 @@ import {
 import { formatStrategyRunPresentation } from "./presentation/run.js";
 import { formatStrategyPreviewPresentation } from "./presentation/preview.js";
 import type { StrategyDecisionRecord } from "../../domain/types.js";
+import type { PositionGuardPilotRefreshReceipt } from "../../domain/pilot-types.js";
+import {
+  isExactCandidateStateRollbackFlat,
+  parseCandidatePilotTimestamp,
+  toPositionGuardCandidateRoutingState,
+  validateCandidatePilotDeployment,
+  type CandidatePilotRepository,
+} from "../db/pilot-interfaces.js";
+
+type TelegramCandidatePilotReader = Pick<
+  CandidatePilotRepository,
+  "getDeploymentForExchangeAccount" | "getExactState"
+>;
+
+type TelegramCommandRouterDependencies = TelegramRouterDependencies & Readonly<{
+  candidatePilotReader?: TelegramCandidatePilotReader;
+}>;
 
 export class TelegramCommandRouter {
-  constructor(private readonly dependencies: TelegramRouterDependencies) {}
+  constructor(private readonly dependencies: TelegramCommandRouterDependencies) {}
 
   getSupportedCommands(): SupportedTelegramCommand[] {
     return listSupportedTelegramCommands();
@@ -537,7 +554,7 @@ export class TelegramCommandRouter {
   ): Promise<TelegramResponse> {
     const result = await this.requestStrategyPreview(args, exchangeAccountId);
     const btcPilot = result.market === "KRW-BTC"
-      ? await this.readBtcPilotVisibility(exchangeAccountId)
+      ? await this.readBtcPilotVisibility(exchangeAccountId, { kind: "LATEST" })
       : null;
     return {
       text: formatStrategyPreviewPresentation(
@@ -554,7 +571,12 @@ export class TelegramCommandRouter {
   ): Promise<TelegramResponse> {
     const result = await this.requestStrategyRun(args, exchangeAccountId);
     const btcPilot = result.market === "KRW-BTC"
-      ? await this.readBtcPilotVisibility(exchangeAccountId, result.strategyDecisionId)
+      ? await this.readBtcPilotVisibility(
+          exchangeAccountId,
+          result.strategyDecisionId === null
+            ? { kind: "NONE" }
+            : { kind: "EXACT", strategyDecisionId: result.strategyDecisionId },
+        )
       : null;
     return {
       text: formatStrategyRunPresentation(
@@ -571,7 +593,7 @@ export class TelegramCommandRouter {
       this.dependencies.operatorState.listTransitions(3),
       this.dependencies.repositories.listReconciliationRuns(exchangeAccountId, 1),
       this.dependencies.repositories.listStrategySchedulerRuns(exchangeAccountId, 5),
-      this.readBtcPilotVisibility(exchangeAccountId),
+      this.readBtcPilotVisibility(exchangeAccountId, { kind: "LATEST" }),
     ]);
 
     const options = buildStatusFormatOptions(
@@ -620,7 +642,7 @@ export class TelegramCommandRouter {
       this.dependencies.repositories.listActiveOrders(exchangeAccountId, undefined, 20),
       this.dependencies.repositories.listRiskEvents(exchangeAccountId, 20),
       this.dependencies.repositories.listPendingOperatorNotifications(exchangeAccountId, { limit: 20 }),
-      this.readBtcPilotVisibility(exchangeAccountId),
+      this.readBtcPilotVisibility(exchangeAccountId, { kind: "LATEST" }),
     ]);
 
     const readinessInput = {
@@ -653,13 +675,79 @@ export class TelegramCommandRouter {
 
   private async readBtcPilotVisibility(
     exchangeAccountId: string,
-    preferredDecisionId: string | null = null,
+    decisionSelection: BtcPilotDecisionSelection,
   ): Promise<BtcCandidatePilotVisibility | null> {
-    const decision = preferredDecisionId && this.dependencies.repositories.getStrategyDecisionById
-      ? await this.dependencies.repositories.getStrategyDecisionById(preferredDecisionId)
-      : await this.dependencies.repositories.getLatestStrategyDecision(exchangeAccountId, "KRW-BTC");
-    if (decision?.exchangeAccountId !== exchangeAccountId || decision.market !== "KRW-BTC") return null;
-    return parseBtcPilotVisibility(decision);
+    const decision = await this.readBtcPilotDecision(exchangeAccountId, decisionSelection);
+    const audit = parseBtcPilotDecisionAudit(decision);
+    const reader = this.dependencies.candidatePilotReader;
+    if (!reader) {
+      return audit === null ? null : unavailableBtcPilotVisibility(audit.latestOutcome);
+    }
+
+    try {
+      const rawDeployment = await reader.getDeploymentForExchangeAccount(exchangeAccountId);
+      if (rawDeployment === null) return unavailableBtcPilotVisibility(audit?.latestOutcome ?? null);
+      const deployment = validateCandidatePilotDeployment(rawDeployment);
+      if (deployment.exchangeAccountId !== exchangeAccountId) {
+        return unavailableBtcPilotVisibility(audit?.latestOutcome ?? null);
+      }
+      const exactState = await reader.getExactState(deployment.id);
+      if (exactState === null) return unavailableBtcPilotVisibility(audit?.latestOutcome ?? null);
+      toPositionGuardCandidateRoutingState(exactState);
+
+      const routeVerified = audit !== null && isAuditCurrentAndVerified({
+        audit,
+        exchangeAccountId,
+        deploymentId: deployment.id,
+        phase: deployment.phase,
+        activationAt: deployment.activationAt,
+        stateVersion: exactState.stateVersion,
+      });
+      return {
+        deploymentId: deployment.id,
+        pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+        phase: deployment.phase,
+        policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+        stateVersion: exactState.stateVersion,
+        activationAt: deployment.activationAt,
+        lastEvidenceAt: exactState.lastEvidenceAt,
+        lastEvidenceId: exactState.lastEvidenceId,
+        currentAuthorityCheck: "VERIFIED_CURRENT",
+        exactFlatCheck: isExactCandidateStateRollbackFlat(exactState)
+          ? "VERIFIED_CURRENT"
+          : "BLOCKED_NON_FLAT",
+        replayCheck: routeVerified ? "VERIFIED_BY_ROUTE" : "UNAVAILABLE",
+        leaseCheck: "UNAVAILABLE",
+        reconciliationCheck: routeVerified ? "VERIFIED_BY_ROUTE" : "UNAVAILABLE",
+        reconciliationRunId: routeVerified ? audit.refreshProvenance?.reconciliationRunId ?? null : null,
+        latestOutcome: audit?.latestOutcome ?? null,
+      };
+    } catch {
+      return unavailableBtcPilotVisibility(audit?.latestOutcome ?? null);
+    }
+  }
+
+  private async readBtcPilotDecision(
+    exchangeAccountId: string,
+    selection: BtcPilotDecisionSelection,
+  ): Promise<StrategyDecisionRecord | null> {
+    try {
+      let decision: StrategyDecisionRecord | null;
+      if (selection.kind === "NONE") return null;
+      if (selection.kind === "EXACT") {
+        const getById = this.dependencies.repositories.getStrategyDecisionById;
+        if (!getById) return null;
+        decision = await getById.call(this.dependencies.repositories, selection.strategyDecisionId);
+        if (decision?.id !== selection.strategyDecisionId) return null;
+      } else {
+        decision = await this.dependencies.repositories.getLatestStrategyDecision(exchangeAccountId, "KRW-BTC");
+      }
+      return decision?.exchangeAccountId === exchangeAccountId && decision.market === "KRW-BTC"
+        ? decision
+        : null;
+    } catch {
+      return null;
+    }
   }
 
   private async buildStateHistoryResponse(): Promise<TelegramResponse> {
@@ -864,14 +952,42 @@ const PILOT_ROUTE_REASON_CODES = new Set([
   "CANDIDATE_EARLY_THESIS_FAILURE",
 ] as const);
 
-function parseBtcPilotVisibility(
+type BtcPilotDecisionSelection =
+  | Readonly<{ kind: "LATEST" }>
+  | Readonly<{ kind: "EXACT"; strategyDecisionId: string }>
+  | Readonly<{ kind: "NONE" }>;
+
+interface BtcPilotDecisionAudit {
+  readonly deploymentId: string | null;
+  readonly phase: BtcCandidatePilotVisibility["phase"];
+  readonly stateVersion: number | null;
+  readonly activationAt: string | null;
+  readonly refreshProvenance: PositionGuardPilotRefreshReceipt | null;
+  readonly latestOutcome: NonNullable<BtcCandidatePilotVisibility["latestOutcome"]>;
+}
+
+const REFRESH_PROVENANCE_KEYS = [
+  "exchangeAccountId",
+  "requestedAt",
+  "balanceSnapshotId",
+  "balanceCapturedAt",
+  "positionSnapshotId",
+  "positionCapturedAt",
+  "reconciliationRunId",
+  "reconciliationStartedAt",
+  "reconciliationCompletedAt",
+  "reconciliationSource",
+] as const;
+
+function parseBtcPilotDecisionAudit(
   decision: StrategyDecisionRecord | null,
-): BtcCandidatePilotVisibility | null {
+): BtcPilotDecisionAudit | null {
   if (decision === null || decision.market !== "KRW-BTC") return null;
 
   let basis: unknown;
   try {
     basis = JSON.parse(decision.decisionBasisJson) as unknown;
+    parseCandidatePilotTimestamp(decision.createdAt, "Telegram candidate decision createdAt");
   } catch {
     return null;
   }
@@ -892,24 +1008,21 @@ function parseBtcPilotVisibility(
     return null;
   }
 
-  const refresh = isPlainRecord(route.refreshProvenance) ? route.refreshProvenance : null;
-  const reconciliationRunId = readNullableNonEmptyString(refresh?.reconciliationRunId);
-  const routeVerified = refresh === null ? "UNAVAILABLE" as const : "VERIFIED_BY_ROUTE" as const;
-
+  const deploymentId = readNullableNonEmptyString(route.deploymentId);
+  const activationAt = readNullableNonEmptyString(route.activationAt);
+  if (activationAt !== null) {
+    try {
+      parseCandidatePilotTimestamp(activationAt, "Telegram candidate activationAt");
+    } catch {
+      return null;
+    }
+  }
   return {
-    deploymentId: readNullableNonEmptyString(route.deploymentId),
-    pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+    deploymentId,
     phase: route.phase as BtcCandidatePilotVisibility["phase"],
-    policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
     stateVersion: route.stateVersion as number | null,
-    activationAt: readNullableNonEmptyString(route.activationAt),
-    lastEvidenceAt: null,
-    lastEvidenceId: null,
-    exactFlatCheck: "UNAVAILABLE",
-    replayCheck: routeVerified,
-    leaseCheck: routeVerified,
-    reconciliationCheck: reconciliationRunId === null ? "UNAVAILABLE" : "VERIFIED_BY_ROUTE",
-    reconciliationRunId,
+    activationAt,
+    refreshProvenance: parseCompleteRefreshProvenance(route.refreshProvenance, decision.createdAt),
     latestOutcome: {
       strategyDecisionId: decision.id,
       action: decision.action,
@@ -917,6 +1030,85 @@ function parseBtcPilotVisibility(
       executionBlocked: route.executionBlocked,
       createdAt: decision.createdAt,
     },
+  };
+}
+
+function parseCompleteRefreshProvenance(
+  value: unknown,
+  decisionCreatedAt: string,
+): PositionGuardPilotRefreshReceipt | null {
+  if (!isExactOwnDataRecord(value, REFRESH_PROVENANCE_KEYS)) return null;
+  const strings = REFRESH_PROVENANCE_KEYS.slice(0, -1).map((key) => value[key]);
+  if (strings.some((item) =>
+    typeof item !== "string" || item.length === 0 || item !== item.trim()
+  )) return null;
+  if (value.reconciliationSource !== "SCHEDULER_PREFLIGHT") return null;
+
+  const receipt = value as unknown as PositionGuardPilotRefreshReceipt;
+  try {
+    const requestedAt = parseCandidatePilotTimestamp(receipt.requestedAt, "Telegram refresh requestedAt");
+    const balanceAt = parseCandidatePilotTimestamp(receipt.balanceCapturedAt, "Telegram balance capturedAt");
+    const positionAt = parseCandidatePilotTimestamp(receipt.positionCapturedAt, "Telegram position capturedAt");
+    const reconciliationStartedAt = parseCandidatePilotTimestamp(
+      receipt.reconciliationStartedAt,
+      "Telegram reconciliation startedAt",
+    );
+    const reconciliationCompletedAt = parseCandidatePilotTimestamp(
+      receipt.reconciliationCompletedAt,
+      "Telegram reconciliation completedAt",
+    );
+    const decisionAt = parseCandidatePilotTimestamp(decisionCreatedAt, "Telegram candidate decision createdAt");
+    if (
+      requestedAt !== balanceAt ||
+      requestedAt !== positionAt ||
+      requestedAt > reconciliationStartedAt ||
+      reconciliationStartedAt > reconciliationCompletedAt ||
+      reconciliationCompletedAt > decisionAt
+    ) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  return Object.freeze({ ...receipt });
+}
+
+function isAuditCurrentAndVerified(input: {
+  audit: BtcPilotDecisionAudit;
+  exchangeAccountId: string;
+  deploymentId: string;
+  phase: NonNullable<BtcCandidatePilotVisibility["phase"]>;
+  activationAt: string | null;
+  stateVersion: number;
+}): boolean {
+  const receipt = input.audit.refreshProvenance;
+  return receipt !== null &&
+    receipt.exchangeAccountId === input.exchangeAccountId &&
+    input.audit.deploymentId === input.deploymentId &&
+    input.audit.phase === input.phase &&
+    input.audit.activationAt === input.activationAt &&
+    input.audit.stateVersion === input.stateVersion;
+}
+
+function unavailableBtcPilotVisibility(
+  latestOutcome: BtcCandidatePilotVisibility["latestOutcome"],
+): BtcCandidatePilotVisibility {
+  return {
+    deploymentId: null,
+    pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+    phase: null,
+    policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+    stateVersion: null,
+    activationAt: null,
+    lastEvidenceAt: null,
+    lastEvidenceId: null,
+    currentAuthorityCheck: "BLOCKED_UNAVAILABLE",
+    exactFlatCheck: "UNAVAILABLE",
+    replayCheck: "UNAVAILABLE",
+    leaseCheck: "UNAVAILABLE",
+    reconciliationCheck: "UNAVAILABLE",
+    reconciliationRunId: null,
+    latestOutcome,
   };
 }
 
@@ -936,7 +1128,28 @@ function appendPilotTechnicalVisibility(
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  return value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
+
+function isExactOwnDataRecord<const TKeys extends readonly string[]>(
+  value: unknown,
+  keys: TKeys,
+): value is Record<TKeys[number], unknown> {
+  if (!isPlainRecord(value)) return false;
+  const ownKeys = Reflect.ownKeys(value);
+  if (
+    ownKeys.length !== keys.length ||
+    ownKeys.some((key) => typeof key !== "string" || !keys.includes(key))
+  ) {
+    return false;
+  }
+  return ownKeys.every((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && "value" in descriptor && descriptor.enumerable;
+  });
 }
 
 function isNullableNonNegativeSafeInteger(value: unknown): boolean {

@@ -84,6 +84,7 @@ const ACTIVE_PILOT_VISIBILITY: BtcCandidatePilotVisibility = {
   stateVersion: 4,
   lastEvidenceAt: null,
   lastEvidenceId: null,
+  currentAuthorityCheck: "VERIFIED_CURRENT",
   exactFlatCheck: "UNAVAILABLE",
   replayCheck: "VERIFIED_BY_ROUTE",
   leaseCheck: "VERIFIED_BY_ROUTE",

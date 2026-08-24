@@ -30,6 +30,11 @@ type LocalizedLabel = {
   readonly en: string;
 };
 
+type PilotOperatorNotificationType = Extract<
+  OperatorNotificationType,
+  `POSITION_GUARD_PILOT_${string}`
+>;
+
 const DISPLAYED_NOTIFICATION_LIMIT = 3;
 const DISPLAYED_DELIVERY_RUN_LIMIT = 1;
 const DISPLAYED_DELIVERY_ATTEMPT_LIMIT = 1;
@@ -90,6 +95,112 @@ const DELIVERY_RUN_STATUS_LABELS: Readonly<Record<OperatorNotificationDeliveryRu
   SKIPPED: label("건너뜀", "Skipped"),
   FAILED: label("실패", "Failed"),
 };
+
+const PILOT_PUSH_COPY: Readonly<Record<
+  PilotOperatorNotificationType,
+  Readonly<{ title: LocalizedLabel; message: LocalizedLabel }>
+>> = {
+  POSITION_GUARD_PILOT_ACTIVATED: {
+    title: label("BTC 후보 파일럿 활성화", "BTC candidate pilot activated"),
+    message: label("현재 저장 권위가 ACTIVE 단계로 전환되었습니다.", "The persisted authority entered ACTIVE."),
+  },
+  POSITION_GUARD_PILOT_FAULT_PAUSED: {
+    title: label("BTC 후보 파일럿 장애 일시정지", "BTC candidate pilot fault paused"),
+    message: label("복구 또는 검증 오류로 파일럿 실행이 차단되었습니다.", "Pilot execution was blocked by a recovery or verification fault."),
+  },
+  POSITION_GUARD_PILOT_UNCERTAIN_SUBMISSION: {
+    title: label("BTC 후보 파일럿 주문 상태 불확실", "BTC candidate pilot submission uncertain"),
+    message: label("주문 제출 결과를 확정할 수 없어 파일럿 실행이 차단되었습니다.", "Pilot execution was blocked because submission outcome is uncertain."),
+  },
+  POSITION_GUARD_PILOT_ROLLBACK_STARTED: {
+    title: label("BTC 후보 파일럿 롤백 시작", "BTC candidate pilot rollback started"),
+    message: label("신규 후보 위험을 차단하고 기존 노출 축소를 시작했습니다.", "New candidate risk was blocked and existing exposure started draining."),
+  },
+  POSITION_GUARD_PILOT_ROLLBACK_COMPLETED: {
+    title: label("BTC 후보 파일럿 롤백 완료", "BTC candidate pilot rollback completed"),
+    message: label("정확한 무포지션 상태를 확인하고 파일럿을 비활성화했습니다.", "The pilot was disabled after exact-flat state was verified."),
+  },
+};
+
+export function formatOperatorNotificationPushPresentation(
+  notification: Pick<
+    OperatorNotificationRecord,
+    "id" | "severity" | "notificationType" | "payloadJson" | "createdAt"
+  >,
+  locale: TelegramLocale,
+): string | null {
+  if (!isPilotOperatorNotificationType(notification.notificationType)) return null;
+  const copy = PILOT_PUSH_COPY[notification.notificationType];
+  const payload = parsePilotNotificationPayload(notification.payloadJson);
+  const fields = collectPilotTechnicalFields(payload, locale);
+  return (locale === "ko-KR"
+    ? [
+        `[${localized(SEVERITY_LABELS[notification.severity], locale)}] ${localized(copy.title, locale)}`,
+        `알림 코드: ${notification.notificationType}`,
+        `알림 ID: ${notification.id}`,
+        `설명: ${localized(copy.message, locale)}`,
+        ...fields,
+        `발생 시각: ${formatTimestamp(notification.createdAt, locale)} (created_at: ${notification.createdAt})`,
+      ]
+    : [
+        `[${localized(SEVERITY_LABELS[notification.severity], locale)}] ${localized(copy.title, locale)}`,
+        `Notification code: ${notification.notificationType}`,
+        `Notification ID: ${notification.id}`,
+        `Description: ${localized(copy.message, locale)}`,
+        ...fields,
+        `Created: ${formatTimestamp(notification.createdAt, locale)} (created_at: ${notification.createdAt})`,
+      ]).join("\n");
+}
+
+function isPilotOperatorNotificationType(
+  value: OperatorNotificationType,
+): value is PilotOperatorNotificationType {
+  return Object.hasOwn(PILOT_PUSH_COPY, value);
+}
+
+function parsePilotNotificationPayload(value: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function collectPilotTechnicalFields(
+  payload: Record<string, unknown> | null,
+  locale: TelegramLocale,
+): string[] {
+  if (payload === null) return [];
+  const labels = locale === "ko-KR"
+    ? {
+        deploymentId: "배포 ID",
+        phase: "현재 단계",
+        stateVersion: "상태 버전",
+        reasonCode: "사유 코드",
+        faultId: "장애 ID",
+      }
+    : {
+        deploymentId: "Deployment ID",
+        phase: "Current phase",
+        stateVersion: "State version",
+        reasonCode: "Reason code",
+        faultId: "Fault ID",
+      };
+  const lines: string[] = [];
+  for (const key of ["deploymentId", "phase", "stateVersion", "reasonCode", "faultId"] as const) {
+    const value = payload[key];
+    if (
+      (typeof value === "string" && value.trim().length > 0) ||
+      (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+    ) {
+      lines.push(`${labels[key]}: ${String(value)}`);
+    }
+  }
+  return lines;
+}
 
 export function formatOperatorNotificationsPresentation(
   notifications: readonly OperatorNotificationRecord[],

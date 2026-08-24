@@ -13,6 +13,7 @@ import type {
   PositionSnapshotRecord,
   RiskEventRecord,
   RiskRuleCode,
+  StrategyDecisionRecord,
   StrategySchedulerRunRecord,
   StrategySchedulerStatus,
 } from "../src/domain/types.js";
@@ -5426,6 +5427,98 @@ test("telegram router calls a wired strategy run controller for supported assets
   assert.match(response.text, /submission_accepted: none/);
 });
 
+function createBtcPilotDecision(input: {
+  id: string;
+  phase: "ACTIVE" | "DRAINING";
+  stateVersion: number;
+  reasonCode: "CANDIDATE_ALLOWED" | "DRAINING_RISK_REDUCTION_PRESERVED";
+}): StrategyDecisionRecord {
+  return {
+    id: input.id,
+    exchangeAccountId: "primary",
+    strategyKey: "position_guard.paper_core.v1",
+    market: "KRW-BTC",
+    action: input.phase === "ACTIVE" ? "ADD" : "REDUCE",
+    status: "READY",
+    decisionBasisJson: JSON.stringify({
+      policyRoute: {
+        schemaVersion: "POSITION_GUARD_POLICY_ROUTE_AUDIT_V1",
+        configuredSelection: {
+          kind: "BTC_CANDIDATE_PILOT",
+          pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+          market: "KRW-BTC",
+          policyId: "COMBINED_CONSERVATIVE",
+          policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+          liveOperatorConfirmed: true,
+        },
+        resolvedSelection: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+        executionBlocked: input.phase !== "ACTIVE",
+        deploymentId: "deployment-pilot-1",
+        pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+        policyId: "COMBINED_CONSERVATIVE",
+        policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+        phase: input.phase,
+        activationAt: "2026-08-21T03:00:00.000Z",
+        stateVersion: input.stateVersion,
+        reasonCode: input.reasonCode,
+        refreshProvenance: {
+          exchangeAccountId: "primary",
+          requestedAt: "2026-08-21T03:29:00.000Z",
+          balanceSnapshotId: "balance-pilot-1",
+          balanceCapturedAt: "2026-08-21T03:29:00.000Z",
+          positionSnapshotId: "position-pilot-1",
+          positionCapturedAt: "2026-08-21T03:29:00.000Z",
+          reconciliationRunId: "reconciliation-pilot-1",
+          reconciliationStartedAt: "2026-08-21T03:29:00.100Z",
+          reconciliationCompletedAt: "2026-08-21T03:29:00.200Z",
+          reconciliationSource: "SCHEDULER_PREFLIGHT",
+        },
+      },
+    }),
+    intendedNotionalKrw: input.phase === "ACTIVE" ? "5000" : null,
+    intendedQuantity: input.phase === "DRAINING" ? "0.00001" : null,
+    referencePrice: "100000000",
+    createdAt: "2026-08-21T03:30:00.000Z",
+  };
+}
+
+function createCandidatePilotReader(input: {
+  phase: "ACTIVE" | "DRAINING";
+  stateVersion: number;
+}) {
+  return {
+    async getDeploymentForExchangeAccount() {
+      return {
+        id: "deployment-pilot-1",
+        exchangeAccountId: "primary",
+        pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1" as const,
+        market: "KRW-BTC" as const,
+        policyId: "COMBINED_CONSERVATIVE" as const,
+        policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1" as const,
+        phase: input.phase,
+        activationAt: "2026-08-21T03:00:00.000Z",
+        activationEpochNs: BigInt(Date.parse("2026-08-21T03:00:00.000Z")) * 1_000_000n,
+        createdAt: "2026-08-21T02:00:00.000Z",
+        updatedAt: "2026-08-21T03:30:00.000Z",
+      };
+    },
+    async getExactState() {
+      return {
+        currentEpisodeAddCount: 1,
+        currentEpisodeCostBasisKrw: "5000",
+        currentEpisodeInventoryQuantity: "0.00005",
+        currentEpisodeRealizedPnlKrw: "0",
+        lastFullExitAt: null,
+        lastFullExitRealizedPnlKrw: null,
+        lastEntryPath: "PULLBACK" as const,
+        lastEvidenceAt: "2026-08-21T03:20:00.000Z",
+        lastEvidenceId: "evidence-pilot-1",
+        stateVersion: input.stateVersion,
+      };
+    },
+  };
+}
+
 test("telegram router exposes persisted BTC pilot audit on status, readiness, run, and preview", async () => {
   const repository = new InMemoryExecutionRepository();
   const decisionBasisJson = JSON.stringify({
@@ -5450,7 +5543,16 @@ test("telegram router exposes persisted BTC pilot audit on status, readiness, ru
       stateVersion: 4,
       reasonCode: "CANDIDATE_ALLOWED",
       refreshProvenance: {
+        exchangeAccountId: "primary",
+        requestedAt: "2026-08-21T03:29:00.000Z",
+        balanceSnapshotId: "balance-pilot-1",
+        balanceCapturedAt: "2026-08-21T03:29:00.000Z",
+        positionSnapshotId: "position-pilot-1",
+        positionCapturedAt: "2026-08-21T03:29:00.000Z",
         reconciliationRunId: "reconciliation-pilot-1",
+        reconciliationStartedAt: "2026-08-21T03:29:00.100Z",
+        reconciliationCompletedAt: "2026-08-21T03:29:00.200Z",
+        reconciliationSource: "SCHEDULER_PREFLIGHT",
       },
     },
     localConfirmation: "I_UNDERSTAND_BTC_CANDIDATE_LIVE_PILOT",
@@ -5469,8 +5571,39 @@ test("telegram router exposes persisted BTC pilot audit on status, readiness, ru
     referencePrice: "100000000",
     createdAt: "2026-08-21T03:30:00.000Z",
   });
-  const router = new TelegramCommandRouter({
+  const dependencies = {
     repositories: repository,
+    candidatePilotReader: {
+      async getDeploymentForExchangeAccount() {
+        return {
+          id: "deployment-pilot-1",
+          exchangeAccountId: "primary",
+          pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1" as const,
+          market: "KRW-BTC" as const,
+          policyId: "COMBINED_CONSERVATIVE" as const,
+          policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1" as const,
+          phase: "ACTIVE" as const,
+          activationAt: "2026-08-21T03:00:00.000Z",
+          activationEpochNs: BigInt(Date.parse("2026-08-21T03:00:00.000Z")) * 1_000_000n,
+          createdAt: "2026-08-21T02:00:00.000Z",
+          updatedAt: "2026-08-21T03:30:00.000Z",
+        };
+      },
+      async getExactState() {
+        return {
+          currentEpisodeAddCount: 1,
+          currentEpisodeCostBasisKrw: "5000",
+          currentEpisodeInventoryQuantity: "0.00005",
+          currentEpisodeRealizedPnlKrw: "0",
+          lastFullExitAt: null,
+          lastFullExitRealizedPnlKrw: null,
+          lastEntryPath: "PULLBACK" as const,
+          lastEvidenceAt: "2026-08-21T03:20:00.000Z",
+          lastEvidenceId: "evidence-pilot-1",
+          stateVersion: 4,
+        };
+      },
+    },
     operatorState: new InMemoryOperatorStateStore({
       id: "state-pilot-visibility",
       exchangeAccountId: "primary",
@@ -5485,7 +5618,7 @@ test("telegram router exposes persisted BTC pilot audit on status, readiness, ru
     }),
     liveSendPath: "LIVE_ADAPTER",
     strategyRunController: {
-      async requestRun(request) {
+      async requestRun(request: { market: "KRW-BTC" | "KRW-ETH" }) {
         return {
           status: "COMPLETED",
           requestedAt: "2026-08-21T03:31:00.000Z",
@@ -5498,7 +5631,7 @@ test("telegram router exposes persisted BTC pilot audit on status, readiness, ru
           detail: "Candidate decision persisted.",
         };
       },
-      async requestPreview(request) {
+      async requestPreview(request: { market: "KRW-BTC" | "KRW-ETH" }) {
         return {
           status: "COMPLETED",
           requestedAt: "2026-08-21T03:31:00.000Z",
@@ -5517,7 +5650,8 @@ test("telegram router exposes persisted BTC pilot audit on status, readiness, ru
       },
     },
     now: () => "2026-08-21T03:31:00.000Z",
-  });
+  };
+  const router = new TelegramCommandRouter(dependencies as unknown as ConstructorParameters<typeof TelegramCommandRouter>[0]);
 
   const responses = await Promise.all([
     router.route("/status"),
@@ -5539,6 +5673,239 @@ test("telegram router exposes persisted BTC pilot audit on status, readiness, ru
   assert.match(responses[0]!.text, /최근 BTC 후보 결과: 추가 매수 · CANDIDATE_ALLOWED/u);
   assert.match(responses[1]!.text, /btc_pilot_latest_reason_code: CANDIDATE_ALLOWED/u);
   assert.match(responses[3]!.text, /btc_pilot_replay_check: VERIFIED_BY_ROUTE/u);
+  assert.match(responses[3]!.text, /btc_pilot_lease_check: UNAVAILABLE/u);
+});
+
+test("status and readiness use current persisted BTC pilot authority instead of a stale decision phase", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveStrategyDecision(createBtcPilotDecision({
+    id: "decision-stale-active",
+    phase: "ACTIVE",
+    stateVersion: 4,
+    reasonCode: "CANDIDATE_ALLOWED",
+  }));
+  const candidatePilotReader = createCandidatePilotReader({ phase: "DRAINING", stateVersion: 5 });
+  let deploymentReadCount = 0;
+  let stateReadCount = 0;
+  const dependencies = {
+    repositories: repository,
+    candidatePilotReader: {
+      async getDeploymentForExchangeAccount(exchangeAccountId: string) {
+        deploymentReadCount += 1;
+        void exchangeAccountId;
+        return candidatePilotReader.getDeploymentForExchangeAccount();
+      },
+      async getExactState(deploymentId: string) {
+        stateReadCount += 1;
+        void deploymentId;
+        return candidatePilotReader.getExactState();
+      },
+    },
+    operatorState: new InMemoryOperatorStateStore(createControlState({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+    })),
+    liveSendPath: "LIVE_ADAPTER" as const,
+    locale: "en-US" as const,
+  };
+  const router = new TelegramCommandRouter(dependencies as unknown as ConstructorParameters<typeof TelegramCommandRouter>[0]);
+
+  const status = await router.route("/status detail");
+  const readiness = await router.route("/readiness detail");
+
+  assert.match(status.text, /btc_pilot_phase: DRAINING/u);
+  assert.match(status.text, /btc_pilot_state_version: 5/u);
+  assert.doesNotMatch(status.text, /btc_pilot_phase: ACTIVE/u);
+  assert.match(readiness.text, /btc_pilot_phase: DRAINING/u);
+  assert.match(readiness.text, /btc_pilot_current_authority_check: VERIFIED_CURRENT/u);
+  assert.match(readiness.text, /btc_pilot_replay_check: UNAVAILABLE/u);
+  assert.equal(deploymentReadCount, 2);
+  assert.equal(stateReadCount, 2);
+});
+
+test("status blocks BTC pilot visibility when current persisted authority is unavailable or malformed", async () => {
+  const repository = new InMemoryExecutionRepository();
+  await repository.saveStrategyDecision(createBtcPilotDecision({
+    id: "decision-cannot-authorize-current",
+    phase: "ACTIVE",
+    stateVersion: 4,
+    reasonCode: "CANDIDATE_ALLOWED",
+  }));
+  const dependencies = {
+    repositories: repository,
+    candidatePilotReader: {
+      async getDeploymentForExchangeAccount() {
+        return { phase: "ACTIVE" };
+      },
+      async getExactState() {
+        throw new Error("must not read state after malformed deployment");
+      },
+    },
+    operatorState: new InMemoryOperatorStateStore(createControlState({})),
+  };
+  const router = new TelegramCommandRouter(dependencies as unknown as ConstructorParameters<typeof TelegramCommandRouter>[0]);
+
+  const response = await router.route("/status detail");
+
+  assert.match(response.text, /btc_pilot_phase: unavailable/u);
+  assert.match(response.text, /btc_pilot_current_authority_check: BLOCKED_UNAVAILABLE/u);
+  assert.doesNotMatch(response.text, /btc_pilot_phase: ACTIVE/u);
+});
+
+test("truncated or incoherent BTC refresh provenance is never labeled verified", async () => {
+  const scenarios = [
+    {
+      name: "truncated",
+      mutate(provenance: Record<string, unknown>) {
+        delete provenance.positionSnapshotId;
+      },
+    },
+    {
+      name: "wrong-account",
+      mutate(provenance: Record<string, unknown>) {
+        provenance.exchangeAccountId = "different-account";
+      },
+    },
+    {
+      name: "non-canonical-id",
+      mutate(provenance: Record<string, unknown>) {
+        provenance.balanceSnapshotId = " balance-pilot-1 ";
+      },
+    },
+    {
+      name: "non-canonical-timezone",
+      mutate(provenance: Record<string, unknown>) {
+        provenance.balanceCapturedAt = "2026-08-21 03:29:00";
+      },
+    },
+    {
+      name: "reconciliation-time-reversal",
+      mutate(provenance: Record<string, unknown>) {
+        provenance.reconciliationStartedAt = "2026-08-21T03:29:00.300Z";
+        provenance.reconciliationCompletedAt = "2026-08-21T03:29:00.200Z";
+      },
+    },
+  ] as const;
+
+  for (const scenario of scenarios) {
+    const repository = new InMemoryExecutionRepository();
+    const malformed = createBtcPilotDecision({
+      id: `decision-${scenario.name}-provenance`,
+      phase: "ACTIVE",
+      stateVersion: 4,
+      reasonCode: "CANDIDATE_ALLOWED",
+    });
+    const basis = JSON.parse(malformed.decisionBasisJson) as {
+      policyRoute: { refreshProvenance: Record<string, unknown> };
+    };
+    scenario.mutate(basis.policyRoute.refreshProvenance);
+    await repository.saveStrategyDecision({ ...malformed, decisionBasisJson: JSON.stringify(basis) });
+    const dependencies = {
+      repositories: repository,
+      candidatePilotReader: createCandidatePilotReader({ phase: "ACTIVE", stateVersion: 4 }),
+      operatorState: new InMemoryOperatorStateStore(createControlState({})),
+    };
+    const router = new TelegramCommandRouter(
+      dependencies as unknown as ConstructorParameters<typeof TelegramCommandRouter>[0],
+    );
+
+    const response = await router.route("/readiness detail");
+
+    assert.match(response.text, /btc_pilot_current_authority_check: VERIFIED_CURRENT/u, scenario.name);
+    assert.match(response.text, /btc_pilot_replay_check: UNAVAILABLE/u, scenario.name);
+    assert.match(response.text, /btc_pilot_lease_check: UNAVAILABLE/u, scenario.name);
+    assert.match(response.text, /btc_pilot_reconciliation_check: UNAVAILABLE/u, scenario.name);
+    assert.doesNotMatch(response.text, /VERIFIED_BY_ROUTE/u, scenario.name);
+  }
+});
+
+test("run BTC never falls back to another strategy decision when exact lookup mismatches", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const stale = createBtcPilotDecision({
+    id: "decision-stale-latest",
+    phase: "ACTIVE",
+    stateVersion: 4,
+    reasonCode: "CANDIDATE_ALLOWED",
+  });
+  await repository.saveStrategyDecision(stale);
+  repository.getStrategyDecisionById = async () => stale;
+  const dependencies = {
+    repositories: repository,
+    candidatePilotReader: createCandidatePilotReader({ phase: "ACTIVE", stateVersion: 4 }),
+    operatorState: new InMemoryOperatorStateStore(createControlState({})),
+    strategyRunController: {
+      async requestRun() {
+        return {
+          status: "COMPLETED" as const,
+          requestedAt: "2026-08-21T03:31:00.000Z",
+          market: "KRW-BTC" as const,
+          strategyDecisionId: "decision-exact-returned",
+          action: "HOLD" as const,
+          orderId: null,
+          orderStatus: null,
+          submissionAccepted: null,
+          detail: "Exact decision lookup mismatch fixture.",
+        };
+      },
+      async requestPreview() {
+        throw new Error("preview must not run");
+      },
+    },
+  };
+  const router = new TelegramCommandRouter(dependencies as unknown as ConstructorParameters<typeof TelegramCommandRouter>[0]);
+
+  const response = await router.route("/run BTC");
+
+  assert.match(response.text, /decision-exact-returned/u);
+  assert.doesNotMatch(response.text, /decision-stale-latest/u);
+  assert.doesNotMatch(response.text, /CANDIDATE_ALLOWED/u);
+});
+
+test("run BTC omits decision audit when exact lookup is unavailable", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const stale = createBtcPilotDecision({
+    id: "decision-latest-must-not-be-used",
+    phase: "ACTIVE",
+    stateVersion: 4,
+    reasonCode: "CANDIDATE_ALLOWED",
+  });
+  await repository.saveStrategyDecision(stale);
+  Object.defineProperty(repository, "getStrategyDecisionById", {
+    configurable: true,
+    value: undefined,
+  });
+  const dependencies = {
+    repositories: repository,
+    candidatePilotReader: createCandidatePilotReader({ phase: "ACTIVE", stateVersion: 4 }),
+    operatorState: new InMemoryOperatorStateStore(createControlState({})),
+    strategyRunController: {
+      async requestRun() {
+        return {
+          status: "COMPLETED" as const,
+          requestedAt: "2026-08-21T03:31:00.000Z",
+          market: "KRW-BTC" as const,
+          strategyDecisionId: "decision-exact-unavailable",
+          action: "HOLD" as const,
+          orderId: null,
+          orderStatus: null,
+          submissionAccepted: null,
+          detail: "Exact decision lookup unavailable fixture.",
+        };
+      },
+      async requestPreview() {
+        throw new Error("preview must not run");
+      },
+    },
+  };
+  const router = new TelegramCommandRouter(
+    dependencies as unknown as ConstructorParameters<typeof TelegramCommandRouter>[0],
+  );
+
+  const response = await router.route("/run BTC");
+
+  assert.match(response.text, /decision-exact-unavailable/u);
+  assert.doesNotMatch(response.text, /decision-latest-must-not-be-used/u);
+  assert.doesNotMatch(response.text, /CANDIDATE_ALLOWED/u);
 });
 
 test("router localizes run, calls BTC and ETH exactly once, and adds one bounded BTC audit read", async () => {
