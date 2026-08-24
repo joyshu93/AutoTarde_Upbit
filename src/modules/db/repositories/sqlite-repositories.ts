@@ -979,24 +979,6 @@ export class SqliteExecutionRepository implements ExecutionRepository {
         last_attempt_at, next_attempt_at, failure_class, lease_token,
         lease_expires_at, created_at, delivered_at, last_error
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        exchange_account_id = excluded.exchange_account_id,
-        channel = excluded.channel,
-        notification_type = excluded.notification_type,
-        severity = excluded.severity,
-        title = excluded.title,
-        message = excluded.message,
-        payload_json = excluded.payload_json,
-        delivery_status = excluded.delivery_status,
-        attempt_count = excluded.attempt_count,
-        last_attempt_at = excluded.last_attempt_at,
-        next_attempt_at = excluded.next_attempt_at,
-        failure_class = excluded.failure_class,
-        lease_token = excluded.lease_token,
-        lease_expires_at = excluded.lease_expires_at,
-        created_at = excluded.created_at,
-        delivered_at = excluded.delivered_at,
-        last_error = excluded.last_error
     `).run(
       record.id,
       record.exchangeAccountId,

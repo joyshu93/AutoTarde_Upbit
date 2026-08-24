@@ -671,13 +671,11 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   }
 
   async saveOperatorNotification(record: OperatorNotificationRecord): Promise<void> {
-    const index = this.operatorNotifications.findIndex((candidate) => candidate.id === record.id);
-    if (index === -1) {
-      this.operatorNotifications.push(record);
-      return;
+    if (this.operatorNotifications.some((candidate) => candidate.id === record.id)) {
+      throw new Error(`Operator notification ${record.id} already exists.`);
     }
 
-    this.operatorNotifications[index] = record;
+    this.operatorNotifications.push(record);
   }
 
   async saveOperatorNotificationDeliveryAttempt(

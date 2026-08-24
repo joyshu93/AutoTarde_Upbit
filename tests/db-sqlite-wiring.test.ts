@@ -54,6 +54,52 @@ test("in-memory atomic lifecycle writes are idempotent, validated, and detached"
   await assertAtomicLifecycleContract(repository);
 });
 
+test("in-memory operator notification persistence rejects duplicate ids without rewinding delivery state", async () => {
+  await assertOperatorNotificationInsertOnlyContract(new InMemoryExecutionRepository());
+});
+
+test("sqlite operator notification persistence rejects duplicate ids without rewinding delivery state", async () => {
+  const databasePath = await createTempDatabasePath("notification-insert-only");
+  const bundle = createNotificationTestPersistence(databasePath);
+
+  try {
+    await assertOperatorNotificationInsertOnlyContract(bundle.repositories);
+  } finally {
+    bundle.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("sqlite operator notification insert race stores one immutable row and rejects one writer", async () => {
+  const databasePath = await createTempDatabasePath("notification-insert-race");
+  const first = createNotificationTestPersistence(databasePath);
+  const second = createNotificationTestPersistence(databasePath);
+  const notification = createNotification({
+    id: "operator-notification-race",
+    title: "Candidate pilot recovery completed",
+    message: "Candidate pilot recovery completed without drift.",
+    payloadJson: JSON.stringify({ deploymentId: "deployment-race" }),
+    createdAt: "2026-08-24T00:10:00.000Z",
+  });
+
+  try {
+    const results = await Promise.allSettled([
+      first.repositories.saveOperatorNotification({ ...notification }),
+      second.repositories.saveOperatorNotification({ ...notification }),
+    ]);
+
+    assert.deepEqual(
+      results.map((result) => result.status).sort(),
+      ["fulfilled", "rejected"],
+    );
+    assert.deepEqual(await first.repositories.listOperatorNotifications("primary", 10), [notification]);
+  } finally {
+    second.close();
+    first.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
 test("in-memory automatic fault pauses are idempotent and preserve kill switches", async () => {
   await assertFaultTimestampPrecisionContract(createInMemoryOperatorState());
 
@@ -1411,6 +1457,109 @@ async function createTempDatabasePath(label: string): Promise<string> {
 
 async function cleanupTempDatabase(databasePath: string): Promise<void> {
   await rm(databasePath, { force: true });
+}
+
+function createNotificationTestPersistence(databasePath: string) {
+  return createSqlitePersistence({
+    databasePath,
+    exchangeAccountId: "primary",
+    userId: "user-notification-test",
+    userTelegramId: "telegram-notification-test",
+    userDisplayName: "Notification Test Operator",
+    accessKeyRef: "secret://upbit/access",
+    secretKeyRef: "secret://upbit/secret",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    killSwitchActive: false,
+  });
+}
+
+async function assertOperatorNotificationInsertOnlyContract(repository: ExecutionRepository): Promise<void> {
+  const pending = createNotification({
+    id: "operator-notification-insert-only",
+    title: "Candidate pilot recovery completed",
+    message: "Candidate pilot recovery completed without drift.",
+    payloadJson: JSON.stringify({ deploymentId: "deployment-insert-only" }),
+    createdAt: "2026-08-24T00:00:00.000Z",
+  });
+
+  await repository.saveOperatorNotification(pending);
+  await assert.rejects(repository.saveOperatorNotification({ ...pending }));
+  assert.deepEqual(await readOperatorNotification(repository, pending.id), pending);
+
+  await assert.rejects(repository.saveOperatorNotification({
+    ...pending,
+    message: "Conflicting immutable notification material.",
+  }));
+  assert.deepEqual(await readOperatorNotification(repository, pending.id), pending);
+
+  const [leased] = await repository.claimPendingOperatorNotifications("primary", {
+    limit: 1,
+    dueBefore: "2026-08-24T00:01:00.000Z",
+    claimedAt: "2026-08-24T00:01:00.000Z",
+    leaseToken: "lease-insert-only-sent",
+    leaseExpiresAt: "2026-08-24T00:02:00.000Z",
+  });
+  assert.equal(leased?.id, pending.id);
+  const leasedReadback = await readOperatorNotification(repository, pending.id);
+  await assert.rejects(repository.saveOperatorNotification({ ...pending }));
+  assert.deepEqual(await readOperatorNotification(repository, pending.id), leasedReadback);
+
+  assert.equal(await repository.compareAndSetOperatorNotificationDeliveryStatus({
+    id: pending.id,
+    leaseToken: "lease-insert-only-sent",
+    deliveryStatus: "SENT",
+    attemptCount: leased?.attemptCount ?? 0,
+    lastAttemptAt: "2026-08-24T00:01:01.000Z",
+    nextAttemptAt: null,
+    failureClass: null,
+    deliveredAt: "2026-08-24T00:01:01.000Z",
+    lastError: null,
+  }), true);
+  const sentReadback = await readOperatorNotification(repository, pending.id);
+  await assert.rejects(repository.saveOperatorNotification({ ...pending }));
+  assert.deepEqual(await readOperatorNotification(repository, pending.id), sentReadback);
+
+  const pendingFailure = createNotification({
+    id: "operator-notification-insert-only-failed",
+    title: "Candidate pilot recovery failed",
+    message: "Candidate pilot recovery requires operator action.",
+    payloadJson: JSON.stringify({ deploymentId: "deployment-insert-only" }),
+    createdAt: "2026-08-24T00:03:00.000Z",
+  });
+  await repository.saveOperatorNotification(pendingFailure);
+  const [leasedFailure] = await repository.claimPendingOperatorNotifications("primary", {
+    limit: 1,
+    dueBefore: "2026-08-24T00:04:00.000Z",
+    claimedAt: "2026-08-24T00:04:00.000Z",
+    leaseToken: "lease-insert-only-failed",
+    leaseExpiresAt: "2026-08-24T00:05:00.000Z",
+  });
+  assert.equal(leasedFailure?.id, pendingFailure.id);
+  assert.equal(await repository.compareAndSetOperatorNotificationDeliveryStatus({
+    id: pendingFailure.id,
+    leaseToken: "lease-insert-only-failed",
+    deliveryStatus: "FAILED",
+    attemptCount: leasedFailure?.attemptCount ?? 0,
+    lastAttemptAt: "2026-08-24T00:04:01.000Z",
+    nextAttemptAt: null,
+    failureClass: "PERMANENT",
+    deliveredAt: null,
+    lastError: "telegram_http_403",
+  }), true);
+  const failedReadback = await readOperatorNotification(repository, pendingFailure.id);
+  await assert.rejects(repository.saveOperatorNotification({ ...pendingFailure }));
+  assert.deepEqual(await readOperatorNotification(repository, pendingFailure.id), failedReadback);
+}
+
+async function readOperatorNotification(
+  repository: ExecutionRepository,
+  notificationId: string,
+): Promise<OperatorNotificationRecord> {
+  const notification = (await repository.listOperatorNotifications("primary", 100))
+    .find((candidate) => candidate.id === notificationId);
+  assert.ok(notification, `Expected operator notification ${notificationId}.`);
+  return notification;
 }
 
 async function createPre0016Database(
