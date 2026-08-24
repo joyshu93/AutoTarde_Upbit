@@ -46,6 +46,55 @@ test("application startup runs every production continuation step after candidat
   ]);
 });
 
+test("selected-candidate startup recovery completes before every generic and runtime surface", async () => {
+  const events: string[] = [];
+  const { runAppStartup } = await loadFreshIndexModule();
+  const app = createAppFixture(events, {
+    async initialize() {
+      events.push("initializer");
+    },
+  }, true, "COMPLETED", {
+    async prepareAndRecover() {
+      events.push("candidate:recovery");
+      return { status: "READY" } as const;
+    },
+  });
+
+  await runAppStartup(app, createOperations(events));
+
+  assert.deepEqual(events.slice(0, 5), [
+    "initializer",
+    "candidate:recovery",
+    "recovery",
+    "policy",
+    "delivery",
+  ]);
+});
+
+test("candidate startup recovery failure owns shutdown before either market can start", async () => {
+  const events: string[] = [];
+  const { runAppStartup } = await loadFreshIndexModule();
+  const originalError = new Error("candidate_startup_recovery_failed");
+  const app = createAppFixture(events, null, true, "COMPLETED", {
+    async prepareAndRecover() {
+      events.push("candidate:recovery");
+      throw originalError;
+    },
+  });
+
+  await assert.rejects(
+    () => runAppStartup(app, createOperations(events)),
+    (error) => error === originalError,
+  );
+
+  assert.deepEqual(events, [
+    "candidate:recovery",
+    "telegram:stop",
+    "scheduler:stop",
+    "persistence:close",
+  ]);
+});
+
 test("application startup keeps successful background work open", async () => {
   const events: string[] = [];
   const { runAppStartup } = await loadFreshIndexModule();
@@ -180,9 +229,14 @@ function createAppFixture(
   candidatePilotInitializer: { initialize(): Promise<unknown> } | null,
   hasBackgroundWork: boolean,
   menuStatus: "COMPLETED" | "FAILED" = "COMPLETED",
+  candidatePilotStartupRecovery: {
+    prepareAndRecover(): Promise<Readonly<{ status: "READY" }>>;
+  } | null = null,
 ): AppServices {
   return {
     candidatePilotInitializer,
+    candidatePilotStartupAuthority: candidatePilotInitializer,
+    candidatePilotStartupRecovery,
     exchangeBackedReadEnabled: false,
     portfolioSyncService: {} as never,
     operatorState: {

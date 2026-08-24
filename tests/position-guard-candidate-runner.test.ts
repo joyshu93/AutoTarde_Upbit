@@ -90,7 +90,26 @@ test("default runner router covers ACTIVE, DRAINING, DISABLED, and ETH baseline 
       [drainingResult.strategyDecision.action, readPolicyRoute(drainingResult.strategyDecisionRecord).reasonCode],
       [expectedAction, expectedReason],
     );
-    assert.equal(draining.submitted[0]?.candidateAuthority, undefined);
+    if (action === "REDUCE" || action === "EXIT") {
+      assert.deepEqual(draining.submitted[0]?.candidateAuthority, {
+        kind: "POSITION_GUARD_BTC_CANDIDATE",
+        deploymentId: "deployment-1",
+        exchangeAccountId: "primary",
+        pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+        market: "KRW-BTC",
+        strategyKey: "position_guard.paper_core.v1",
+        policyId: "COMBINED_CONSERVATIVE",
+        policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+        activationAt: "2026-08-21T23:00:00.000Z",
+        activationEpochNs: 1_787_353_200_000_000_000n,
+        expectedDeploymentUpdatedAt: "2026-08-21T23:00:00.000Z",
+        expectedStateVersion: 4,
+        expectedPhase: "DRAINING",
+        routeReason: "DRAINING_RISK_REDUCTION_PRESERVED",
+      });
+    } else {
+      assert.equal(draining.submitted[0]?.candidateAuthority, undefined);
+    }
   }
 
   const disabled = createHarness({

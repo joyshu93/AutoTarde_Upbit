@@ -79,9 +79,10 @@ export async function runAppStartup(
   const runtimeShutdown = createRuntimeShutdown(app);
 
   await runRuntimeStartupGate({
-    initializer: app.candidatePilotInitializer,
+    initializer: app.candidatePilotStartupAuthority,
     shutdown: runtimeShutdown,
     continueStartup: async () => {
+  await app.candidatePilotStartupRecovery?.prepareAndRecover();
   const startupRecovery = await runStartupRecoveryOperation({
     exchangeAccountId: "primary",
     enabled: app.exchangeBackedReadEnabled,

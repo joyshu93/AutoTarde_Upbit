@@ -600,7 +600,20 @@ function parseDecisionBasis(decision: StrategyDecisionRecord): { entryPath: Stra
   const record = parsed as Record<string, unknown>;
   const strategyDecision = asRecord(record.strategyDecision);
   const engineDecision = asRecord(record.engineDecision);
-  const entryPath = engineDecision?.entryPath;
+  const diagnostics = asRecord(engineDecision?.diagnostics);
+  const canonicalEntryPath = diagnostics?.entryPath;
+  const legacyEntryPath = engineDecision?.entryPath;
+  if (
+    canonicalEntryPath !== undefined &&
+    legacyEntryPath !== undefined &&
+    canonicalEntryPath !== legacyEntryPath
+  ) {
+    throw new CandidateEvidenceFault(
+      "STRATEGY_DECISION_INVALID",
+      "Strategy decision basis contains conflicting entry-path provenance.",
+    );
+  }
+  const entryPath = canonicalEntryPath ?? legacyEntryPath;
   if (strategyDecision?.market !== decision.market || strategyDecision.action !== decision.action || !isEntryPath(entryPath)) {
     throw new CandidateEvidenceFault("STRATEGY_DECISION_INVALID", "Strategy decision basis does not match persisted decision provenance.");
   }

@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { access, mkdir, rm } from "node:fs/promises";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { createApp } from "../src/app/create-app.js";
 import type { AppConfig } from "../src/app/env.js";
-import { startTelegramRuntime } from "../src/index.js";
+import { runAppStartup, startTelegramRuntime, type AppStartupOperations } from "../src/index.js";
 import {
   DryRunExchangeAdapter,
   type LiveExecutionAdapter,
@@ -61,6 +62,78 @@ test("createApp baseline never invokes candidate authority or constructs candida
   } finally {
     (app as ReturnType<typeof createApp> | null)?.persistence.close();
     await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("baseline startup rejects every persisted nonterminal candidate phase before runtime surfaces", async () => {
+  for (const phase of ["PENDING_FLAT", "ACTIVE", "DRAINING", "PAUSED_FAULT"] as const) {
+    const databasePath = await createTempDatabasePath(`baseline-persisted-${phase.toLowerCase()}`);
+    let baselineApp: ReturnType<typeof createApp> | null = null;
+
+    try {
+      await seedPersistedCandidatePhase(databasePath, phase);
+      baselineApp = createApp(createConfig({ databasePath }));
+      const boundary = createStartupBoundaryOperations();
+      let notificationCalls = 0;
+      const startupApp = {
+        ...baselineApp,
+        notificationDelivery: {
+          ...baselineApp.notificationDelivery,
+          async deliverPending() {
+            notificationCalls += 1;
+            return {} as never;
+          },
+          isConfigured() {
+            return false;
+          },
+        },
+        persistence: {
+          ...baselineApp.persistence,
+          close() {},
+        },
+      } as unknown as typeof baselineApp;
+
+      await assert.rejects(
+        () => runAppStartup(startupApp, boundary.operations),
+        /candidate|pilot|baseline|selection|authority/i,
+        phase,
+      );
+
+      assert.equal(notificationCalls, 0, phase);
+      assert.equal(boundary.runtimeSurfaceCalls(), 0, phase);
+      assert.equal((await baselineApp.operatorState.getState()).systemStatus, "PAUSED", phase);
+    } finally {
+      baselineApp?.persistence.close();
+      await cleanupTempDatabase(databasePath);
+    }
+  }
+});
+
+test("fresh and canonically rollback-completed databases remain baseline without candidate recovery", async () => {
+  for (const authority of ["FRESH", "CANONICAL_DISABLED"] as const) {
+    const databasePath = await createTempDatabasePath(`baseline-${authority.toLowerCase()}`);
+    let baselineApp: ReturnType<typeof createApp> | null = null;
+
+    try {
+      if (authority === "CANONICAL_DISABLED") {
+        await seedCanonicalDisabledCandidate(databasePath);
+      }
+      baselineApp = createApp(createConfig({ databasePath }));
+      const boundary = createStartupBoundaryOperations();
+
+      await runAppStartup(baselineApp, boundary.operations);
+
+      assert.equal(boundary.runtimeSurfaceCalls(), 1, authority);
+      assert.equal(
+        (baselineApp as typeof baselineApp & { candidatePilotStartupRecovery?: unknown })
+          .candidatePilotStartupRecovery ?? null,
+        null,
+        authority,
+      );
+    } finally {
+      baselineApp?.persistence.close();
+      await cleanupTempDatabase(databasePath);
+    }
   }
 });
 
@@ -965,6 +1038,100 @@ function candidatePolicySelection(): AppConfig["positionGuardPolicySelection"] {
     policyId: "COMBINED_CONSERVATIVE",
     policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
     liveOperatorConfirmed: true,
+  };
+}
+
+async function seedPersistedCandidatePhase(
+  databasePath: string,
+  phase: "PENDING_FLAT" | "ACTIVE" | "DRAINING" | "PAUSED_FAULT",
+): Promise<void> {
+  const candidateApp = createApp(createConfig({
+    databasePath,
+    executionMode: "LIVE",
+    positionGuardPolicySelection: candidatePolicySelection(),
+  }));
+  const initialized = await candidateApp.candidatePilotInitializer!.initialize();
+  candidateApp.persistence.close();
+  if (phase === "PENDING_FLAT") return;
+
+  const activationAt = initialized.deployment.createdAt;
+  const activationEpochNs = BigInt(Date.parse(activationAt)) * 1_000_000n;
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.prepare(`
+      UPDATE strategy_pilot_deployments
+      SET phase = ?, activation_at = ?, activation_epoch_ns = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      phase,
+      activationAt,
+      activationEpochNs.toString(),
+      activationAt,
+      initialized.deployment.id,
+    );
+  } finally {
+    db.close();
+  }
+}
+
+async function seedCanonicalDisabledCandidate(databasePath: string): Promise<void> {
+  const candidateApp = createApp(createConfig({
+    databasePath,
+    executionMode: "LIVE",
+    positionGuardPolicySelection: candidatePolicySelection(),
+  }));
+  try {
+    const initialized = await candidateApp.candidatePilotInitializer!.initialize();
+    const operatorState = await candidateApp.operatorState.pause("candidate_rollback_test");
+    const transitionAt = new Date().toISOString();
+    const disabled = await candidateApp.persistence.candidatePilots.completeRollback({
+      deploymentId: initialized.deployment.id,
+      expectedPhase: "PENDING_FLAT",
+      expectedUpdatedAt: initialized.deployment.updatedAt,
+      expectedStateVersion: 0,
+      expectedOperatorState: {
+        id: operatorState.id,
+        exchangeAccountId: operatorState.exchangeAccountId,
+        systemStatus: operatorState.systemStatus as "PAUSED" | "KILL_SWITCHED",
+        updatedAt: operatorState.updatedAt,
+      },
+      transitionAt,
+      transitionEpochNs: BigInt(Date.parse(transitionAt)) * 1_000_000n,
+    });
+    assert.equal(disabled?.phase, "DISABLED");
+  } finally {
+    candidateApp.persistence.close();
+  }
+}
+
+function createStartupBoundaryOperations(): Readonly<{
+  operations: AppStartupOperations;
+  runtimeSurfaceCalls(): number;
+}> {
+  let runtimeSurfaceCalls = 0;
+  return {
+    operations: {
+      async runStartupRecovery() {
+        return {} as never;
+      },
+      async applyStartupRecoveryPolicy() {
+        return {} as never;
+      },
+      async buildStrategySchedulerStartupPreflight() {
+        return {} as never;
+      },
+      async startTelegramRuntime() {
+        runtimeSurfaceCalls += 1;
+        return {
+          strategySchedulerStatus: { started: true },
+          strategySchedulerStartupBlockNotified: false,
+          telegramInboundPollingStatus: { running: false },
+          telegramCommandMenuSetup: {} as never,
+        };
+      },
+      writeBanner() {},
+    },
+    runtimeSurfaceCalls: () => runtimeSurfaceCalls,
   };
 }
 

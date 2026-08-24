@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import { buildExecutionRiskLimits, loadAppConfig, type AppConfig } from "./env.js";
 import { CandidateBtcRunPreparationService } from "./candidate-btc-run-preparation.js";
+import { CandidatePilotStartupRecoveryService } from "./candidate-pilot-startup-recovery.js";
 import { PositionGuardPilotRecovery } from "./position-guard-pilot-recovery.js";
 import {
   PositionGuardPilotInitializer,
   type PositionGuardPilotInitializerClock,
   type PositionGuardPilotInitializerRepository,
 } from "./position-guard-pilot-initializer.js";
+import { PositionGuardPilotStartupAuthorityGuard } from "./position-guard-pilot-startup-authority.js";
 import { loadCheckedInPositionGuardPilotAbandonment } from "./position-guard-pilot-registry-loader.js";
 import { buildManualStrategyRunPreflight, buildStrategySchedulerStartupPreflight } from "./scheduler-preflight.js";
 import {
@@ -62,6 +64,8 @@ export interface AppServices {
   executionService: ExecutionService;
   candidateEvidenceService: CandidateExecutionEvidenceService | null;
   candidatePilotInitializer: PositionGuardPilotInitializer | null;
+  candidatePilotStartupAuthority: PositionGuardPilotStartupAuthorityGuard;
+  candidatePilotStartupRecovery: CandidatePilotStartupRecoveryService | null;
   candidatePilotRecovery: PositionGuardPilotRecovery | null;
   reconciliationService: ReconciliationService;
   portfolioSyncService: PortfolioSyncService;
@@ -132,6 +136,12 @@ export function createApp(
         },
       })
     : null;
+  const candidatePilotStartupAuthority = new PositionGuardPilotStartupAuthorityGuard({
+    configuredInitializer: candidatePilotInitializer,
+    candidatePilots: persistence.candidatePilots,
+    operatorState,
+    clock: { now: () => new Date().toISOString() },
+  });
 
   const strategy = new DeterministicStubStrategy();
   const liveExchangeClient = new UpbitPrivateClient({
@@ -269,6 +279,15 @@ export function createApp(
         repositories,
         exchangeBackedReadEnabled,
         liveSendPath,
+      })
+    : null;
+  const candidatePilotStartupRecovery = candidateBtcRunPreparation && candidatePilotRecovery
+    ? new CandidatePilotStartupRecoveryService({
+        preparation: candidateBtcRunPreparation,
+        recovery: candidatePilotRecovery,
+        operatorState,
+        exchangeAccountId: "primary",
+        clock: { now: () => new Date().toISOString() },
       })
     : null;
   const strategyRunController = new InlineTelegramStrategyRunController({
@@ -421,6 +440,8 @@ export function createApp(
     executionService,
     candidateEvidenceService,
     candidatePilotInitializer,
+    candidatePilotStartupAuthority,
+    candidatePilotStartupRecovery,
     candidatePilotRecovery,
     reconciliationService,
     portfolioSyncService,

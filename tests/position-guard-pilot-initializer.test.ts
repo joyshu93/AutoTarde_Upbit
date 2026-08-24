@@ -173,6 +173,20 @@ test("candidate initializer accepts structurally intact ACTIVE and PAUSED_FAULT 
   }
 });
 
+test("candidate initializer accepts canonical DRAINING restart authority", async () => {
+  const authority = drainingAuthority();
+  const fixture = createFixture({ result: authority });
+
+  const result = await fixture.initializer.initialize();
+
+  assert.equal(result.deployment.phase, "DRAINING");
+  assert.deepEqual(result.exactState, authority.exactState);
+  assert.deepEqual(
+    result.auditEvents.map((event) => event.eventType),
+    ["DEPLOYMENT_CREATED", "PHASE_TRANSITION", "STATE_ADVANCED", "ROLLBACK_STARTED"],
+  );
+});
+
 test("candidate initializer rejects malformed ACTIVE and PAUSED_FAULT lifecycle audit authority", async () => {
   const active = () => mutableAuthority(validAuthority({
     outcome: "EXISTING",
@@ -988,6 +1002,15 @@ function pausedFaultFromDrainingAuthority(): ReturnType<typeof mutableAuthority>
     0,
     rollbackStartedAudit(authority.deployment, authority.exactState.stateVersion),
   );
+  return authority;
+}
+
+function drainingAuthority(): ReturnType<typeof mutableAuthority> {
+  const authority = pausedFaultFromDrainingAuthority();
+  const rollback = rollbackEvent(authority);
+  authority.deployment.phase = "DRAINING";
+  authority.deployment.updatedAt = rollback.createdAt;
+  authority.auditEvents = authority.auditEvents.filter((event) => event.eventType !== "FAULT_PAUSED");
   return authority;
 }
 

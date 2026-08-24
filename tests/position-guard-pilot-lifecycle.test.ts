@@ -32,8 +32,14 @@ import { ReconciliationService } from "../src/modules/reconciliation/reconciliat
 import { createEmptyPositionGuardCandidateState } from
   "../src/modules/strategy/position-guard-candidate-state.js";
 import {
-  routePositionGuardPolicy,
-} from "../src/modules/strategy/position-guard-policy-router.js";
+  createDefaultPositionGuardRunnerConfig,
+  PositionGuardStrategyRunner,
+} from "../src/modules/strategy/position-guard-runner.js";
+import {
+  toStrategyDecision,
+  type PositionGuardStrategyContext,
+} from "../src/modules/strategy/position-guard-core.js";
+import { routePositionGuardPolicy } from "../src/modules/strategy/position-guard-policy-router.js";
 import type {
   PositionGuardEngineDecision,
   PositionGuardStructureAnalysis,
@@ -169,6 +175,208 @@ test("pending-flat suppresses new BTC risk until fake exchange-backed flat recov
   assert.equal(result.phase, "ACTIVE");
   assert.equal(result.deployment.phase, "ACTIVE");
   assert.equal((await candidatePilots.listAuditEvents(DEPLOYMENT_ID)).at(-1)?.eventType, "PHASE_TRANSITION");
+});
+
+test("real runner binds DRAINING EXIT through projection, restart replay, and flat completion", async () => {
+  const operatorState = new InMemoryOperatorStateStore(executionState("LIVE"));
+  const candidatePilots = new InMemoryCandidatePilotRepository(operatorState);
+  const repositories = new InMemoryExecutionRepository(operatorState, candidatePilots);
+  await candidatePilots.createDeploymentWithInitialState({
+    deployment: {
+      id: DEPLOYMENT_ID,
+      ...PILOT_IDENTITY,
+      phase: "PENDING_FLAT",
+      activationAt: null,
+      activationEpochNs: null,
+      createdAt: CREATED_AT,
+      updatedAt: CREATED_AT,
+    },
+    initialState: createEmptyPositionGuardCandidateState(),
+  });
+  const activationAt = "2026-08-21T00:00:05.000Z";
+  const activated = await candidatePilots.activateDeployment({
+    deploymentId: DEPLOYMENT_ID,
+    expectedPhase: "PENDING_FLAT",
+    expectedUpdatedAt: CREATED_AT,
+    activationAt,
+    activationEpochNs: BigInt(Date.parse(activationAt)) * 1_000_000n,
+  });
+  assert.ok(activated);
+  await candidatePilots.advanceStateWithEvidence({
+    deploymentId: DEPLOYMENT_ID,
+    expectedStateVersion: 0,
+    evidence: {
+      evidenceId: "draining-seed-enter",
+      executedAt: "2026-08-21T00:00:06.000Z",
+      action: "ENTER",
+      entryPath: "PULLBACK",
+      terminalStatus: "FILLED",
+      executedQuantity: "0.1",
+      grossQuoteValueKrw: "10000000",
+      confirmedFeeKrw: "5000",
+      remainingQuantity: "0.1",
+    },
+  });
+  const paused = await operatorState.pause("operator_requested_candidate_rollback");
+  const rollbackAt = "2026-08-21T00:00:08.000Z";
+  const draining = await candidatePilots.startRollback({
+    deploymentId: DEPLOYMENT_ID,
+    expectedPhase: "ACTIVE",
+    expectedUpdatedAt: activationAt,
+    expectedStateVersion: 1,
+    expectedOperatorState: {
+      id: paused.id,
+      exchangeAccountId: paused.exchangeAccountId,
+      systemStatus: "PAUSED",
+      updatedAt: paused.updatedAt,
+    },
+    transitionAt: rollbackAt,
+    transitionEpochNs: BigInt(Date.parse(rollbackAt)) * 1_000_000n,
+  });
+  assert.equal(draining?.phase, "DRAINING");
+  await operatorState.resume();
+
+  await repositories.saveBalanceSnapshot({
+    id: "draining-runner-balance",
+    exchangeAccountId: ACCOUNT_ID,
+    capturedAt: "2026-08-21T00:00:09.000Z",
+    source: "EXCHANGE_POLL",
+    totalKrwValue: "11000000",
+    balancesJson: JSON.stringify([
+      { currency: "KRW", balance: "1000000", locked: "0", avgBuyPrice: "0", unitCurrency: "KRW" },
+      { currency: "BTC", balance: "0.1", locked: "0", avgBuyPrice: "100000000", unitCurrency: "KRW" },
+    ]),
+  });
+  await repositories.savePositionSnapshot({
+    id: "draining-runner-position",
+    exchangeAccountId: ACCOUNT_ID,
+    capturedAt: "2026-08-21T00:00:09.000Z",
+    source: "EXCHANGE_POLL",
+    positionsJson: JSON.stringify([{
+      asset: "BTC",
+      market: "KRW-BTC",
+      quantity: "0.1",
+      averageEntryPrice: "100000000",
+      markPrice: "100000000",
+      marketValue: "10000000",
+      exposureRatio: "0.9090909090909091",
+      capturedAt: "2026-08-21T00:00:09.000Z",
+    }]),
+  });
+
+  const adapter = new ImmediateDrainingExitLiveAdapter();
+  const executionService = executionServiceFor({
+    adapter,
+    repositories,
+    operatorState,
+    candidatePilots,
+    now: "2026-08-21T00:00:20.000Z",
+  });
+  const refreshReceipt = {
+    exchangeAccountId: ACCOUNT_ID,
+    requestedAt: "2026-08-21T00:00:09.000Z",
+    balanceSnapshotId: "draining-runner-balance",
+    balanceCapturedAt: "2026-08-21T00:00:09.000Z",
+    positionSnapshotId: "draining-runner-position",
+    positionCapturedAt: "2026-08-21T00:00:09.000Z",
+    reconciliationRunId: "draining-runner-reconciliation",
+    reconciliationStartedAt: "2026-08-21T00:00:09.000Z",
+    reconciliationCompletedAt: "2026-08-21T00:00:10.000Z",
+    reconciliationSource: "SCHEDULER_PREFLIGHT" as const,
+  };
+  const exactState = await candidatePilots.getExactState(DEPLOYMENT_ID);
+  assert.ok(exactState);
+  const runner = new PositionGuardStrategyRunner({
+    repositories,
+    executionService,
+    marketDataReader: {} as never,
+    config: createDefaultPositionGuardRunnerConfig(ACCOUNT_ID),
+    policySelection: candidateSelection(),
+    candidateRunVerifier: {
+      async verifyAndPrepareBtcRun() {
+        return {
+          status: "READY" as const,
+          verificationOnly: true as const,
+          deployment: draining!,
+          phase: "DRAINING" as const,
+          activation: {
+            activationAt,
+            activationEpochNs: BigInt(Date.parse(activationAt)) * 1_000_000n,
+          },
+          state: exactState!,
+          stateVersion: exactState!.stateVersion,
+          refreshProvenance: refreshReceipt,
+        };
+      },
+    },
+  });
+  const generatedAt = "2026-08-21T00:00:10.000Z";
+  const exitDecision = decision("EXIT");
+  const context = drainingOpenContext(generatedAt);
+  Object.defineProperty(runner, "buildDecision", {
+    value: async () => ({
+      strategyDecision: toStrategyDecision(context, exitDecision),
+      engineDecision: exitDecision,
+      context,
+      referencePriceCapturedAt: generatedAt,
+    }),
+  });
+
+  const run = await runner.runOnce({ market: "KRW-BTC", generatedAt, refreshReceipt });
+  assert.equal(run.submission?.accepted, true);
+  assert.equal(run.submission?.order.status, "FILLED");
+  const binding = await candidatePilots.getExecutionBindingForOrder(run.submission!.order.id);
+  assert.equal(binding?.deploymentId, DEPLOYMENT_ID);
+  assert.equal(binding?.action, "EXIT");
+  assert.equal(binding?.boundVolume, "0.1");
+
+  const evidenceService = new CandidateExecutionEvidenceService({
+    exchangeAccountId: ACCOUNT_ID,
+    repositories,
+    pilotRepository: candidatePilots,
+    operatorState,
+    clock: {
+      now: () => ({
+        occurredAt: "2026-08-21T00:00:23.000Z",
+        occurredAtEpochMs: Date.parse("2026-08-21T00:00:23.000Z"),
+      }),
+    },
+  });
+  const projection = await evidenceService.processTerminalOrder(run.submission!.order.id);
+  assert.equal(projection.outcome, "ADVANCED", projection.detail);
+  assert.equal((await candidatePilots.getExactState(DEPLOYMENT_ID))?.currentEpisodeInventoryQuantity, "0");
+
+  const initializer = new PositionGuardPilotInitializer({
+    identity: PILOT_IDENTITY,
+    repository: {
+      initializeDeploymentWithInitialState: (request) =>
+        candidatePilots.initializeDeploymentWithInitialState(request),
+    },
+    clock: { now: () => "2026-08-21T00:00:30.000Z" },
+  });
+  const reconstructed = await initializer.initialize();
+  assert.equal(reconstructed.deployment.phase, "DRAINING");
+  assert.equal(reconstructed.exactState.currentEpisodeInventoryQuantity, "0");
+
+  const completionPause = await operatorState.pause("operator_confirmed_flat_completion");
+  const completedAt = "2026-08-21T00:00:31.000Z";
+  const disabled = await candidatePilots.completeRollback({
+    deploymentId: DEPLOYMENT_ID,
+    expectedPhase: "DRAINING",
+    expectedUpdatedAt: rollbackAt,
+    expectedStateVersion: 2,
+    expectedOperatorState: {
+      id: completionPause.id,
+      exchangeAccountId: completionPause.exchangeAccountId,
+      systemStatus: "PAUSED",
+      updatedAt: completionPause.updatedAt,
+    },
+    transitionAt: completedAt,
+    transitionEpochNs: BigInt(Date.parse(completedAt)) * 1_000_000n,
+  });
+  assert.equal(disabled?.phase, "DISABLED");
+  assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal(adapter.createOrderCalls, 1);
 });
 
 test("fake validation and one send normalize cancel-with-fill and persist evidence exactly once across restart", async () => {
@@ -785,6 +993,39 @@ class NonNetworkLiveAdapter implements LiveExecutionAdapter {
   }
 }
 
+class ImmediateDrainingExitLiveAdapter extends NonNetworkLiveAdapter {
+  createOrderCalls = 0;
+
+  override async createOrder(request: UpbitOrderRequest): Promise<ExchangeOrderSnapshot> {
+    this.createOrderCalls += 1;
+    return {
+      uuid: "fake-draining-exit-order",
+      identifier: request.identifier,
+      market: request.market,
+      side: request.side,
+      ordType: request.ordType,
+      state: "done",
+      price: request.price,
+      volume: request.volume,
+      remainingVolume: "0",
+      executedVolume: request.volume,
+      paidFee: "5000",
+      createdAt: "2026-08-21T00:00:12.000Z",
+      fills: [{
+        tradeUuid: "fake-draining-exit-fill",
+        side: "ask",
+        price: "100000000",
+        volume: request.volume ?? "0",
+        funds: "10000000",
+        fee: "5000",
+        createdAt: "2026-08-21T00:00:21.000Z",
+        raw: { fake: true, drainingExit: true },
+      }],
+      raw: { fake: true, drainingExit: true },
+    };
+  }
+}
+
 class ImmediateCancelWithFillLiveAdapter extends NonNetworkLiveAdapter {
   orderChanceCalls = 0;
   orderTestCalls = 0;
@@ -1059,6 +1300,30 @@ function decision(action: PositionGuardEngineDecision["action"]): PositionGuardE
       pullbackZone: true,
       reclaimStructure: false,
       breakoutHoldStructure: false,
+    },
+  };
+}
+
+function drainingOpenContext(generatedAt: string): PositionGuardStrategyContext {
+  return {
+    asset: "BTC",
+    market: "KRW-BTC",
+    generatedAt,
+    availableKrw: 1_000_000,
+    positionQuantity: 0.1,
+    averageEntryPrice: 100_000_000,
+    portfolio: {
+      totalEquityKrw: 11_000_000,
+      assetMarketValueKrw: 10_000_000,
+      totalExposureKrw: 10_000_000,
+    },
+    latestDecision: null,
+    recentExit: { createdAt: null, hoursSinceExit: null, realizedPnl: null },
+    settings: createDefaultPositionGuardRunnerConfig(ACCOUNT_ID).settings,
+    analysis: {
+      ...structureAnalysis(),
+      averageEntryPrice: 100_000_000,
+      pnlPct: 0,
     },
   };
 }

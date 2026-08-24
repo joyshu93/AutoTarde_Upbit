@@ -389,23 +389,31 @@ function candidateExecutionAuthority(input: {
   route: Readonly<PositionGuardPolicyRouteResult>;
   executionDecision: StrategyDecision;
 }): CandidateExecutionAuthority | undefined {
+  const activeAuthority =
+    input.verification?.phase === "ACTIVE" &&
+    input.route.pilotPhase === "ACTIVE" &&
+    (input.route.reasonCode === "CANDIDATE_ALLOWED" ||
+      input.route.reasonCode === "CANDIDATE_EARLY_THESIS_FAILURE") &&
+    (input.route.reasonCode !== "CANDIDATE_EARLY_THESIS_FAILURE" ||
+      input.executionDecision.action === "EXIT");
+  const drainingAuthority =
+    input.verification?.phase === "DRAINING" &&
+    input.route.pilotPhase === "DRAINING" &&
+    input.route.reasonCode === "DRAINING_RISK_REDUCTION_PRESERVED" &&
+    (input.executionDecision.action === "REDUCE" || input.executionDecision.action === "EXIT");
   if (
     input.verification === null ||
-    input.verification.phase !== "ACTIVE" ||
     input.verification.activation === null ||
-    input.route.pilotPhase !== "ACTIVE" ||
     input.route.executionBlocked ||
     input.executionDecision.action === "HOLD" ||
     input.executionDecision.metadata.executionDisposition === "DEFERRED_CONFIRMATION" ||
-    (input.route.reasonCode !== "CANDIDATE_ALLOWED" &&
-      input.route.reasonCode !== "CANDIDATE_EARLY_THESIS_FAILURE") ||
-    (input.route.reasonCode === "CANDIDATE_EARLY_THESIS_FAILURE" && input.executionDecision.action !== "EXIT")
+    (!activeAuthority && !drainingAuthority)
   ) {
     return undefined;
   }
 
   const deployment = input.verification.deployment;
-  return Object.freeze({
+  const baseAuthority = {
     kind: "POSITION_GUARD_BTC_CANDIDATE",
     deploymentId: deployment.id,
     exchangeAccountId: deployment.exchangeAccountId,
@@ -418,8 +426,18 @@ function candidateExecutionAuthority(input: {
     activationEpochNs: input.verification.activation.activationEpochNs,
     expectedDeploymentUpdatedAt: deployment.updatedAt,
     expectedStateVersion: input.verification.stateVersion,
+  } as const;
+  if (drainingAuthority) {
+    return Object.freeze({
+      ...baseAuthority,
+      expectedPhase: "DRAINING",
+      routeReason: "DRAINING_RISK_REDUCTION_PRESERVED",
+    });
+  }
+  return Object.freeze({
+    ...baseAuthority,
     expectedPhase: "ACTIVE",
-    routeReason: input.route.reasonCode,
+    routeReason: input.route.reasonCode as "CANDIDATE_ALLOWED" | "CANDIDATE_EARLY_THESIS_FAILURE",
   });
 }
 

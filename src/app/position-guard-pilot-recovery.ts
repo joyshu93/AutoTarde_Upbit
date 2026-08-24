@@ -1736,6 +1736,17 @@ export class PositionGuardPilotRecovery {
         // The deterministic pause write remains safe and idempotent when its optional readback is unavailable.
       }
       if (existing) occurredAt = existing.createdAt;
+      if (!existing) {
+        const getState = this.dependencies.operatorState.getState;
+        if (!getState) throw new Error("Global-only recovery fault requires operator state read authority.");
+        const operatorState = await getState.call(this.dependencies.operatorState);
+        if (
+          parseTimestamp(operatorState.updatedAt, "operator state updatedAt", "IDENTITY_MISMATCH") >
+          parseTimestamp(occurredAt, "global recovery fault occurredAt", "IDENTITY_MISMATCH")
+        ) {
+          occurredAt = operatorState.updatedAt;
+        }
+      }
       await this.dependencies.operatorState.pauseForFault({
         exchangeAccountId: this.dependencies.exchangeAccountId,
         faultId,
