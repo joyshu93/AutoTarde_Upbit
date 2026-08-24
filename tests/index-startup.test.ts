@@ -1,11 +1,26 @@
 import assert from "node:assert/strict";
 
-import { runAppStartup, type AppStartupOperations } from "../src/index.js";
 import type { AppServices } from "../src/app/create-app.js";
+import type { AppStartupOperations } from "../src/index.js";
 import { test } from "./harness.js";
+
+type IndexModule = typeof import("../src/index.js") & {
+  runMain(createApplication?: () => AppServices): Promise<void>;
+};
+
+let indexModulePromise: Promise<IndexModule> | null = null;
+
+test("freshly evaluating the index module has no runtime startup side effect", async () => {
+  const before = process.listenerCount("SIGINT");
+
+  await loadFreshIndexModule();
+
+  assert.equal(process.listenerCount("SIGINT"), before);
+});
 
 test("application startup runs every production continuation step after candidate initialization", async () => {
   const events: string[] = [];
+  const { runAppStartup } = await loadFreshIndexModule();
   const app = createAppFixture(events, {
     async initialize() {
       events.push("initializer");
@@ -33,6 +48,7 @@ test("application startup runs every production continuation step after candidat
 
 test("application startup keeps successful background work open", async () => {
   const events: string[] = [];
+  const { runAppStartup } = await loadFreshIndexModule();
   const app = createAppFixture(events, null, true);
 
   await runAppStartup(app, createOperations(events));
@@ -44,6 +60,7 @@ test("application startup keeps successful background work open", async () => {
 
 test("application startup performs the existing one-time stop when no background work starts", async () => {
   const events: string[] = [];
+  const { runAppStartup } = await loadFreshIndexModule();
   const app = createAppFixture(events, null, false);
 
   await runAppStartup(app, createOperations(events));
@@ -55,6 +72,7 @@ test("application startup performs the existing one-time stop when no background
 
 test("application startup keeps command-menu failure isolated and nonthrowing", async () => {
   const events: string[] = [];
+  const { runAppStartup } = await loadFreshIndexModule();
   const app = createAppFixture(events, null, true, "FAILED");
 
   await runAppStartup(app, createOperations(events));
@@ -64,6 +82,7 @@ test("application startup keeps command-menu failure isolated and nonthrowing", 
 
 test("application startup shares one shutdown owner after banner failure following signal installation", async () => {
   const events: string[] = [];
+  const { runAppStartup } = await loadFreshIndexModule();
   const originalError = new Error("banner_failed");
   let installedShutdown: (() => unknown) | null = null;
   const app = createAppFixture(events, null, true);
@@ -91,13 +110,44 @@ test("application startup shares one shutdown owner after banner failure followi
   assert.equal(events.filter((event) => event === "persistence:close").length, 1);
 });
 
-test("importing the index module has no runtime startup side effect", async () => {
-  const before = process.listenerCount("SIGINT");
+test("runMain leaves createApp failure cleanup with the factory and preserves error identity", async () => {
+  const events: string[] = [];
+  const { runMain } = await loadFreshIndexModule();
+  const originalError = new Error("create_app_failed");
+  const app = createAppFixture(events, {
+    async initialize() {
+      events.push("initializer");
+    },
+  }, true);
 
-  await import("../src/index.js");
+  await assert.rejects(
+    () => runMain(() => {
+      events.push("factory");
+      app.telegramInboundPolling.stop();
+      app.strategyScheduler.stop();
+      app.persistence.close();
+      throw originalError;
+    }),
+    (error) => error === originalError,
+  );
 
-  assert.equal(process.listenerCount("SIGINT"), before);
+  assert.deepEqual(events, [
+    "factory",
+    "telegram:stop",
+    "scheduler:stop",
+    "persistence:close",
+  ]);
 });
+
+function loadFreshIndexModule(): Promise<IndexModule> {
+  if (!indexModulePromise) {
+    const moduleUrl = new URL("../src/index.js", import.meta.url);
+    moduleUrl.searchParams.set("index-startup-test", "fresh-evaluation");
+    indexModulePromise = import(moduleUrl.href) as Promise<IndexModule>;
+  }
+
+  return indexModulePromise;
+}
 
 function createOperations(
   events: string[],

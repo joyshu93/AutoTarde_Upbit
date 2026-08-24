@@ -217,13 +217,15 @@ export async function runAppStartup(
   });
 }
 
-async function main(): Promise<void> {
-  const app = createApp();
+export async function runMain(
+  createApplication: () => AppServices = createApp,
+): Promise<void> {
+  const app = createApplication();
   await runAppStartup(app);
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  void main().catch((error) => {
+  void runMain().catch((error) => {
     console.error(error);
     process.exitCode = 1;
   });

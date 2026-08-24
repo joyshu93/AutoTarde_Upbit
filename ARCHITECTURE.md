@@ -333,8 +333,8 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 
 ## Runtime Flow
 
-1. Bootstrap configuration.
-2. Optionally run an exchange-backed startup recovery sweep when Upbit read credentials are configured.
+1. Bootstrap configuration and construct the app. Baseline selection exposes a null candidate initializer and makes no candidate-storage call. A validated candidate selection is initialized immediately after `createApp`; initialization only creates or reuses pristine `PENDING_FLAT` deployment authority and never activates it.
+2. Only after candidate initialization completes, optionally run an exchange-backed startup recovery sweep when Upbit read credentials are configured. Notification delivery, operator-state and scheduler-preflight reads, scheduler startup/reporting, Telegram inbound polling and command-menu setup, and signal installation are likewise reachable only after the initializer gate.
 3. During startup recovery, persist fresh balance and position snapshots, reconcile orders/fills, detect unexplained portfolio drift, then apply the bootstrap-only `DEGRADED` policy if needed.
 4. Load execution policy and operator state.
 5. If the scheduler is enabled, build a scheduler startup preflight; in `LIVE` scope, block timer installation unless live-send configuration, execution state, fresh persisted snapshots, fresh latest reconciliation, and active-order state are safe.

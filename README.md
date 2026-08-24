@@ -119,6 +119,8 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 
 ## Runtime Shape
 
+Runtime startup constructs the app first. Baseline selection exposes a null candidate initializer and makes no candidate-storage call. A validated candidate selection is initialized immediately after `createApp` and before startup recovery or exchange-backed reads, notification delivery, operator-state/preflight reads, scheduler startup/reporting, Telegram polling or menu setup, and signal installation. Initialization only creates or reuses the candidate's pristine `PENDING_FLAT` deployment authority; it never activates the deployment.
+
 1. A deterministic strategy emits a `StrategyDecision`.
 2. If Upbit read credentials are configured, startup runs an exchange-backed recovery sweep before showing the banner.
 3. The execution layer derives an order intent plus idempotency key.
