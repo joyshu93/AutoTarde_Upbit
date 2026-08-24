@@ -187,3 +187,66 @@ Fresh GREEN result: exit 0, 83 passed, 0 failed. The narrower parser plus candid
 ## Open Concerns
 
 None for F1-F11. The residual risks above are explicit fail-closed operational boundaries, not open findings.
+
+## Residual Safety Follow-up (2026-08-24)
+
+Scope was limited to residual F7, residual F10, and the authorized README/architecture/risk-policy clarification. F1-F6, F8-F9, F11, migrations, and unrelated research/performance code were not revisited.
+
+### Residual F7 - Final Own-Order Race During Operator-State Await
+
+- Status: fixed.
+- Root cause: final account blocker and exact own-order reads occurred before the awaited operator-state read. Reconciliation could therefore change the durable own row from `SUBMITTING` to `CANCELED` while that state read was pending, after which the sole `createOrder` call still ran.
+- Expected RED command:
+
+```powershell
+node --import tsx --input-type=module -e "await import('./tests/execution-candidate-final-authority.test.ts'); const { runRegisteredTests } = await import('./tests/harness.ts'); await runRegisteredTests();"
+```
+
+- Expected RED result: exit 1, 3/17 failed after the test/static expectations were changed. The race expected `CandidateExecutionSafetyError` with zero sends but received `PostSendPersistenceSafetyError`, proving exchange submission had already been invoked before the canceled row was discovered during post-send persistence. The old success trace and old static-order test also proved the account/order reads preceded operator state.
+- Fix: candidate-only event/decision/deployment/exact-state/binding reads now complete first, followed by the authoritative operator-state check. Every candidate and baseline path then performs the canonical bounded account blocker read and direct exact account-plus-order-ID read. The exact own-row read is the final await in `submitOrderFromDecision`; synchronous account/own-row validation and the sole `createOrder` invocation follow with no intervening await or async helper seam. Competing, saturated, missing, terminal, mutated, or read-failure authority uses the existing fail-closed pause/fault and no-retry paths.
+- GREEN command/result: the same focused command exited 0, 17/17. The related execution group (`execution-candidate-final-authority`, `execution-send-authority`, `execution-candidate-intent`, `execution-service`) exited 0, 82/82. Typecheck and diff check also passed before commit.
+- Files changed: `src/modules/execution/execution-service.ts`, `tests/execution-candidate-final-authority.test.ts`.
+- Commit: `a3d5027` (`fix(execution): close final send authority race`).
+- Residual risk: exchange I/O necessarily begins after the final local authority snapshot. The durable account lease, exact identifier, exact final row, sole send site, explicit uncertainty recording, and no uncertain retry contain that irreducible boundary.
+
+### Residual F10 - Decision And Fill Provenance In Readiness
+
+- Status: fixed.
+- Root cause: readiness required and queried terminal source orders and immutable bindings but never required or queried `strategy_decisions` or `fills`. Its nominal PASS fixture therefore used a price bid with `volume = NULL`, conflicting decision/binding `intendedQuantity = 0.001`, and no fill rows while evidence supplied inferred terminal quantity/gross/fee material.
+- Expected RED command:
+
+```powershell
+node --import tsx --input-type=module -e "await import('./tests/position-guard-pilot-readiness.test.ts'); const { runRegisteredTests } = await import('./tests/harness.ts'); await runRegisteredTests();"
+```
+
+- Expected RED result: exit 1, 4 grouped tests failed while the prior readiness checks remained green. Missing decision, missing fills, fill/order mismatch, and future fill each returned provenance `PASS` instead of `BLOCK`; each group then covered all requested decision and fill mutations after implementation.
+- Fix: read-only required-schema validation now includes exact decision and fill columns. For each terminal evidence row, readiness validates the persisted READY decision identity, account, candidate strategy, market/action, canonical decision-basis entry path, intended material, entry/exit order shape, and bounded chronology. It independently loads actual fills, accepts only exchange-confirmed execution timestamps and per-fill KRW fees, validates exact order identity and non-future chronology, aggregates quantity/gross/fee with local pure exact-decimal arithmetic, and requires the latest fill instant plus all aggregate fields to equal persisted terminal evidence. No fee is inferred as zero and no side-effectful execution/runtime composition is imported.
+- GREEN command/result: the same focused command exited 0, 40/40. The related readiness/evidence/live-smoke group (`position-guard-pilot-readiness`, `candidate-evidence-service`, `live-readiness-smoke`) exited 0, 73/73. The valid PASS fixture now contains a canonical entry decision and one exact exchange-confirmed fill. One earlier broad command named a nonexistent test module and executed no tests; the corrected command above passed completely.
+- Files changed: `src/inspection/position-guard-pilot-readiness.ts`, `tests/position-guard-pilot-readiness.test.ts`.
+- Commit: `6e76eb7` (`fix(readiness): prove terminal fill provenance`).
+- Residual risk: readiness proves the complete persisted local chain at the explicit inspection instant; it remains intentionally read-only and does not claim a fresh private-exchange lookup. Missing or malformed local provenance blocks rather than being repaired or inferred.
+
+### Residual Documentation Contract
+
+- Status: updated, with no production behavior change.
+- Fix: `README.md`, `ARCHITECTURE.md`, and `RISK_POLICY.md` now state that baseline startup always inspects persisted pilot authority; fresh/no-deployment and canonical `DISABLED` remain baseline while nonterminal/malformed/mismatched authority fails closed. They document canonical `DRAINING` restart authority with no automatic resume, and the all-path submission blocker shared by lease acquisition, runtime final-send authority, and read-only readiness. Readiness documentation now includes the exact decision/fill/evidence/state chain.
+- GREEN command/result: the startup/initializer/submission-classifier contract group (`runtime-startup-gate`, `position-guard-pilot-initializer`, `index-startup`, `submission-blocking-order`) exited 0, 42/42. Static searches found none of the superseded baseline-no-storage/final-state-await statements, and `git diff --check` passed.
+- Files changed: `README.md`, `ARCHITECTURE.md`, `RISK_POLICY.md` only.
+- Commit: `811a483` (`docs: clarify pilot restart safety authority`).
+
+### Residual Commits
+
+- `a3d5027` - close the exact own-order send race after the operator-state await.
+- `6e76eb7` - require exact decision and exchange-confirmed fill provenance in read-only readiness.
+- `811a483` - align the three authorized root docs with startup, DRAINING, blocker, and readiness contracts.
+
+### Residual Final Verification
+
+- Residual F7 focused final-authority harness: 17/17; related execution authority/service harness: 82/82.
+- Residual F10 focused readiness harness: 40/40; related readiness/evidence/live-smoke harness: 73/73.
+- Documentation behavior contract harness: 42/42.
+- `npm.cmd run typecheck`: exit 0.
+- `npm.cmd run build`: exit 0.
+- `git diff --check`: exit 0 before the report commit.
+- Full offline `npm.cmd run test`: the sandboxed run passed all 1,569 registered custom-harness tests and 101/102 isolated tests; the sole isolated failure was the known esbuild worktree read denial (`Access is denied`). The exact offline command was rerun outside that filesystem restriction and exited 0 with all 1,569 custom-harness tests plus 102/102 isolated tests passing, including byte-for-byte prospective bundle reproduction.
+- No operational database, network, Upbit, Telegram, runtime/startup process, scheduler/sync/strategy execution, order transmission, activation, merge, push, or subagent was used.
