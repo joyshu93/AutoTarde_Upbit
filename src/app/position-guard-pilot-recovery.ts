@@ -667,7 +667,7 @@ export class PositionGuardPilotRecovery {
       case "DRAINING": {
         const activationEpoch = this.verifyCanonicalActivationAudit(deployment, auditEvents, "DISABLED");
         const rollback = this.verifyCanonicalRollbackStarted(deployment, evidenceRecords, auditEvents);
-        if (rollback.at < activationEpoch || rollback.at > completedAt) {
+        if (rollback.at < activationEpoch || rollback.at >= completedAt) {
           throw recoveryFault("IDENTITY_MISMATCH", "DRAINING completion chronology is invalid.");
         }
         this.verifyCanonicalStateAdvanceChain(

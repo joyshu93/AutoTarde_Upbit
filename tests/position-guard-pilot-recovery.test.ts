@@ -1626,6 +1626,85 @@ test("DISABLED recovery validates the full completion predecessor history", asyn
   await expectDisabledFault(drainingFixture, "IDENTITY_MISMATCH", "DRAINING completion requires its rollback boundary");
 });
 
+test("DRAINING rollback completion must be strictly later than rollback start", async () => {
+  const fixture = await createFixture({
+    phase: "ACTIVE",
+    evidenceQuantity: "0.1",
+    balanceFree: "0.1",
+    positionQuantity: "0.1",
+  });
+  await fixture.operatorState.pauseForFault({
+    exchangeAccountId: ACCOUNT_ID,
+    faultId: "equal-rollback-completion-fixture-pause",
+    reason: "fixture pause before rollback",
+    occurredAt: "2026-08-21T00:00:59.000Z",
+  });
+  await fixture.recovery.requestRollback(fixture.receipt);
+  await fixture.candidatePilots.advanceStateWithEvidence({
+    deploymentId: DEPLOYMENT_ID,
+    expectedStateVersion: 1,
+    evidence: {
+      evidenceId: "evidence-exit-equal-rollback-completion",
+      executedAt: "2026-08-21T00:01:30.000Z",
+      action: "EXIT",
+      entryPath: "NONE",
+      terminalStatus: "FILLED",
+      executedQuantity: "0.1",
+      grossQuoteValueKrw: "10000000",
+      confirmedFeeKrw: "5000",
+      remainingQuantity: "0",
+    },
+  });
+  const flatSnapshotAt = "2026-08-21T00:01:20.000Z";
+  const flatCompletedAt = "2026-08-21T00:01:21.000Z";
+  await fixture.repositories.saveBalanceSnapshot(balanceSnapshot({
+    id: "balance-equal-rollback-completion",
+    capturedAt: flatSnapshotAt,
+    balanceFree: "0",
+  }));
+  await fixture.repositories.savePositionSnapshot({
+    ...positionSnapshot({ capturedAt: flatSnapshotAt, quantity: "0" }),
+    id: "position-equal-rollback-completion",
+  });
+  await fixture.repositories.saveReconciliationRun({
+    ...reconciliationRun({ startedAt: flatSnapshotAt, completedAt: flatCompletedAt }),
+    id: "reconciliation-equal-rollback-completion",
+  });
+  const flatReceipt: PositionGuardPilotRefreshReceipt = {
+    exchangeAccountId: ACCOUNT_ID,
+    requestedAt: flatSnapshotAt,
+    balanceSnapshotId: "balance-equal-rollback-completion",
+    balanceCapturedAt: flatSnapshotAt,
+    positionSnapshotId: "position-equal-rollback-completion",
+    positionCapturedAt: flatSnapshotAt,
+    reconciliationRunId: "reconciliation-equal-rollback-completion",
+    reconciliationStartedAt: flatSnapshotAt,
+    reconciliationCompletedAt: flatCompletedAt,
+    reconciliationSource: "SCHEDULER_PREFLIGHT",
+  };
+  await fixture.createRecovery(undefined, undefined, undefined, "2026-08-21T00:01:30.000Z")
+    .completeRollback(flatReceipt);
+  fixture.receipt = flatReceipt;
+
+  const audits = await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  const completion = audits.find((event) => event.eventType === "ROLLBACK_COMPLETED");
+  assert.ok(completion);
+  const completionEpochNanoseconds = BigInt(Date.parse(completion.createdAt)) * 1_000_000n;
+  const corruptAudits = audits.map((event) => event.eventType === "ROLLBACK_STARTED"
+    ? {
+      ...event,
+      id: `${DEPLOYMENT_ID}:rollback_started:${completionEpochNanoseconds.toString()}`,
+      payloadJson: JSON.stringify({ transitionAt: completion.createdAt }),
+      createdAt: completion.createdAt,
+    }
+    : event);
+  fixture.recovery = fixture.createRecovery(overrideCandidatePilots(fixture.candidatePilots, {
+    listAuditEvents: async () => corruptAudits,
+  }), undefined, undefined, "2026-08-21T00:01:31.000Z");
+
+  await expectDisabledFault(fixture, "IDENTITY_MISMATCH", "DRAINING completion must strictly follow rollback start");
+});
+
 test("completeRollback on ACTIVE non-flat authority never starts rollback or mutates pilot state", async () => {
   const fixture = await createFixture({
     phase: "ACTIVE",
