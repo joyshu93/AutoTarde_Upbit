@@ -58,6 +58,96 @@ test("in-memory operator notification persistence rejects duplicate ids without 
   await assertOperatorNotificationInsertOnlyContract(new InMemoryExecutionRepository());
 });
 
+test("in-memory operator notification delivery records are detached from caller and delivery reads", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const saved = createNotification({
+    id: "operator-notification-detached-pending",
+    title: "Original pending notification",
+    createdAt: "2026-08-24T00:30:00.000Z",
+  });
+  await repository.saveOperatorNotification(saved);
+
+  saved.title = "Mutated saved input";
+  saved.deliveryStatus = "SENT";
+  saved.leaseToken = "caller-lease";
+  const listedPending = await readOperatorNotification(repository, saved.id);
+  assert.equal(listedPending.title, "Original pending notification");
+  assert.equal(listedPending.deliveryStatus, "PENDING");
+  assert.equal(listedPending.leaseToken, null);
+
+  listedPending.title = "Mutated notification list result";
+  listedPending.deliveryStatus = "FAILED";
+  const pendingRead = (await repository.listPendingOperatorNotifications("primary", { limit: 1 }))[0];
+  assert.ok(pendingRead);
+  pendingRead.message = "Mutated pending list result";
+  assert.equal((await readOperatorNotification(repository, saved.id)).title, "Original pending notification");
+  assert.equal((await readOperatorNotification(repository, saved.id)).message, "Operator-facing event.");
+  assert.equal((await readOperatorNotification(repository, saved.id)).deliveryStatus, "PENDING");
+
+  const [claimed] = await repository.claimPendingOperatorNotifications("primary", {
+    limit: 1,
+    dueBefore: "2026-08-24T00:31:00.000Z",
+    claimedAt: "2026-08-24T00:31:00.000Z",
+    leaseToken: "durable-pending-lease",
+    leaseExpiresAt: "2026-08-24T00:32:00.000Z",
+  });
+  assert.ok(claimed);
+  claimed.deliveryStatus = "FAILED";
+  claimed.leaseToken = "mutated-claim-lease";
+  claimed.title = "Mutated claim result";
+  const leased = await readOperatorNotification(repository, saved.id);
+  assert.equal(leased.deliveryStatus, "PENDING");
+  assert.equal(leased.leaseToken, "durable-pending-lease");
+  assert.equal(leased.title, "Original pending notification");
+
+  assert.equal(await repository.compareAndSetOperatorNotificationDeliveryStatus({
+    id: saved.id,
+    leaseToken: "durable-pending-lease",
+    deliveryStatus: "SENT",
+    attemptCount: 1,
+    lastAttemptAt: "2026-08-24T00:31:01.000Z",
+    nextAttemptAt: null,
+    failureClass: null,
+    deliveredAt: "2026-08-24T00:31:01.000Z",
+    lastError: null,
+  }), true);
+  const sent = await readOperatorNotification(repository, saved.id);
+  sent.deliveryStatus = "FAILED";
+  sent.deliveredAt = null;
+  assert.equal((await readOperatorNotification(repository, saved.id)).deliveryStatus, "SENT");
+  assert.equal((await readOperatorNotification(repository, saved.id)).deliveredAt, "2026-08-24T00:31:01.000Z");
+
+  const failed = createNotification({
+    id: "operator-notification-detached-failed",
+    createdAt: "2026-08-24T00:33:00.000Z",
+  });
+  await repository.saveOperatorNotification(failed);
+  const [failedClaim] = await repository.claimPendingOperatorNotifications("primary", {
+    limit: 1,
+    dueBefore: "2026-08-24T00:34:00.000Z",
+    claimedAt: "2026-08-24T00:34:00.000Z",
+    leaseToken: "durable-failed-lease",
+    leaseExpiresAt: "2026-08-24T00:35:00.000Z",
+  });
+  assert.equal(failedClaim?.id, failed.id);
+  assert.equal(await repository.compareAndSetOperatorNotificationDeliveryStatus({
+    id: failed.id,
+    leaseToken: "durable-failed-lease",
+    deliveryStatus: "FAILED",
+    attemptCount: 1,
+    lastAttemptAt: "2026-08-24T00:34:01.000Z",
+    nextAttemptAt: null,
+    failureClass: "PERMANENT",
+    deliveredAt: null,
+    lastError: "telegram_http_403",
+  }), true);
+  const failedRead = await readOperatorNotification(repository, failed.id);
+  failedRead.deliveryStatus = "SENT";
+  failedRead.lastError = null;
+  assert.equal((await readOperatorNotification(repository, failed.id)).deliveryStatus, "FAILED");
+  assert.equal((await readOperatorNotification(repository, failed.id)).lastError, "telegram_http_403");
+});
+
 test("sqlite operator notification persistence rejects duplicate ids without rewinding delivery state", async () => {
   const databasePath = await createTempDatabasePath("notification-insert-only");
   const bundle = createNotificationTestPersistence(databasePath);

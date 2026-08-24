@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdir, rm } from "node:fs/promises";
+import path from "node:path";
 
 import type { OperatorNotificationRecord } from "../src/domain/types.js";
 import { InMemoryExecutionRepository } from "../src/modules/db/repositories/in-memory-repositories.js";
+import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
 import {
   OperatorNotificationDeliveryService,
   TelegramBotApiClient,
@@ -1204,7 +1207,67 @@ test("durable reporter resolves a concurrent deterministic insert race by exact 
 
   assert.equal(saveCalls, 2);
   assert.equal(stored.get(input.notificationId)?.id, input.notificationId);
-  assert.deepEqual(kickedExchangeAccounts, ["primary"]);
+  assert.deepEqual(kickedExchangeAccounts, ["primary", "primary"]);
+});
+
+test("durable reporters re-kick a pending SQLite winner after a synchronized deterministic insert race", async () => {
+  const databasePath = await createTempDatabasePath("reporter-deterministic-race");
+  const first = createNotificationTestPersistence(databasePath);
+  const second = createNotificationTestPersistence(databasePath);
+  const kickedExchangeAccounts: string[] = [];
+  const waitForBothInitialReads = createTwoPartyBarrier();
+  let listCalls = 0;
+  const input = {
+    notificationId: "operator_notification:position_guard_pilot_activated:sqlite-race:1",
+    exchangeAccountId: "primary",
+    notificationType: "POSITION_GUARD_PILOT_ACTIVATED" as const,
+    severity: "INFO" as const,
+    title: "Candidate pilot activated",
+    message: "Candidate authority is ACTIVE.",
+    payload: { deploymentId: "sqlite-race" },
+  };
+  const createReporter = (repositories: typeof first.repositories) => new DurableTelegramReporter({
+    repositories: {
+      async listOperatorNotifications(exchangeAccountId: string, limit?: number) {
+        const notifications = await repositories.listOperatorNotifications(exchangeAccountId, limit);
+        listCalls += 1;
+        if (listCalls <= 2) await waitForBothInitialReads();
+        return notifications;
+      },
+      saveOperatorNotification: repositories.saveOperatorNotification.bind(repositories),
+    },
+    deliveryService: {
+      kick(exchangeAccountId) {
+        kickedExchangeAccounts.push(exchangeAccountId);
+      },
+    },
+    now: () => "2026-08-24T00:20:00.000Z",
+  });
+
+  try {
+    await Promise.all([
+      createReporter(first.repositories).report(input),
+      createReporter(second.repositories).report(input),
+    ]);
+
+    assert.deepEqual(
+      await first.repositories.listOperatorNotifications("primary", 10),
+      [createNotification({
+        id: input.notificationId,
+        notificationType: input.notificationType,
+        severity: input.severity,
+        title: input.title,
+        message: input.message,
+        payloadJson: JSON.stringify(input.payload),
+        createdAt: "2026-08-24T00:20:00.000Z",
+      })],
+    );
+    assert.deepEqual(kickedExchangeAccounts, ["primary", "primary"]);
+  } finally {
+    second.close();
+    first.close();
+    await cleanupTempDatabase(databasePath);
+  }
 });
 
 test("nondeterministic reporter calls do not require notification listing support", async () => {
@@ -1358,5 +1421,44 @@ function createNotification(
     createdAt,
     deliveredAt: null,
     lastError: null,
+  };
+}
+
+async function createTempDatabasePath(label: string): Promise<string> {
+  const directory = path.resolve(process.cwd(), ".tmp-db-tests");
+  await mkdir(directory, { recursive: true });
+  return path.join(directory, `sqlite-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}.sqlite`);
+}
+
+async function cleanupTempDatabase(databasePath: string): Promise<void> {
+  await rm(databasePath, { force: true });
+}
+
+function createNotificationTestPersistence(databasePath: string) {
+  return createSqlitePersistence({
+    databasePath,
+    exchangeAccountId: "primary",
+    userId: "user-notification-test",
+    userTelegramId: "telegram-notification-test",
+    userDisplayName: "Notification Test Operator",
+    accessKeyRef: "secret://upbit/access",
+    secretKeyRef: "secret://upbit/secret",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    killSwitchActive: false,
+  });
+}
+
+function createTwoPartyBarrier(): () => Promise<void> {
+  let arrivals = 0;
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  return async () => {
+    arrivals += 1;
+    if (arrivals === 2) release();
+    await released;
   };
 }

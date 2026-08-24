@@ -705,7 +705,7 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       throw new Error(`Operator notification ${record.id} already exists.`);
     }
 
-    this.operatorNotifications.push(record);
+    this.operatorNotifications.push(cloneRecord(record));
   }
 
   async saveOperatorNotificationDeliveryAttempt(
@@ -774,8 +774,8 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
         leaseToken: input.leaseToken,
         leaseExpiresAt: input.leaseExpiresAt,
       };
-      this.operatorNotifications[index] = claimedRecord;
-      return claimedRecord;
+      this.operatorNotifications[index] = cloneRecord(claimedRecord);
+      return cloneRecord(claimedRecord);
     });
   }
 
@@ -817,7 +817,8 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       .filter((candidate) => candidate.exchangeAccountId === exchangeAccountId)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 
-    return typeof limit === "number" ? notifications.slice(0, limit) : notifications;
+    const limited = typeof limit === "number" ? notifications.slice(0, limit) : notifications;
+    return limited.map(cloneRecord);
   }
 
   async listOperatorNotificationDeliveryAttempts(
@@ -865,7 +866,8 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
         return leftDueAt.localeCompare(rightDueAt) || left.createdAt.localeCompare(right.createdAt);
       });
 
-    return typeof options?.limit === "number" ? notifications.slice(0, options.limit) : notifications;
+    const limited = typeof options?.limit === "number" ? notifications.slice(0, options.limit) : notifications;
+    return limited.map(cloneRecord);
   }
 }
 

@@ -89,6 +89,9 @@ export class DurableTelegramReporter implements OperatorNotificationReporter {
       )).find((candidate) => candidate.id === input.notificationId);
       if (!existing) throw error;
       assertSameNotificationMaterial(existing, record);
+      if (existing.deliveryStatus === "PENDING") {
+        this.dependencies.deliveryService?.kick(input.exchangeAccountId);
+      }
       return;
     }
     this.dependencies.deliveryService?.kick(input.exchangeAccountId);
