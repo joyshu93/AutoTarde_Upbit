@@ -1220,8 +1220,8 @@ test("durable reporter resolves a concurrent deterministic insert race by exact 
 
 test("durable reporters re-kick a pending SQLite winner after a synchronized deterministic insert race", async () => {
   const databasePath = await createTempDatabasePath("reporter-deterministic-race");
-  const first = createNotificationTestPersistence(databasePath);
-  const second = createNotificationTestPersistence(databasePath);
+  let first: ReturnType<typeof createNotificationTestPersistence> | null = null;
+  let second: ReturnType<typeof createNotificationTestPersistence> | null = null;
   const kickedExchangeAccounts: string[] = [];
   const waitForBothInitialReads = createTwoPartyBarrier();
   let listCalls = 0;
@@ -1234,7 +1234,9 @@ test("durable reporters re-kick a pending SQLite winner after a synchronized det
     message: "Candidate authority is ACTIVE.",
     payload: { deploymentId: "sqlite-race" },
   };
-  const createReporter = (repositories: typeof first.repositories) => new DurableTelegramReporter({
+  const createReporter = (
+    repositories: ReturnType<typeof createNotificationTestPersistence>["repositories"],
+  ) => new DurableTelegramReporter({
     repositories: {
       async listOperatorNotifications(exchangeAccountId: string, limit?: number) {
         const notifications = await repositories.listOperatorNotifications(exchangeAccountId, limit);
@@ -1253,6 +1255,8 @@ test("durable reporters re-kick a pending SQLite winner after a synchronized det
   });
 
   try {
+    first = createNotificationTestPersistence(databasePath);
+    second = createNotificationTestPersistence(databasePath);
     await Promise.all([
       createReporter(first.repositories).report(input),
       createReporter(second.repositories).report(input),
@@ -1272,9 +1276,15 @@ test("durable reporters re-kick a pending SQLite winner after a synchronized det
     );
     assert.deepEqual(kickedExchangeAccounts, ["primary", "primary"]);
   } finally {
-    second.close();
-    first.close();
-    await cleanupTempDatabase(databasePath);
+    try {
+      second?.close();
+    } finally {
+      try {
+        first?.close();
+      } finally {
+        await cleanupTempDatabase(databasePath);
+      }
+    }
   }
 });
 

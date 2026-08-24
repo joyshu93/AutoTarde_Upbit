@@ -8,6 +8,8 @@ import type {
   BalanceSnapshotRecord,
   ExecutionStateRecord,
   FillRecord,
+  OperatorNotificationDeliveryAttemptRecord,
+  OperatorNotificationDeliveryRunRecord,
   OperatorNotificationRecord,
   OrderEventRecord,
   OrderRecord,
@@ -146,6 +148,108 @@ test("in-memory operator notification delivery records are detached from caller 
   failedRead.lastError = null;
   assert.equal((await readOperatorNotification(repository, failed.id)).deliveryStatus, "FAILED");
   assert.equal((await readOperatorNotification(repository, failed.id)).lastError, "telegram_http_403");
+});
+
+test("in-memory operator notification delivery attempts are detached on save and list", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const attempt: OperatorNotificationDeliveryAttemptRecord = {
+    id: "delivery-attempt-detached",
+    notificationId: "notification-detached",
+    exchangeAccountId: "primary",
+    attemptCount: 1,
+    leaseToken: "lease-detached",
+    outcome: "SENT",
+    failureClass: null,
+    attemptedAt: "2026-08-24T00:40:00.000Z",
+    nextAttemptAt: null,
+    deliveredAt: "2026-08-24T00:40:01.000Z",
+    errorMessage: null,
+    createdAt: "2026-08-24T00:40:01.000Z",
+  };
+  await repository.saveOperatorNotificationDeliveryAttempt(attempt);
+
+  attempt.outcome = "FAILED";
+  attempt.errorMessage = "mutated caller input";
+  const [saved] = await repository.listOperatorNotificationDeliveryAttempts("primary", 1);
+  assert.equal(saved?.outcome, "SENT");
+  assert.equal(saved?.errorMessage, null);
+
+  const replacement: OperatorNotificationDeliveryAttemptRecord = {
+    ...attempt,
+    outcome: "RETRY_SCHEDULED",
+    failureClass: "RETRYABLE",
+    nextAttemptAt: "2026-08-24T00:41:00.000Z",
+    errorMessage: "retry scheduled",
+  };
+  await repository.saveOperatorNotificationDeliveryAttempt(replacement);
+  replacement.outcome = "FAILED";
+  replacement.errorMessage = "mutated replacement input";
+  const [listed] = await repository.listOperatorNotificationDeliveryAttempts("primary", 1);
+  assert.equal(listed?.outcome, "RETRY_SCHEDULED");
+  assert.equal(listed?.errorMessage, "retry scheduled");
+
+  if (listed) {
+    listed.outcome = "FAILED";
+    listed.errorMessage = "mutated list output";
+  }
+  const [persisted] = await repository.listOperatorNotificationDeliveryAttempts("primary", 1);
+  assert.equal(persisted?.outcome, "RETRY_SCHEDULED");
+  assert.equal(persisted?.errorMessage, "retry scheduled");
+});
+
+test("in-memory operator notification delivery runs are detached on save and list", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const run: OperatorNotificationDeliveryRunRecord = {
+    id: "delivery-run-detached",
+    exchangeAccountId: "primary",
+    workerName: "inline",
+    status: "COMPLETED",
+    startedAt: "2026-08-24T00:50:00.000Z",
+    completedAt: "2026-08-24T00:50:01.000Z",
+    attemptedCount: 1,
+    sentCount: 1,
+    retryScheduledCount: 0,
+    failedCount: 0,
+    staleLeaseCount: 0,
+    pendingTotalCount: 0,
+    pendingDueCount: 0,
+    pendingScheduledCount: 0,
+    activeLeaseCount: 0,
+    expiredLeaseCount: 0,
+    abandonedLeaseCandidateCount: 0,
+    skippedReason: null,
+    errorMessage: null,
+    summaryJson: JSON.stringify({ sent: 1 }),
+  };
+  await repository.saveOperatorNotificationDeliveryRun(run);
+
+  run.status = "FAILED";
+  run.errorMessage = "mutated caller input";
+  const [saved] = await repository.listOperatorNotificationDeliveryRuns("primary", 1);
+  assert.equal(saved?.status, "COMPLETED");
+  assert.equal(saved?.errorMessage, null);
+
+  const replacement: OperatorNotificationDeliveryRunRecord = {
+    ...run,
+    status: "SKIPPED",
+    skippedReason: "not configured",
+    errorMessage: null,
+    summaryJson: JSON.stringify({ skipped: true }),
+  };
+  await repository.saveOperatorNotificationDeliveryRun(replacement);
+  replacement.status = "FAILED";
+  replacement.summaryJson = JSON.stringify({ mutated: true });
+  const [listed] = await repository.listOperatorNotificationDeliveryRuns("primary", 1);
+  assert.equal(listed?.status, "SKIPPED");
+  assert.equal(listed?.summaryJson, JSON.stringify({ skipped: true }));
+
+  if (listed) {
+    listed.status = "FAILED";
+    listed.summaryJson = JSON.stringify({ mutatedList: true });
+  }
+  const [persisted] = await repository.listOperatorNotificationDeliveryRuns("primary", 1);
+  assert.equal(persisted?.status, "SKIPPED");
+  assert.equal(persisted?.summaryJson, JSON.stringify({ skipped: true }));
 });
 
 test("sqlite operator notification persistence rejects duplicate ids without rewinding delivery state", async () => {

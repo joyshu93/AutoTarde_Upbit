@@ -713,11 +713,11 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   ): Promise<void> {
     const index = this.operatorNotificationDeliveryAttempts.findIndex((candidate) => candidate.id === record.id);
     if (index === -1) {
-      this.operatorNotificationDeliveryAttempts.push(record);
+      this.operatorNotificationDeliveryAttempts.push(cloneRecord(record));
       return;
     }
 
-    this.operatorNotificationDeliveryAttempts[index] = record;
+    this.operatorNotificationDeliveryAttempts[index] = cloneRecord(record);
   }
 
   async saveOperatorNotificationDeliveryRun(
@@ -725,11 +725,11 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
   ): Promise<void> {
     const index = this.operatorNotificationDeliveryRuns.findIndex((candidate) => candidate.id === record.id);
     if (index === -1) {
-      this.operatorNotificationDeliveryRuns.push(record);
+      this.operatorNotificationDeliveryRuns.push(cloneRecord(record));
       return;
     }
 
-    this.operatorNotificationDeliveryRuns[index] = record;
+    this.operatorNotificationDeliveryRuns[index] = cloneRecord(record);
   }
 
   async claimPendingOperatorNotifications(
@@ -829,7 +829,8 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       .filter((candidate) => candidate.exchangeAccountId === exchangeAccountId)
       .sort((left, right) => right.attemptedAt.localeCompare(left.attemptedAt));
 
-    return typeof limit === "number" ? attempts.slice(0, limit) : attempts;
+    const limited = typeof limit === "number" ? attempts.slice(0, limit) : attempts;
+    return limited.map(cloneRecord);
   }
 
   async listOperatorNotificationDeliveryRuns(
@@ -840,7 +841,8 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       .filter((candidate) => candidate.exchangeAccountId === exchangeAccountId)
       .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
 
-    return typeof limit === "number" ? runs.slice(0, limit) : runs;
+    const limited = typeof limit === "number" ? runs.slice(0, limit) : runs;
+    return limited.map(cloneRecord);
   }
 
   async listPendingOperatorNotifications(
