@@ -646,6 +646,8 @@ test("reconciliation stays lookup-eligible after atomic fill failure and project
   };
   const order = createOrderRecord({
     id: "reconciliation-fault-order",
+    ordType: "limit",
+    volume: "0.003",
     status: "OPEN",
     executionMode: "LIVE",
     upbitUuid: "reconciliation-fault-uuid",

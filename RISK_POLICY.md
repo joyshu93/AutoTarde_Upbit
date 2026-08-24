@@ -235,6 +235,7 @@ Retryable delivery failures should remain explicit as `PENDING` plus future `nex
 Concurrent delivery workers should only finalize a notification when the persisted lease token still matches the worker claim.
 Delivery kicks requested during an active inline worker run should not strand due `PENDING` notifications; they should trigger a follow-up worker pass.
 Long-running runtime shutdown should be explicit: signal handling must stop inbound polling, clear scheduler timers, and close SQLite persistence. Cleanup failures should be visible as partial shutdown failures instead of being swallowed.
+SQLite migration application must not expose schema effects without the matching `_schema_migrations` authority row. Migration transaction structure is validated rather than rewritten heuristically; schema and ledger changes commit atomically, foreign-key enforcement is restored, and historical ledger repair requires exact canonical schema compatibility. Unknown, malformed, or incompatible partial migration state blocks startup instead of being silently recorded as applied.
 
 ## Current Implementation Note
 

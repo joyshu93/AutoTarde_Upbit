@@ -38,6 +38,7 @@ import {
 } from "./candidate-pilot-repository-contract.test.js";
 import { verifyAccountExecutionLeaseContract } from "./account-execution-lease-contract.test.js";
 
+const MIGRATION_0017 = "0017_add_btc_candidate_live_pilot.sql";
 const MIGRATION_0018 = "0018_scope_candidate_evidence_identity_to_deployment.sql";
 const MIGRATION_0019 = "0019_store_candidate_evidence_decimals_as_text.sql";
 const MIGRATION_0020 = "0020_add_candidate_execution_bindings.sql";
@@ -1057,6 +1058,165 @@ test("sqlite account execution lease store satisfies the common contract", async
   });
 });
 
+test("transaction-owning migration schema and ledger roll back together when ledger insertion fails", async () => {
+  const databasePath = await createTempDatabasePath("migration-0017-ledger-atomicity");
+  await createPre0017Fixture(databasePath);
+  installMigrationLedgerFailure(databasePath, MIGRATION_0017);
+
+  try {
+    assert.throws(() => openSqliteDatabase(databasePath), /injected migration ledger failure/u);
+
+    const afterFailure = new DatabaseSync(databasePath);
+    try {
+      assert.equal(hasMigration(afterFailure, MIGRATION_0017), false);
+      assert.equal(tableExistsForTest(afterFailure, "strategy_pilot_deployments"), false);
+      afterFailure.exec("DROP TRIGGER fail_selected_migration_ledger_insert;");
+    } finally {
+      afterFailure.close();
+    }
+
+    const recovered = openSqliteDatabase(databasePath);
+    try {
+      assert.equal(hasMigration(recovered.db, MIGRATION_0017), true);
+      assert.equal(tableExistsForTest(recovered.db, "strategy_pilot_deployments"), true);
+      assertDatabaseIntegrity(recovered.db);
+    } finally {
+      recovered.close();
+    }
+  } finally {
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("plain migration schema and ledger roll back together when ledger insertion fails", async () => {
+  const databasePath = await createTempDatabasePath("migration-0022-ledger-atomicity");
+  await createPre0022Fixture(databasePath);
+  installMigrationLedgerFailure(databasePath, MIGRATION_0022);
+
+  try {
+    assert.throws(() => openSqliteDatabase(databasePath), /injected migration ledger failure/u);
+
+    const afterFailure = new DatabaseSync(databasePath);
+    try {
+      assert.equal(hasMigration(afterFailure, MIGRATION_0022), false);
+      assert.equal(tableHasColumnForTest(afterFailure, "strategy_pilot_deployments", "activation_at"), false);
+      assert.equal(
+        tableHasColumnForTest(afterFailure, "strategy_pilot_deployments", "activation_epoch_ns"),
+        false,
+      );
+      afterFailure.exec("DROP TRIGGER fail_selected_migration_ledger_insert;");
+    } finally {
+      afterFailure.close();
+    }
+
+    const recovered = openSqliteDatabase(databasePath);
+    try {
+      assert.equal(hasMigration(recovered.db, MIGRATION_0022), true);
+      assert.equal(tableHasColumnForTest(recovered.db, "strategy_pilot_deployments", "activation_at"), true);
+      assert.equal(
+        tableHasColumnForTest(recovered.db, "strategy_pilot_deployments", "activation_epoch_ns"),
+        true,
+      );
+      assertDatabaseIntegrity(recovered.db);
+    } finally {
+      recovered.close();
+    }
+  } finally {
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("a fully applied historical 0017 schema without its ledger row is repaired deterministically", async () => {
+  const databasePath = await createTempDatabasePath("migration-0017-historical-partial");
+  await createPre0017Fixture(databasePath);
+  const partial = new DatabaseSync(databasePath);
+  try {
+    partial.exec(await readFile(path.resolve(process.cwd(), "migrations", MIGRATION_0017), "utf8"));
+    assert.equal(hasMigration(partial, MIGRATION_0017), false);
+    assert.equal(tableExistsForTest(partial, "strategy_pilot_deployments"), true);
+  } finally {
+    partial.close();
+  }
+
+  try {
+    const recovered = openSqliteDatabase(databasePath);
+    try {
+      assert.equal(hasMigration(recovered.db, MIGRATION_0017), true);
+      assert.equal(hasMigration(recovered.db, MIGRATION_0022), true);
+      assertCompositeEvidenceIdentity(recovered.db);
+      assertDatabaseIntegrity(recovered.db);
+    } finally {
+      recovered.close();
+    }
+  } finally {
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("a partially applied historical 0022 schema is completed and recorded deterministically", async () => {
+  const databasePath = await createTempDatabasePath("migration-0022-historical-partial");
+  await createPre0022Fixture(databasePath);
+  const partial = new DatabaseSync(databasePath);
+  try {
+    partial.exec("ALTER TABLE strategy_pilot_deployments ADD COLUMN activation_at TEXT;");
+    assert.equal(hasMigration(partial, MIGRATION_0022), false);
+  } finally {
+    partial.close();
+  }
+
+  try {
+    const recovered = openSqliteDatabase(databasePath);
+    try {
+      assert.equal(hasMigration(recovered.db, MIGRATION_0022), true);
+      assert.equal(tableHasColumnForTest(
+        recovered.db,
+        "strategy_pilot_deployments",
+        "activation_epoch_ns",
+      ), true);
+      assertDatabaseIntegrity(recovered.db);
+    } finally {
+      recovered.close();
+    }
+  } finally {
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("an incompatible historical 0017 fragment is rejected without a ledger row", async () => {
+  const databasePath = await createTempDatabasePath("migration-0017-incompatible-partial");
+  await createPre0017Fixture(databasePath);
+  const partial = new DatabaseSync(databasePath);
+  try {
+    partial.exec("CREATE TABLE strategy_pilot_deployments (id TEXT PRIMARY KEY);");
+  } finally {
+    partial.close();
+  }
+
+  try {
+    assert.throws(
+      () => openSqliteDatabase(databasePath),
+      /incompatible partially applied migration 0017_add_btc_candidate_live_pilot\.sql/iu,
+    );
+    const afterFailure = new DatabaseSync(databasePath);
+    try {
+      assert.equal(hasMigration(afterFailure, MIGRATION_0017), false);
+      const columns = afterFailure.prepare("PRAGMA table_info(strategy_pilot_deployments)").all() as
+        Array<{ cid: number; name: string; type: string; notnull: number; dflt_value: unknown; pk: number }>;
+      assert.equal(columns.length, 1);
+      assert.equal(columns[0]?.cid, 0);
+      assert.equal(columns[0]?.name, "id");
+      assert.equal(columns[0]?.type, "TEXT");
+      assert.equal(columns[0]?.notnull, 0);
+      assert.equal(columns[0]?.dflt_value, null);
+      assert.equal(columns[0]?.pk, 1);
+    } finally {
+      afterFailure.close();
+    }
+  } finally {
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
 test("migration 0017 reserves exact values and preserves pre-0017 rows and delivery foreign keys", async () => {
   const databasePath = await createTempDatabasePath("upgrade");
   await createPre0017Fixture(databasePath);
@@ -1690,6 +1850,53 @@ async function cleanupTempDatabase(databasePath: string): Promise<void> {
   await rm(databasePath, { force: true });
   await rm(`${databasePath}-shm`, { force: true });
   await rm(`${databasePath}-wal`, { force: true });
+}
+
+function installMigrationLedgerFailure(databasePath: string, filename: string): void {
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.exec(`
+      CREATE TRIGGER fail_selected_migration_ledger_insert
+      BEFORE INSERT ON _schema_migrations
+      WHEN NEW.filename = '${filename}'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected migration ledger failure');
+      END;
+    `);
+  } finally {
+    db.close();
+  }
+}
+
+function hasMigration(db: DatabaseSync, filename: string): boolean {
+  return db.prepare("SELECT 1 FROM _schema_migrations WHERE filename = ?").get(filename) !== undefined;
+}
+
+function tableExistsForTest(db: DatabaseSync, tableName: string): boolean {
+  return db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+  ).get(tableName) !== undefined;
+}
+
+function tableHasColumnForTest(db: DatabaseSync, tableName: string, columnName: string): boolean {
+  return (db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>)
+    .some((column) => column.name === columnName);
+}
+
+async function createPre0022Fixture(databasePath: string): Promise<void> {
+  const current = openSqliteDatabase(databasePath);
+  current.close();
+
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.exec("DROP INDEX idx_strategy_pilot_deployments_activation;");
+    db.exec("ALTER TABLE strategy_pilot_deployments DROP COLUMN activation_epoch_ns;");
+    db.exec("ALTER TABLE strategy_pilot_deployments DROP COLUMN activation_at;");
+    db.prepare("DELETE FROM _schema_migrations WHERE filename = ?").run(MIGRATION_0022);
+    assertDatabaseIntegrity(db);
+  } finally {
+    db.close();
+  }
 }
 
 async function createPre0017Fixture(databasePath: string): Promise<void> {

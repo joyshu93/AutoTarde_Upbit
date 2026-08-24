@@ -270,6 +270,7 @@ Owns repository interfaces and storage adapters.
 The default runtime path is SQLite-backed local persistence via `DATABASE_PATH` (default: `./var/autotrade-upbit.sqlite`).
 Persisted `execution_state` is the operator authority for runtime control, including pause, resume, kill-switch, and live-order gating decisions.
 It also carries persisted `degraded_reason` / `degraded_at` metadata so startup health signals survive `/pause -> /resume` without being conflated with pause semantics.
+Migration scripts are lexically validated before execution. The database adapter unwraps only one complete, recognized transaction envelope, preserves trigger bodies unchanged, and commits each migration's schema effects and `_schema_migrations` row in the same outer transaction. Scripts that require foreign keys off restore the prior enabled state after commit or rollback. A missing historical ledger row is repaired only when the persisted schema exactly matches the canonical migration delta; the known additive 0022 partial state is completed and revalidated transactionally, while malformed or incompatible states fail closed.
 
 This slice contains:
 - the initial migration

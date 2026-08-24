@@ -2,6 +2,8 @@ import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, extname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { parseMigrationScript, type ParsedMigrationScript } from "../migration-script.js";
+
 export interface SqliteDatabaseHandle {
   db: DatabaseSync;
   close(): void;
@@ -65,9 +67,7 @@ function ensureMigrationTable(db: DatabaseSync): void {
 }
 
 function applyMigrations(db: DatabaseSync, migrationsDir: string): void {
-  const filenames = readdirSync(migrationsDir)
-    .filter((filename) => extname(filename) === ".sql")
-    .sort((left, right) => left.localeCompare(right));
+  const filenames = listMigrationFilenames(migrationsDir);
 
   const appliedStatement = db.prepare("SELECT filename FROM _schema_migrations WHERE filename = ?");
   const insertStatement = db.prepare("INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)");
@@ -86,25 +86,371 @@ function applyMigrations(db: DatabaseSync, migrationsDir: string): void {
     }
 
     const migrationSql = readFileSync(join(migrationsDir, filename), "utf8");
+    const parsed = parseMigrationScript(migrationSql);
+    if (repairHistoricalMigrationLedger(
+      db,
+      migrationsDir,
+      filename,
+      migrationSql,
+      () => insertStatement.run(filename, new Date().toISOString()),
+    )) {
+      continue;
+    }
+
+    applyMigrationAtomically(db, parsed, () => {
+      executeMigrationBody(db, filename, parsed.bodySql);
+      assertForeignKeyIntegrity(db, filename);
+      insertStatement.run(filename, new Date().toISOString());
+    });
+  }
+}
+
+function listMigrationFilenames(migrationsDir: string): string[] {
+  return readdirSync(migrationsDir)
+    .filter((filename) => extname(filename) === ".sql")
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function executeMigrationBody(db: DatabaseSync, filename: string, bodySql: string): void {
+  try {
+    db.exec(bodySql);
+  } catch (error) {
+    const repair = legacyMigrationRepair(filename);
+    if (repair === null) throw error;
+    repair(db);
+  }
+}
+
+function legacyMigrationRepair(filename: string): ((db: DatabaseSync) => void) | null {
+  if (filename === "0005_add_startup_degraded_policy_and_portfolio_drift_codes.sql") {
+    return repairMigration0005;
+  }
+  if (filename === "0006_add_operator_notification_retry_metadata.sql") {
+    return repairMigration0006;
+  }
+  if (filename === "0007_add_operator_notification_delivery_leases.sql") {
+    return repairMigration0007;
+  }
+  if (filename === "0008_add_operator_notification_delivery_attempt_history.sql") {
+    return repairMigration0008;
+  }
+  if (filename === "0009_add_history_recovery_checkpoints.sql") {
+    return repairMigration0009;
+  }
+  return null;
+}
+
+function applyMigrationAtomically(
+  db: DatabaseSync,
+  parsed: Pick<ParsedMigrationScript, "requiresForeignKeysOff">,
+  operation: () => void,
+): void {
+  if (db.isTransaction) {
+    throw new Error("Cannot apply a migration while another SQLite transaction is active.");
+  }
+
+  const foreignKeysBefore = readForeignKeysPragma(db);
+  if (parsed.requiresForeignKeysOff && foreignKeysBefore !== 0) {
+    db.exec("PRAGMA foreign_keys = OFF;");
+    if (readForeignKeysPragma(db) !== 0) {
+      throw new Error("Failed to disable SQLite foreign keys before migration transaction.");
+    }
+  }
+
+  let operationError: unknown;
+  try {
+    db.exec("BEGIN IMMEDIATE;");
     try {
-      db.exec(migrationSql);
+      operation();
+      db.exec("COMMIT;");
     } catch (error) {
-      if (filename === "0005_add_startup_degraded_policy_and_portfolio_drift_codes.sql") {
-        repairMigration0005(db);
-      } else if (filename === "0006_add_operator_notification_retry_metadata.sql") {
-        repairMigration0006(db);
-      } else if (filename === "0007_add_operator_notification_delivery_leases.sql") {
-        repairMigration0007(db);
-      } else if (filename === "0008_add_operator_notification_delivery_attempt_history.sql") {
-        repairMigration0008(db);
-      } else if (filename === "0009_add_history_recovery_checkpoints.sql") {
-        repairMigration0009(db);
-      } else {
-        throw error;
+      operationError = error;
+      if (db.isTransaction) db.exec("ROLLBACK;");
+    }
+  } finally {
+    if (parsed.requiresForeignKeysOff && foreignKeysBefore !== 0) {
+      db.exec("PRAGMA foreign_keys = ON;");
+      if (readForeignKeysPragma(db) !== foreignKeysBefore) {
+        throw new Error("Failed to restore SQLite foreign keys after migration transaction.");
       }
     }
-    insertStatement.run(filename, new Date().toISOString());
   }
+
+  if (operationError !== undefined) throw operationError;
+}
+
+function readForeignKeysPragma(db: DatabaseSync): number {
+  const row = db.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number };
+  return row.foreign_keys;
+}
+
+function assertForeignKeyIntegrity(db: DatabaseSync, filename: string): void {
+  const violations = db.prepare("PRAGMA foreign_key_check").all();
+  if (violations.length > 0) {
+    throw new Error(`Migration ${filename} produced ${violations.length} foreign-key violation(s).`);
+  }
+}
+
+type SchemaObjectType = "index" | "table" | "trigger";
+
+interface SchemaObjectSignature {
+  type: SchemaObjectType;
+  name: string;
+  tableName: string;
+  normalizedSql: string;
+}
+
+interface SchemaSnapshot {
+  objects: ReadonlyMap<string, Readonly<SchemaObjectSignature>>;
+  columns: ReadonlyMap<string, ReadonlySet<string>>;
+}
+
+interface SchemaObjectChange {
+  key: string;
+  before: Readonly<SchemaObjectSignature> | null;
+  after: Readonly<SchemaObjectSignature> | null;
+}
+
+interface CanonicalMigrationDelta {
+  objectChanges: readonly Readonly<SchemaObjectChange>[];
+  addedColumns: readonly Readonly<{ tableName: string; columnName: string }>[];
+  transientObjectNames: readonly string[];
+}
+
+const canonicalMigrationDeltaCache = new Map<string, Readonly<CanonicalMigrationDelta>>();
+
+function repairHistoricalMigrationLedger(
+  db: DatabaseSync,
+  migrationsDir: string,
+  filename: string,
+  migrationSql: string,
+  recordMigration: () => void,
+): boolean {
+  const delta = canonicalMigrationDelta(migrationsDir, filename, migrationSql);
+  if (delta.objectChanges.length === 0) return false;
+
+  if (matchesCanonicalMigrationDelta(readSchemaSnapshot(db), delta)) {
+    applyMigrationAtomically(db, { requiresForeignKeysOff: false }, () => {
+      if (!matchesCanonicalMigrationDelta(readSchemaSnapshot(db), delta)) {
+        throw incompatibleHistoricalMigration(filename);
+      }
+      assertMigrationDatabaseIntegrity(db, filename);
+      recordMigration();
+    });
+    return true;
+  }
+
+  const snapshot = readSchemaSnapshot(db);
+  if (!hasPartialMigrationMarkers(snapshot, delta)) return false;
+
+  if (filename === "0022_add_candidate_deployment_activation.sql") {
+    applyMigrationAtomically(db, { requiresForeignKeysOff: false }, () => {
+      repairMigration0022Body(db);
+      if (!matchesCanonicalMigrationDelta(readSchemaSnapshot(db), delta)) {
+        throw incompatibleHistoricalMigration(filename);
+      }
+      assertMigrationDatabaseIntegrity(db, filename);
+      recordMigration();
+    });
+    return true;
+  }
+
+  throw incompatibleHistoricalMigration(filename);
+}
+
+function canonicalMigrationDelta(
+  migrationsDir: string,
+  filename: string,
+  migrationSql: string,
+): Readonly<CanonicalMigrationDelta> {
+  const cacheKey = `${migrationsDir}\u0000${filename}\u0000${migrationSql}`;
+  const cached = canonicalMigrationDeltaCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  const shadow = new DatabaseSync(":memory:");
+  try {
+    shadow.exec("PRAGMA foreign_keys = ON;");
+    let before: SchemaSnapshot | null = null;
+    let after: SchemaSnapshot | null = null;
+    for (const candidate of listMigrationFilenames(migrationsDir)) {
+      if (candidate === filename) before = readSchemaSnapshot(shadow);
+      const candidateSql = readFileSync(join(migrationsDir, candidate), "utf8");
+      const parsed = parseMigrationScript(candidateSql);
+      applyMigrationAtomically(shadow, parsed, () => {
+        executeMigrationBody(shadow, candidate, parsed.bodySql);
+        assertForeignKeyIntegrity(shadow, candidate);
+      });
+      if (candidate === filename) {
+        after = readSchemaSnapshot(shadow);
+        break;
+      }
+    }
+    if (before === null || after === null) {
+      throw new Error(`Cannot build canonical schema delta for unknown migration ${filename}.`);
+    }
+
+    const delta = Object.freeze(buildCanonicalMigrationDelta(before, after, migrationSql));
+    canonicalMigrationDeltaCache.set(cacheKey, delta);
+    return delta;
+  } finally {
+    shadow.close();
+  }
+}
+
+function buildCanonicalMigrationDelta(
+  before: SchemaSnapshot,
+  after: SchemaSnapshot,
+  migrationSql: string,
+): CanonicalMigrationDelta {
+  const objectKeys = new Set([...before.objects.keys(), ...after.objects.keys()]);
+  const objectChanges = Array.from(objectKeys)
+    .sort((left, right) => left.localeCompare(right))
+    .flatMap((key): SchemaObjectChange[] => {
+      const beforeObject = before.objects.get(key) ?? null;
+      const afterObject = after.objects.get(key) ?? null;
+      return sameSchemaObject(beforeObject, afterObject)
+        ? []
+        : [{ key, before: beforeObject, after: afterObject }];
+    });
+
+  const addedColumns: Array<{ tableName: string; columnName: string }> = [];
+  for (const [tableName, afterColumns] of after.columns) {
+    const beforeColumns = before.columns.get(tableName) ?? new Set<string>();
+    for (const columnName of afterColumns) {
+      if (!beforeColumns.has(columnName)) addedColumns.push({ tableName, columnName });
+    }
+  }
+
+  const transientObjectNames = Array.from(migrationSql.matchAll(
+    /\bALTER\s+TABLE\s+[A-Za-z_][A-Za-z0-9_]*\s+RENAME\s+TO\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/giu,
+  ), (match) => match[1]!)
+    .filter((name) => !Array.from(after.objects.values()).some((object) => object.name === name));
+
+  return {
+    objectChanges: Object.freeze(objectChanges),
+    addedColumns: Object.freeze(addedColumns),
+    transientObjectNames: Object.freeze(transientObjectNames),
+  };
+}
+
+function readSchemaSnapshot(db: DatabaseSync): SchemaSnapshot {
+  const rows = db.prepare(`
+    SELECT type, name, tbl_name, sql
+    FROM sqlite_master
+    WHERE type IN ('table', 'index', 'trigger')
+      AND sql IS NOT NULL
+      AND name NOT LIKE 'sqlite_%'
+      AND name <> '_schema_migrations'
+    ORDER BY type ASC, name ASC
+  `).all() as Array<{ type: SchemaObjectType; name: string; tbl_name: string; sql: string }>;
+  const objects = new Map<string, Readonly<SchemaObjectSignature>>();
+  const columns = new Map<string, ReadonlySet<string>>();
+  for (const row of rows) {
+    objects.set(schemaObjectKey(row.type, row.name), Object.freeze({
+      type: row.type,
+      name: row.name,
+      tableName: row.tbl_name,
+      normalizedSql: normalizeSchemaSql(row.sql),
+    }));
+    if (row.type === "table") {
+      const tableColumns = db.prepare(`PRAGMA table_xinfo(${quoteSqlIdentifier(row.name)})`).all() as
+        Array<{ name: string }>;
+      columns.set(row.name, new Set(tableColumns.map((column) => column.name)));
+    }
+  }
+  return { objects, columns };
+}
+
+function matchesCanonicalMigrationDelta(
+  snapshot: SchemaSnapshot,
+  delta: Readonly<CanonicalMigrationDelta>,
+): boolean {
+  for (const change of delta.objectChanges) {
+    const actual = snapshot.objects.get(change.key) ?? null;
+    if (!sameSchemaObject(actual, change.after)) return false;
+  }
+  for (const transientName of delta.transientObjectNames) {
+    if (Array.from(snapshot.objects.values()).some((object) => object.name === transientName)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function hasPartialMigrationMarkers(
+  snapshot: SchemaSnapshot,
+  delta: Readonly<CanonicalMigrationDelta>,
+): boolean {
+  for (const change of delta.objectChanges) {
+    if (change.before === null && snapshot.objects.has(change.key)) return true;
+  }
+  for (const addedColumn of delta.addedColumns) {
+    if (snapshot.columns.get(addedColumn.tableName)?.has(addedColumn.columnName) === true) return true;
+  }
+  return delta.transientObjectNames.some((name) =>
+    Array.from(snapshot.objects.values()).some((object) => object.name === name));
+}
+
+function sameSchemaObject(
+  left: Readonly<SchemaObjectSignature> | null,
+  right: Readonly<SchemaObjectSignature> | null,
+): boolean {
+  if (left === null || right === null) return left === right;
+  return left.type === right.type &&
+    left.name === right.name &&
+    left.tableName === right.tableName &&
+    left.normalizedSql === right.normalizedSql;
+}
+
+function schemaObjectKey(type: SchemaObjectType, name: string): string {
+  return `${type}:${name}`;
+}
+
+function quoteSqlIdentifier(identifier: string): string {
+  return `"${identifier.replaceAll('"', '""')}"`;
+}
+
+function normalizeSchemaSql(sql: string): string {
+  let normalized = "";
+  let index = 0;
+  let quote: "'" | '"' | "`" | "]" | null = null;
+  while (index < sql.length) {
+    const character = sql[index]!;
+    if (quote === null) {
+      if (/\s/u.test(character)) {
+        index += 1;
+        continue;
+      }
+      if (character === "'" || character === '"' || character === "`") quote = character;
+      else if (character === "[") quote = "]";
+      normalized += character.toLowerCase();
+      index += 1;
+      continue;
+    }
+
+    normalized += character;
+    index += 1;
+    if (character !== quote) continue;
+    if (sql[index] === quote) {
+      normalized += sql[index];
+      index += 1;
+    } else {
+      quote = null;
+    }
+  }
+  return normalized;
+}
+
+function assertMigrationDatabaseIntegrity(db: DatabaseSync, filename: string): void {
+  assertForeignKeyIntegrity(db, filename);
+  const row = db.prepare("PRAGMA integrity_check").get() as { integrity_check: string };
+  if (row.integrity_check !== "ok") {
+    throw new Error(`Migration ${filename} cannot be repaired because integrity_check returned ${row.integrity_check}.`);
+  }
+}
+
+function incompatibleHistoricalMigration(filename: string): Error {
+  return new Error(`Incompatible partially applied migration ${filename}: canonical schema validation failed.`);
 }
 
 function repairMigration0005(db: DatabaseSync): void {
@@ -275,19 +621,22 @@ function repairMigration0021(db: DatabaseSync): void {
 function repairMigration0022(db: DatabaseSync): void {
   db.exec("BEGIN IMMEDIATE;");
   try {
-    if (tableExists(db, "strategy_pilot_deployments")) {
-      ensureCandidatePilotColumn(db, "strategy_pilot_deployments", "activation_at", "TEXT");
-      ensureCandidatePilotColumn(db, "strategy_pilot_deployments", "activation_epoch_ns", "TEXT");
-      db.exec(`
-        CREATE INDEX IF NOT EXISTS idx_strategy_pilot_deployments_activation
-          ON strategy_pilot_deployments(exchange_account_id, phase, activation_epoch_ns, id);
-      `);
-    }
+    repairMigration0022Body(db);
     db.exec("COMMIT;");
   } catch (error) {
     if (db.isTransaction) db.exec("ROLLBACK;");
     throw error;
   }
+}
+
+function repairMigration0022Body(db: DatabaseSync): void {
+  if (!tableExists(db, "strategy_pilot_deployments")) return;
+  ensureCandidatePilotColumn(db, "strategy_pilot_deployments", "activation_at", "TEXT");
+  ensureCandidatePilotColumn(db, "strategy_pilot_deployments", "activation_epoch_ns", "TEXT");
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_strategy_pilot_deployments_activation
+      ON strategy_pilot_deployments(exchange_account_id, phase, activation_epoch_ns, id);
+  `);
 }
 
 function ensureExecutionStateColumn(
