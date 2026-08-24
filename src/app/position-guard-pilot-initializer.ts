@@ -20,10 +20,8 @@ import {
   projectExactCandidateState,
   type ExactCandidateState,
 } from "../modules/execution/candidate-evidence-decimals.js";
-import {
-  createEmptyPositionGuardCandidateState,
-  type PositionGuardCandidateExecutionEvidence,
-} from "../modules/strategy/position-guard-candidate-state.js";
+
+type CandidateExecutionEvidence = CandidateEvidenceRecord["evidence"];
 
 export type PositionGuardPilotInitializerIdentity = CandidatePilotRecoveryIdentity;
 
@@ -181,7 +179,7 @@ export class PositionGuardPilotInitializer {
         createdAt: now,
         updatedAt: now,
       },
-      initialState: createEmptyPositionGuardCandidateState(),
+      initialState: toPositionGuardCandidateRoutingState(createExactEmptyCandidateState()),
     });
     return validateAndSnapshotAuthority({
       initialization,
@@ -375,16 +373,16 @@ function snapshotEvidenceRecords(
       `PositionGuard pilot evidence ${index}`,
       EVIDENCE_KEYS,
     );
-    const evidence: PositionGuardCandidateExecutionEvidence = {
+    const evidence: CandidateExecutionEvidence = {
       evidenceId: evidenceRecord.evidenceId as string,
       executedAt: evidenceRecord.executedAt as string,
-      action: evidenceRecord.action as PositionGuardCandidateExecutionEvidence["action"],
-      entryPath: evidenceRecord.entryPath as PositionGuardCandidateExecutionEvidence["entryPath"],
-      terminalStatus: evidenceRecord.terminalStatus as PositionGuardCandidateExecutionEvidence["terminalStatus"],
-      executedQuantity: evidenceRecord.executedQuantity as PositionGuardCandidateExecutionEvidence["executedQuantity"],
-      grossQuoteValueKrw: evidenceRecord.grossQuoteValueKrw as PositionGuardCandidateExecutionEvidence["grossQuoteValueKrw"],
-      confirmedFeeKrw: evidenceRecord.confirmedFeeKrw as PositionGuardCandidateExecutionEvidence["confirmedFeeKrw"],
-      remainingQuantity: evidenceRecord.remainingQuantity as PositionGuardCandidateExecutionEvidence["remainingQuantity"],
+      action: evidenceRecord.action as CandidateExecutionEvidence["action"],
+      entryPath: evidenceRecord.entryPath as CandidateExecutionEvidence["entryPath"],
+      terminalStatus: evidenceRecord.terminalStatus as CandidateExecutionEvidence["terminalStatus"],
+      executedQuantity: evidenceRecord.executedQuantity as CandidateExecutionEvidence["executedQuantity"],
+      grossQuoteValueKrw: evidenceRecord.grossQuoteValueKrw as CandidateExecutionEvidence["grossQuoteValueKrw"],
+      confirmedFeeKrw: evidenceRecord.confirmedFeeKrw as CandidateExecutionEvidence["confirmedFeeKrw"],
+      remainingQuantity: evidenceRecord.remainingQuantity as CandidateExecutionEvidence["remainingQuantity"],
     };
     const material = candidateEvidenceMaterial(deployment.id, evidence);
     if (record.materialVersion !== "EXACT_V2" || record.materialHash !== material.hash) {
