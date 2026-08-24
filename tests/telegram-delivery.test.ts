@@ -1092,6 +1092,14 @@ test("durable reporter retry kicks an exact pre-existing pending notification wi
 
   await reporter.report(input);
 
+  await assert.rejects(
+    reporter.report({
+      ...input,
+      message: "Conflicting deterministic notification material.",
+    }),
+    /Conflicting deterministic operator notification/,
+  );
+
   assert.equal(saveCalls, 0);
   assert.deepEqual(await baseRepository.listOperatorNotifications("primary"), [persisted]);
   assert.deepEqual(kickedExchangeAccounts, ["primary"]);
