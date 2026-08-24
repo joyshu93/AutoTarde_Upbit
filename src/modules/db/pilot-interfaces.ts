@@ -494,6 +494,9 @@ export function validateCandidatePilotRollbackChronology(
     deployment.updatedAt,
     "candidate deployment updatedAt",
   );
+  if (deployment.phase === "DRAINING" && input.transitionEpochNs <= deploymentUpdatedAt) {
+    throw new Error("Candidate pilot rollback completion from DRAINING must occur strictly after the prior transition.");
+  }
   if (input.transitionEpochNs < deploymentCreatedAt || input.transitionEpochNs < deploymentUpdatedAt) {
     throw new Error("Candidate pilot rollback cannot precede persisted deployment chronology.");
   }
@@ -555,6 +558,37 @@ export function validateCandidatePilotRecoveryFaultInput(
   }
   if (provenance === null || typeof provenance !== "object" || Array.isArray(provenance)) {
     throw new Error("Candidate recovery fault provenanceJson must contain an object.");
+  }
+}
+
+export function validateCandidatePilotRecoveryFaultChronology(
+  input: Pick<PauseCandidatePilotForRecoveryFaultInput, "occurredAt">,
+  deployment: PositionGuardPilotDeploymentRecord,
+  latestAuditAt: string | null,
+): void {
+  const occurredAtEpoch = parsePositionGuardCandidateTimestamp(
+    input.occurredAt,
+    "candidate recovery fault occurredAt",
+  );
+  const deploymentUpdatedAtEpoch = parsePositionGuardCandidateTimestamp(
+    deployment.updatedAt,
+    "deployment updatedAt",
+  );
+  const latestAuditEpoch = latestAuditAt === null
+    ? null
+    : parsePositionGuardCandidateTimestamp(latestAuditAt, "candidate audit createdAt");
+  if (
+    deployment.phase === "DRAINING" &&
+    (occurredAtEpoch <= deploymentUpdatedAtEpoch ||
+      (latestAuditEpoch !== null && occurredAtEpoch <= latestAuditEpoch))
+  ) {
+    throw new Error("Candidate recovery fault from DRAINING must occur strictly after deployment and audit chronology.");
+  }
+  if (
+    occurredAtEpoch < deploymentUpdatedAtEpoch ||
+    (latestAuditEpoch !== null && occurredAtEpoch < latestAuditEpoch)
+  ) {
+    throw new Error("Candidate recovery fault cannot precede deployment chronology.");
   }
 }
 

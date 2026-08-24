@@ -4,8 +4,11 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 
-import type { CandidatePilotDeploymentInitializationResult } from
-  "../src/modules/db/pilot-interfaces.js";
+import type { PositionGuardPilotDeploymentRecord } from "../src/domain/pilot-types.js";
+import type {
+  CandidatePilotDeploymentInitializationResult,
+  CandidatePilotRollbackInput,
+} from "../src/modules/db/pilot-interfaces.js";
 import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
 import { openSqliteDatabase } from "../src/modules/db/repositories/sqlite-database.js";
 import { SqliteCandidatePilotRepository } from
@@ -25,6 +28,7 @@ import {
   verifyCandidatePilotRepositoryContract,
   verifyCandidatePilotIdentityValidation,
   verifyCandidateDeploymentActivationContract,
+  verifyCandidatePilotDrainingFaultChronology,
   verifyCandidatePilotRollbackContract,
   verifyDeploymentScopedEvidenceIdentityContract,
   verifyMixedOffsetReplayContract,
@@ -72,6 +76,100 @@ test("sqlite candidate pilot rollback persistence satisfies the common contract"
   } finally {
     for (const bundle of bundles) bundle.close();
     await Promise.all(databasePaths.map((databasePath) => cleanupTempDatabase(databasePath)));
+  }
+});
+
+test("sqlite draining recovery faults require strict forward chronology without partial mutation", async () => {
+  await withFreshBundle("draining-fault-chronology", async (bundle) => {
+    await verifyCandidatePilotDrainingFaultChronology({
+      repository: bundle.candidatePilots,
+      getExecutionState: () => bundle.operatorState.getState(),
+      listExecutionTransitions: () => bundle.operatorState.listTransitions(Number.MAX_SAFE_INTEGER),
+    });
+  });
+});
+
+test("two sqlite connections produce one rollback start and completion CAS winner", async () => {
+  const databasePath = await createTempDatabasePath("rollback-two-connection-race");
+  const bootstrap = createBundle(databasePath);
+  let bootstrapClosed = false;
+  try {
+    const deployment = await bootstrap.candidatePilots.createDeploymentWithInitialState(
+      initialDeploymentInput("rollback-two-connection-race"),
+    );
+    const activationAt = "2026-08-21T00:00:01.000000000Z";
+    const activated = await bootstrap.candidatePilots.activateDeployment({
+      deploymentId: deployment.id,
+      expectedPhase: "PENDING_FLAT",
+      expectedUpdatedAt: deployment.updatedAt,
+      activationAt,
+      activationEpochNs: parsePositionGuardCandidateTimestamp(activationAt, "rollback race activation"),
+    });
+    assert.ok(activated);
+    bootstrap.close();
+    bootstrapClosed = true;
+
+    const rollbackAt = "2026-08-21T00:00:02.000000000Z";
+    const startInput: CandidatePilotRollbackInput = {
+      deploymentId: activated.id,
+      expectedPhase: "ACTIVE",
+      expectedUpdatedAt: activated.updatedAt,
+      expectedStateVersion: 0,
+      transitionAt: rollbackAt,
+      transitionEpochNs: parsePositionGuardCandidateTimestamp(rollbackAt, "rollback race start"),
+    };
+    const startResults = await runCandidateRollbackConnectionRace(databasePath, "startRollback", startInput);
+    assert.equal(startResults.filter((result) => result !== null).length, 1);
+    assert.deepEqual(startResults.filter((result) => result !== null).map((result) => result?.phase), ["DRAINING"]);
+
+    let completionInput: CandidatePilotRollbackInput;
+    const startInspection = openSqliteDatabase(databasePath);
+    try {
+      const repository = new SqliteCandidatePilotRepository(startInspection.db);
+      const draining = await repository.getDeployment(deployment.id);
+      const state = await repository.getExactState(deployment.id);
+      assert.equal(draining?.phase, "DRAINING");
+      assert.ok(draining);
+      assert.ok(state);
+      assert.equal((await repository.listAuditEvents(deployment.id)).filter(
+        (event) => event.eventType === "ROLLBACK_STARTED",
+      ).length, 1);
+      assertDatabaseIntegrity(startInspection.db);
+      const completionAt = "2026-08-21T00:00:03.000000000Z";
+      completionInput = {
+        deploymentId: draining.id,
+        expectedPhase: "DRAINING",
+        expectedUpdatedAt: draining.updatedAt,
+        expectedStateVersion: state.stateVersion,
+        transitionAt: completionAt,
+        transitionEpochNs: parsePositionGuardCandidateTimestamp(completionAt, "rollback race completion"),
+      };
+    } finally {
+      startInspection.close();
+    }
+
+    const completionResults = await runCandidateRollbackConnectionRace(
+      databasePath,
+      "completeRollback",
+      completionInput,
+    );
+    assert.equal(completionResults.filter((result) => result !== null).length, 1);
+    assert.deepEqual(completionResults.filter((result) => result !== null).map((result) => result?.phase), ["DISABLED"]);
+
+    const completionInspection = openSqliteDatabase(databasePath);
+    try {
+      const repository = new SqliteCandidatePilotRepository(completionInspection.db);
+      assert.equal((await repository.getDeployment(deployment.id))?.phase, "DISABLED");
+      const audits = await repository.listAuditEvents(deployment.id);
+      assert.equal(audits.filter((event) => event.eventType === "ROLLBACK_STARTED").length, 1);
+      assert.equal(audits.filter((event) => event.eventType === "ROLLBACK_COMPLETED").length, 1);
+      assertDatabaseIntegrity(completionInspection.db);
+    } finally {
+      completionInspection.close();
+    }
+  } finally {
+    if (!bootstrapClosed) bootstrap.close();
+    await cleanupTempDatabase(databasePath);
   }
 });
 
@@ -185,6 +283,125 @@ async function awaitCandidateBootstrapWorkers(
       new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(
           () => reject(new Error("Timed out waiting for candidate bootstrap contention workers.")),
+          10_000,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    await Promise.allSettled(workers.map(({ worker }) => worker.terminate()));
+  }
+}
+
+interface StartedCandidateRollbackWorker {
+  worker: Worker;
+  result: Promise<PositionGuardPilotDeploymentRecord | null>;
+}
+
+const CANDIDATE_ROLLBACK_WORKER_SOURCE = String.raw`
+  const { parentPort, workerData } = require("node:worker_threads");
+  const { DatabaseSync } = require("node:sqlite");
+
+  (async () => {
+    let db;
+    try {
+      const repositoryModule = await import(workerData.repositoryModuleUrl);
+      db = new DatabaseSync(workerData.databasePath);
+      db.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+      const repository = new repositoryModule.SqliteCandidatePilotRepository(db);
+      const synchronization = new Int32Array(workerData.synchronization);
+      const ready = Atomics.add(synchronization, 0, 1) + 1;
+      if (ready === 2) Atomics.notify(synchronization, 0);
+      while (Atomics.load(synchronization, 0) < 2) {
+        const observed = Atomics.load(synchronization, 0);
+        if (Atomics.wait(synchronization, 0, observed, 5_000) === "timed-out") {
+          throw new Error("Timed out waiting for the second rollback worker connection.");
+        }
+      }
+      const result = await repository[workerData.method](workerData.input);
+      parentPort.postMessage({ ok: true, result });
+    } catch (error) {
+      parentPort.postMessage({
+        ok: false,
+        error: error instanceof Error ? error.stack ?? error.message : String(error),
+      });
+    } finally {
+      if (db) db.close();
+    }
+  })();
+`;
+
+function startCandidateRollbackWorker(input: {
+  databasePath: string;
+  method: "startRollback" | "completeRollback";
+  rollback: CandidatePilotRollbackInput;
+  synchronization: SharedArrayBuffer;
+}): StartedCandidateRollbackWorker {
+  const worker = new Worker(CANDIDATE_ROLLBACK_WORKER_SOURCE, {
+    eval: true,
+    workerData: {
+      databasePath: input.databasePath,
+      method: input.method,
+      input: input.rollback,
+      synchronization: input.synchronization,
+      repositoryModuleUrl: new URL(
+        "../src/modules/db/repositories/sqlite-candidate-pilot-repository.js",
+        import.meta.url,
+      ).href,
+    },
+    execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")),
+  });
+  const result = new Promise<PositionGuardPilotDeploymentRecord | null>((resolve, reject) => {
+    let received = false;
+    let workerResult: PositionGuardPilotDeploymentRecord | null = null;
+    let failure: Error | null = null;
+    worker.once("message", (message: Readonly<{
+      ok: boolean;
+      result?: PositionGuardPilotDeploymentRecord | null;
+      error?: string;
+    }>) => {
+      if (message.ok && "result" in message) {
+        received = true;
+        workerResult = message.result ?? null;
+      } else {
+        failure = new Error(message.error ?? "Candidate rollback worker failed without an error.");
+      }
+    });
+    worker.once("error", (error) => {
+      failure = error;
+    });
+    worker.once("exit", (code) => {
+      if (failure) {
+        reject(failure);
+      } else if (code !== 0) {
+        reject(new Error(`Candidate rollback worker exited with code ${code}.`));
+      } else if (received) {
+        resolve(workerResult);
+      } else {
+        reject(new Error(`Candidate rollback worker exited without a result (code ${code}).`));
+      }
+    });
+  });
+  return { worker, result };
+}
+
+async function runCandidateRollbackConnectionRace(
+  databasePath: string,
+  method: "startRollback" | "completeRollback",
+  input: CandidatePilotRollbackInput,
+): Promise<Array<PositionGuardPilotDeploymentRecord | null>> {
+  const synchronization = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const workers = [
+    startCandidateRollbackWorker({ databasePath, method, rollback: input, synchronization }),
+    startCandidateRollbackWorker({ databasePath, method, rollback: input, synchronization }),
+  ];
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.all(workers.map(({ result }) => result)),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`Timed out waiting for candidate rollback ${method} workers.`)),
           10_000,
         );
       }),

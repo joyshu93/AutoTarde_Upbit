@@ -491,7 +491,9 @@ export async function verifyCandidatePilotRollbackContract(
   await verifyNonFlatActiveRollbackStart(create);
   await verifyPristinePendingRollbackCompletion(create);
   await verifyFullyExitedActiveRollbackCompletion(create);
+  await verifySameInstantDirectRollbackCompletion(create);
   await verifyDrainingRollbackCompletion(create);
+  await verifySameInstantDrainingRollbackCompletionRejection(create);
   await verifyRollbackRejectsNonFlatAndStaleRequests(create);
   await verifyRollbackCompletionCasMisses(create);
   await verifyRollbackSnapshotsInputsAndSerializesConcurrentRequests(create);
@@ -566,6 +568,34 @@ async function verifyFullyExitedActiveRollbackCompletion(create: CandidatePilotR
   assert.equal((await repository.listEvidenceRecords(deployment.id)).length, 2);
 }
 
+async function verifySameInstantDirectRollbackCompletion(create: CandidatePilotRepositoryFactory): Promise<void> {
+  const pendingRepository = await create();
+  const pending = await pendingRepository.createDeploymentWithInitialState(
+    initialDeploymentInput("rollback-complete-pending-same-instant"),
+  );
+  const pendingAuthority = await requireRollbackAuthority(pendingRepository, pending.id);
+  const pendingCompleted = await pendingRepository.completeRollback(
+    rollbackInput(pendingAuthority, pending.updatedAt),
+  );
+  assert.equal(pendingCompleted?.phase, "DISABLED");
+  assert.deepEqual(
+    (await pendingRepository.listAuditEvents(pending.id)).map((event) => event.eventType),
+    ["DEPLOYMENT_CREATED", "ROLLBACK_COMPLETED"],
+  );
+
+  const activeRepository = await create();
+  const active = await createActiveDeployment(activeRepository, "rollback-complete-active-same-instant");
+  const activeAuthority = await requireRollbackAuthority(activeRepository, active.id);
+  const activeCompleted = await activeRepository.completeRollback(
+    rollbackInput(activeAuthority, active.updatedAt),
+  );
+  assert.equal(activeCompleted?.phase, "DISABLED");
+  assert.deepEqual(
+    (await activeRepository.listAuditEvents(active.id)).map((event) => event.eventType),
+    ["DEPLOYMENT_CREATED", "PHASE_TRANSITION", "ROLLBACK_COMPLETED"],
+  );
+}
+
 async function verifyDrainingRollbackCompletion(create: CandidatePilotRepositoryFactory): Promise<void> {
   const repository = await create();
   const deployment = await createActiveDeployment(repository, "rollback-complete-draining");
@@ -578,6 +608,73 @@ async function verifyDrainingRollbackCompletion(create: CandidatePilotRepository
   );
 
   assert.equal(completed?.phase, "DISABLED");
+}
+
+async function verifySameInstantDrainingRollbackCompletionRejection(
+  create: CandidatePilotRepositoryFactory,
+): Promise<void> {
+  const repository = await create();
+  const deployment = await createActiveDeployment(repository, "rollback-complete-draining-same-instant");
+  const active = await requireRollbackAuthority(repository, deployment.id);
+  const rollbackAt = "2026-08-21T00:00:02.000000000Z";
+  const started = await repository.startRollback(rollbackInput(active, rollbackAt));
+  assert.equal(started?.phase, "DRAINING");
+  const draining = await requireRollbackAuthority(repository, deployment.id);
+  const deploymentBefore = await repository.getDeployment(deployment.id);
+  const auditsBefore = await repository.listAuditEvents(deployment.id);
+
+  await assert.rejects(
+    () => repository.completeRollback(rollbackInput(draining, rollbackAt)),
+    /strictly after|chronology/i,
+  );
+
+  assert.deepEqual(await repository.getDeployment(deployment.id), deploymentBefore);
+  assert.deepEqual(await repository.listAuditEvents(deployment.id), auditsBefore);
+}
+
+export async function verifyCandidatePilotDrainingFaultChronology(input: {
+  repository: CandidatePilotRepository;
+  getExecutionState: () => Promise<unknown>;
+  listExecutionTransitions: () => Promise<readonly unknown[]>;
+}): Promise<void> {
+  const deployment = await createActiveDeployment(input.repository, "draining-fault-same-instant");
+  const active = await requireRollbackAuthority(input.repository, deployment.id);
+  const rollbackAt = "2026-08-21T00:00:02.000000000Z";
+  const started = await input.repository.startRollback(rollbackInput(active, rollbackAt));
+  assert.equal(started?.phase, "DRAINING");
+  const latestAuditAt = "2026-08-21T00:00:03.000000000Z";
+  await input.repository.advanceStateWithEvidence(advanceInput(deployment.id, "draining-fault-latest-evidence", 0, {
+    executedAt: latestAuditAt,
+  }));
+  const deploymentBefore = await input.repository.getDeployment(deployment.id);
+  const stateBefore = await input.repository.getExactState(deployment.id);
+  const evidenceBefore = await input.repository.listEvidenceRecords(deployment.id);
+  const auditsBefore = await input.repository.listAuditEvents(deployment.id);
+  const executionStateBefore = await input.getExecutionState();
+  const executionTransitionsBefore = await input.listExecutionTransitions();
+  assert.equal(auditsBefore.at(-1)?.eventType, "STATE_ADVANCED");
+  assert.equal(auditsBefore.at(-1)?.createdAt, latestAuditAt);
+
+  for (const faultId of ["000-draining-fault-same-audit", "zzz-draining-fault-same-audit"]) {
+    await assert.rejects(
+      () => input.repository.pauseForRecoveryFault({
+        deploymentId: deployment.id,
+        exchangeAccountId: deployment.exchangeAccountId,
+        faultId,
+        reasonCode: "REPLAY_MISMATCH",
+        provenanceJson: "{}",
+        occurredAt: latestAuditAt,
+      }),
+      /strictly after|chronology/i,
+    );
+
+    assert.deepEqual(await input.repository.getDeployment(deployment.id), deploymentBefore);
+    assert.deepEqual(await input.repository.getExactState(deployment.id), stateBefore);
+    assert.deepEqual(await input.repository.listEvidenceRecords(deployment.id), evidenceBefore);
+    assert.deepEqual(await input.repository.listAuditEvents(deployment.id), auditsBefore);
+    assert.deepEqual(await input.getExecutionState(), executionStateBefore);
+    assert.deepEqual(await input.listExecutionTransitions(), executionTransitionsBefore);
+  }
 }
 
 async function verifyRollbackRejectsNonFlatAndStaleRequests(create: CandidatePilotRepositoryFactory): Promise<void> {
@@ -593,11 +690,15 @@ async function verifyRollbackRejectsNonFlatAndStaleRequests(create: CandidatePil
   assert.equal((await repository.listAuditEvents(deployment.id)).length, 3);
 
   const staleVersion = { ...nonFlat, expectedStateVersion: current.state.stateVersion - 1 };
-  assert.equal(await repository.startRollback(staleVersion), null);
   const staleUpdatedAt = { ...nonFlat, expectedUpdatedAt: "2026-08-21T00:00:00.000Z" };
-  assert.equal(await repository.startRollback(staleUpdatedAt), null);
   const stalePhase = { ...nonFlat, expectedPhase: "PENDING_FLAT" as const };
-  assert.equal(await repository.startRollback(stalePhase as never), null);
+  for (const staleInput of [staleVersion, staleUpdatedAt, stalePhase]) {
+    const deploymentBefore = await repository.getDeployment(deployment.id);
+    const auditsBefore = await repository.listAuditEvents(deployment.id);
+    assert.equal(await repository.startRollback(staleInput), null);
+    assert.deepEqual(await repository.getDeployment(deployment.id), deploymentBefore);
+    assert.deepEqual(await repository.listAuditEvents(deployment.id), auditsBefore);
+  }
   await assert.rejects(
     () => repository.startRollback({
       ...nonFlat,
@@ -672,6 +773,8 @@ async function verifyRollbackCompletionCasMisses(create: CandidatePilotRepositor
   const disabled = await requireRollbackAuthority(repository, deployment.id);
 
   assert.equal(await repository.completeRollback(completion), null);
+  assert.equal((await repository.getDeployment(deployment.id))?.phase, "DISABLED");
+  assert.equal((await repository.listAuditEvents(deployment.id)).length, auditCountAfterCompletion);
   assert.equal(await repository.completeRollback(rollbackInput(disabled, "2026-08-21T00:00:04.000000000Z")), null);
   assert.equal((await repository.getDeployment(deployment.id))?.phase, "DISABLED");
   assert.equal((await repository.listAuditEvents(deployment.id)).length, auditCountAfterCompletion);
@@ -681,15 +784,19 @@ async function verifyRollbackCompletionCasMisses(create: CandidatePilotRepositor
   const staleActive = await requireRollbackAuthority(staleRepository, staleDeployment.id);
   await staleRepository.startRollback(rollbackInput(staleActive, "2026-08-21T00:00:02.000000000Z"));
   const staleDraining = await requireRollbackAuthority(staleRepository, staleDeployment.id);
-  const staleInput = {
-    ...rollbackInput(staleDraining, "2026-08-21T00:00:03.000000000Z"),
-    expectedStateVersion: staleDraining.state.stateVersion + 1,
-  };
-  const staleAuditCount = (await staleRepository.listAuditEvents(staleDeployment.id)).length;
-
-  assert.equal(await staleRepository.completeRollback(staleInput), null);
-  assert.equal((await staleRepository.getDeployment(staleDeployment.id))?.phase, "DRAINING");
-  assert.equal((await staleRepository.listAuditEvents(staleDeployment.id)).length, staleAuditCount);
+  const validCompletion = rollbackInput(staleDraining, "2026-08-21T00:00:03.000000000Z");
+  const staleInputs = [
+    { ...validCompletion, expectedStateVersion: staleDraining.state.stateVersion + 1 },
+    { ...validCompletion, expectedUpdatedAt: staleActive.deployment.updatedAt },
+    { ...validCompletion, expectedPhase: "ACTIVE" as const },
+  ];
+  for (const staleInput of staleInputs) {
+    const deploymentBefore = await staleRepository.getDeployment(staleDeployment.id);
+    const auditsBefore = await staleRepository.listAuditEvents(staleDeployment.id);
+    assert.equal(await staleRepository.completeRollback(staleInput), null);
+    assert.deepEqual(await staleRepository.getDeployment(staleDeployment.id), deploymentBefore);
+    assert.deepEqual(await staleRepository.listAuditEvents(staleDeployment.id), auditsBefore);
+  }
 }
 
 async function createActiveDeployment(
@@ -837,6 +944,28 @@ test("in-memory candidate pilot activation persists an actual active instant wit
 
 test("in-memory candidate pilot rollback persistence satisfies the common contract", async () => {
   await verifyCandidatePilotRollbackContract(() => new InMemoryCandidatePilotRepository());
+});
+
+test("in-memory draining recovery faults require strict forward chronology without partial mutation", async () => {
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "execution_state_primary",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-08-21T00:00:00.000Z",
+  });
+  const repository = new InMemoryCandidatePilotRepository(operatorState);
+
+  await verifyCandidatePilotDrainingFaultChronology({
+    repository,
+    getExecutionState: () => operatorState.getState(),
+    listExecutionTransitions: () => operatorState.listTransitions(Number.MAX_SAFE_INTEGER),
+  });
 });
 
 test("in-memory rollback completion rejects a persisted PAUSED_FAULT without mutation or audit", async () => {

@@ -33,6 +33,7 @@ import {
   validateCandidateExecutionBinding,
   validateCandidateIntentFaultInput,
   validateCandidatePilotDeployment,
+  validateCandidatePilotRecoveryFaultChronology,
   validateCandidatePilotRecoveryFaultInput,
   validateCandidatePilotRollbackChronology,
   validateCandidatePilotRollbackInput,
@@ -703,19 +704,11 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
       if (!isFaultPausablePhase(deployment.phase)) {
         throw new Error(`Candidate recovery fault cannot pause phase ${deployment.phase}.`);
       }
+      validateCandidatePilotRecoveryFaultChronology(effectiveInput, deployment, latestAuditAt);
       const occurredAtEpoch = parsePositionGuardCandidateTimestamp(
         effectiveInput.occurredAt,
         "candidate recovery fault occurredAt",
       );
-      if (
-        occurredAtEpoch < parsePositionGuardCandidateTimestamp(deployment.updatedAt, "deployment updatedAt") ||
-        (latestAuditAt !== null && occurredAtEpoch < parsePositionGuardCandidateTimestamp(
-          latestAuditAt,
-          "candidate audit createdAt",
-        ))
-      ) {
-        throw new Error("Candidate recovery fault cannot precede deployment chronology.");
-      }
       const transitionAt = validateFaultPauseTimestamp(faultPause, executionState);
       const auditEvent = buildCandidatePilotRecoveryFaultAuditEvent({
         fault: effectiveInput,

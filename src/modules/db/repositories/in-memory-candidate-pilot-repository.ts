@@ -27,6 +27,7 @@ import {
   validateCandidateExecutionBinding,
   validateCandidateIntentFaultInput,
   validateCandidatePilotDeployment,
+  validateCandidatePilotRecoveryFaultChronology,
   validateCandidatePilotRecoveryFaultInput,
   validateCandidatePilotRollbackChronology,
   validateCandidatePilotRollbackInput,
@@ -552,9 +553,6 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
         ? event
         : latest;
     }, null);
-    const latestAuditEpoch = latestAudit === null
-      ? null
-      : parsePositionGuardCandidateTimestamp(latestAudit.createdAt, "candidate audit createdAt");
     const effectiveInput = candidateIntentInput === null
       ? input
       : existingAudit
@@ -595,16 +593,7 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
     if (!isFaultPausablePhase(deployment.phase)) {
       throw new Error(`Candidate recovery fault cannot pause phase ${deployment.phase}.`);
     }
-    const occurredAtEpoch = parsePositionGuardCandidateTimestamp(
-      effectiveInput.occurredAt,
-      "candidate recovery fault occurredAt",
-    );
-    if (
-      occurredAtEpoch < parsePositionGuardCandidateTimestamp(deployment.updatedAt, "deployment updatedAt") ||
-      (latestAuditEpoch !== null && occurredAtEpoch < latestAuditEpoch)
-    ) {
-      throw new Error("Candidate recovery fault cannot precede deployment chronology.");
-    }
+    validateCandidatePilotRecoveryFaultChronology(effectiveInput, deployment, latestAudit?.createdAt ?? null);
     const auditEvent = buildCandidatePilotRecoveryFaultAuditEvent({
       fault: effectiveInput,
       fromPhase: deployment.phase,
