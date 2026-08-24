@@ -226,6 +226,11 @@ const REQUIRED_SCHEMA: Readonly<Record<string, readonly string[]>> = Object.free
     "bound_volume_exact", "bound_time_in_force", "bound_smp_type", "material_version",
     "order_material_hash", "created_at",
   ],
+  strategy_decisions: [
+    "id", "exchange_account_id", "strategy_key", "market", "action", "status",
+    "decision_basis_json", "intended_notional_krw", "intended_quantity",
+    "reference_price", "created_at",
+  ],
   strategy_candidate_states: [
     "deployment_id", "current_episode_add_count", "last_full_exit_at", "last_entry_path",
     "last_evidence_at", "last_evidence_id", "state_version", "updated_at", "material_version",
@@ -244,6 +249,11 @@ const REQUIRED_SCHEMA: Readonly<Record<string, readonly string[]>> = Object.free
     "strategy_decision_id", "market", "side", "ord_type", "volume", "price",
     "time_in_force", "smp_type", "origin", "execution_mode", "upbit_uuid",
     "exchange_response_json", "failure_code",
+  ],
+  fills: [
+    "id", "order_id", "exchange_fill_id", "market", "side", "price", "volume",
+    "fee_currency", "fee_amount", "fee_provenance", "filled_at", "raw_payload_json",
+    "execution_timestamp_provenance", "execution_epoch_ns",
   ],
   order_events: ["id", "order_id", "event_type", "event_source", "created_at"],
   order_submission_recovery_observations: [
@@ -789,7 +799,7 @@ function inspectDeploymentAndReplay(
   const phaseCheck = classifyPhase(deployment.phase, options.selection.kind);
   mutable.checks.push(phaseCheck);
   try {
-    const replay = inspectReplay(db, deployment, mutable);
+    const replay = inspectReplay(db, deployment, options.checkedAt, mutable);
     if (replay === null) {
       mutable.checks.push({
         name: "audit_chain",
@@ -827,6 +837,7 @@ function inspectDeploymentAndReplay(
 function inspectReplay(
   db: DatabaseSync,
   deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  checkedAt: string,
   mutable: MutableInspection,
 ): ReplayAuthority | null {
   const deploymentId = deployment.id;
@@ -860,11 +871,11 @@ function inspectReplay(
   const evidenceRows = evidenceStatement.all(deploymentId) as EvidenceRow[];
   const evidence = evidenceRows.map((row) => evidenceFromRow(row, deploymentId));
   try {
-    validateTerminalEvidenceSources(db, deployment, evidence);
+    validateTerminalEvidenceSources(db, deployment, evidence, checkedAt);
     mutable.checks.push({
       name: "evidence_source_provenance",
       status: "PASS",
-      detail: `${evidence.length} terminal evidence record(s) match their immutable source orders and bindings.`,
+      detail: `${evidence.length} terminal evidence record(s) match their exact decisions, source orders, bindings, and exchange-confirmed fills.`,
     });
   } catch (error) {
     mutable.checks.push({
@@ -906,7 +917,9 @@ function validateTerminalEvidenceSources(
   db: DatabaseSync,
   deployment: Readonly<PositionGuardPilotDeploymentRecord>,
   evidenceRecords: readonly ValidatedEvidenceRecord[],
+  checkedAt: string,
 ): void {
+  const checkedAtEpoch = parseCandidatePilotTimestamp(checkedAt, "readiness checkedAt");
   for (const record of evidenceRecords) {
     const prefix = "terminal-order:";
     if (!record.evidence.evidenceId.startsWith(prefix)) {
@@ -920,7 +933,7 @@ function validateTerminalEvidenceSources(
     const order = db.prepare(`
       SELECT id, strategy_decision_id, exchange_account_id, market, side, ord_type,
         volume, price, time_in_force, smp_type, origin, requested_at, status,
-        execution_mode, created_at, updated_at
+        execution_mode, upbit_uuid, created_at, updated_at
       FROM orders WHERE id = ?
     `).get(orderId) as EvidenceSourceOrderRow | undefined;
     if (!order) throw new Error(`Evidence ${record.evidence.evidenceId} source order is missing.`);
@@ -938,14 +951,30 @@ function validateTerminalEvidenceSources(
     if (!bindingRow) throw new Error(`Evidence ${record.evidence.evidenceId} source binding is missing.`);
     const binding = bindingFromReadinessRow(bindingRow);
 
+    const decision = db.prepare(`
+      SELECT id, exchange_account_id, strategy_key, market, action, status,
+        decision_basis_json, intended_notional_krw, intended_quantity,
+        reference_price, created_at
+      FROM strategy_decisions WHERE id = ?
+    `).get(binding.strategyDecisionId) as ReadinessStrategyDecisionRow | undefined;
+    if (!decision) throw new Error(`Evidence ${record.evidence.evidenceId} source strategy decision is missing.`);
+
+    const fillRows = db.prepare(`
+      SELECT id, order_id, exchange_fill_id, market, side, price, volume,
+        fee_currency, fee_amount, fee_provenance, filled_at, raw_payload_json,
+        execution_timestamp_provenance, execution_epoch_ns
+      FROM fills WHERE order_id = ?
+      ORDER BY execution_epoch_ns ASC, exchange_fill_id ASC, id ASC
+    `).all(orderId) as ReadinessFillRow[];
+
     const orderStatus = requireOrderLifecycleStatus(order.status);
     const strategyDecisionId = nullableString(order.strategy_decision_id, "evidence source strategyDecisionId");
     const requestedAt = requireString(order.requested_at, "evidence source order requestedAt");
     const createdAt = requireString(order.created_at, "evidence source order createdAt");
     const updatedAt = requireString(order.updated_at, "evidence source order updatedAt");
     const requestedEpoch = parseCandidatePilotTimestamp(requestedAt, "evidence source order requestedAt");
-    parseCandidatePilotTimestamp(createdAt, "evidence source order createdAt");
-    parseCandidatePilotTimestamp(updatedAt, "evidence source order updatedAt");
+    const createdEpoch = parseCandidatePilotTimestamp(createdAt, "evidence source order createdAt");
+    const updatedEpoch = parseCandidatePilotTimestamp(updatedAt, "evidence source order updatedAt");
     const evidenceEpoch = parseCandidatePilotTimestamp(
       record.evidence.executedAt,
       "candidate evidence executedAt",
@@ -969,6 +998,8 @@ function validateTerminalEvidenceSources(
       binding.orderId !== orderId ||
       requireString(order.market, "evidence source market") !== binding.market ||
       requireString(order.execution_mode, "evidence source executionMode") !== binding.executionMode ||
+      requireString(order.execution_mode, "evidence source executionMode") !== "LIVE" ||
+      nullableString(order.upbit_uuid, "evidence source upbitUuid") === null ||
       requireString(order.ord_type, "evidence source ordType") !== binding.ordType ||
       requireString(order.side, "evidence source side") !== binding.side ||
       nullableString(order.price, "evidence source price") !== binding.boundPrice ||
@@ -980,12 +1011,281 @@ function validateTerminalEvidenceSources(
       orderStatus !== record.evidence.terminalStatus ||
       binding.action !== record.evidence.action ||
       createdAt !== requestedAt ||
+      createdEpoch !== requestedEpoch ||
       bindingEpoch + 1n !== requestedEpoch ||
-      evidenceEpoch < requestedEpoch
+      evidenceEpoch < requestedEpoch ||
+      updatedEpoch < evidenceEpoch ||
+      updatedEpoch > checkedAtEpoch ||
+      evidenceEpoch > checkedAtEpoch
     ) {
       throw new Error(`Evidence ${record.evidence.evidenceId} conflicts with its source order or binding authority.`);
     }
+
+    validateEvidenceStrategyDecision({
+      row: decision,
+      deployment,
+      binding,
+      order,
+      evidence: record.evidence,
+      requestedEpoch,
+      bindingEpoch,
+      checkedAtEpoch,
+    });
+    const aggregate = deriveEvidenceFillAggregate({
+      rows: fillRows,
+      orderId,
+      order,
+      bindingEpoch,
+      requestedEpoch,
+      updatedEpoch,
+      evidenceEpoch,
+      checkedAtEpoch,
+    });
+    if (
+      aggregate.executedAt !== record.evidence.executedAt ||
+      aggregate.executedQuantity !== record.evidence.executedQuantity ||
+      aggregate.grossQuoteValueKrw !== record.evidence.grossQuoteValueKrw ||
+      aggregate.confirmedFeeKrw !== record.evidence.confirmedFeeKrw
+    ) {
+      throw new Error(`Evidence ${record.evidence.evidenceId} conflicts with exact persisted fill material.`);
+    }
   }
+}
+
+function validateEvidenceStrategyDecision(input: Readonly<{
+  row: ReadinessStrategyDecisionRow;
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>;
+  binding: Readonly<CandidateExecutionBindingRecord>;
+  order: EvidenceSourceOrderRow;
+  evidence: Readonly<PositionGuardCandidateExecutionEvidence>;
+  requestedEpoch: bigint;
+  bindingEpoch: bigint;
+  checkedAtEpoch: bigint;
+}>): void {
+  const id = requireString(input.row.id, "evidence source decision id");
+  const accountId = requireString(input.row.exchange_account_id, "evidence source decision account");
+  const strategyKey = requireString(input.row.strategy_key, "evidence source decision strategyKey");
+  const market = requireString(input.row.market, "evidence source decision market");
+  const action = requireString(input.row.action, "evidence source decision action");
+  const status = requireString(input.row.status, "evidence source decision status");
+  const intendedNotionalKrw = input.row.intended_notional_krw === null
+    ? null
+    : canonicalNonNegativeDecimal(input.row.intended_notional_krw, "evidence source intended notional");
+  const intendedQuantity = input.row.intended_quantity === null
+    ? null
+    : canonicalNonNegativeDecimal(input.row.intended_quantity, "evidence source intended quantity");
+  if (input.row.reference_price !== null) {
+    canonicalNonNegativeDecimal(input.row.reference_price, "evidence source reference price");
+  }
+  const decisionCreatedAt = requireString(input.row.created_at, "evidence source decision createdAt");
+  const decisionEpoch = parseCandidatePilotTimestamp(decisionCreatedAt, "evidence source decision createdAt");
+  const entryPath = decisionEntryPath(
+    requireString(input.row.decision_basis_json, "evidence source decisionBasisJson"),
+    market,
+    action,
+  );
+  const orderSide = requireString(input.order.side, "evidence source order side");
+  const orderType = requireString(input.order.ord_type, "evidence source order ordType");
+  const orderPrice = nullableString(input.order.price, "evidence source order price");
+  const orderVolume = nullableString(input.order.volume, "evidence source order volume");
+  const isEntry = action === "ENTER" || action === "ADD";
+  const isExit = action === "REDUCE" || action === "EXIT";
+
+  if (
+    id !== input.binding.strategyDecisionId ||
+    id !== nullableString(input.order.strategy_decision_id, "evidence source strategyDecisionId") ||
+    accountId !== input.deployment.exchangeAccountId ||
+    accountId !== input.binding.exchangeAccountId ||
+    accountId !== requireString(input.order.exchange_account_id, "evidence source order account") ||
+    strategyKey !== "position_guard.paper_core.v1" ||
+    strategyKey !== input.binding.strategyKey ||
+    market !== input.deployment.market ||
+    market !== input.binding.market ||
+    market !== requireString(input.order.market, "evidence source order market") ||
+    status !== "READY" ||
+    (!isEntry && !isExit) ||
+    action !== input.binding.action ||
+    action !== input.evidence.action ||
+    entryPath !== input.evidence.entryPath ||
+    intendedNotionalKrw !== input.binding.intendedNotionalKrw ||
+    intendedQuantity !== input.binding.intendedQuantity ||
+    decisionEpoch > input.bindingEpoch ||
+    decisionEpoch > input.checkedAtEpoch ||
+    input.bindingEpoch >= input.requestedEpoch ||
+    input.deployment.activationEpochNs === null ||
+    input.requestedEpoch < input.deployment.activationEpochNs
+  ) {
+    throw new Error(`Evidence ${input.evidence.evidenceId} conflicts with its persisted strategy decision.`);
+  }
+  if (isEntry) {
+    if (
+      orderSide !== "bid" || orderType !== "price" || orderVolume !== null ||
+      orderPrice === null || orderPrice !== intendedNotionalKrw || intendedQuantity !== null ||
+      nullableString(input.order.time_in_force, "evidence source order timeInForce") !== null ||
+      nullableString(input.order.smp_type, "evidence source order smpType") !== null
+    ) {
+      throw new Error(`Evidence ${input.evidence.evidenceId} conflicts with its entry decision shape.`);
+    }
+  } else if (
+    orderSide !== "ask" || orderType !== "market" || orderPrice !== null ||
+    orderVolume === null || orderVolume !== intendedQuantity || intendedNotionalKrw !== null ||
+    nullableString(input.order.time_in_force, "evidence source order timeInForce") !== null ||
+    nullableString(input.order.smp_type, "evidence source order smpType") !== null
+  ) {
+    throw new Error(`Evidence ${input.evidence.evidenceId} conflicts with its exit decision shape.`);
+  }
+}
+
+function decisionEntryPath(
+  value: string,
+  market: string,
+  action: string,
+): PositionGuardCandidateExecutionEvidence["entryPath"] {
+  const basis = parsePlainJsonObject(value, "evidence source decision basis");
+  if (!isPlainRecord(basis.strategyDecision) || !isPlainRecord(basis.engineDecision)) {
+    throw new Error("Evidence source decision basis is missing strategy or engine provenance.");
+  }
+  const diagnostics = isPlainRecord(basis.engineDecision.diagnostics)
+    ? basis.engineDecision.diagnostics
+    : null;
+  const canonicalEntryPath = diagnostics?.entryPath;
+  const legacyEntryPath = basis.engineDecision.entryPath;
+  if (
+    canonicalEntryPath !== undefined && legacyEntryPath !== undefined &&
+    canonicalEntryPath !== legacyEntryPath
+  ) {
+    throw new Error("Evidence source decision basis contains conflicting entry-path provenance.");
+  }
+  const entryPath = canonicalEntryPath ?? legacyEntryPath;
+  if (
+    basis.strategyDecision.market !== market ||
+    basis.strategyDecision.action !== action ||
+    (entryPath !== "PULLBACK" && entryPath !== "RECLAIM" &&
+      entryPath !== "BREAKOUT_HOLD" && entryPath !== "NONE")
+  ) {
+    throw new Error("Evidence source decision basis conflicts with persisted decision provenance.");
+  }
+  return entryPath;
+}
+
+function deriveEvidenceFillAggregate(input: Readonly<{
+  rows: readonly ReadinessFillRow[];
+  orderId: string;
+  order: EvidenceSourceOrderRow;
+  bindingEpoch: bigint;
+  requestedEpoch: bigint;
+  updatedEpoch: bigint;
+  evidenceEpoch: bigint;
+  checkedAtEpoch: bigint;
+}>): Readonly<{
+  executedAt: string;
+  executedQuantity: string;
+  grossQuoteValueKrw: string;
+  confirmedFeeKrw: string;
+}> {
+  if (input.rows.length === 0) {
+    throw new Error(`Evidence terminal-order:${input.orderId} has no persisted exchange fill.`);
+  }
+  const orderMarket = requireString(input.order.market, "evidence source order market");
+  const orderSide = requireString(input.order.side, "evidence source order side");
+  const seenFillIds = new Set<string>();
+  const seenExchangeFillIds = new Set<string>();
+  const verified = input.rows.map((row) => {
+    const id = requireString(row.id, "evidence source fill id");
+    const exchangeFillId = requireString(row.exchange_fill_id, "evidence source exchangeFillId");
+    if (seenFillIds.has(id) || seenExchangeFillIds.has(exchangeFillId)) {
+      throw new Error(`Evidence terminal-order:${input.orderId} has duplicate fill identity.`);
+    }
+    seenFillIds.add(id);
+    seenExchangeFillIds.add(exchangeFillId);
+    if (
+      requireString(row.order_id, "evidence source fill orderId") !== input.orderId ||
+      requireString(row.market, "evidence source fill market") !== orderMarket ||
+      requireString(row.side, "evidence source fill side") !== orderSide
+    ) {
+      throw new Error(`Evidence terminal-order:${input.orderId} fill conflicts with its source order.`);
+    }
+    if (
+      requireString(row.fee_currency, "evidence source fill feeCurrency") !== "KRW" ||
+      requireString(row.fee_provenance, "evidence source fill feeProvenance") !== "EXCHANGE_FILL_CONFIRMED" ||
+      requireString(
+        row.execution_timestamp_provenance,
+        "evidence source fill timestamp provenance",
+      ) !== "EXCHANGE_FILL_CONFIRMED"
+    ) {
+      throw new Error(`Evidence terminal-order:${input.orderId} fill provenance is not exchange-confirmed.`);
+    }
+    parsePlainJsonObject(requireString(row.raw_payload_json, "evidence source fill raw payload"), "fill raw payload");
+    const price = parseCanonicalNonNegativeDecimal(row.price, "evidence source fill price");
+    const volume = parseCanonicalNonNegativeDecimal(row.volume, "evidence source fill volume");
+    const fee = parseCanonicalNonNegativeDecimal(row.fee_amount, "evidence source fill fee");
+    if (price.coefficient === 0n || volume.coefficient === 0n) {
+      throw new Error(`Evidence terminal-order:${input.orderId} fill price and volume must be positive.`);
+    }
+    const executionEpochRaw = requireString(row.execution_epoch_ns, "evidence source fill executionEpochNs");
+    if (!/^(0|[1-9][0-9]*)$/u.test(executionEpochRaw)) {
+      throw new Error(`Evidence terminal-order:${input.orderId} fill execution epoch is invalid.`);
+    }
+    const filledAt = requireString(row.filled_at, "evidence source fill filledAt");
+    const executionEpoch = parseCandidatePilotTimestamp(filledAt, "evidence source fill filledAt");
+    if (
+      executionEpoch.toString() !== executionEpochRaw ||
+      executionEpoch < input.requestedEpoch ||
+      executionEpoch <= input.bindingEpoch ||
+      executionEpoch > input.evidenceEpoch ||
+      executionEpoch > input.updatedEpoch ||
+      executionEpoch > input.checkedAtEpoch
+    ) {
+      throw new Error(`Evidence terminal-order:${input.orderId} fill timestamp provenance is invalid or future-dated.`);
+    }
+    return { id, exchangeFillId, filledAt, executionEpoch, price, volume, fee };
+  }).sort((left, right) => {
+    if (left.executionEpoch < right.executionEpoch) return -1;
+    if (left.executionEpoch > right.executionEpoch) return 1;
+    if (left.exchangeFillId !== right.exchangeFillId) {
+      return left.exchangeFillId < right.exchangeFillId ? -1 : 1;
+    }
+    return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+  });
+
+  let executedQuantity = parseCanonicalNonNegativeDecimal("0", "evidence aggregate quantity");
+  let grossQuoteValueKrw = parseCanonicalNonNegativeDecimal("0", "evidence aggregate gross");
+  let confirmedFeeKrw = parseCanonicalNonNegativeDecimal("0", "evidence aggregate fee");
+  for (const fill of verified) {
+    executedQuantity = addExactDecimals(executedQuantity, fill.volume);
+    grossQuoteValueKrw = addExactDecimals(
+      grossQuoteValueKrw,
+      multiplyExactDecimals(fill.price, fill.volume),
+    );
+    confirmedFeeKrw = addExactDecimals(confirmedFeeKrw, fill.fee);
+  }
+  if (executedQuantity.coefficient === 0n) {
+    throw new Error(`Evidence terminal-order:${input.orderId} contains only zero fill quantity.`);
+  }
+  const orderVolume = nullableString(input.order.volume, "evidence source order volume");
+  if (
+    orderVolume !== null &&
+    compareExactDecimals(executedQuantity, parseCanonicalNonNegativeDecimal(orderVolume, "order volume")) > 0
+  ) {
+    throw new Error(`Evidence terminal-order:${input.orderId} fill quantity exceeds its source order.`);
+  }
+  const orderType = requireString(input.order.ord_type, "evidence source order ordType");
+  if (orderSide === "bid" && orderType === "price") {
+    const orderPrice = parseCanonicalNonNegativeDecimal(input.order.price, "evidence source order price");
+    if (compareExactDecimals(grossQuoteValueKrw, orderPrice) > 0) {
+      throw new Error(`Evidence terminal-order:${input.orderId} fill gross exceeds its source order budget.`);
+    }
+  }
+  const latest = verified.at(-1)!;
+  if (latest.executionEpoch !== input.evidenceEpoch) {
+    throw new Error(`Evidence terminal-order:${input.orderId} executedAt does not equal its latest fill.`);
+  }
+  return Object.freeze({
+    executedAt: latest.filledAt,
+    executedQuantity: formatExactDecimal(executedQuantity),
+    grossQuoteValueKrw: formatExactDecimal(grossQuoteValueKrw),
+    confirmedFeeKrw: formatExactDecimal(confirmedFeeKrw),
+  });
 }
 
 function bindingFromReadinessRow(row: ReadinessBindingRow): CandidateExecutionBindingRecord {
@@ -2455,7 +2755,19 @@ type EvidenceRow = Record<
 type EvidenceSourceOrderRow = Record<
   "id" | "strategy_decision_id" | "exchange_account_id" | "market" | "side" |
   "ord_type" | "volume" | "price" | "time_in_force" | "smp_type" | "origin" |
-  "requested_at" | "status" | "execution_mode" | "created_at" | "updated_at",
+  "requested_at" | "status" | "execution_mode" | "upbit_uuid" | "created_at" | "updated_at",
+  unknown
+>;
+type ReadinessStrategyDecisionRow = Record<
+  "id" | "exchange_account_id" | "strategy_key" | "market" | "action" | "status" |
+  "decision_basis_json" | "intended_notional_krw" | "intended_quantity" |
+  "reference_price" | "created_at",
+  unknown
+>;
+type ReadinessFillRow = Record<
+  "id" | "order_id" | "exchange_fill_id" | "market" | "side" | "price" | "volume" |
+  "fee_currency" | "fee_amount" | "fee_provenance" | "filled_at" | "raw_payload_json" |
+  "execution_timestamp_provenance" | "execution_epoch_ns",
   unknown
 >;
 type ReadinessBindingRow = Record<

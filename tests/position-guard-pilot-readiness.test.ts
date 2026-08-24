@@ -630,6 +630,83 @@ test("terminal candidate evidence accepts one exact source order and binding cha
   });
 });
 
+test("terminal candidate evidence requires its exact persisted READY strategy decision", async () => {
+  for (const mutation of ["MISSING_DECISION", "FOREIGN_DECISION", "CONFLICTING_DECISION"] as const) {
+    await withMigratedFixture(async ({ databasePath, db }) => {
+      seedDeployment(db, "ACTIVE", { audit: "LIFECYCLE_ONLY" });
+      seedHealth(db);
+      const orderId = `invalid-decision-${mutation.toLowerCase()}`;
+      seedTerminalEvidenceState(db, orderId);
+      seedTerminalEvidenceSource(db, orderId, mutation);
+
+      const report = inspectPositionGuardPilotReadiness(options(databasePath));
+
+      assert.equal(check(report, "state_replay").status, "PASS", mutation);
+      assert.equal(check(report, "evidence_source_provenance").status, "BLOCK", mutation);
+      assert.match(check(report, "evidence_source_provenance").detail, /decision|source|conflict/u, mutation);
+      assert.equal(report.status, "BLOCK", mutation);
+    });
+  }
+});
+
+test("terminal candidate evidence requires at least one persisted exchange fill", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE", { audit: "LIFECYCLE_ONLY" });
+    seedHealth(db);
+    seedTerminalEvidenceState(db, "missing-fill-source");
+    seedTerminalEvidenceSource(db, "missing-fill-source", "MISSING_FILLS");
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+
+    assert.equal(check(report, "state_replay").status, "PASS");
+    assert.equal(check(report, "evidence_source_provenance").status, "BLOCK");
+    assert.match(check(report, "evidence_source_provenance").detail, /fill|source/u);
+    assert.equal(report.status, "BLOCK");
+  });
+});
+
+test("terminal candidate evidence must equal exact persisted fill quantity, gross, and fee material", async () => {
+  for (const mutation of ["FILL_ORDER_MISMATCH", "FILL_QUANTITY", "FILL_GROSS", "FILL_FEE"] as const) {
+    await withMigratedFixture(async ({ databasePath, db }) => {
+      seedDeployment(db, "ACTIVE", { audit: "LIFECYCLE_ONLY" });
+      seedHealth(db);
+      const orderId = `invalid-fill-material-${mutation.toLowerCase()}`;
+      seedTerminalEvidenceState(db, orderId);
+      seedTerminalEvidenceSource(db, orderId, mutation);
+
+      const report = inspectPositionGuardPilotReadiness(options(databasePath));
+
+      assert.equal(check(report, "state_replay").status, "PASS", mutation);
+      assert.equal(check(report, "evidence_source_provenance").status, "BLOCK", mutation);
+      assert.match(
+        check(report, "evidence_source_provenance").detail,
+        /fill|quantity|gross|fee|source|conflict/u,
+        mutation,
+      );
+      assert.equal(report.status, "BLOCK", mutation);
+    });
+  }
+});
+
+test("terminal candidate evidence rejects future or unconfirmed fill provenance", async () => {
+  for (const mutation of ["FILL_FUTURE", "FILL_FEE_PROVENANCE", "FILL_TIMESTAMP_PROVENANCE"] as const) {
+    await withMigratedFixture(async ({ databasePath, db }) => {
+      seedDeployment(db, "ACTIVE", { audit: "LIFECYCLE_ONLY" });
+      seedHealth(db);
+      const orderId = `invalid-fill-provenance-${mutation.toLowerCase()}`;
+      seedTerminalEvidenceState(db, orderId);
+      seedTerminalEvidenceSource(db, orderId, mutation);
+
+      const report = inspectPositionGuardPilotReadiness(options(databasePath));
+
+      assert.equal(check(report, "state_replay").status, "PASS", mutation);
+      assert.equal(check(report, "evidence_source_provenance").status, "BLOCK", mutation);
+      assert.match(check(report, "evidence_source_provenance").detail, /fill|future|provenance|timestamp/u, mutation);
+      assert.equal(report.status, "BLOCK", mutation);
+    });
+  }
+});
+
 test("terminal candidate evidence rejects foreign or conflicting source authority", async () => {
   for (const mutation of ["FOREIGN_BINDING", "ORDER_MATERIAL", "BINDING_HASH", "TERMINAL_STATUS"] as const) {
     await withMigratedFixture(async ({ databasePath, db }) => {
@@ -1262,20 +1339,47 @@ function seedTerminalEvidenceState(db: DatabaseSync, orderId: string): void {
 function seedTerminalEvidenceSource(
   db: DatabaseSync,
   orderId: string,
-  mutation: "VALID" | "FOREIGN_BINDING" | "ORDER_MATERIAL" | "BINDING_HASH" | "TERMINAL_STATUS",
+  mutation:
+    | "VALID"
+    | "FOREIGN_BINDING"
+    | "ORDER_MATERIAL"
+    | "BINDING_HASH"
+    | "TERMINAL_STATUS"
+    | "MISSING_DECISION"
+    | "FOREIGN_DECISION"
+    | "CONFLICTING_DECISION"
+    | "MISSING_FILLS"
+    | "FILL_ORDER_MISMATCH"
+    | "FILL_QUANTITY"
+    | "FILL_GROSS"
+    | "FILL_FEE"
+    | "FILL_FUTURE"
+    | "FILL_FEE_PROVENANCE"
+    | "FILL_TIMESTAMP_PROVENANCE",
 ): void {
   const activationAt = "2026-08-23T23:59:30.000Z";
   const activationEpochNs = BigInt(epochMs(activationAt)) * 1_000_000n;
   const bindingCreatedAt = "2026-08-24T00:09:59.999999999Z";
   const requestedAt = "2026-08-24T00:10:00.000000000Z";
   const decisionId = `${orderId}-decision`;
+  if (mutation === "FOREIGN_DECISION") db.exec("PRAGMA foreign_keys = OFF");
   db.prepare(`
     INSERT INTO strategy_decisions (
       id, exchange_account_id, strategy_key, market, action, status, decision_basis_json,
       intended_notional_krw, intended_quantity, reference_price, created_at
-    ) VALUES (?, 'primary', 'position_guard.paper_core.v1', 'KRW-BTC', 'ENTER', 'READY',
-      ?, '100000', '0.001', '100000000', ?)
-  `).run(decisionId, JSON.stringify({ entryPath: "PULLBACK" }), activationAt);
+    ) VALUES (?, ?, 'position_guard.paper_core.v1', 'KRW-BTC', 'ENTER', 'READY',
+      ?, '100000', ?, '100000000', ?)
+  `).run(
+    decisionId,
+    mutation === "FOREIGN_DECISION" ? "foreign-account" : "primary",
+    JSON.stringify({
+      strategyDecision: { market: "KRW-BTC", action: "ENTER" },
+      engineDecision: { diagnostics: { entryPath: "PULLBACK" } },
+    }),
+    mutation === "CONFLICTING_DECISION" ? "0.001" : null,
+    activationAt,
+  );
+  if (mutation === "FOREIGN_DECISION") db.exec("PRAGMA foreign_keys = ON");
   db.prepare(`
     INSERT INTO orders (
       id, strategy_decision_id, exchange_account_id, market, side, ord_type, volume,
@@ -1311,7 +1415,7 @@ function seedTerminalEvidenceSource(
     ordType: "price",
     action: "ENTER",
     side: "bid",
-    intendedQuantity: "0.001",
+    intendedQuantity: null,
     intendedNotionalKrw: "100000",
     boundPrice: mutation === "ORDER_MATERIAL" ? "99999" : "100000",
     boundVolume: null,
@@ -1342,6 +1446,37 @@ function seedTerminalEvidenceSource(
     material.materialVersion, material.orderMaterialHash, material.createdAt,
   );
   if (mutation === "FOREIGN_BINDING") db.exec("PRAGMA foreign_keys = ON");
+
+  if (mutation !== "MISSING_FILLS") {
+    const filledAt = mutation === "FILL_FUTURE"
+      ? "2026-08-24T01:00:00.000Z"
+      : "2026-08-24T00:10:00.000Z";
+    db.prepare(`
+      INSERT INTO fills (
+        id, order_id, exchange_fill_id, market, side, price, volume,
+        fee_currency, fee_amount, filled_at, raw_payload_json, fee_provenance,
+        execution_timestamp_provenance, execution_epoch_ns
+      ) VALUES (?, ?, ?, ?, 'bid', ?, ?, 'KRW', ?, ?, '{}', ?, ?, ?)
+    `).run(
+      `${orderId}-fill`,
+      orderId,
+      `${orderId}-exchange-fill`,
+      mutation === "FILL_ORDER_MISMATCH" ? "KRW-ETH" : "KRW-BTC",
+      mutation === "FILL_GROSS" ? "99000000" : "100000000",
+      mutation === "FILL_QUANTITY" ? "0.002" : "0.001",
+      mutation === "FILL_FEE" ? "51" : "50",
+      filledAt,
+      mutation === "FILL_FEE_PROVENANCE" ? "MISSING" : "EXCHANGE_FILL_CONFIRMED",
+      mutation === "FILL_TIMESTAMP_PROVENANCE" ? "LEGACY_UNVERIFIED" : "EXCHANGE_FILL_CONFIRMED",
+      (BigInt(epochMs(filledAt)) * 1_000_000n).toString(),
+    );
+  }
+
+  if (mutation === "MISSING_DECISION") {
+    db.exec("PRAGMA foreign_keys = OFF");
+    db.prepare("DELETE FROM strategy_decisions WHERE id = ?").run(decisionId);
+    db.exec("PRAGMA foreign_keys = ON");
+  }
 }
 
 function seedHealth(db: DatabaseSync): void {
