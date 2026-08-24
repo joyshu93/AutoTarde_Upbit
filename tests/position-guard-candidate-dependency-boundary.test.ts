@@ -279,6 +279,26 @@ test("only the reviewed runner bridge may import the candidate policy router", (
   );
 });
 
+test("repository source graph contains exactly one approved runtime import of the candidate policy router", async () => {
+  const routerImporters: string[] = [];
+  for (const absoluteFile of await listTypeScriptFiles(SOURCE_ROOT)) {
+    const importer = toRepositoryPath(absoluteFile);
+    if (importer === APPROVED_POLICY_ROUTER) continue;
+    const source = await readFile(absoluteFile, "utf8");
+    for (const edge of extractModuleEdges(source)) {
+      if (edge.kind !== "RUNTIME" || !edge.specifier.startsWith(".")) continue;
+      const dependency = toRepositoryPath(await resolveSourceImport(absoluteFile, edge.specifier));
+      if (dependency === APPROVED_POLICY_ROUTER) {
+        routerImporters.push(`${importer}->${dependency}`);
+      }
+    }
+  }
+
+  assert.deepEqual(routerImporters.sort(), [
+    `${APPROVED_POLICY_ROUTER_IMPORTER}->${APPROVED_POLICY_ROUTER}`,
+  ]);
+});
+
 test("candidate modules recursively exclude operational, prospective, and side-effect dependencies", async () => {
   const candidateFiles = await discoverCandidateFiles();
   const candidateEntries = new Set(candidateFiles.map(toRepositoryPath));

@@ -324,6 +324,8 @@ test("createApp wires candidate-only BTC preparation and recovery without changi
     );
 
     assert.notEqual(app.candidateEvidenceService, null);
+    assert.notEqual(app.candidatePilotInitializer, null);
+    assert.equal(privateAdapter.getCreateOrderCallCount(), 0);
 
     const createdAt = new Date().toISOString();
     await app.persistence.candidatePilots.createDeploymentWithInitialState({
@@ -763,9 +765,11 @@ function createLiveExecutionAdapterFake(): LiveExecutionAdapter {
 function createCountingLiveExecutionAdapterFake(): Readonly<{
   adapter: LiveExecutionAdapter;
   getBalanceCallCount(): number;
+  getCreateOrderCallCount(): number;
 }> {
   const baseAdapter = new DryRunExchangeAdapter();
   let balanceCallCount = 0;
+  let createOrderCallCount = 0;
   return {
     adapter: {
       sendPath: "LIVE_ADAPTER",
@@ -775,12 +779,16 @@ function createCountingLiveExecutionAdapterFake(): Readonly<{
       },
       getOrderChance: baseAdapter.getOrderChance.bind(baseAdapter),
       testOrder: baseAdapter.testOrder.bind(baseAdapter),
-      createOrder: baseAdapter.createOrder.bind(baseAdapter),
+      async createOrder(request) {
+        createOrderCallCount += 1;
+        return baseAdapter.createOrder(request);
+      },
       cancelOrder: baseAdapter.cancelOrder.bind(baseAdapter),
       getOrder: baseAdapter.getOrder.bind(baseAdapter),
       listOpenOrders: baseAdapter.listOpenOrders.bind(baseAdapter),
       listClosedOrders: baseAdapter.listClosedOrders.bind(baseAdapter),
     },
     getBalanceCallCount: () => balanceCallCount,
+    getCreateOrderCallCount: () => createOrderCallCount,
   };
 }

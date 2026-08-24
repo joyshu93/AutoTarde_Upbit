@@ -82,6 +82,7 @@ await import("./position-guard-candidate-dependency-boundary.test.js");
 await import("./position-guard-policy-router.test.js");
 await import("./candidate-pilot-recovery-fault-persistence.test.js");
 await import("./position-guard-pilot-recovery.test.js");
+await import("./position-guard-pilot-lifecycle.test.js");
 await import("./candidate-bound-order-validation.test.js");
 await import("./candidate-bound-order-intent-in-memory.test.js");
 await import("./candidate-bound-order-intent-sqlite.test.js");
