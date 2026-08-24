@@ -225,6 +225,103 @@ test("candidate createApp construction invokes no exchange, market, Telegram, or
   }
 });
 
+test("production createApp router reads current candidate persistence while baseline stays reader-free", async () => {
+  const candidateDatabasePath = await createTempDatabasePath("candidate-router-persistence");
+  const baselineDatabasePath = await createTempDatabasePath("baseline-router-no-candidate-reader");
+  const fakes = createConstructionSideEffectFakes();
+  let candidateApp: ReturnType<typeof createApp> | null = null;
+  let baselineApp: ReturnType<typeof createApp> | null = null;
+
+  try {
+    candidateApp = createApp(
+      createConfig({
+        databasePath: candidateDatabasePath,
+        executionMode: "LIVE",
+        positionGuardPolicySelection: candidatePolicySelection(),
+        telegramLocale: "en-US",
+      }),
+      {
+        privateExchangeAdapter: fakes.privateAdapter,
+        publicMarketDataReader: fakes.publicMarketDataReader,
+      },
+    );
+    const deploymentId = "create-app-router-current-candidate";
+    const createdAt = "2026-08-24T00:00:00.000000000Z";
+    const deployment = await candidateApp.persistence.candidatePilots.createDeploymentWithInitialState({
+      deployment: {
+        id: deploymentId,
+        exchangeAccountId: "primary",
+        pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+        market: "KRW-BTC",
+        policyId: "COMBINED_CONSERVATIVE",
+        policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+        phase: "PENDING_FLAT",
+        activationAt: null,
+        activationEpochNs: null,
+        createdAt,
+        updatedAt: createdAt,
+      },
+      initialState: createEmptyPositionGuardCandidateState(),
+    });
+    const activationAt = "2026-08-24T00:00:01.000000000Z";
+    const activated = await candidateApp.persistence.candidatePilots.activateDeployment({
+      deploymentId,
+      expectedPhase: "PENDING_FLAT",
+      expectedUpdatedAt: deployment.updatedAt,
+      activationAt,
+      activationEpochNs: BigInt(Date.parse(activationAt)) * 1_000_000n,
+    });
+    assert.ok(activated);
+    await candidateApp.persistence.candidatePilots.advanceStateWithEvidence({
+      deploymentId,
+      expectedStateVersion: 0,
+      evidence: {
+        evidenceId: "create-app-router-current-evidence",
+        executedAt: "2026-08-24T00:00:02.000000000Z",
+        action: "ENTER",
+        entryPath: "RECLAIM",
+        terminalStatus: "FILLED",
+        executedQuantity: "0.01",
+        grossQuoteValueKrw: "1000000",
+        confirmedFeeKrw: "500",
+        remainingQuantity: "0.01",
+      },
+    });
+
+    const [status, readiness] = await Promise.all([
+      candidateApp.telegramRouter.route("/status detail"),
+      candidateApp.telegramRouter.route("/readiness detail"),
+    ]);
+    for (const response of [status, readiness]) {
+      assert.match(response.text, new RegExp(`btc_pilot_deployment_id: ${deploymentId}`, "u"));
+      assert.match(response.text, /btc_pilot_phase: ACTIVE/u);
+      assert.match(response.text, /btc_pilot_state_version: 1/u);
+      assert.match(response.text, /btc_pilot_current_authority_check: VERIFIED_CURRENT/u);
+      assert.doesNotMatch(response.text, /btc_pilot_phase: unavailable/u);
+      assert.doesNotMatch(response.text, /btc_pilot_state_version: none/u);
+    }
+
+    baselineApp = createApp(createConfig({
+      databasePath: baselineDatabasePath,
+      telegramLocale: "en-US",
+    }));
+    const [baselineStatus, baselineReadiness] = await Promise.all([
+      baselineApp.telegramRouter.route("/status detail"),
+      baselineApp.telegramRouter.route("/readiness detail"),
+    ]);
+    assert.doesNotMatch(baselineStatus.text, /btc_pilot_/u);
+    assert.doesNotMatch(baselineReadiness.text, /btc_pilot_/u);
+    assert.deepEqual(fakes.counts, emptyConstructionSideEffectCounts());
+    assert.equal(candidateApp.strategyScheduler.getStatus().started, false);
+    assert.equal(baselineApp.strategyScheduler.getStatus().started, false);
+  } finally {
+    candidateApp?.persistence.close();
+    baselineApp?.persistence.close();
+    await cleanupTempDatabase(candidateDatabasePath);
+    await cleanupTempDatabase(baselineDatabasePath);
+  }
+});
+
 test("createApp runs the candidate authority observer after checked-in validation and before SQLite persistence", async () => {
   const databasePath = await createTempDatabasePath("candidate-authority-before-sqlite");
   let observerCalls = 0;

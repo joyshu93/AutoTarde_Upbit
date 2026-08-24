@@ -342,6 +342,7 @@ export function createApp(
   const telegramRouter = new TelegramCommandRouter({
     operatorState,
     repositories,
+    ...(candidatePolicySelection ? { candidatePilotReader: persistence.candidatePilots } : {}),
     locale: telegramLocale,
     runtimeConfig: {
       serviceName: config.serviceName,
