@@ -523,10 +523,7 @@ export class ExecutionService {
     let createOrderInvoked = false;
     let synchronousSubmissionError: unknown = null;
     try {
-      const authorityBlockedByOrders = await this.assertFinalPreSendAuthority({
-        exchangeAccountId: input.exchangeAccountId,
-        orderId: order.id,
-        expectedOrder: submittingOrder,
+      await this.assertFinalCandidatePreSendAuthority({
         candidate: candidateContext && candidateBinding
           ? {
               authority: candidateContext.authority,
@@ -537,14 +534,12 @@ export class ExecutionService {
             }
           : null,
       });
-      // This is the final await on the successful path. Only synchronous checks and the sole send follow.
       const finalState = await this.dependencies.operatorState.getState();
       const finalAuthority = selectExecutionAuthority(finalState);
       const authorityUnchanged =
         finalAuthority.executionMode === initialAuthority.executionMode &&
         finalAuthority.liveExecutionGate === initialAuthority.liveExecutionGate;
       if (
-        authorityBlockedByOrders ||
         finalState.systemStatus !== "RUNNING" ||
         finalState.killSwitchActive ||
         !authorityUnchanged ||
@@ -552,6 +547,21 @@ export class ExecutionService {
       ) {
         throw new Error("final pre-send authority is blocked");
       }
+      const finalActiveOrders = await this.dependencies.repositories.listSubmissionBlockingOrders(
+        input.exchangeAccountId,
+        CANDIDATE_FINAL_ORDER_SCAN_LIMIT + 1,
+      );
+      // This exact own-order read is the final await on the successful path.
+      const finalPersistedOrder = await this.dependencies.repositories.findOrderById(
+        input.exchangeAccountId,
+        order.id,
+      );
+      this.assertFinalPersistedSubmissionAuthority({
+        orderId: order.id,
+        expectedOrder: submittingOrder,
+        activeOrders: finalActiveOrders,
+        persistedOrder: finalPersistedOrder,
+      });
       createOrderInvoked = true;
       exchangeOrderPromise = this.dependencies.executionAdapter.createOrder({
         market,
@@ -999,10 +1009,7 @@ export class ExecutionService {
     );
   }
 
-  private async assertFinalPreSendAuthority(input: {
-    exchangeAccountId: string;
-    orderId: string;
-    expectedOrder: OrderRecord;
+  private async assertFinalCandidatePreSendAuthority(input: {
     candidate: {
       authority: CandidateExecutionAuthority;
       expectedOrder: OrderRecord;
@@ -1010,17 +1017,57 @@ export class ExecutionService {
       expectedDecision: StrategyDecisionRecord;
       expectedBinding: CandidateExecutionBindingRecord;
     } | null;
-  }): Promise<boolean> {
-    const activeOrders = await this.dependencies.repositories.listSubmissionBlockingOrders(
-      input.exchangeAccountId,
-      CANDIDATE_FINAL_ORDER_SCAN_LIMIT + 1,
+  }): Promise<void> {
+    if (!input.candidate) return;
+    const candidatePilots = this.dependencies.candidatePilots;
+    if (!candidatePilots || !this.dependencies.repositories.getStrategyDecisionById) {
+      throw new Error("candidate final pre-send dependencies are unavailable");
+    }
+    const events = await this.dependencies.repositories.listOrderEvents(input.candidate.expectedOrder.id);
+    const firstEvent = events[0] ?? null;
+    const getDecision = this.dependencies.repositories.getStrategyDecisionById;
+    const decision = await getDecision.call(
+      this.dependencies.repositories,
+      input.candidate.expectedDecision.id,
     );
-    if (activeOrders.length > CANDIDATE_FINAL_ORDER_SCAN_LIMIT) {
+    const deployment = await candidatePilots.getDeployment(input.candidate.authority.deploymentId);
+    const exactState = await candidatePilots.getExactState(input.candidate.authority.deploymentId);
+    const binding = await candidatePilots.getExecutionBindingForOrder(input.candidate.expectedOrder.id);
+    if (events.length !== 1 || !firstEvent || !decision || !deployment || !exactState || !binding) {
+      throw new Error("candidate final persisted authority or intent material changed");
+    }
+    const projected = projectCandidateFinalBoundOrderIntent({
+      persistedOrder: input.candidate.expectedOrder,
+      expectedOrder: input.candidate.expectedOrder,
+      persistedEvent: firstEvent,
+      expectedEvent: input.candidate.expectedEvent,
+      persistedDecision: decision,
+      expectedDecision: input.candidate.expectedDecision,
+      persistedBinding: binding,
+      expectedBinding: input.candidate.expectedBinding,
+    });
+    validateCandidateBoundOrderIntent({
+      ...projected,
+      deployment,
+      exactStateVersion: exactState.stateVersion,
+      expectedPhase: input.candidate.authority.expectedPhase,
+      expectedDeploymentUpdatedAt: input.candidate.authority.expectedDeploymentUpdatedAt,
+      expectedStateVersion: input.candidate.authority.expectedStateVersion,
+    });
+  }
+
+  private assertFinalPersistedSubmissionAuthority(input: {
+    orderId: string;
+    expectedOrder: OrderRecord;
+    activeOrders: OrderRecord[];
+    persistedOrder: OrderRecord | null;
+  }): void {
+    if (input.activeOrders.length > CANDIDATE_FINAL_ORDER_SCAN_LIMIT) {
       throw new Error("final submission-blocking order scan exceeded its safety bound");
     }
     let expectedOrderIsActive = false;
     let hasCompetingOrder = false;
-    for (const activeOrder of activeOrders) {
+    for (const activeOrder of input.activeOrders) {
       if (activeOrder.id === input.orderId) {
         if (expectedOrderIsActive || !sameOrderRecord(activeOrder, input.expectedOrder)) {
           throw new Error("final persisted order scan is ambiguous or mutated");
@@ -1031,60 +1078,15 @@ export class ExecutionService {
       }
     }
 
-    const persistedOrder = await this.dependencies.repositories.findOrderById(
-      input.exchangeAccountId,
-      input.orderId,
-    );
     if (
+      hasCompetingOrder ||
       !expectedOrderIsActive ||
-      !persistedOrder ||
-      persistedOrder.status !== "SUBMITTING" ||
-      !sameOrderRecord(persistedOrder, input.expectedOrder)
+      !input.persistedOrder ||
+      input.persistedOrder.status !== "SUBMITTING" ||
+      !sameOrderRecord(input.persistedOrder, input.expectedOrder)
     ) {
       throw new Error("final persisted SUBMITTING order authority changed");
     }
-
-    if (input.candidate) {
-      const candidatePilots = this.dependencies.candidatePilots;
-      if (!candidatePilots || !this.dependencies.repositories.getStrategyDecisionById) {
-        throw new Error("candidate final pre-send dependencies are unavailable");
-      }
-      const events = await this.dependencies.repositories.listOrderEvents(input.orderId);
-      const firstEvent = events[0] ?? null;
-      const getDecision = this.dependencies.repositories.getStrategyDecisionById;
-      const decision = await getDecision.call(
-        this.dependencies.repositories,
-        input.candidate.expectedDecision.id,
-      );
-      const deployment = await candidatePilots.getDeployment(input.candidate.authority.deploymentId);
-      const exactState = await candidatePilots.getExactState(input.candidate.authority.deploymentId);
-      const binding = await candidatePilots.getExecutionBindingForOrder(input.orderId);
-      if (
-        hasCompetingOrder ||
-        events.length !== 1 || !firstEvent || !decision || !deployment || !exactState || !binding
-      ) {
-        throw new Error("candidate final persisted authority or intent material changed");
-      }
-      const projected = projectCandidateFinalBoundOrderIntent({
-        persistedOrder,
-        expectedOrder: input.candidate.expectedOrder,
-        persistedEvent: firstEvent,
-        expectedEvent: input.candidate.expectedEvent,
-        persistedDecision: decision,
-        expectedDecision: input.candidate.expectedDecision,
-        persistedBinding: binding,
-        expectedBinding: input.candidate.expectedBinding,
-      });
-      validateCandidateBoundOrderIntent({
-        ...projected,
-        deployment,
-        exactStateVersion: exactState.stateVersion,
-        expectedPhase: input.candidate.authority.expectedPhase,
-        expectedDeploymentUpdatedAt: input.candidate.authority.expectedDeploymentUpdatedAt,
-        expectedStateVersion: input.candidate.authority.expectedStateVersion,
-      });
-    }
-    return hasCompetingOrder;
   }
 
   private async recordLeaseBlockedAndPause(input: {

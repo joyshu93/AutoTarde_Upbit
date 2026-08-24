@@ -52,6 +52,7 @@ type FinalMutation =
   | "FAILED_COMPETING_ORDER"
   | "REJECTED_COMPETING_ORDER"
   | "ORDER_ID_REFERENCE_COLLISION"
+  | "ORDER_CANCELED_DURING_OPERATOR_STATE"
   | "HELPER_RESOLUTION_PAUSE"
   | "OPERATOR_STATE";
 
@@ -63,14 +64,14 @@ test("bound candidate success rereads every final authority in strict order and 
   assert.equal(result.accepted, true);
   assert.equal(fixture.adapter.createOrderCalls, 1);
   assert.deepEqual(fixture.trace, [
-    "activeOrders",
-    "order",
     "firstEvent",
     "decision",
     "deployment",
     "exactState",
     "binding",
     "operatorState",
+    "activeOrders",
+    "order",
     "createOrder",
   ]);
 });
@@ -117,7 +118,7 @@ test("candidate final order reread uses exact account and order id despite refer
   assert.equal(fixture.repositories.referenceLookupCalls, 0);
 });
 
-test("final state read and sole send have no helper-resolution microtask seam", async () => {
+test("final exact order read and sole send have no helper-resolution microtask seam", async () => {
   const fixture = await createFixture("HELPER_RESOLUTION_PAUSE");
 
   const result = await fixture.service.submitOrderFromDecision(candidateInput());
@@ -126,10 +127,12 @@ test("final state read and sole send have no helper-resolution microtask seam", 
   assert.equal(result.accepted, true);
   assert.equal(fixture.adapter.createOrderCalls, 1);
   assert.equal(fixture.adapter.systemStatusAtSend, "RUNNING");
-  assert.deepEqual(fixture.trace.slice(-3), [
+  assert.deepEqual(fixture.trace.slice(-5), [
     "operatorState",
+    "activeOrders",
+    "order",
     "createOrder",
-    "operatorStateMicrotaskPause",
+    "finalOrderMicrotaskPause",
   ]);
 });
 
@@ -142,9 +145,7 @@ test("a final operator-state race occurs after all candidate reads and sends zer
   );
 
   assert.equal(fixture.adapter.createOrderCalls, 0);
-  assert.deepEqual(fixture.trace.slice(0, 8), [
-    "activeOrders",
-    "order",
+  assert.deepEqual(fixture.trace.slice(0, 6), [
     "firstEvent",
     "decision",
     "deployment",
@@ -155,7 +156,21 @@ test("a final operator-state race occurs after all candidate reads and sends zer
   await assertCandidateFaultState(fixture);
 });
 
-test("candidate final authority keeps the sole send immediately behind the final state await", async () => {
+test("an own-order cancellation during the final operator-state await sends zero", async () => {
+  const fixture = await createFixture("ORDER_CANCELED_DURING_OPERATOR_STATE");
+
+  await assert.rejects(
+    () => fixture.service.submitOrderFromDecision(candidateInput()),
+    CandidateExecutionSafetyError,
+  );
+
+  assert.equal(fixture.adapter.createOrderCalls, 0);
+  assert.equal((await fixture.repositories.listOrders("primary"))[0]?.status, "CANCELED");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  assert.notEqual(await fixture.leases.getLease("primary"), null);
+});
+
+test("candidate final authority keeps the exact account/order revalidation immediately before the sole send", async () => {
   const source = await readFile(
     path.resolve(process.cwd(), "src/modules/execution/execution-service.ts"),
     "utf8",
@@ -165,12 +180,16 @@ test("candidate final authority keeps the sole send immediately behind the final
   const submitMethodStart = source.indexOf("async submitOrderFromDecision");
   const submitMethodEnd = source.indexOf("private async prepareCandidateContext", submitMethodStart);
   const submitMethod = source.slice(submitMethodStart, submitMethodEnd);
-  const finalMethodStart = source.indexOf("private async assertFinalPreSendAuthority");
-  const finalMethodEnd = source.indexOf("private async recordLeaseBlockedAndPause", finalMethodStart);
-  const finalMethod = source.slice(finalMethodStart, finalMethodEnd);
-  const orderedReads = [
-    "listSubmissionBlockingOrders",
-    "findOrderById",
+  const candidateMethodStart = source.indexOf("private async assertFinalCandidatePreSendAuthority");
+  const candidateMethodEnd = source.indexOf(
+    "private async assertFinalPersistedSubmissionAuthority",
+    candidateMethodStart,
+  );
+  const candidateMethod = source.slice(candidateMethodStart, candidateMethodEnd);
+  const persistedMethodStart = candidateMethodEnd;
+  const persistedMethodEnd = source.indexOf("private async recordLeaseBlockedAndPause", persistedMethodStart);
+  const persistedMethod = source.slice(persistedMethodStart, persistedMethodEnd);
+  const candidateReads = [
     "listOrderEvents",
     "getStrategyDecisionById",
     "getDeployment",
@@ -178,24 +197,47 @@ test("candidate final authority keeps the sole send immediately behind the final
     "getExecutionBindingForOrder",
   ];
   let cursor = -1;
-  for (const marker of orderedReads) {
-    const next = finalMethod.indexOf(marker, cursor + 1);
-    assert.ok(next > cursor, `expected ordered final read ${marker}`);
+  for (const marker of candidateReads) {
+    const next = candidateMethod.indexOf(marker, cursor + 1);
+    assert.ok(next > cursor, `expected ordered final candidate read ${marker}`);
     cursor = next;
   }
 
-  assert.doesNotMatch(finalMethod, /operatorState\.getState/u);
-  const helperCall = submitMethod.indexOf("await this.assertFinalPreSendAuthority");
+  assert.doesNotMatch(candidateMethod, /listSubmissionBlockingOrders|findOrderById/u);
+  assert.doesNotMatch(
+    persistedMethod,
+    /\bawait\b|operatorState\.getState|candidatePilots|listSubmissionBlockingOrders|findOrderById/u,
+  );
+
+  const candidateHelperCall = submitMethod.indexOf("await this.assertFinalCandidatePreSendAuthority");
   const finalStateRead = submitMethod.indexOf(
     "await this.dependencies.operatorState.getState()",
-    helperCall,
+    candidateHelperCall,
   );
-  const sendSite = submitMethod.indexOf("this.dependencies.executionAdapter.createOrder", finalStateRead);
-  assert.ok(helperCall >= 0 && finalStateRead > helperCall && sendSite > finalStateRead);
-  const afterFinalState = submitMethod.slice(finalStateRead, sendSite);
-  assert.equal((afterFinalState.match(/\bawait\b/gu) ?? []).length, 1);
-  assert.doesNotMatch(afterFinalState, /\.(?:filter|map|forEach|reduce|some|every)\s*\(/u);
-  assert.doesNotMatch(afterFinalState, /assertFinalPreSendAuthority/u);
+  const blockerRead = submitMethod.indexOf(
+    "await this.dependencies.repositories.listSubmissionBlockingOrders",
+    finalStateRead,
+  );
+  const exactOrderRead = submitMethod.indexOf(
+    "await this.dependencies.repositories.findOrderById",
+    blockerRead,
+  );
+  const persistedHelperCall = submitMethod.indexOf(
+    "this.assertFinalPersistedSubmissionAuthority",
+    exactOrderRead,
+  );
+  const sendSite = submitMethod.indexOf(
+    "this.dependencies.executionAdapter.createOrder",
+    persistedHelperCall,
+  );
+  assert.ok(
+    candidateHelperCall >= 0 && finalStateRead > candidateHelperCall &&
+    blockerRead > finalStateRead && exactOrderRead > blockerRead &&
+    persistedHelperCall > exactOrderRead && sendSite > persistedHelperCall,
+  );
+  const afterFinalPersistedRead = submitMethod.slice(exactOrderRead, sendSite);
+  assert.equal((afterFinalPersistedRead.match(/\bawait\b/gu) ?? []).length, 1);
+  assert.doesNotMatch(afterFinalPersistedRead, /operatorState\.getState|candidatePilots/u);
 });
 
 async function assertFinalCandidateFault(mutation: FinalMutation): Promise<void> {
@@ -235,18 +277,40 @@ async function assertCandidateFaultState(
 class FinalAuthorityRepository extends InMemoryExecutionRepository {
   finalReadsArmed = false;
   referenceLookupCalls = 0;
+  cancellationMutations = 0;
+  private submittingOrder: OrderRecord | null = null;
 
   constructor(
     candidatePilots: InMemoryCandidatePilotRepository,
     private readonly mutation: FinalMutation,
     readonly trace: string[],
+    private readonly onFinalOrderResolved: () => void,
   ) {
     super(undefined, candidatePilots);
   }
 
   override async updateOrder(record: OrderRecord): Promise<void> {
     await super.updateOrder(record);
-    if (record.status === "SUBMITTING") this.finalReadsArmed = true;
+    if (record.status === "SUBMITTING") {
+      this.finalReadsArmed = true;
+      this.submittingOrder = record;
+    }
+  }
+
+  async cancelSubmittingOrderDuringOperatorState(): Promise<void> {
+    const order = (await super.listOrders("primary")).find(
+      (candidate) => candidate.status === "SUBMITTING",
+    );
+    if (!order) {
+      if (this.cancellationMutations > 0) return;
+      throw new Error("expected submitting order for race fixture");
+    }
+    await super.updateOrder({
+      ...order,
+      status: "CANCELED",
+      updatedAt: "2026-08-21T00:00:00.001Z",
+    });
+    this.cancellationMutations += 1;
   }
 
   override async listActiveOrders(
@@ -277,9 +341,27 @@ class FinalAuthorityRepository extends InMemoryExecutionRepository {
     return orders;
   }
 
-  async findOrderById(exchangeAccountId: string, orderId: string): Promise<OrderRecord | null> {
-    const order = (await super.listOrders(exchangeAccountId)).find((candidate) => candidate.id === orderId);
-    if (!this.finalReadsArmed) return order ?? null;
+  findOrderById(exchangeAccountId: string, orderId: string): Promise<OrderRecord | null> {
+    if (
+      this.finalReadsArmed &&
+      this.mutation === "HELPER_RESOLUTION_PAUSE" &&
+      this.submittingOrder?.id === orderId &&
+      this.submittingOrder.exchangeAccountId === exchangeAccountId
+    ) {
+      const order = this.submittingOrder;
+      this.trace.push("order");
+      return {
+        then: (resolve: (value: OrderRecord) => unknown) => {
+          resolve(order);
+          queueMicrotask(() => {
+            this.onFinalOrderResolved();
+            this.trace.push("finalOrderMicrotaskPause");
+          });
+        },
+      } as unknown as Promise<OrderRecord>;
+    }
+    return super.findOrderById(exchangeAccountId, orderId).then((order) => {
+      if (!this.finalReadsArmed) return order;
     this.trace.push("order");
     if (!order) return null;
     if (this.mutation === "ORDER_STATUS") return { ...order, status: "OPEN" };
@@ -288,6 +370,7 @@ class FinalAuthorityRepository extends InMemoryExecutionRepository {
       return { ...order, upbitUuid: "unexpected-upbit-uuid" };
     }
     return order;
+    });
   }
 
   override async findOrderByReference(
@@ -337,6 +420,7 @@ class TracingOperatorStateStore extends InMemoryOperatorStateStore {
     private readonly finalReadsArmed: () => boolean,
     private readonly mutation: FinalMutation,
     private readonly trace: string[],
+    private readonly cancelSubmittingOrder: () => Promise<void>,
   ) {
     super(initialState);
   }
@@ -344,17 +428,11 @@ class TracingOperatorStateStore extends InMemoryOperatorStateStore {
   override getState(): Promise<ExecutionStateRecord> {
     if (!this.finalReadsArmed()) return super.getState();
     this.trace.push("operatorState");
-    if (this.mutation === "HELPER_RESOLUTION_PAUSE") {
-      const state = executionState();
-      return {
-        then: (resolve: (value: ExecutionStateRecord) => unknown) => {
-          resolve(state);
-          queueMicrotask(() => {
-            this.visibleSystemStatus = "PAUSED";
-            this.trace.push("operatorStateMicrotaskPause");
-          });
-        },
-      } as unknown as Promise<ExecutionStateRecord>;
+    if (this.mutation === "ORDER_CANCELED_DURING_OPERATOR_STATE") {
+      return super.getState().then(async (state) => {
+        await this.cancelSubmittingOrder();
+        return state;
+      });
     }
     return super.getState().then((state) => this.mutation === "OPERATOR_STATE"
       ? { ...state, systemStatus: "PAUSED", pauseReason: "final race" }
@@ -390,9 +468,12 @@ async function createFixture(mutation: FinalMutation) {
     () => repositories?.finalReadsArmed ?? false,
     mutation,
     trace,
+    () => repositories.cancelSubmittingOrderDuringOperatorState(),
   );
   const candidatePilots = new InMemoryCandidatePilotRepository(operatorState);
-  repositories = new FinalAuthorityRepository(candidatePilots, mutation, trace);
+  repositories = new FinalAuthorityRepository(candidatePilots, mutation, trace, () => {
+    operatorState.visibleSystemStatus = "PAUSED";
+  });
   const leases = new InMemoryAccountExecutionLeaseStore();
   const adapter = new TracingDryRunAdapter(
     trace,
