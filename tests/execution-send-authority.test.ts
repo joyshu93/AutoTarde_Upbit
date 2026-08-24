@@ -683,12 +683,8 @@ class FinalAuthorityDriftOperatorStateStore extends InMemoryOperatorStateStore {
 }
 
 class FailingFinalActiveOrdersRepository extends InMemoryExecutionRepository {
-  private reads = 0;
-
-  override async listActiveOrders(...args: Parameters<InMemoryExecutionRepository["listActiveOrders"]>) {
-    this.reads += 1;
-    if (this.reads === 2) throw new Error("injected final active-order read failure");
-    return super.listActiveOrders(...args);
+  override async listSubmissionBlockingOrders(): Promise<never> {
+    throw new Error("injected final submission-blocking order read failure");
   }
 }
 
