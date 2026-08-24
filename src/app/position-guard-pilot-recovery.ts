@@ -501,7 +501,13 @@ export class PositionGuardPilotRecovery {
         );
         break;
       case "DISABLED":
-        this.verifyDisabledRollback(readback.deployment, readback.auditEvents, state);
+        this.verifyDisabledRollback(
+          readback.deployment,
+          readback.evidenceRecords,
+          readback.auditEvents,
+          state,
+          nowEpochNanoseconds,
+        );
         this.verifyReplayInventoryAgreement(
           state.currentEpisodeInventoryQuantity,
           inventory.balanceQuantity,
@@ -523,9 +529,8 @@ export class PositionGuardPilotRecovery {
     auditEvents: PositionGuardPilotAuditEventRecord[],
     state: Readonly<ExactCandidateState>,
   ): void {
-    if (deployment.activationAt === null || deployment.activationEpochNs === null) {
-      throw recoveryFault("IDENTITY_MISMATCH", "DRAINING deployment has no persisted activation instant.");
-    }
+    this.verifyCanonicalDeploymentCreatedAudit(deployment, auditEvents);
+    const activationEpoch = this.verifyCanonicalActivationAudit(deployment, auditEvents, "DRAINING");
     const rollbackEvents = auditEvents.filter((event) => event.eventType === "ROLLBACK_STARTED");
     const completedEvents = auditEvents.filter((event) => event.eventType === "ROLLBACK_COMPLETED");
     if (rollbackEvents.length !== 1 || completedEvents.length !== 0) {
@@ -556,34 +561,45 @@ export class PositionGuardPilotRecovery {
       payload.transitionAt !== rollback.createdAt) {
       throw recoveryFault("IDENTITY_MISMATCH", "DRAINING rollback-start payload is invalid.");
     }
-
-    const stateEvents = auditEvents.filter((event) => event.eventType === "STATE_ADVANCED");
-    if (stateEvents.length !== evidenceRecords.length || state.stateVersion !== evidenceRecords.length) {
-      throw recoveryFault("REPLAY_MISMATCH", "DRAINING evidence and audit counts do not match.");
+    if (rollbackAt < activationEpoch) {
+      throw recoveryFault("IDENTITY_MISMATCH", "DRAINING rollback predates canonical activation.");
     }
+
+    const stateEvents = this.verifyCanonicalStateAdvanceChain(
+      deployment,
+      evidenceRecords,
+      auditEvents,
+      state,
+      (index) => index < rollback.stateVersion ? "ACTIVE" : "DRAINING",
+    );
     for (const [index, record] of evidenceRecords.entries()) {
       const phase = index < rollback.stateVersion ? "ACTIVE" : "DRAINING";
       if (phase === "DRAINING" && record.evidence.action !== "REDUCE" && record.evidence.action !== "EXIT") {
         throw recoveryFault("REPLAY_MISMATCH", "DRAINING evidence must be REDUCE or EXIT.");
       }
-      const event = stateEvents[index];
-      if (!event || event.id !== `${deployment.id}:evidence:${record.evidence.evidenceId}` ||
-        event.fromPhase !== phase || event.toPhase !== phase || event.stateVersion !== index + 1 ||
-        event.createdAt !== record.evidence.executedAt) {
-        throw recoveryFault("REPLAY_MISMATCH", "DRAINING evidence audit chain is invalid.");
-      }
       const evidenceAt = parseTimestamp(record.evidence.executedAt, "candidate evidence executedAt", "REPLAY_MISMATCH");
+      if (evidenceAt <= activationEpoch) {
+        throw recoveryFault("REPLAY_MISMATCH", "DRAINING evidence does not follow canonical activation.");
+      }
       if ((index < rollback.stateVersion && evidenceAt > rollbackAt) ||
         (index >= rollback.stateVersion && evidenceAt < rollbackAt)) {
         throw recoveryFault("REPLAY_MISMATCH", "DRAINING evidence crosses the rollback boundary.");
       }
+      if (stateEvents[index]!.createdAt !== record.evidence.executedAt) {
+        throw recoveryFault("REPLAY_MISMATCH", "DRAINING evidence audit chronology is invalid.");
+      }
+    }
+    if (auditEvents.length !== evidenceRecords.length + 3) {
+      throw recoveryFault("IDENTITY_MISMATCH", "DRAINING audit history contains non-canonical events.");
     }
   }
 
   private verifyDisabledRollback(
     deployment: PositionGuardPilotDeploymentRecord,
+    evidenceRecords: Array<Readonly<CandidateEvidenceRecord>>,
     auditEvents: PositionGuardPilotAuditEventRecord[],
     state: Readonly<ExactCandidateState>,
+    nowEpochNanoseconds: bigint,
   ): void {
     if (!isExactCandidateStateRollbackFlat(state)) {
       throw recoveryFault("REPLAY_MISMATCH", "DISABLED rollback authority must be exactly flat.");
@@ -605,6 +621,84 @@ export class PositionGuardPilotRecovery {
         completion.fromPhase !== "DRAINING")
     ) {
       throw recoveryFault("IDENTITY_MISMATCH", "DISABLED rollback completion audit is invalid.");
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(completion.payloadJson) as unknown;
+    } catch {
+      throw recoveryFault("IDENTITY_MISMATCH", "DISABLED rollback completion payload is malformed.");
+    }
+    if (!isPlainRecord(payload) || !hasExactOwnKeys(payload, ["transitionAt"]) ||
+      payload.transitionAt !== completion.createdAt) {
+      throw recoveryFault("IDENTITY_MISMATCH", "DISABLED rollback completion payload is invalid.");
+    }
+    this.verifyCanonicalDeploymentCreatedAudit(deployment, auditEvents);
+    switch (completion.fromPhase) {
+      case "PENDING_FLAT":
+        if (
+          deployment.activationAt !== null ||
+          deployment.activationEpochNs !== null ||
+          auditEvents.length !== 2
+        ) {
+          throw recoveryFault("IDENTITY_MISMATCH", "PENDING_FLAT completion requires pristine rollback history.");
+        }
+        this.verifyPendingFlatState(state, evidenceRecords);
+        break;
+      case "ACTIVE": {
+        const activationEpoch = this.verifyCanonicalActivationAudit(deployment, auditEvents, "DISABLED");
+        this.verifyCanonicalStateAdvanceChain(
+          deployment,
+          evidenceRecords,
+          auditEvents,
+          state,
+          () => "ACTIVE",
+        );
+        this.verifyEvidenceRange(
+          evidenceRecords,
+          activationEpoch,
+          completedAt,
+          "ACTIVE completion evidence chronology is invalid.",
+        );
+        if (auditEvents.length !== evidenceRecords.length + 3) {
+          throw recoveryFault("IDENTITY_MISMATCH", "ACTIVE completion audit history is non-canonical.");
+        }
+        break;
+      }
+      case "DRAINING": {
+        const activationEpoch = this.verifyCanonicalActivationAudit(deployment, auditEvents, "DISABLED");
+        const rollback = this.verifyCanonicalRollbackStarted(deployment, evidenceRecords, auditEvents);
+        if (rollback.at < activationEpoch || rollback.at > completedAt) {
+          throw recoveryFault("IDENTITY_MISMATCH", "DRAINING completion chronology is invalid.");
+        }
+        this.verifyCanonicalStateAdvanceChain(
+          deployment,
+          evidenceRecords,
+          auditEvents,
+          state,
+          (index) => index < rollback.stateVersion ? "ACTIVE" : "DRAINING",
+        );
+        for (const [index, record] of evidenceRecords.entries()) {
+          const evidenceAt = parseTimestamp(record.evidence.executedAt, "candidate evidence executedAt", "REPLAY_MISMATCH");
+          if (
+            evidenceAt <= activationEpoch ||
+            evidenceAt > completedAt ||
+            (index < rollback.stateVersion && evidenceAt > rollback.at) ||
+            (index >= rollback.stateVersion && evidenceAt < rollback.at) ||
+            (index >= rollback.stateVersion && record.evidence.action !== "REDUCE" && record.evidence.action !== "EXIT")
+          ) {
+            throw recoveryFault("REPLAY_MISMATCH", "DRAINING completion evidence chronology is invalid.");
+          }
+        }
+        if (auditEvents.length !== evidenceRecords.length + 4) {
+          throw recoveryFault("IDENTITY_MISMATCH", "DRAINING completion audit history is non-canonical.");
+        }
+        break;
+      }
+      default:
+        throw recoveryFault("IDENTITY_MISMATCH", "DISABLED completion predecessor phase is invalid.");
+    }
+    if (completedAt > nowEpochNanoseconds) {
+      throw recoveryFault("IDENTITY_MISMATCH", "DISABLED completion is future-dated.");
     }
   }
 
@@ -813,7 +907,13 @@ export class PositionGuardPilotRecovery {
         );
         break;
       case "DISABLED":
-        this.verifyDisabledRollback(readback.deployment, readback.auditEvents, state);
+        this.verifyDisabledRollback(
+          readback.deployment,
+          readback.evidenceRecords,
+          readback.auditEvents,
+          state,
+          nowEpochNanoseconds,
+        );
         this.verifyReplayInventoryAgreement(
           state.currentEpisodeInventoryQuantity,
           inventory.balanceQuantity,
@@ -1272,21 +1372,47 @@ export class PositionGuardPilotRecovery {
     state: Readonly<ExactCandidateState>,
     nowEpochNanoseconds: bigint,
   ): void {
+    this.verifyCanonicalDeploymentCreatedAudit(deployment, auditEvents);
+    const activationEpoch = this.verifyCanonicalActivationAudit(deployment, auditEvents, "ACTIVE");
+    this.verifyCanonicalStateAdvanceChain(
+      deployment,
+      evidenceRecords,
+      auditEvents,
+      state,
+      () => "ACTIVE",
+    );
+    this.verifyEvidenceRange(
+      evidenceRecords,
+      activationEpoch,
+      nowEpochNanoseconds,
+      "Candidate evidence does not follow activation chronology.",
+    );
+    if (auditEvents.length !== evidenceRecords.length + 2) {
+      throw recoveryFault("IDENTITY_MISMATCH", "ACTIVE audit history contains non-canonical events.");
+    }
+  }
+
+  private verifyCanonicalActivationAudit(
+    deployment: PositionGuardPilotDeploymentRecord,
+    auditEvents: PositionGuardPilotAuditEventRecord[],
+    phase: "ACTIVE" | "DRAINING" | "DISABLED",
+  ): bigint {
     if (deployment.activationAt === null || deployment.activationEpochNs === null) {
-      throw recoveryFault("IDENTITY_MISMATCH", "ACTIVE deployment has no persisted activation instant.");
+      throw recoveryFault("IDENTITY_MISMATCH", `${phase} deployment has no persisted activation instant.`);
     }
     const activationEpoch = parseTimestamp(deployment.activationAt, "deployment activationAt", "IDENTITY_MISMATCH");
-    if (activationEpoch !== deployment.activationEpochNs || activationEpoch > nowEpochNanoseconds) {
+    if (activationEpoch !== deployment.activationEpochNs) {
       throw recoveryFault("IDENTITY_MISMATCH", "Persisted activation timestamp and epoch are invalid.");
     }
     const createdEpoch = parseTimestamp(deployment.createdAt, "deployment createdAt", "IDENTITY_MISMATCH");
     if (activationEpoch < createdEpoch) {
       throw recoveryFault("IDENTITY_MISMATCH", "Persisted activation predates deployment creation.");
     }
-    const activationEvents = auditEvents.filter((event) => event.eventType === "PHASE_TRANSITION" &&
+    const phaseTransitions = auditEvents.filter((event) => event.eventType === "PHASE_TRANSITION");
+    const activationEvents = phaseTransitions.filter((event) =>
       event.fromPhase === "PENDING_FLAT" && event.toPhase === "ACTIVE");
-    if (activationEvents.length !== 1) {
-      throw recoveryFault("IDENTITY_MISMATCH", "ACTIVE deployment requires one activation audit event.");
+    if (phaseTransitions.length !== 1 || activationEvents.length !== 1) {
+      throw recoveryFault("IDENTITY_MISMATCH", `${phase} deployment requires one canonical activation audit event.`);
     }
     const activationEvent = activationEvents[0]!;
     let payload: unknown;
@@ -1296,6 +1422,8 @@ export class PositionGuardPilotRecovery {
       throw recoveryFault("IDENTITY_MISMATCH", "Activation audit payload JSON is malformed.");
     }
     if (
+      activationEvent.id !== `${deployment.id}:activation:${deployment.activationEpochNs.toString()}` ||
+      activationEvent.deploymentId !== deployment.id ||
       activationEvent.createdAt !== deployment.activationAt ||
       activationEvent.stateVersion !== 0 ||
       !isPlainRecord(payload) ||
@@ -1305,15 +1433,54 @@ export class PositionGuardPilotRecovery {
     ) {
       throw recoveryFault("IDENTITY_MISMATCH", "Activation audit does not match persisted deployment chronology.");
     }
+    return activationEpoch;
+  }
+
+  private verifyCanonicalDeploymentCreatedAudit(
+    deployment: PositionGuardPilotDeploymentRecord,
+    auditEvents: PositionGuardPilotAuditEventRecord[],
+  ): void {
+    const createdEvents = auditEvents.filter((event) => event.eventType === "DEPLOYMENT_CREATED");
+    if (createdEvents.length !== 1) {
+      throw recoveryFault("IDENTITY_MISMATCH", "Candidate deployment requires one canonical creation audit event.");
+    }
+    const created = createdEvents[0]!;
+    let payload: unknown;
+    try {
+      payload = JSON.parse(created.payloadJson) as unknown;
+    } catch {
+      throw recoveryFault("IDENTITY_MISMATCH", "Candidate deployment creation payload is malformed.");
+    }
+    if (
+      created.id !== `${deployment.id}:created` ||
+      created.deploymentId !== deployment.id ||
+      created.fromPhase !== null ||
+      created.toPhase !== "PENDING_FLAT" ||
+      created.stateVersion !== 0 ||
+      created.createdAt !== deployment.createdAt ||
+      !isPlainRecord(payload) ||
+      !hasExactOwnKeys(payload, ["pilotId", "market", "policyId", "policyVersion"]) ||
+      payload.pilotId !== deployment.pilotId ||
+      payload.market !== deployment.market ||
+      payload.policyId !== deployment.policyId ||
+      payload.policyVersion !== deployment.policyVersion
+    ) {
+      throw recoveryFault("IDENTITY_MISMATCH", "Candidate deployment creation audit is invalid.");
+    }
+  }
+
+  private verifyCanonicalStateAdvanceChain(
+    deployment: PositionGuardPilotDeploymentRecord,
+    evidenceRecords: Array<Readonly<CandidateEvidenceRecord>>,
+    auditEvents: PositionGuardPilotAuditEventRecord[],
+    state: Readonly<ExactCandidateState>,
+    phaseAt: (index: number) => "ACTIVE" | "DRAINING",
+  ): PositionGuardPilotAuditEventRecord[] {
     const stateAdvanceEvents = auditEvents.filter((event) => event.eventType === "STATE_ADVANCED");
     if (stateAdvanceEvents.length !== evidenceRecords.length || state.stateVersion !== evidenceRecords.length) {
       throw recoveryFault("REPLAY_MISMATCH", "Candidate evidence and STATE_ADVANCED audit counts do not match.");
     }
     for (const [index, record] of evidenceRecords.entries()) {
-      const evidenceAt = parseTimestamp(record.evidence.executedAt, "candidate evidence executedAt", "REPLAY_MISMATCH");
-      if (evidenceAt <= activationEpoch || evidenceAt > nowEpochNanoseconds) {
-        throw recoveryFault("REPLAY_MISMATCH", "Candidate evidence does not follow activation chronology.");
-      }
       const event = stateAdvanceEvents[index];
       if (!event) {
         throw recoveryFault("REPLAY_MISMATCH", "Candidate evidence has no STATE_ADVANCED audit event.");
@@ -1325,10 +1492,12 @@ export class PositionGuardPilotRecovery {
         throw recoveryFault("REPLAY_MISMATCH", "STATE_ADVANCED audit payload JSON is malformed.");
       }
       const expectedVersion = index + 1;
+      const phase = phaseAt(index);
       if (
         event.id !== `${deployment.id}:evidence:${record.evidence.evidenceId}` ||
-        event.fromPhase !== "ACTIVE" ||
-        event.toPhase !== "ACTIVE" ||
+        event.deploymentId !== deployment.id ||
+        event.fromPhase !== phase ||
+        event.toPhase !== phase ||
         event.stateVersion !== expectedVersion ||
         event.createdAt !== record.evidence.executedAt ||
         !isPlainRecord(statePayload) ||
@@ -1343,6 +1512,56 @@ export class PositionGuardPilotRecovery {
         statePayload.toStateVersion !== expectedVersion
       ) {
         throw recoveryFault("REPLAY_MISMATCH", "STATE_ADVANCED audit chain does not match candidate evidence.");
+      }
+    }
+    return stateAdvanceEvents;
+  }
+
+  private verifyCanonicalRollbackStarted(
+    deployment: PositionGuardPilotDeploymentRecord,
+    evidenceRecords: Array<Readonly<CandidateEvidenceRecord>>,
+    auditEvents: PositionGuardPilotAuditEventRecord[],
+  ): { at: bigint; stateVersion: number } {
+    const rollbacks = auditEvents.filter((event) => event.eventType === "ROLLBACK_STARTED");
+    if (rollbacks.length !== 1) {
+      throw recoveryFault("IDENTITY_MISMATCH", "DRAINING authority requires one rollback-start audit.");
+    }
+    const rollback = rollbacks[0]!;
+    const rollbackAt = parseTimestamp(rollback.createdAt, "rollback startedAt", "IDENTITY_MISMATCH");
+    if (
+      rollback.id !== `${deployment.id}:rollback_started:${rollbackAt.toString()}` ||
+      rollback.deploymentId !== deployment.id ||
+      rollback.fromPhase !== "ACTIVE" ||
+      rollback.toPhase !== "DRAINING" ||
+      !Number.isSafeInteger(rollback.stateVersion) ||
+      rollback.stateVersion < 0 ||
+      rollback.stateVersion > evidenceRecords.length
+    ) {
+      throw recoveryFault("IDENTITY_MISMATCH", "DRAINING rollback-start audit is invalid.");
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(rollback.payloadJson) as unknown;
+    } catch {
+      throw recoveryFault("IDENTITY_MISMATCH", "DRAINING rollback-start payload is malformed.");
+    }
+    if (!isPlainRecord(payload) || !hasExactOwnKeys(payload, ["transitionAt"]) ||
+      payload.transitionAt !== rollback.createdAt) {
+      throw recoveryFault("IDENTITY_MISMATCH", "DRAINING rollback-start payload is invalid.");
+    }
+    return { at: rollbackAt, stateVersion: rollback.stateVersion };
+  }
+
+  private verifyEvidenceRange(
+    evidenceRecords: Array<Readonly<CandidateEvidenceRecord>>,
+    lowerExclusive: bigint,
+    upperInclusive: bigint,
+    message: string,
+  ): void {
+    for (const record of evidenceRecords) {
+      const evidenceAt = parseTimestamp(record.evidence.executedAt, "candidate evidence executedAt", "REPLAY_MISMATCH");
+      if (evidenceAt <= lowerExclusive || evidenceAt > upperInclusive) {
+        throw recoveryFault("REPLAY_MISMATCH", message);
       }
     }
   }
@@ -1461,24 +1680,53 @@ export class PositionGuardPilotRecovery {
 
     const deploymentIdentityEstablished = hasEstablishedDeploymentIdentity(readback, this.dependencies);
     if (deploymentIdentityEstablished) {
-      const fault: PauseCandidatePilotForRecoveryFaultInput = {
-        deploymentId: requireResolvedDeploymentId(readback),
-        exchangeAccountId: this.dependencies.exchangeAccountId,
-        faultId,
-        reasonCode,
-        provenanceJson,
-        occurredAt,
-      };
-      const existing = readback.auditEvents.find((event) => event.id === faultId);
-      if (existing) {
-        fault.occurredAt = existing.createdAt;
-      } else if (readback.deployment.phase === "PAUSED_FAULT") {
-        fault.occurredAt = readback.deployment.updatedAt;
-      }
-      occurredAt = fault.occurredAt;
-      const persisted = await this.dependencies.candidatePilots.pauseForRecoveryFault(fault);
-      if (persisted.auditEvent.id !== faultId || persisted.deployment.phase !== "PAUSED_FAULT") {
-        throw new Error("Candidate recovery fault pause did not persist the expected atomic authority.");
+      if (readback.deployment.phase === "DISABLED") {
+        // DISABLED is terminal, so retain it while atomically blocking global execution.
+        let existing = null;
+        try {
+          existing = await this.dependencies.operatorState.getTransitionById(faultId);
+        } catch {
+          // The deterministic global pause remains safe and idempotent without the optional readback.
+        }
+        if (existing) occurredAt = existing.createdAt;
+        if (!existing) {
+          const getState = this.dependencies.operatorState.getState;
+          if (!getState) throw new Error("Terminal recovery fault requires operator state read authority.");
+          const operatorState = await getState.call(this.dependencies.operatorState);
+          if (
+            parseTimestamp(operatorState.updatedAt, "operator state updatedAt", "IDENTITY_MISMATCH") >
+            parseTimestamp(occurredAt, "terminal recovery fault occurredAt", "IDENTITY_MISMATCH")
+          ) {
+            occurredAt = operatorState.updatedAt;
+          }
+        }
+        await this.dependencies.operatorState.pauseForFault({
+          exchangeAccountId: this.dependencies.exchangeAccountId,
+          faultId,
+          reason: candidatePilotRecoveryFaultReason(faultMaterial),
+          occurredAt,
+          ...(existing ? { transitionAt: existing.createdAt } : {}),
+        });
+      } else {
+        const fault: PauseCandidatePilotForRecoveryFaultInput = {
+          deploymentId: requireResolvedDeploymentId(readback),
+          exchangeAccountId: this.dependencies.exchangeAccountId,
+          faultId,
+          reasonCode,
+          provenanceJson,
+          occurredAt,
+        };
+        const existing = readback.auditEvents.find((event) => event.id === faultId);
+        if (existing) {
+          fault.occurredAt = existing.createdAt;
+        } else if (readback.deployment.phase === "PAUSED_FAULT") {
+          fault.occurredAt = readback.deployment.updatedAt;
+        }
+        occurredAt = fault.occurredAt;
+        const persisted = await this.dependencies.candidatePilots.pauseForRecoveryFault(fault);
+        if (persisted.auditEvent.id !== faultId || persisted.deployment.phase !== "PAUSED_FAULT") {
+          throw new Error("Candidate recovery fault pause did not persist the expected atomic authority.");
+        }
       }
     } else {
       let existing = null;

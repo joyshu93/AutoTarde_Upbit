@@ -1511,6 +1511,121 @@ test("recovery preserves validated DRAINING and rollback-completed DISABLED rout
   );
 });
 
+test("DRAINING recovery requires the canonical activation audit", async () => {
+  const fixture = await createFixture({
+    phase: "ACTIVE",
+    evidenceQuantity: "0.1",
+    balanceFree: "0.1",
+    positionQuantity: "0.1",
+  });
+  await fixture.recovery.requestRollback(fixture.receipt);
+  const audits = await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  fixture.recovery = fixture.createRecovery(
+    overrideCandidatePilots(fixture.candidatePilots, {
+      listAuditEvents: async () => audits.map((event) => event.eventType === "PHASE_TRANSITION"
+        ? { ...event, payloadJson: JSON.stringify({ activationAt: event.createdAt, activationEpochNs: "0" }) }
+        : event),
+    }),
+    undefined,
+    undefined,
+    "2026-08-21T00:01:10.000Z",
+  );
+
+  await expectFault(fixture, "IDENTITY_MISMATCH");
+});
+
+test("DRAINING recovery requires exact STATE_ADVANCED evidence payload linkage", async () => {
+  const fixture = await createFixture({
+    phase: "ACTIVE",
+    evidenceQuantity: "0.1",
+    balanceFree: "0.1",
+    positionQuantity: "0.1",
+  });
+  await fixture.recovery.requestRollback(fixture.receipt);
+  const audits = await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  fixture.recovery = fixture.createRecovery(
+    overrideCandidatePilots(fixture.candidatePilots, {
+      listAuditEvents: async () => audits.map((event) => event.eventType === "STATE_ADVANCED"
+        ? { ...event, payloadJson: JSON.stringify({}) }
+        : event),
+    }),
+    undefined,
+    undefined,
+    "2026-08-21T00:01:10.000Z",
+  );
+
+  await expectFault(fixture, "REPLAY_MISMATCH");
+});
+
+test("DISABLED recovery validates the full completion predecessor history", async () => {
+  const pendingFixture = await createFixture();
+  await pendingFixture.recovery.requestRollback(pendingFixture.receipt);
+  const pendingAudits = await pendingFixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  pendingFixture.recovery = pendingFixture.createRecovery(overrideCandidatePilots(pendingFixture.candidatePilots, {
+    listAuditEvents: async () => [...pendingAudits, {
+      id: `${DEPLOYMENT_ID}:unexpected_activation`,
+      deploymentId: DEPLOYMENT_ID,
+      eventType: "PHASE_TRANSITION",
+      fromPhase: "PENDING_FLAT",
+      toPhase: "ACTIVE",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({ activationAt: ACTIVATED_AT, activationEpochNs: "1787353200000000000" }),
+      createdAt: ACTIVATED_AT,
+    }],
+  }));
+  await expectDisabledFault(pendingFixture, "IDENTITY_MISMATCH", "PENDING_FLAT completion must remain pristine");
+
+  const activeFixture = await createFixture({ phase: "ACTIVE", evidenceQuantity: "0.1" });
+  await activeFixture.candidatePilots.advanceStateWithEvidence({
+    deploymentId: DEPLOYMENT_ID,
+    expectedStateVersion: 1,
+    evidence: {
+      evidenceId: "evidence-exit-active",
+      executedAt: "2026-08-21T00:00:20.000Z",
+      action: "EXIT",
+      entryPath: "NONE",
+      terminalStatus: "FILLED",
+      executedQuantity: "0.1",
+      grossQuoteValueKrw: "10000000",
+      confirmedFeeKrw: "5000",
+      remainingQuantity: "0",
+    },
+  });
+  await activeFixture.recovery.requestRollback(activeFixture.receipt);
+  const activeAudits = await activeFixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  activeFixture.recovery = activeFixture.createRecovery(overrideCandidatePilots(activeFixture.candidatePilots, {
+    listAuditEvents: async () => activeAudits.map((event) => event.eventType === "STATE_ADVANCED"
+      ? { ...event, payloadJson: JSON.stringify({}) }
+      : event),
+  }));
+  await expectDisabledFault(activeFixture, "REPLAY_MISMATCH", "ACTIVE completion requires canonical active evidence audits");
+
+  const drainingFixture = await createFixture({ phase: "ACTIVE", evidenceQuantity: "0.1" });
+  await drainingFixture.candidatePilots.advanceStateWithEvidence({
+    deploymentId: DEPLOYMENT_ID,
+    expectedStateVersion: 1,
+    evidence: {
+      evidenceId: "evidence-exit-draining-claim",
+      executedAt: "2026-08-21T00:00:20.000Z",
+      action: "EXIT",
+      entryPath: "NONE",
+      terminalStatus: "FILLED",
+      executedQuantity: "0.1",
+      grossQuoteValueKrw: "10000000",
+      confirmedFeeKrw: "5000",
+      remainingQuantity: "0",
+    },
+  });
+  await drainingFixture.recovery.requestRollback(drainingFixture.receipt);
+  const drainingAudits = await drainingFixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  drainingFixture.recovery = drainingFixture.createRecovery(overrideCandidatePilots(drainingFixture.candidatePilots, {
+    listAuditEvents: async () => drainingAudits.map((event) => event.eventType === "ROLLBACK_COMPLETED"
+      ? { ...event, fromPhase: "DRAINING" }
+      : event),
+  }));
+  await expectDisabledFault(drainingFixture, "IDENTITY_MISMATCH", "DRAINING completion requires its rollback boundary");
+});
+
 test("completeRollback on ACTIVE non-flat authority never starts rollback or mutates pilot state", async () => {
   const fixture = await createFixture({
     phase: "ACTIVE",
@@ -1941,6 +2056,20 @@ async function expectFault(
   assert.equal((await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "PAUSED_FAULT", label);
   assert.equal((await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID))
     .filter((event) => event.id === result.faultId).length, 1, label);
+}
+
+async function expectDisabledFault(
+  fixture: RecoveryFixture,
+  reasonCode: CandidatePilotRecoveryFaultReason,
+  label: string,
+): Promise<void> {
+  const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+  assert.equal(result.status, "BLOCKED_FAULT", label);
+  if (result.status !== "BLOCKED_FAULT") return;
+  assert.equal(result.reasonCode, reasonCode, label);
+  assert.equal(result.executableAuthority, false, label);
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED", label);
+  assert.equal((await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "DISABLED", label);
 }
 
 function deploymentRecord(input: { exchangeAccountId: string }): PositionGuardPilotDeploymentRecord {

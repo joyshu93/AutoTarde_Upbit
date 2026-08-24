@@ -70,6 +70,7 @@ test("default runner router covers ACTIVE, DRAINING, DISABLED, and ETH baseline 
   assert.ok(active.submitted[0]?.candidateAuthority);
 
   for (const [action, expectedAction, expectedReason] of [
+    ["ENTER", "HOLD", "DRAINING_NEW_RISK_SUPPRESSED"],
     ["ADD", "HOLD", "DRAINING_NEW_RISK_SUPPRESSED"],
     ["HOLD", "HOLD", "DRAINING_BASELINE_HOLD_PRESERVED"],
     ["REDUCE", "REDUCE", "DRAINING_RISK_REDUCTION_PRESERVED"],
