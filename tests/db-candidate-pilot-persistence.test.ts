@@ -66,7 +66,7 @@ test("two sqlite candidate pilot connections initialize one deployment and prese
     END;
   `);
   setup.close();
-  const synchronization = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3);
+  const synchronization = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 5);
   const input = initialDeploymentInput("candidate-bootstrap-concurrency");
   try {
     const workers = [
@@ -83,6 +83,8 @@ test("two sqlite candidate pilot connections initialize one deployment and prese
       assert.equal(Atomics.load(observedSynchronization, 0), 1);
       assert.equal(Atomics.load(observedSynchronization, 1), 1);
       assert.equal(Atomics.load(observedSynchronization, 2), 1);
+      assert.equal(Atomics.load(observedSynchronization, 3), 1);
+      assert.equal(Atomics.load(observedSynchronization, 4), 1);
       assert.deepEqual(results.map((result) => result.outcome).sort(), ["CREATED", "EXISTING"]);
       assert.equal(
         (inspection.db.prepare("SELECT COUNT(*) AS count FROM strategy_pilot_deployments").get() as { count: number }).count,
