@@ -81,8 +81,12 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
     input: CreateCandidatePilotDeploymentInput,
   ): Promise<CandidatePilotDeploymentInitializationResult> {
     const deployment = this.validateInitialDeployment(input);
-    if (deployment.phase !== "PENDING_FLAT") {
-      throw new Error("Candidate pilot deployment initialization requires PENDING_FLAT phase.");
+    if (
+      deployment.phase !== "PENDING_FLAT" ||
+      deployment.activationAt !== null ||
+      deployment.activationEpochNs !== null
+    ) {
+      throw new Error("Candidate pilot deployment initialization requires PENDING_FLAT without activation authority.");
     }
     return this.serializeInitialization(async () => {
       const existingById = this.deployments.get(deployment.id);

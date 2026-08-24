@@ -66,26 +66,32 @@ test("two sqlite candidate pilot connections initialize one deployment and prese
     END;
   `);
   setup.close();
-  const startBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
-  const lockHoldCounter = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const synchronization = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3);
   const input = initialDeploymentInput("candidate-bootstrap-concurrency");
   try {
-    const results = await Promise.all([
-      runCandidateBootstrapWorker({ databasePath, input, startBarrier, lockHoldCounter }),
-      runCandidateBootstrapWorker({ databasePath, input, startBarrier, lockHoldCounter }),
-    ]);
+    const workers = [
+      startCandidateBootstrapWorker({ databasePath, input, role: "HOLDER", synchronization }),
+      startCandidateBootstrapWorker({ databasePath, input, role: "CONTENDER", synchronization }),
+    ];
+    const results = await awaitCandidateBootstrapWorkers(workers);
+    const [holderResult, contenderResult] = results;
+    assert.ok(holderResult);
+    assert.ok(contenderResult);
     const inspection = openSqliteDatabase(databasePath);
     try {
-      assert.equal(Atomics.load(new Int32Array(lockHoldCounter), 0), 1);
+      const observedSynchronization = new Int32Array(synchronization);
+      assert.equal(Atomics.load(observedSynchronization, 0), 1);
+      assert.equal(Atomics.load(observedSynchronization, 1), 1);
+      assert.equal(Atomics.load(observedSynchronization, 2), 1);
       assert.deepEqual(results.map((result) => result.outcome).sort(), ["CREATED", "EXISTING"]);
       assert.equal(
         (inspection.db.prepare("SELECT COUNT(*) AS count FROM strategy_pilot_deployments").get() as { count: number }).count,
         1,
       );
-      assert.deepEqual(results[0].deployment, results[1].deployment);
-      assert.deepEqual(results[0].exactState, results[1].exactState);
-      assert.deepEqual(results[0].evidenceRecords, results[1].evidenceRecords);
-      assert.deepEqual(results[0].auditEvents, results[1].auditEvents);
+      assert.deepEqual(holderResult.deployment, contenderResult.deployment);
+      assert.deepEqual(holderResult.exactState, contenderResult.exactState);
+      assert.deepEqual(holderResult.evidenceRecords, contenderResult.evidenceRecords);
+      assert.deepEqual(holderResult.auditEvents, contenderResult.auditEvents);
       assertDatabaseIntegrity(inspection.db);
     } finally {
       inspection.close();
@@ -95,20 +101,25 @@ test("two sqlite candidate pilot connections initialize one deployment and prese
   }
 });
 
-function runCandidateBootstrapWorker(input: {
+interface StartedCandidateBootstrapWorker {
+  worker: Worker;
+  result: Promise<CandidatePilotDeploymentInitializationResult>;
+}
+
+function startCandidateBootstrapWorker(input: {
   databasePath: string;
   input: ReturnType<typeof initialDeploymentInput>;
-  startBarrier: SharedArrayBuffer;
-  lockHoldCounter: SharedArrayBuffer;
-}): Promise<CandidatePilotDeploymentInitializationResult> {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(
-      new URL("./fixtures/candidate-pilot-bootstrap-worker.js", import.meta.url),
-      {
-        workerData: input,
-        execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")),
-      },
-    );
+  role: "HOLDER" | "CONTENDER";
+  synchronization: SharedArrayBuffer;
+}): StartedCandidateBootstrapWorker {
+  const worker = new Worker(
+    new URL("./fixtures/candidate-pilot-bootstrap-worker.js", import.meta.url),
+    {
+      workerData: input,
+      execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")),
+    },
+  );
+  const result = new Promise<CandidatePilotDeploymentInitializationResult>((resolve, reject) => {
     let result: CandidatePilotDeploymentInitializationResult | null = null;
     let failure: Error | null = null;
     worker.once("message", (message: Readonly<{
@@ -137,6 +148,27 @@ function runCandidateBootstrapWorker(input: {
       }
     });
   });
+  return { worker, result };
+}
+
+async function awaitCandidateBootstrapWorkers(
+  workers: readonly StartedCandidateBootstrapWorker[],
+): Promise<CandidatePilotDeploymentInitializationResult[]> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.all(workers.map(({ result }) => result)),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error("Timed out waiting for candidate bootstrap contention workers.")),
+          10_000,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    await Promise.allSettled(workers.map(({ worker }) => worker.terminate()));
+  }
 }
 
 test("sqlite candidate bootstrap rolls back every partial row when initial state persistence fails", async () => {

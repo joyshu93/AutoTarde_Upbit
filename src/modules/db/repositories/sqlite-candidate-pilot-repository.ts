@@ -175,8 +175,12 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
     input: CreateCandidatePilotDeploymentInput,
   ): Promise<CandidatePilotDeploymentInitializationResult> {
     const bootstrap = prepareInitialDeployment(input);
-    if (bootstrap.deployment.phase !== "PENDING_FLAT") {
-      throw new Error("Candidate pilot deployment initialization requires PENDING_FLAT phase.");
+    if (
+      bootstrap.deployment.phase !== "PENDING_FLAT" ||
+      bootstrap.deployment.activationAt !== null ||
+      bootstrap.deployment.activationEpochNs !== null
+    ) {
+      throw new Error("Candidate pilot deployment initialization requires PENDING_FLAT without activation authority.");
     }
     return withImmediateTransaction(this.db, () => {
       const existing = selectBootstrapExistingDeploymentRow(this.db, bootstrap.deployment);

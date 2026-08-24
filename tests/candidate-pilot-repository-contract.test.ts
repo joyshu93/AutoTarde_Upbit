@@ -82,6 +82,19 @@ export async function verifyAtomicDeploymentInitializationContract(
   const repository = await create();
   const input = initialDeploymentInput("deployment-atomic-bootstrap");
 
+  const activatedPendingInput = initialDeploymentInput("deployment-activated-pending-bootstrap");
+  const forbiddenActivationAt = "2026-08-21T00:00:00.000000001Z";
+  activatedPendingInput.deployment.activationAt = forbiddenActivationAt;
+  activatedPendingInput.deployment.activationEpochNs = parsePositionGuardCandidateTimestamp(
+    forbiddenActivationAt,
+    "forbidden pending bootstrap activation",
+  );
+  await assert.rejects(
+    () => repository.initializeDeploymentWithInitialState(activatedPendingInput),
+    /without activation|activation.*null/i,
+  );
+  assert.equal(await repository.getDeployment(activatedPendingInput.deployment.id), null);
+
   const created = await repository.initializeDeploymentWithInitialState(input);
   assert.equal(created.outcome, "CREATED");
   assert.deepEqual(created.deployment, input.deployment);
