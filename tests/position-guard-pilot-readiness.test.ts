@@ -5,8 +5,11 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import type { PositionGuardPolicySelection } from "../src/domain/pilot-types.js";
-import { candidateEvidenceMaterial } from "../src/modules/db/pilot-interfaces.js";
+import type { CandidateExecutionBindingRecord, PositionGuardPolicySelection } from "../src/domain/pilot-types.js";
+import {
+  candidateEvidenceMaterial,
+  candidateExecutionBindingMaterialHash,
+} from "../src/modules/db/pilot-interfaces.js";
 import { openSqliteDatabase } from "../src/modules/db/repositories/sqlite-database.js";
 import {
   formatPositionGuardPilotReadiness,
@@ -117,6 +120,34 @@ test("pre-0017 database fails closed with a stable schema check", async () => {
     assert.equal(report.status, "BLOCK");
     assert.equal(check(report, "required_schema").status, "BLOCK");
     assert.match(check(report, "required_schema").detail, /strategy_pilot_deployments/u);
+  });
+});
+
+test("candidate readiness requires the immutable execution binding table", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE");
+    seedHealth(db);
+    db.exec("DROP TABLE strategy_candidate_execution_bindings");
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+
+    assert.equal(report.status, "BLOCK");
+    assert.equal(check(report, "required_schema").status, "BLOCK");
+    assert.match(check(report, "required_schema").detail, /strategy_candidate_execution_bindings/u);
+  });
+});
+
+test("candidate readiness requires append-only execution binding authority", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE");
+    seedHealth(db);
+    db.exec("DROP TRIGGER strategy_candidate_execution_bindings_no_update");
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+
+    assert.equal(report.status, "BLOCK");
+    assert.equal(check(report, "required_schema").status, "BLOCK");
+    assert.match(check(report, "required_schema").detail, /binding trigger/u);
   });
 });
 
@@ -567,6 +598,57 @@ test("rollback completion cannot precede later exact state authority", async () 
   });
 });
 
+test("terminal candidate evidence requires its canonical source order and immutable binding", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE", { audit: "LIFECYCLE_ONLY" });
+    seedHealth(db);
+    seedTerminalEvidenceState(db, "missing-source-order");
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+
+    assert.equal(check(report, "state_replay").status, "PASS");
+    assert.equal(check(report, "audit_chain").status, "PASS");
+    assert.equal(check(report, "evidence_source_provenance").status, "BLOCK");
+    assert.match(check(report, "evidence_source_provenance").detail, /source order|binding/u);
+    assert.equal(report.status, "BLOCK");
+  });
+});
+
+test("terminal candidate evidence accepts one exact source order and binding chain", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE", { audit: "LIFECYCLE_ONLY" });
+    seedHealth(db);
+    seedTerminalEvidenceState(db, "valid-source-order");
+    seedTerminalEvidenceSource(db, "valid-source-order", "VALID");
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+
+    assert.equal(check(report, "state_replay").status, "PASS");
+    assert.equal(check(report, "evidence_source_provenance").status, "PASS");
+    assert.equal(check(report, "audit_chain").status, "PASS");
+    assert.equal(report.status, "PASS");
+  });
+});
+
+test("terminal candidate evidence rejects foreign or conflicting source authority", async () => {
+  for (const mutation of ["FOREIGN_BINDING", "ORDER_MATERIAL", "BINDING_HASH", "TERMINAL_STATUS"] as const) {
+    await withMigratedFixture(async ({ databasePath, db }) => {
+      seedDeployment(db, "ACTIVE", { audit: "LIFECYCLE_ONLY" });
+      seedHealth(db);
+      const orderId = `invalid-source-${mutation.toLowerCase()}`;
+      seedTerminalEvidenceState(db, orderId);
+      seedTerminalEvidenceSource(db, orderId, mutation);
+
+      const report = inspectPositionGuardPilotReadiness(options(databasePath));
+
+      assert.equal(check(report, "state_replay").status, "PASS", mutation);
+      assert.equal(check(report, "evidence_source_provenance").status, "BLOCK", mutation);
+      assert.match(check(report, "evidence_source_provenance").detail, /binding|source|conflict|material/u, mutation);
+      assert.equal(report.status, "BLOCK", mutation);
+    });
+  }
+});
+
 test("active and uncertain account orders fail closed independently", async () => {
   await withMigratedFixture(async ({ databasePath, db }) => {
     seedDeployment(db, "ACTIVE");
@@ -580,6 +662,31 @@ test("active and uncertain account orders fail closed independently", async () =
     assert.equal(report.orderState.uncertainCount, 1);
     assert.equal(check(report, "active_orders").status, "BLOCK");
     assert.equal(check(report, "uncertain_orders").status, "BLOCK");
+  });
+});
+
+test("readiness reports unresolved potentially-dispatched FAILED and REJECTED orders", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE");
+    seedHealth(db);
+    for (const status of ["FAILED", "REJECTED"] as const) {
+      const id = `unresolved-${status.toLowerCase()}`;
+      seedOrder(db, id, status);
+      db.prepare("UPDATE orders SET failure_code = ? WHERE id = ?")
+        .run("SUBMISSION_RESPONSE_UNCERTAIN", id);
+      db.prepare(`
+        INSERT INTO order_events (id, order_id, event_type, event_source, payload_json, created_at)
+        VALUES (?, ?, 'RECONCILIATION_RECOVERY_REQUIRED', 'EXCHANGE', '{}', ?)
+      `).run(`${id}-uncertain-event`, id, CHECKED_AT);
+    }
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+    const orderState = report.orderState;
+
+    assert.equal(report.status, "BLOCK");
+    assert.deepEqual(orderState.blockingOrders.map((order) => order.id), ["unresolved-failed", "unresolved-rejected"]);
+    assert.ok(orderState.blockingOrders.every((order) => order.reason.length > 0));
+    assert.equal(check(report, "active_orders").status, "BLOCK");
   });
 });
 
@@ -1106,6 +1213,135 @@ function seedExactEvidence(
     materialHash: material.hash,
     materialVersion: material.materialVersion,
   });
+}
+
+function seedTerminalEvidenceState(db: DatabaseSync, orderId: string): void {
+  const evidence = seedExactEvidence(db, {
+    evidenceId: `terminal-order:${orderId}`,
+    executedAt: "2026-08-24T00:10:00.000Z",
+    action: "ENTER",
+    entryPath: "PULLBACK",
+    terminalStatus: "FILLED",
+    executedQuantity: "0.001",
+    grossQuoteValueKrw: "100000",
+    confirmedFeeKrw: "50",
+    remainingQuantity: "0.001",
+  });
+  db.prepare(`
+    UPDATE strategy_candidate_states
+    SET current_episode_cost_basis_krw = 100050,
+        current_episode_inventory_quantity = 0.001,
+        last_entry_path = 'PULLBACK', last_evidence_at = ?, last_evidence_id = ?,
+        state_version = 1, updated_at = ?,
+        current_episode_cost_basis_krw_exact = '100050',
+        current_episode_inventory_quantity_exact = '0.001'
+    WHERE deployment_id = ?
+  `).run(
+    evidence.evidence.executedAt,
+    evidence.evidence.evidenceId,
+    evidence.evidence.executedAt,
+    IDENTITY.deploymentId,
+  );
+  seedAudit(db, {
+    id: `${IDENTITY.deploymentId}:evidence:${evidence.evidence.evidenceId}`,
+    eventType: "STATE_ADVANCED",
+    fromPhase: "ACTIVE",
+    toPhase: "ACTIVE",
+    stateVersion: 1,
+    payloadJson: JSON.stringify({
+      evidenceId: evidence.evidence.evidenceId,
+      materialHash: evidence.materialHash,
+      materialVersion: evidence.materialVersion,
+      fromStateVersion: 0,
+      toStateVersion: 1,
+    }),
+    createdAt: evidence.evidence.executedAt,
+  });
+}
+
+function seedTerminalEvidenceSource(
+  db: DatabaseSync,
+  orderId: string,
+  mutation: "VALID" | "FOREIGN_BINDING" | "ORDER_MATERIAL" | "BINDING_HASH" | "TERMINAL_STATUS",
+): void {
+  const activationAt = "2026-08-23T23:59:30.000Z";
+  const activationEpochNs = BigInt(epochMs(activationAt)) * 1_000_000n;
+  const bindingCreatedAt = "2026-08-24T00:09:59.999999999Z";
+  const requestedAt = "2026-08-24T00:10:00.000000000Z";
+  const decisionId = `${orderId}-decision`;
+  db.prepare(`
+    INSERT INTO strategy_decisions (
+      id, exchange_account_id, strategy_key, market, action, status, decision_basis_json,
+      intended_notional_krw, intended_quantity, reference_price, created_at
+    ) VALUES (?, 'primary', 'position_guard.paper_core.v1', 'KRW-BTC', 'ENTER', 'READY',
+      ?, '100000', '0.001', '100000000', ?)
+  `).run(decisionId, JSON.stringify({ entryPath: "PULLBACK" }), activationAt);
+  db.prepare(`
+    INSERT INTO orders (
+      id, strategy_decision_id, exchange_account_id, market, side, ord_type, volume,
+      price, time_in_force, smp_type, identifier, idempotency_key, origin, requested_at,
+      upbit_uuid, status, execution_mode, exchange_response_json, failure_code,
+      failure_message, created_at, updated_at
+    ) VALUES (?, ?, 'primary', 'KRW-BTC', 'bid', 'price', NULL, '100000', NULL, NULL,
+      ?, ?, 'STRATEGY', ?, ?, ?, 'LIVE', '{}', NULL, NULL, ?, '2026-08-24T00:10:00.000Z')
+  `).run(
+    orderId,
+    decisionId,
+    `${orderId}-identifier`,
+    `${orderId}-idempotency`,
+    requestedAt,
+    `${orderId}-upbit-uuid`,
+    mutation === "TERMINAL_STATUS" ? "CANCELED" : "FILLED",
+    requestedAt,
+  );
+
+  const material: CandidateExecutionBindingRecord = {
+    id: `${orderId}-binding`,
+    deploymentId: mutation === "FOREIGN_BINDING" ? "foreign-deployment" : IDENTITY.deploymentId,
+    strategyDecisionId: decisionId,
+    orderId,
+    exchangeAccountId: "primary",
+    activationAt,
+    activationEpochNs,
+    market: "KRW-BTC",
+    strategyKey: "position_guard.paper_core.v1",
+    policyId: "COMBINED_CONSERVATIVE",
+    policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+    executionMode: "LIVE",
+    ordType: "price",
+    action: "ENTER",
+    side: "bid",
+    intendedQuantity: "0.001",
+    intendedNotionalKrw: "100000",
+    boundPrice: mutation === "ORDER_MATERIAL" ? "99999" : "100000",
+    boundVolume: null,
+    boundTimeInForce: null,
+    boundSmpType: null,
+    materialVersion: "BINDING_V2",
+    orderMaterialHash: "",
+    createdAt: bindingCreatedAt,
+  };
+  material.orderMaterialHash = candidateExecutionBindingMaterialHash(material);
+  if (mutation === "BINDING_HASH") material.orderMaterialHash = "0".repeat(64);
+  if (mutation === "FOREIGN_BINDING") db.exec("PRAGMA foreign_keys = OFF");
+  db.prepare(`
+    INSERT INTO strategy_candidate_execution_bindings (
+      id, deployment_id, strategy_decision_id, order_id, exchange_account_id,
+      activation_at, activation_epoch_ns, market, strategy_key, policy_id, policy_version,
+      execution_mode, ord_type, action, side, intended_quantity_exact,
+      intended_notional_krw_exact, bound_price_exact, bound_volume_exact,
+      bound_time_in_force, bound_smp_type, material_version, order_material_hash, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    material.id, material.deploymentId, material.strategyDecisionId, material.orderId,
+    material.exchangeAccountId, material.activationAt, material.activationEpochNs,
+    material.market, material.strategyKey, material.policyId, material.policyVersion,
+    material.executionMode, material.ordType, material.action, material.side,
+    material.intendedQuantity, material.intendedNotionalKrw, material.boundPrice,
+    material.boundVolume, material.boundTimeInForce, material.boundSmpType,
+    material.materialVersion, material.orderMaterialHash, material.createdAt,
+  );
+  if (mutation === "FOREIGN_BINDING") db.exec("PRAGMA foreign_keys = ON");
 }
 
 function seedHealth(db: DatabaseSync): void {

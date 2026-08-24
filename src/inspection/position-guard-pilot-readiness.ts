@@ -4,12 +4,18 @@ import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 
 import type {
+  CandidateExecutionBindingRecord,
   PositionGuardPilotAbandonmentValidation,
   PositionGuardPilotAuditEventRecord,
   PositionGuardPilotDeploymentRecord,
   PositionGuardPilotPhase,
   PositionGuardPolicySelection,
 } from "../domain/pilot-types.js";
+import {
+  classifySubmissionBlockingOrder,
+  SUBMISSION_BLOCKING_CANDIDATE_STATUSES,
+  type SubmissionBlockingReasonCode,
+} from "../domain/submission-blocking-order.js";
 import {
   parsePositionGuardPolicySelection,
 } from "../app/position-guard-pilot-config.js";
@@ -19,10 +25,12 @@ import {
 import {
   candidateEvidenceMaterial,
   parseCandidatePilotTimestamp,
+  validateCandidateExecutionBinding,
   validateCandidatePilotDeployment,
   type CandidatePilotRecoveryIdentity,
 } from "../modules/db/pilot-interfaces.js";
 import type { PositionGuardCandidateExecutionEvidence } from "../modules/strategy/position-guard-candidate-state.js";
+import type { OrderLifecycleStatus } from "../domain/types.js";
 
 export type PositionGuardPilotReadinessFormat = "TEXT" | "JSON";
 export type PositionGuardPilotReadinessStatus = "PASS" | "WARN" | "BLOCK";
@@ -106,6 +114,12 @@ export interface PositionGuardPilotReadinessReport {
     uncertainCount: number;
     activeStatuses: readonly string[];
     uncertainStatuses: readonly string[];
+    blockingOrders: readonly Readonly<{
+      id: string;
+      status: string;
+      reasonCode: SubmissionBlockingReasonCode;
+      reason: string;
+    }>[];
   }>;
   health: Readonly<{
     balance: HealthEvidence | null;
@@ -204,6 +218,14 @@ const REQUIRED_SCHEMA: Readonly<Record<string, readonly string[]>> = Object.free
     "executed_quantity_exact", "gross_quote_value_krw_exact", "confirmed_fee_krw_exact",
     "remaining_quantity_exact",
   ],
+  strategy_candidate_execution_bindings: [
+    "id", "deployment_id", "strategy_decision_id", "order_id", "exchange_account_id",
+    "activation_at", "activation_epoch_ns", "market", "strategy_key", "policy_id",
+    "policy_version", "execution_mode", "ord_type", "action", "side",
+    "intended_quantity_exact", "intended_notional_krw_exact", "bound_price_exact",
+    "bound_volume_exact", "bound_time_in_force", "bound_smp_type", "material_version",
+    "order_material_hash", "created_at",
+  ],
   strategy_candidate_states: [
     "deployment_id", "current_episode_add_count", "last_full_exit_at", "last_entry_path",
     "last_evidence_at", "last_evidence_id", "state_version", "updated_at", "material_version",
@@ -217,7 +239,16 @@ const REQUIRED_SCHEMA: Readonly<Record<string, readonly string[]>> = Object.free
   account_execution_leases: [
     "exchange_account_id", "owner_token", "purpose", "acquired_at_epoch_ms", "expires_at_epoch_ms",
   ],
-  orders: ["id", "exchange_account_id", "status", "requested_at", "created_at", "updated_at"],
+  orders: [
+    "id", "exchange_account_id", "status", "requested_at", "created_at", "updated_at",
+    "strategy_decision_id", "market", "side", "ord_type", "volume", "price",
+    "time_in_force", "smp_type", "origin", "execution_mode", "upbit_uuid",
+    "exchange_response_json", "failure_code",
+  ],
+  order_events: ["id", "order_id", "event_type", "event_source", "created_at"],
+  order_submission_recovery_observations: [
+    "id", "order_id", "outcome", "observed_at_epoch_ms",
+  ],
   balance_snapshots: ["id", "exchange_account_id", "captured_at", "source", "total_krw_value", "balances_json"],
   position_snapshots: ["id", "exchange_account_id", "captured_at", "source", "positions_json"],
   reconciliation_runs: [
@@ -226,11 +257,9 @@ const REQUIRED_SCHEMA: Readonly<Record<string, readonly string[]>> = Object.free
   _schema_migrations: ["filename", "applied_at"],
 });
 
-const ACTIVE_ORDER_STATUSES = Object.freeze([
-  "INTENT_CREATED", "PERSISTED", "SUBMITTING", "OPEN", "PARTIALLY_FILLED",
-  "CANCEL_REQUESTED", "RECONCILIATION_REQUIRED",
+const UNCERTAIN_ORDER_STATUSES = Object.freeze([
+  "SUBMITTING", "RECONCILIATION_REQUIRED", "FAILED", "REJECTED",
 ] as const);
-const UNCERTAIN_ORDER_STATUSES = Object.freeze(["SUBMITTING", "RECONCILIATION_REQUIRED"] as const);
 const REVIEWED_NON_BLOCKING_RECONCILIATION_CODES = new Set([
   "ORDER_STATUS_RECONCILED", "ORDER_FILLS_BACKFILLED", "TERMINAL_ORDER_RECHECKED",
   "ORDER_IDENTIFIER_RECOVERED", "ORDER_SUBMISSION_ABSENCE_CONFIRMED",
@@ -270,6 +299,10 @@ const RECOVERY_FAULT_REASONS = new Set([
 const REQUIRED_AUDIT_IMMUTABILITY_TRIGGERS = Object.freeze({
   strategy_pilot_audit_events_no_update: /^\s*CREATE\s+TRIGGER\s+strategy_pilot_audit_events_no_update\s+BEFORE\s+UPDATE\s+ON\s+strategy_pilot_audit_events\s+BEGIN\s+SELECT\s+RAISE\s*\(\s*ABORT\s*,\s*'strategy pilot audit events are append-only'\s*\)\s*;\s*END\s*;?\s*$/iu,
   strategy_pilot_audit_events_no_delete: /^\s*CREATE\s+TRIGGER\s+strategy_pilot_audit_events_no_delete\s+BEFORE\s+DELETE\s+ON\s+strategy_pilot_audit_events\s+BEGIN\s+SELECT\s+RAISE\s*\(\s*ABORT\s*,\s*'strategy pilot audit events are append-only'\s*\)\s*;\s*END\s*;?\s*$/iu,
+});
+const REQUIRED_BINDING_IMMUTABILITY_TRIGGERS = Object.freeze({
+  strategy_candidate_execution_bindings_no_update: /^\s*CREATE\s+TRIGGER\s+strategy_candidate_execution_bindings_no_update\s+BEFORE\s+UPDATE\s+ON\s+strategy_candidate_execution_bindings\s+BEGIN\s+SELECT\s+RAISE\s*\(\s*ABORT\s*,\s*'strategy candidate execution bindings are append-only'\s*\)\s*;\s*END\s*;?\s*$/iu,
+  strategy_candidate_execution_bindings_no_delete: /^\s*CREATE\s+TRIGGER\s+strategy_candidate_execution_bindings_no_delete\s+BEFORE\s+DELETE\s+ON\s+strategy_candidate_execution_bindings\s+BEGIN\s+SELECT\s+RAISE\s*\(\s*ABORT\s*,\s*'strategy candidate execution bindings are append-only'\s*\)\s*;\s*END\s*;?\s*$/iu,
 });
 
 export function inspectPositionGuardPilotReadiness(
@@ -402,6 +435,7 @@ export function formatPositionGuardPilotReadiness(
     `last_evidence_at: ${report.stateProvenance?.lastEvidenceAt ?? "none"}`,
     `active_orders: ${report.orderState.activeCount}`,
     `uncertain_orders: ${report.orderState.uncertainCount}`,
+    `blocking_order_ids: ${report.orderState.blockingOrders.map((order) => order.id).join(",") || "none"}`,
     `lease: ${report.leaseState.classification}`,
     `eth_policy: ${report.ethPolicy}`,
     "checks:",
@@ -624,6 +658,15 @@ function validateRequiredSchema(db: DatabaseSync): string | null {
       return `Required immutable append-only audit trigger ${name} is missing or malformed.`;
     }
   }
+  for (const [name, expectedSql] of Object.entries(REQUIRED_BINDING_IMMUTABILITY_TRIGGERS)) {
+    const trigger = db.prepare(`
+      SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?
+    `).get(name) as { tbl_name?: unknown; sql?: unknown } | undefined;
+    if (trigger?.tbl_name !== "strategy_candidate_execution_bindings" ||
+      typeof trigger.sql !== "string" || !expectedSql.test(trigger.sql)) {
+      return `Required immutable append-only candidate binding trigger ${name} is missing or malformed.`;
+    }
+  }
   return null;
 }
 
@@ -685,6 +728,11 @@ function inspectDeploymentAndReplay(
     });
     mutable.checks.push({ name: "pilot_phase", status: "WARN", detail: "No persisted pilot phase is available." });
     mutable.checks.push({ name: "state_replay", status: "WARN", detail: "No candidate state exists to replay." });
+    mutable.checks.push({
+      name: "evidence_source_provenance",
+      status: options.selection.kind === "BASELINE" ? "WARN" : "BLOCK",
+      detail: "No candidate deployment exists for terminal evidence provenance validation.",
+    });
     return;
   }
   if (rows.length !== 1) {
@@ -695,6 +743,11 @@ function inspectDeploymentAndReplay(
     });
     mutable.checks.push({ name: "pilot_phase", status: "BLOCK", detail: "Pilot phase is ambiguous." });
     mutable.checks.push({ name: "state_replay", status: "BLOCK", detail: "Candidate state replay is ambiguous." });
+    mutable.checks.push({
+      name: "evidence_source_provenance",
+      status: "BLOCK",
+      detail: "Candidate terminal evidence provenance is ambiguous.",
+    });
     return;
   }
 
@@ -736,7 +789,7 @@ function inspectDeploymentAndReplay(
   const phaseCheck = classifyPhase(deployment.phase, options.selection.kind);
   mutable.checks.push(phaseCheck);
   try {
-    const replay = inspectReplay(db, deployment.id, mutable);
+    const replay = inspectReplay(db, deployment, mutable);
     if (replay === null) {
       mutable.checks.push({
         name: "audit_chain",
@@ -761,10 +814,22 @@ function inspectDeploymentAndReplay(
         detail: `Pilot audit authority is invalid: ${formatError(error)}`,
       });
     }
+    if (!mutable.checks.some((item) => item.name === "evidence_source_provenance")) {
+      mutable.checks.push({
+        name: "evidence_source_provenance",
+        status: "BLOCK",
+        detail: `Candidate terminal evidence provenance is invalid: ${formatError(error)}`,
+      });
+    }
   }
 }
 
-function inspectReplay(db: DatabaseSync, deploymentId: string, mutable: MutableInspection): ReplayAuthority | null {
+function inspectReplay(
+  db: DatabaseSync,
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  mutable: MutableInspection,
+): ReplayAuthority | null {
+  const deploymentId = deployment.id;
   const stateRow = db.prepare(`
     SELECT deployment_id, current_episode_add_count, last_full_exit_at,
       last_full_exit_realized_pnl_krw_exact, last_entry_path, last_evidence_at,
@@ -775,6 +840,11 @@ function inspectReplay(db: DatabaseSync, deploymentId: string, mutable: MutableI
   `).get(deploymentId) as StateRow | undefined;
   if (stateRow === undefined) {
     mutable.checks.push({ name: "state_replay", status: "BLOCK", detail: "Persisted exact candidate state is missing." });
+    mutable.checks.push({
+      name: "evidence_source_provenance",
+      status: "BLOCK",
+      detail: "Terminal evidence provenance cannot be validated without persisted exact candidate state.",
+    });
     return null;
   }
   const persisted = exactStateFromRow(stateRow);
@@ -789,6 +859,20 @@ function inspectReplay(db: DatabaseSync, deploymentId: string, mutable: MutableI
   evidenceStatement.setReadBigInts(true);
   const evidenceRows = evidenceStatement.all(deploymentId) as EvidenceRow[];
   const evidence = evidenceRows.map((row) => evidenceFromRow(row, deploymentId));
+  try {
+    validateTerminalEvidenceSources(db, deployment, evidence);
+    mutable.checks.push({
+      name: "evidence_source_provenance",
+      status: "PASS",
+      detail: `${evidence.length} terminal evidence record(s) match their immutable source orders and bindings.`,
+    });
+  } catch (error) {
+    mutable.checks.push({
+      name: "evidence_source_provenance",
+      status: "BLOCK",
+      detail: `Candidate terminal evidence source provenance is invalid: ${formatError(error)}`,
+    });
+  }
   mutable.stateProvenance = Object.freeze({
     materialVersion: requireString(stateRow.material_version, "candidate state materialVersion"),
     stateVersion: persisted.stateVersion,
@@ -816,6 +900,142 @@ function inspectReplay(db: DatabaseSync, deploymentId: string, mutable: MutableI
       : "Exact persisted candidate state, evidence material, or deterministic replay does not match.",
   });
   return Object.freeze({ state: persisted, evidence: Object.freeze(evidence) });
+}
+
+function validateTerminalEvidenceSources(
+  db: DatabaseSync,
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  evidenceRecords: readonly ValidatedEvidenceRecord[],
+): void {
+  for (const record of evidenceRecords) {
+    const prefix = "terminal-order:";
+    if (!record.evidence.evidenceId.startsWith(prefix)) {
+      throw new Error(`Evidence ${record.evidence.evidenceId} has no canonical source-order identity.`);
+    }
+    const orderId = record.evidence.evidenceId.slice(prefix.length);
+    if (orderId.length === 0 || record.evidence.evidenceId !== `${prefix}${orderId}`) {
+      throw new Error(`Evidence ${record.evidence.evidenceId} has an invalid source-order identity.`);
+    }
+
+    const order = db.prepare(`
+      SELECT id, strategy_decision_id, exchange_account_id, market, side, ord_type,
+        volume, price, time_in_force, smp_type, origin, requested_at, status,
+        execution_mode, created_at, updated_at
+      FROM orders WHERE id = ?
+    `).get(orderId) as EvidenceSourceOrderRow | undefined;
+    if (!order) throw new Error(`Evidence ${record.evidence.evidenceId} source order is missing.`);
+
+    const bindingStatement = db.prepare(`
+      SELECT id, deployment_id, strategy_decision_id, order_id, exchange_account_id,
+        activation_at, activation_epoch_ns, market, strategy_key, policy_id, policy_version,
+        execution_mode, ord_type, action, side, intended_quantity_exact,
+        intended_notional_krw_exact, bound_price_exact, bound_volume_exact,
+        bound_time_in_force, bound_smp_type, material_version, order_material_hash, created_at
+      FROM strategy_candidate_execution_bindings WHERE order_id = ?
+    `);
+    bindingStatement.setReadBigInts(true);
+    const bindingRow = bindingStatement.get(orderId) as ReadinessBindingRow | undefined;
+    if (!bindingRow) throw new Error(`Evidence ${record.evidence.evidenceId} source binding is missing.`);
+    const binding = bindingFromReadinessRow(bindingRow);
+
+    const orderStatus = requireOrderLifecycleStatus(order.status);
+    const strategyDecisionId = nullableString(order.strategy_decision_id, "evidence source strategyDecisionId");
+    const requestedAt = requireString(order.requested_at, "evidence source order requestedAt");
+    const createdAt = requireString(order.created_at, "evidence source order createdAt");
+    const updatedAt = requireString(order.updated_at, "evidence source order updatedAt");
+    const requestedEpoch = parseCandidatePilotTimestamp(requestedAt, "evidence source order requestedAt");
+    parseCandidatePilotTimestamp(createdAt, "evidence source order createdAt");
+    parseCandidatePilotTimestamp(updatedAt, "evidence source order updatedAt");
+    const evidenceEpoch = parseCandidatePilotTimestamp(
+      record.evidence.executedAt,
+      "candidate evidence executedAt",
+    );
+    const bindingEpoch = parseCandidatePilotTimestamp(binding.createdAt, "candidate binding createdAt");
+
+    if (
+      requireString(order.id, "evidence source order id") !== orderId ||
+      strategyDecisionId === null ||
+      strategyDecisionId !== binding.strategyDecisionId ||
+      requireString(order.exchange_account_id, "evidence source account") !== deployment.exchangeAccountId ||
+      binding.exchangeAccountId !== deployment.exchangeAccountId ||
+      binding.deploymentId !== deployment.id ||
+      binding.market !== deployment.market ||
+      binding.policyId !== deployment.policyId ||
+      binding.policyVersion !== deployment.policyVersion ||
+      deployment.activationAt === null ||
+      deployment.activationEpochNs === null ||
+      binding.activationAt !== deployment.activationAt ||
+      binding.activationEpochNs !== deployment.activationEpochNs ||
+      binding.orderId !== orderId ||
+      requireString(order.market, "evidence source market") !== binding.market ||
+      requireString(order.execution_mode, "evidence source executionMode") !== binding.executionMode ||
+      requireString(order.ord_type, "evidence source ordType") !== binding.ordType ||
+      requireString(order.side, "evidence source side") !== binding.side ||
+      nullableString(order.price, "evidence source price") !== binding.boundPrice ||
+      nullableString(order.volume, "evidence source volume") !== binding.boundVolume ||
+      nullableString(order.time_in_force, "evidence source timeInForce") !== binding.boundTimeInForce ||
+      nullableString(order.smp_type, "evidence source smpType") !== binding.boundSmpType ||
+      requireString(order.origin, "evidence source origin") !== "STRATEGY" ||
+      (orderStatus !== "FILLED" && orderStatus !== "CANCELED") ||
+      orderStatus !== record.evidence.terminalStatus ||
+      binding.action !== record.evidence.action ||
+      createdAt !== requestedAt ||
+      bindingEpoch + 1n !== requestedEpoch ||
+      evidenceEpoch < requestedEpoch
+    ) {
+      throw new Error(`Evidence ${record.evidence.evidenceId} conflicts with its source order or binding authority.`);
+    }
+  }
+}
+
+function bindingFromReadinessRow(row: ReadinessBindingRow): CandidateExecutionBindingRecord {
+  return validateCandidateExecutionBinding({
+    id: requireString(row.id, "candidate binding id"),
+    deploymentId: requireString(row.deployment_id, "candidate binding deploymentId"),
+    strategyDecisionId: requireString(row.strategy_decision_id, "candidate binding strategyDecisionId"),
+    orderId: requireString(row.order_id, "candidate binding orderId"),
+    exchangeAccountId: requireString(row.exchange_account_id, "candidate binding exchangeAccountId"),
+    activationAt: requireString(row.activation_at, "candidate binding activationAt"),
+    activationEpochNs: requireNonNegativeBigInt(row.activation_epoch_ns, "candidate binding activationEpochNs"),
+    market: requireString(row.market, "candidate binding market") as CandidateExecutionBindingRecord["market"],
+    strategyKey: requireString(
+      row.strategy_key,
+      "candidate binding strategyKey",
+    ) as CandidateExecutionBindingRecord["strategyKey"],
+    policyId: requireString(row.policy_id, "candidate binding policyId") as CandidateExecutionBindingRecord["policyId"],
+    policyVersion: requireString(
+      row.policy_version,
+      "candidate binding policyVersion",
+    ) as CandidateExecutionBindingRecord["policyVersion"],
+    executionMode: requireString(
+      row.execution_mode,
+      "candidate binding executionMode",
+    ) as CandidateExecutionBindingRecord["executionMode"],
+    ordType: requireString(row.ord_type, "candidate binding ordType") as CandidateExecutionBindingRecord["ordType"],
+    action: requireString(row.action, "candidate binding action") as CandidateExecutionBindingRecord["action"],
+    side: requireString(row.side, "candidate binding side") as CandidateExecutionBindingRecord["side"],
+    intendedQuantity: nullableString(row.intended_quantity_exact, "candidate binding intendedQuantity"),
+    intendedNotionalKrw: nullableString(
+      row.intended_notional_krw_exact,
+      "candidate binding intendedNotionalKrw",
+    ),
+    boundPrice: nullableString(row.bound_price_exact, "candidate binding boundPrice"),
+    boundVolume: nullableString(row.bound_volume_exact, "candidate binding boundVolume"),
+    boundTimeInForce: nullableString(
+      row.bound_time_in_force,
+      "candidate binding boundTimeInForce",
+    ) as CandidateExecutionBindingRecord["boundTimeInForce"],
+    boundSmpType: nullableString(
+      row.bound_smp_type,
+      "candidate binding boundSmpType",
+    ) as CandidateExecutionBindingRecord["boundSmpType"],
+    materialVersion: requireString(
+      row.material_version,
+      "candidate binding materialVersion",
+    ) as CandidateExecutionBindingRecord["materialVersion"],
+    orderMaterialHash: requireString(row.order_material_hash, "candidate binding orderMaterialHash"),
+    createdAt: requireString(row.created_at, "candidate binding createdAt"),
+  });
 }
 
 function inspectAuditChain(
@@ -1223,40 +1443,81 @@ function inspectOrders(
   options: PositionGuardPilotReadinessOptions,
   mutable: MutableInspection,
 ): void {
-  const placeholders = ACTIVE_ORDER_STATUSES.map(() => "?").join(", ");
+  const placeholders = SUBMISSION_BLOCKING_CANDIDATE_STATUSES.map(() => "?").join(", ");
   const rows = db.prepare(`
-    SELECT id, status, requested_at, created_at, updated_at FROM orders
+    SELECT id, status, requested_at, created_at, updated_at,
+      upbit_uuid, exchange_response_json, failure_code
+    FROM orders
     WHERE exchange_account_id = ? AND status IN (${placeholders})
     ORDER BY created_at ASC, id ASC
-  `).all(options.identity.exchangeAccountId, ...ACTIVE_ORDER_STATUSES) as OrderRow[];
+  `).all(options.identity.exchangeAccountId, ...SUBMISSION_BLOCKING_CANDIDATE_STATUSES) as OrderRow[];
   const activeStatuses: string[] = [];
   const uncertainStatuses: string[] = [];
+  const blockingOrders: Array<{
+    id: string;
+    status: string;
+    reasonCode: SubmissionBlockingReasonCode;
+    reason: string;
+  }> = [];
   for (const row of rows) {
-    requireString(row.id, "order id");
-    const status = requireString(row.status, "order status");
+    const id = requireString(row.id, "order id");
+    const status = requireOrderLifecycleStatus(row.status);
     parseCandidatePilotTimestamp(requireString(row.requested_at, "order requestedAt"), "order requestedAt");
     parseCandidatePilotTimestamp(requireString(row.created_at, "order createdAt"), "order createdAt");
     parseCandidatePilotTimestamp(requireString(row.updated_at, "order updatedAt"), "order updatedAt");
+    const classification = classifySubmissionBlockingOrder({
+      order: {
+        id,
+        status,
+        failureCode: nullableString(row.failure_code, "order failureCode"),
+        upbitUuid: nullableString(row.upbit_uuid, "order upbitUuid"),
+        exchangeResponseJson: nullableString(row.exchange_response_json, "order exchangeResponseJson"),
+      },
+      events: (db.prepare(`
+        SELECT event_type, event_source, created_at
+        FROM order_events WHERE order_id = ? ORDER BY created_at ASC, id ASC
+      `).all(id) as ReadinessOrderEventRow[]).map((event) => ({
+        eventType: requireString(event.event_type, "order event type"),
+        eventSource: requireOrderEventSource(event.event_source),
+        createdAt: requireString(event.created_at, "order event createdAt"),
+      })),
+      recoveryObservations: (db.prepare(`
+        SELECT outcome, observed_at_epoch_ms
+        FROM order_submission_recovery_observations
+        WHERE order_id = ? ORDER BY observed_at_epoch_ms ASC, id ASC
+      `).all(id) as ReadinessRecoveryObservationRow[]).map((observation) => ({
+        outcome: requireRecoveryOutcome(observation.outcome),
+        observedAtEpochMs: requireSafeNonNegativeInteger(
+          observation.observed_at_epoch_ms,
+          "order recovery observation epoch",
+        ),
+      })),
+    });
+    if (!classification.blocking) continue;
     activeStatuses.push(status);
     if ((UNCERTAIN_ORDER_STATUSES as readonly string[]).includes(status)) uncertainStatuses.push(status);
+    blockingOrders.push({ id, status, reasonCode: classification.reasonCode, reason: classification.reason });
   }
   mutable.orderState = Object.freeze({
-    activeCount: rows.length,
+    activeCount: blockingOrders.length,
     uncertainCount: uncertainStatuses.length,
     activeStatuses: Object.freeze(activeStatuses),
     uncertainStatuses: Object.freeze(uncertainStatuses),
+    blockingOrders: Object.freeze(blockingOrders.map((order) => Object.freeze(order))),
   });
   mutable.checks.push({
     name: "active_orders",
-    status: rows.length === 0 ? "PASS" : "BLOCK",
-    detail: rows.length === 0 ? "No active account order is persisted." : `${rows.length} active account order(s) require resolution.`,
+    status: blockingOrders.length === 0 ? "PASS" : "BLOCK",
+    detail: blockingOrders.length === 0
+      ? "No account-wide submission-blocking order is persisted."
+      : blockingOrders.map((order) => `${order.id}:${order.reasonCode}`).join(", "),
   });
   mutable.checks.push({
     name: "uncertain_orders",
     status: uncertainStatuses.length === 0 ? "PASS" : "BLOCK",
     detail: uncertainStatuses.length === 0
-      ? "No SUBMITTING or RECONCILIATION_REQUIRED account order is persisted."
-      : `${uncertainStatuses.length} uncertain account order(s) require reconciliation.`,
+      ? "No unresolved submission-uncertain account order is persisted."
+      : `${uncertainStatuses.length} unresolved submission-uncertain account order(s) require reconciliation.`,
   });
 }
 
@@ -1958,7 +2219,13 @@ function createMutableInspection(): MutableInspection {
     deployment: null,
     stateProvenance: null,
     evidenceProvenance: null,
-    orderState: Object.freeze({ activeCount: 0, uncertainCount: 0, activeStatuses: [], uncertainStatuses: [] }),
+    orderState: Object.freeze({
+      activeCount: 0,
+      uncertainCount: 0,
+      activeStatuses: [],
+      uncertainStatuses: [],
+      blockingOrders: [],
+    }),
     health: Object.freeze({ balance: null, position: null, reconciliation: null }),
     leaseState: Object.freeze({ classification: "ABSENT", purpose: null, acquiredAtEpochMs: null, expiresAtEpochMs: null }),
     sqliteSharedMemory: "UNCHANGED",
@@ -1969,7 +2236,8 @@ function createMutableInspection(): MutableInspection {
 function addUnavailableChecks(mutable: MutableInspection, reason: string): void {
   const existing = new Set(mutable.checks.map((item) => item.name));
   for (const name of [
-    "sqlite_snapshot", "required_schema", "pilot_deployment", "pilot_phase", "state_replay", "audit_chain", "active_orders",
+    "sqlite_snapshot", "required_schema", "pilot_deployment", "pilot_phase", "state_replay",
+    "evidence_source_provenance", "audit_chain", "active_orders",
     "uncertain_orders", "balance_snapshot", "position_snapshot", "latest_reconciliation", "execution_lease",
   ]) {
     if (!existing.has(name)) mutable.checks.push({ name, status: "BLOCK", detail: `Not evaluated because ${reason}.` });
@@ -2042,6 +2310,7 @@ function buildNextActions(checks: readonly PositionGuardPilotReadinessCheck[]): 
   if (phase?.detail.includes("PAUSED_FAULT")) actions.push("Investigate PAUSED_FAULT evidence and retain the pause until a separately governed recovery decision.");
   if (phase?.detail.includes("DRAINING")) actions.push("Complete rollback draining and reconciliation before candidate operation.");
   if (byName.get("state_replay")?.status === "BLOCK") actions.push("Investigate persisted candidate state/evidence replay mismatch without repairing the operational database here.");
+  if (byName.get("evidence_source_provenance")?.status === "BLOCK") actions.push("Investigate terminal candidate evidence source-order and immutable binding provenance before operation.");
   if (byName.get("active_orders")?.status === "BLOCK" || byName.get("uncertain_orders")?.status === "BLOCK") actions.push("Resolve active or uncertain orders through separately governed reconciliation before pilot operation.");
   if (["balance_snapshot", "position_snapshot", "latest_reconciliation"].some((name) => byName.get(name)?.status !== "PASS")) actions.push("Refresh and reconcile account health only through an explicitly approved runtime operation, then rerun read-only inspection.");
   if (byName.get("execution_lease")?.status !== "PASS") actions.push("Review persisted execution lease state before any order-capable process starts.");
@@ -2083,6 +2352,32 @@ function requireString(value: unknown, label: string): string {
   return value;
 }
 
+function requireOrderLifecycleStatus(value: unknown): OrderLifecycleStatus {
+  if (
+    value !== "INTENT_CREATED" && value !== "RISK_REJECTED" && value !== "PERSISTED" &&
+    value !== "SUBMITTING" && value !== "OPEN" && value !== "PARTIALLY_FILLED" &&
+    value !== "FILLED" && value !== "CANCEL_REQUESTED" && value !== "CANCELED" &&
+    value !== "REJECTED" && value !== "FAILED" && value !== "RECONCILIATION_REQUIRED"
+  ) {
+    throw new Error("Order lifecycle status is invalid.");
+  }
+  return value;
+}
+
+function requireOrderEventSource(value: unknown): "LOCAL" | "EXCHANGE" | "RECONCILIATION" | "TELEGRAM" {
+  if (value !== "LOCAL" && value !== "EXCHANGE" && value !== "RECONCILIATION" && value !== "TELEGRAM") {
+    throw new Error("Order event source is invalid.");
+  }
+  return value;
+}
+
+function requireRecoveryOutcome(value: unknown): "FOUND" | "NOT_FOUND" | "TRANSIENT_FAILURE" {
+  if (value !== "FOUND" && value !== "NOT_FOUND" && value !== "TRANSIENT_FAILURE") {
+    throw new Error("Order recovery observation outcome is invalid.");
+  }
+  return value;
+}
+
 function nullableString(value: unknown, label: string): string | null {
   if (value === null) return null;
   return requireString(value, label);
@@ -2102,6 +2397,17 @@ function requireSafeNonNegativeInteger(value: unknown, label: string): number {
     throw new Error(`${label} must be a non-negative safe integer.`);
   }
   return number;
+}
+
+function requireNonNegativeBigInt(value: unknown, label: string): bigint {
+  let result: bigint;
+  try {
+    result = typeof value === "bigint" ? value : BigInt(requireString(value, label));
+  } catch {
+    throw new Error(`${label} must be a non-negative integer.`);
+  }
+  if (result < 0n) throw new Error(`${label} must be a non-negative integer.`);
+  return result;
 }
 
 function requiredCliValue(values: ReadonlyMap<string, string>, key: string): string {
@@ -2146,12 +2452,33 @@ type EvidenceRow = Record<
   "remaining_quantity_exact",
   unknown
 >;
+type EvidenceSourceOrderRow = Record<
+  "id" | "strategy_decision_id" | "exchange_account_id" | "market" | "side" |
+  "ord_type" | "volume" | "price" | "time_in_force" | "smp_type" | "origin" |
+  "requested_at" | "status" | "execution_mode" | "created_at" | "updated_at",
+  unknown
+>;
+type ReadinessBindingRow = Record<
+  "id" | "deployment_id" | "strategy_decision_id" | "order_id" | "exchange_account_id" |
+  "activation_at" | "activation_epoch_ns" | "market" | "strategy_key" | "policy_id" |
+  "policy_version" | "execution_mode" | "ord_type" | "action" | "side" |
+  "intended_quantity_exact" | "intended_notional_krw_exact" | "bound_price_exact" |
+  "bound_volume_exact" | "bound_time_in_force" | "bound_smp_type" | "material_version" |
+  "order_material_hash" | "created_at",
+  unknown
+>;
 type AuditRow = Record<
   "id" | "deployment_id" | "event_type" | "from_phase" | "to_phase" | "state_version" |
   "payload_json" | "created_at" | "created_at_epoch_ns",
   unknown
 >;
-type OrderRow = Record<"id" | "status" | "requested_at" | "created_at" | "updated_at", unknown>;
+type OrderRow = Record<
+  "id" | "status" | "requested_at" | "created_at" | "updated_at" |
+  "upbit_uuid" | "exchange_response_json" | "failure_code",
+  unknown
+>;
+type ReadinessOrderEventRow = Record<"event_type" | "event_source" | "created_at", unknown>;
+type ReadinessRecoveryObservationRow = Record<"outcome" | "observed_at_epoch_ms", unknown>;
 type BalanceRow = Record<"id" | "captured_at" | "source" | "total_krw_value" | "balances_json", unknown>;
 type PositionRow = Record<"id" | "captured_at" | "source" | "positions_json", unknown>;
 type ReconciliationRow = Record<"id" | "status" | "started_at" | "completed_at" | "summary_json" | "error_message", unknown>;

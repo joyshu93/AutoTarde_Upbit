@@ -29,6 +29,10 @@ import type {
   OrderSubmissionRecoveryObservationRecord,
   PositionGuardPilotDeploymentRecord,
 } from "../../../domain/pilot-types.js";
+import {
+  classifySubmissionBlockingOrder,
+  SUBMISSION_BLOCKING_CANDIDATE_STATUSES,
+} from "../../../domain/submission-blocking-order.js";
 import type {
   SqliteBalanceSnapshotRow,
   SqliteExecutionStateRow,
@@ -111,14 +115,8 @@ const ACTIVE_ORDER_STATUSES = new Set<OrderRecord["status"]>([
 ]);
 const ACTIVE_ORDER_STATUS_VALUES = Array.from(ACTIVE_ORDER_STATUSES);
 const ACTIVE_ORDER_STATUS_PLACEHOLDERS = ACTIVE_ORDER_STATUS_VALUES.map(() => "?").join(", ");
-const CANDIDATE_SUBMISSION_BLOCKING_STATUSES = new Set<OrderRecord["status"]>([
-  ...ACTIVE_ORDER_STATUSES,
-  "FAILED",
-  "REJECTED",
-]);
-const CANDIDATE_SUBMISSION_BLOCKING_STATUS_VALUES = Array.from(CANDIDATE_SUBMISSION_BLOCKING_STATUSES);
-const CANDIDATE_SUBMISSION_BLOCKING_STATUS_PLACEHOLDERS =
-  CANDIDATE_SUBMISSION_BLOCKING_STATUS_VALUES.map(() => "?").join(", ");
+const SUBMISSION_BLOCKING_CANDIDATE_STATUS_PLACEHOLDERS =
+  SUBMISSION_BLOCKING_CANDIDATE_STATUSES.map(() => "?").join(", ");
 
 interface SqliteCandidateDeploymentAuthorityRow {
   id: string;
@@ -604,7 +602,7 @@ export class SqliteExecutionRepository implements ExecutionRepository {
     return rows.map(mapOrderRow);
   }
 
-  async listCandidateSubmissionBlockingOrders(
+  async listSubmissionBlockingOrders(
     exchangeAccountId: string,
     limit: number,
   ): Promise<OrderRecord[]> {
@@ -612,21 +610,36 @@ export class SqliteExecutionRepository implements ExecutionRepository {
     const rows = this.db.prepare(`
       SELECT * FROM orders
       WHERE exchange_account_id = ?
-        AND status IN (${CANDIDATE_SUBMISSION_BLOCKING_STATUS_PLACEHOLDERS})
-        AND (
-          status <> 'FAILED' OR
-          failure_code IS NULL OR
-          failure_code <> 'ORDER_SUBMISSION_ABSENCE_CONFIRMED'
-        )
+        AND status IN (${SUBMISSION_BLOCKING_CANDIDATE_STATUS_PLACEHOLDERS})
       ORDER BY updated_at DESC, id DESC
-      LIMIT ?
     `).all(
       exchangeAccountId,
-      ...CANDIDATE_SUBMISSION_BLOCKING_STATUS_VALUES,
-      limit,
+      ...SUBMISSION_BLOCKING_CANDIDATE_STATUSES,
     ) as unknown as SqliteOrderRow[];
 
-    return rows.map(mapOrderRow);
+    return rows
+      .map(mapOrderRow)
+      .filter((order) => classifySubmissionBlockingOrder({
+        order,
+        events: (this.db.prepare(`
+          SELECT id, order_id, event_type, event_source, payload_json, created_at
+          FROM order_events WHERE order_id = ? ORDER BY created_at ASC, id ASC
+        `).all(order.id) as unknown as SqliteOrderEventRow[]).map(mapOrderEventRow),
+        recoveryObservations: (this.db.prepare(`
+          SELECT id, order_id, outcome, observed_at, observed_at_epoch_ms, detail_json, created_at
+          FROM order_submission_recovery_observations
+          WHERE order_id = ? ORDER BY observed_at_epoch_ms ASC, id ASC
+        `).all(order.id) as unknown as SqliteOrderSubmissionRecoveryObservationRow[])
+          .map(mapOrderSubmissionRecoveryObservationRow),
+      }).blocking)
+      .slice(0, limit);
+  }
+
+  async listCandidateSubmissionBlockingOrders(
+    exchangeAccountId: string,
+    limit: number,
+  ): Promise<OrderRecord[]> {
+    return this.listSubmissionBlockingOrders(exchangeAccountId, limit);
   }
 
   async listOrders(exchangeAccountId: string): Promise<OrderRecord[]> {

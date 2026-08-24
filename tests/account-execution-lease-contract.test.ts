@@ -90,10 +90,41 @@ test("in-memory account execution lease store satisfies the common contract", as
   let blockingOrder = false;
   await verifyAccountExecutionLeaseContract(() => ({
     store: new InMemoryAccountExecutionLeaseStore(
-      (exchangeAccountId) => exchangeAccountId === "primary" && blockingOrder,
+      (exchangeAccountId) => exchangeAccountId === "primary" && blockingOrder
+        ? [blockingEvidence("contract-active-order")]
+        : [],
     ),
     setBlockingOrder(active) {
       blockingOrder = active;
     },
   }));
 });
+
+test("in-memory lease acquisition checks blocking authority even without an existing lease", async () => {
+  const store = new InMemoryAccountExecutionLeaseStore(() => [blockingEvidence("first-insert-blocker")]);
+
+  const acquired = await store.acquireLease({
+    exchangeAccountId: "primary",
+    ownerToken: "must-not-acquire",
+    purpose: "ORDER_SUBMISSION",
+    acquiredAtEpochMs: 1_000,
+    expiresAtEpochMs: 2_000,
+  });
+
+  assert.equal(acquired, null);
+  assert.equal(await store.getLease("primary"), null);
+});
+
+function blockingEvidence(orderId: string) {
+  return {
+    order: {
+      id: orderId,
+      status: "OPEN" as const,
+      failureCode: null,
+      upbitUuid: `${orderId}-uuid`,
+      exchangeResponseJson: "{}",
+    },
+    events: [],
+    recoveryObservations: [],
+  };
+}

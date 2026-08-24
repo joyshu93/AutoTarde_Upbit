@@ -2163,6 +2163,9 @@ function createRepositoryStub(overrides: Partial<ExecutionRepository> = {}): Exe
     async listActiveOrders() {
       return [];
     },
+    async listSubmissionBlockingOrders() {
+      return [];
+    },
     async listCandidateSubmissionBlockingOrders() {
       return [];
     },

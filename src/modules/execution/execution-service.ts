@@ -1011,12 +1011,13 @@ export class ExecutionService {
       expectedBinding: CandidateExecutionBindingRecord;
     } | null;
   }): Promise<boolean> {
-    const activeOrders = input.candidate
-      ? await this.dependencies.repositories.listCandidateSubmissionBlockingOrders(
-          input.exchangeAccountId,
-          CANDIDATE_FINAL_ORDER_SCAN_LIMIT + 1,
-        )
-      : await this.dependencies.repositories.listActiveOrders(input.exchangeAccountId);
+    const activeOrders = await this.dependencies.repositories.listSubmissionBlockingOrders(
+      input.exchangeAccountId,
+      CANDIDATE_FINAL_ORDER_SCAN_LIMIT + 1,
+    );
+    if (activeOrders.length > CANDIDATE_FINAL_ORDER_SCAN_LIMIT) {
+      throw new Error("final submission-blocking order scan exceeded its safety bound");
+    }
     let expectedOrderIsActive = false;
     let hasCompetingOrder = false;
     for (const activeOrder of activeOrders) {
@@ -1059,7 +1060,6 @@ export class ExecutionService {
       const exactState = await candidatePilots.getExactState(input.candidate.authority.deploymentId);
       const binding = await candidatePilots.getExecutionBindingForOrder(input.orderId);
       if (
-        activeOrders.length > CANDIDATE_FINAL_ORDER_SCAN_LIMIT ||
         hasCompetingOrder ||
         events.length !== 1 || !firstEvent || !decision || !deployment || !exactState || !binding
       ) {

@@ -1,5 +1,9 @@
 import type { AccountExecutionLeaseRecord } from "../../../domain/pilot-types.js";
 import {
+  classifySubmissionBlockingOrder,
+  type SubmissionBlockingOrderEvidence,
+} from "../../../domain/submission-blocking-order.js";
+import {
   validateLeaseWindow,
   type AccountExecutionLeaseStore,
   type AcquireAccountExecutionLeaseInput,
@@ -10,7 +14,9 @@ export class InMemoryAccountExecutionLeaseStore implements AccountExecutionLease
   private readonly leases = new Map<string, AccountExecutionLeaseRecord>();
 
   constructor(
-    private readonly hasBlockingOrder: (exchangeAccountId: string) => boolean = () => false,
+    private readonly listOrderEvidence: (
+      exchangeAccountId: string,
+    ) => readonly SubmissionBlockingOrderEvidence[] = () => [],
   ) {}
 
   async getLease(exchangeAccountId: string): Promise<AccountExecutionLeaseRecord | null> {
@@ -23,10 +29,12 @@ export class InMemoryAccountExecutionLeaseStore implements AccountExecutionLease
   ): Promise<AccountExecutionLeaseRecord | null> {
     validateLeaseWindow(input.ownerToken, input.acquiredAtEpochMs, input.expiresAtEpochMs);
     const current = this.leases.get(input.exchangeAccountId);
-    if (current && current.expiresAtEpochMs > input.acquiredAtEpochMs) {
+    if (this.listOrderEvidence(input.exchangeAccountId).some(
+      (evidence) => classifySubmissionBlockingOrder(evidence).blocking,
+    )) {
       return null;
     }
-    if (current && this.hasBlockingOrder(input.exchangeAccountId)) {
+    if (current && current.expiresAtEpochMs > input.acquiredAtEpochMs) {
       return null;
     }
     const lease: AccountExecutionLeaseRecord = {

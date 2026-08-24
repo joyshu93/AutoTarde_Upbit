@@ -28,6 +28,10 @@ import type {
   OrderSubmissionRecoveryObservationRecord,
   PositionGuardPilotDeploymentRecord,
 } from "../../../domain/pilot-types.js";
+import {
+  classifySubmissionBlockingOrder,
+  SUBMISSION_BLOCKING_CANDIDATE_STATUSES,
+} from "../../../domain/submission-blocking-order.js";
 import type {
   ExecutionRepository,
   FinalizeBoundedSubmissionAbsenceInput,
@@ -84,11 +88,8 @@ const ACTIVE_ORDER_STATUSES: ReadonlySet<OrderLifecycleStatus> = new Set([
   "CANCEL_REQUESTED",
   "RECONCILIATION_REQUIRED",
 ]);
-const CANDIDATE_SUBMISSION_BLOCKING_STATUSES: ReadonlySet<OrderLifecycleStatus> = new Set([
-  ...ACTIVE_ORDER_STATUSES,
-  "FAILED",
-  "REJECTED",
-]);
+const SUBMISSION_BLOCKING_CANDIDATE_STATUS_SET: ReadonlySet<OrderLifecycleStatus> =
+  new Set(SUBMISSION_BLOCKING_CANDIDATE_STATUSES);
 
 export class InMemoryExecutionRepository implements ExecutionRepository {
   private readonly strategyDecisions: StrategyDecisionRecord[] = [];
@@ -445,22 +446,39 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
     return (typeof limit === "number" ? orders.slice(0, limit) : orders).map(cloneRecord);
   }
 
-  async listCandidateSubmissionBlockingOrders(
+  async listSubmissionBlockingOrders(
     exchangeAccountId: string,
     limit: number,
   ): Promise<OrderRecord[]> {
     validateCandidateOrderReadLimit(limit);
     return this.orders
-      .filter((candidate) =>
-        candidate.exchangeAccountId === exchangeAccountId &&
-        CANDIDATE_SUBMISSION_BLOCKING_STATUSES.has(candidate.status) &&
-        !(candidate.status === "FAILED" && candidate.failureCode === "ORDER_SUBMISSION_ABSENCE_CONFIRMED"),
-      )
+      .filter((candidate) => {
+        if (
+          candidate.exchangeAccountId !== exchangeAccountId ||
+          !SUBMISSION_BLOCKING_CANDIDATE_STATUS_SET.has(candidate.status)
+        ) {
+          return false;
+        }
+        return classifySubmissionBlockingOrder({
+          order: candidate,
+          events: this.orderEvents.filter((event) => event.orderId === candidate.id),
+          recoveryObservations: this.orderSubmissionRecoveryObservations.filter(
+            (observation) => observation.orderId === candidate.id,
+          ),
+        }).blocking;
+      })
       .sort((left, right) =>
         right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id),
       )
       .slice(0, limit)
       .map(cloneRecord);
+  }
+
+  async listCandidateSubmissionBlockingOrders(
+    exchangeAccountId: string,
+    limit: number,
+  ): Promise<OrderRecord[]> {
+    return this.listSubmissionBlockingOrders(exchangeAccountId, limit);
   }
 
   async listOrders(exchangeAccountId: string): Promise<OrderRecord[]> {

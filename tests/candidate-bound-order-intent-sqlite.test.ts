@@ -236,28 +236,74 @@ test("sqlite candidate authority reads use exact account and order id under refe
   }
 });
 
-test("sqlite candidate authority query matches in-memory bounded active and uncertain statuses", async () => {
+test("sqlite submission authority query matches canonical active and terminal classification", async () => {
   const databasePath = await createTempDatabasePath("blocking-orders");
   const bundle = openBundle(databasePath);
   const methods = candidateAuthorityMethods(bundle.repositories);
-  const blockingStatuses: OrderRecord["status"][] = [
+  const activeStatuses: OrderRecord["status"][] = [
     "INTENT_CREATED", "PERSISTED", "SUBMITTING", "OPEN", "PARTIALLY_FILLED",
-    "CANCEL_REQUESTED", "RECONCILIATION_REQUIRED", "FAILED", "REJECTED",
+    "CANCEL_REQUESTED", "RECONCILIATION_REQUIRED",
   ];
-  const excludedStatuses: OrderRecord["status"][] = ["RISK_REJECTED", "FILLED", "CANCELED"];
+  const resolvedStatuses: OrderRecord["status"][] = ["RISK_REJECTED", "FILLED", "CANCELED"];
   try {
-    for (const [index, status] of [...blockingStatuses, ...excludedStatuses].entries()) {
+    for (const [index, status] of [...activeStatuses, ...resolvedStatuses].entries()) {
       await bundle.repositories.saveOrder(authorityOrder(`order-${status}`, status, {
         updatedAt: `2026-08-21T00:00:${String(index).padStart(2, "0")}.000Z`,
       }));
     }
+    for (const status of ["FAILED", "REJECTED"] as const) {
+      await bundle.repositories.saveOrder(authorityOrder(`order-unresolved-${status}`, status, {
+        failureCode: "SUBMISSION_RESPONSE_UNCERTAIN",
+      }));
+      await bundle.repositories.saveOrder(authorityOrder(`order-pre-send-${status}`, status));
+    }
     await bundle.repositories.saveOrder(authorityOrder("order-absence-confirmed", "FAILED", {
       failureCode: "ORDER_SUBMISSION_ABSENCE_CONFIRMED",
     }));
+    await bundle.repositories.appendOrderEvent({
+      id: "order-absence-confirmed-event",
+      orderId: "order-absence-confirmed",
+      eventType: "RECONCILIATION_IDENTIFIER_ABSENCE_CONFIRMED",
+      eventSource: "RECONCILIATION",
+      payloadJson: "{}",
+      createdAt: "2026-08-21T00:01:00.000Z",
+    });
+    for (const [index, observedAt] of ["2026-08-21T00:00:30.000Z", "2026-08-21T00:00:31.000Z"].entries()) {
+      await bundle.repositories.saveOrderSubmissionRecoveryObservation?.({
+        id: `order-absence-confirmed-observation-${index}`,
+        orderId: "order-absence-confirmed",
+        outcome: "NOT_FOUND",
+        observedAt,
+        observedAtEpochMs: Date.parse(observedAt),
+        detailJson: "{}",
+        createdAt: observedAt,
+      });
+    }
+    await bundle.repositories.saveOrder(authorityOrder("order-exchange-rejected", "REJECTED", {
+      failureCode: "EXCHANGE_ORDER_REJECTED",
+      exchangeResponseJson: "{}",
+    }));
+    await bundle.repositories.appendOrderEvent({
+      id: "order-exchange-rejected-event",
+      orderId: "order-exchange-rejected",
+      eventType: "ORDER_REJECTED",
+      eventSource: "EXCHANGE",
+      payloadJson: "{}",
+      createdAt: "2026-08-21T00:01:00.000Z",
+    });
 
     const rows = await methods.listCandidateSubmissionBlockingOrders("primary", 20);
-    assert.deepEqual(new Set(rows.map((order) => order.status)), new Set(blockingStatuses));
+    assert.deepEqual(
+      new Set(rows.map((order) => order.id)),
+      new Set([
+        ...activeStatuses.map((status) => `order-${status}`),
+        "order-unresolved-FAILED",
+        "order-unresolved-REJECTED",
+      ]),
+    );
+    assert.equal(rows.some((order) => order.id.startsWith("order-pre-send-")), false);
     assert.equal(rows.some((order) => order.id === "order-absence-confirmed"), false);
+    assert.equal(rows.some((order) => order.id === "order-exchange-rejected"), false);
     assert.equal((await methods.listCandidateSubmissionBlockingOrders("primary", 2)).length, 2);
     await assert.rejects(() => methods.listCandidateSubmissionBlockingOrders("primary", 0), /limit/i);
   } finally {

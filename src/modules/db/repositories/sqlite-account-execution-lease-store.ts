@@ -2,6 +2,11 @@ import type { DatabaseSync } from "node:sqlite";
 
 import type { AccountExecutionLeaseRecord } from "../../../domain/pilot-types.js";
 import {
+  classifySubmissionBlockingOrder,
+  SUBMISSION_BLOCKING_CANDIDATE_STATUSES,
+} from "../../../domain/submission-blocking-order.js";
+import type { OrderLifecycleStatus } from "../../../domain/types.js";
+import {
   validateLeaseWindow,
   type AccountExecutionLeaseStore,
   type AcquireAccountExecutionLeaseInput,
@@ -9,16 +14,7 @@ import {
 } from "../pilot-interfaces.js";
 import { withImmediateTransaction } from "./sqlite-transaction.js";
 
-const BLOCKING_ORDER_STATUSES = [
-  "INTENT_CREATED",
-  "PERSISTED",
-  "SUBMITTING",
-  "OPEN",
-  "PARTIALLY_FILLED",
-  "CANCEL_REQUESTED",
-  "RECONCILIATION_REQUIRED",
-] as const;
-const BLOCKING_ORDER_PLACEHOLDERS = BLOCKING_ORDER_STATUSES.map(() => "?").join(", ");
+const BLOCKING_ORDER_PLACEHOLDERS = SUBMISSION_BLOCKING_CANDIDATE_STATUSES.map(() => "?").join(", ");
 
 interface LeaseRow {
   exchange_account_id: string;
@@ -26,6 +22,25 @@ interface LeaseRow {
   purpose: AccountExecutionLeaseRecord["purpose"];
   acquired_at_epoch_ms: number;
   expires_at_epoch_ms: number;
+}
+
+interface BlockingOrderRow {
+  id: string;
+  status: OrderLifecycleStatus;
+  failure_code: string | null;
+  upbit_uuid: string | null;
+  exchange_response_json: string | null;
+}
+
+interface BlockingOrderEventRow {
+  event_type: string;
+  event_source: "LOCAL" | "EXCHANGE" | "RECONCILIATION" | "TELEGRAM";
+  created_at: string;
+}
+
+interface BlockingOrderObservationRow {
+  outcome: "FOUND" | "NOT_FOUND" | "TRANSIENT_FAILURE";
+  observed_at_epoch_ms: number;
 }
 
 export class SqliteAccountExecutionLeaseStore implements AccountExecutionLeaseStore {
@@ -43,6 +58,9 @@ export class SqliteAccountExecutionLeaseStore implements AccountExecutionLeaseSt
 
     return withImmediateTransaction(this.db, () => {
       const current = selectLease(this.db, input.exchangeAccountId);
+      if (hasBlockingOrder(this.db, input.exchangeAccountId)) {
+        return null;
+      }
       if (!current) {
         this.db.prepare(`
           INSERT INTO account_execution_leases (
@@ -60,10 +78,6 @@ export class SqliteAccountExecutionLeaseStore implements AccountExecutionLeaseSt
       if (current.expires_at_epoch_ms > input.acquiredAtEpochMs) {
         return null;
       }
-      if (hasBlockingOrder(this.db, input.exchangeAccountId)) {
-        return null;
-      }
-
       const update = this.db.prepare(`
         UPDATE account_execution_leases SET
           owner_token = ?,
@@ -127,13 +141,37 @@ function selectLease(db: DatabaseSync, exchangeAccountId: string): LeaseRow | un
 }
 
 function hasBlockingOrder(db: DatabaseSync, exchangeAccountId: string): boolean {
-  const row = db.prepare(`
-    SELECT id
+  const rows = db.prepare(`
+    SELECT id, status, failure_code, upbit_uuid, exchange_response_json
     FROM orders
     WHERE exchange_account_id = ? AND status IN (${BLOCKING_ORDER_PLACEHOLDERS})
-    LIMIT 1
-  `).get(exchangeAccountId, ...BLOCKING_ORDER_STATUSES) as { id: string } | undefined;
-  return Boolean(row);
+    ORDER BY updated_at DESC, id DESC
+  `).all(exchangeAccountId, ...SUBMISSION_BLOCKING_CANDIDATE_STATUSES) as unknown as BlockingOrderRow[];
+  return rows.some((row) => classifySubmissionBlockingOrder({
+    order: {
+      id: row.id,
+      status: row.status,
+      failureCode: row.failure_code,
+      upbitUuid: row.upbit_uuid,
+      exchangeResponseJson: row.exchange_response_json,
+    },
+    events: (db.prepare(`
+      SELECT event_type, event_source, created_at
+      FROM order_events WHERE order_id = ? ORDER BY created_at ASC, id ASC
+    `).all(row.id) as unknown as BlockingOrderEventRow[]).map((event) => ({
+      eventType: event.event_type,
+      eventSource: event.event_source,
+      createdAt: event.created_at,
+    })),
+    recoveryObservations: (db.prepare(`
+      SELECT outcome, observed_at_epoch_ms
+      FROM order_submission_recovery_observations
+      WHERE order_id = ? ORDER BY observed_at_epoch_ms ASC, id ASC
+    `).all(row.id) as unknown as BlockingOrderObservationRow[]).map((observation) => ({
+      outcome: observation.outcome,
+      observedAtEpochMs: observation.observed_at_epoch_ms,
+    })),
+  }).blocking);
 }
 
 function leaseFromInput(input: AcquireAccountExecutionLeaseInput): AccountExecutionLeaseRecord {

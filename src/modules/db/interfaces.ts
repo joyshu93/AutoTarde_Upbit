@@ -155,6 +155,7 @@ export interface ExecutionRepository {
   findOrderById(exchangeAccountId: string, orderId: string): Promise<OrderRecord | null>;
   findOrderByReference(exchangeAccountId: string, reference: string): Promise<OrderRecord | null>;
   listActiveOrders(exchangeAccountId: string, market?: SupportedMarket, limit?: number): Promise<OrderRecord[]>;
+  listSubmissionBlockingOrders(exchangeAccountId: string, limit: number): Promise<OrderRecord[]>;
   listCandidateSubmissionBlockingOrders(exchangeAccountId: string, limit: number): Promise<OrderRecord[]>;
   listOrders(exchangeAccountId: string): Promise<OrderRecord[]>;
   appendOrderEvent(record: OrderEventRecord): Promise<void>;

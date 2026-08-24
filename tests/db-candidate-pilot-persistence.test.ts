@@ -1597,6 +1597,54 @@ test("expired sqlite lease cannot be stolen with active or reconciliation-requir
   });
 });
 
+test("sqlite lease checks unresolved terminal submission authority before its first insert", async () => {
+  await withFreshBundle("lease-terminal-authority", async (bundle, _databasePath, db) => {
+    const store = bundle.accountExecutionLeases;
+    for (const status of ["FAILED", "REJECTED"] as const) {
+      const orderId = `potentially-dispatched-${status.toLowerCase()}`;
+      insertOrder(db, orderId, status);
+      db.prepare("UPDATE orders SET failure_code = 'SUBMISSION_RESPONSE_UNCERTAIN' WHERE id = ?")
+        .run(orderId);
+      db.prepare(`
+        INSERT INTO order_events (id, order_id, event_type, event_source, payload_json, created_at)
+        VALUES (?, ?, 'RECONCILIATION_RECOVERY_REQUIRED', 'EXCHANGE', '{}', '2026-08-21T00:00:01Z')
+      `).run(`${orderId}-uncertain`, orderId);
+
+      assert.equal(await store.acquireLease({
+        exchangeAccountId: "primary",
+        ownerToken: `blocked-${status}`,
+        purpose: "ORDER_SUBMISSION",
+        acquiredAtEpochMs: 1_000,
+        expiresAtEpochMs: 2_000,
+      }), null);
+      assert.equal(await store.getLease("primary"), null);
+
+      db.prepare("DELETE FROM order_events WHERE order_id = ?").run(orderId);
+      db.prepare("DELETE FROM orders WHERE id = ?").run(orderId);
+    }
+
+    for (const status of ["FAILED", "REJECTED"] as const) {
+      const orderId = `definitive-pre-send-${status.toLowerCase()}`;
+      insertOrder(db, orderId, status);
+      db.prepare(`
+        INSERT INTO order_events (id, order_id, event_type, event_source, payload_json, created_at)
+        VALUES (?, ?, 'ORDER_PERSISTED', 'LOCAL', '{}', '2026-08-21T00:00:00Z')
+      `).run(`${orderId}-persisted`, orderId);
+      const lease = await store.acquireLease({
+        exchangeAccountId: "primary",
+        ownerToken: `allowed-${status}`,
+        purpose: "ORDER_SUBMISSION",
+        acquiredAtEpochMs: 3_000,
+        expiresAtEpochMs: 4_000,
+      });
+      assert.equal(lease?.ownerToken, `allowed-${status}`);
+      assert.equal(await store.releaseLease("primary", `allowed-${status}`), true);
+      db.prepare("DELETE FROM order_events WHERE order_id = ?").run(orderId);
+      db.prepare("DELETE FROM orders WHERE id = ?").run(orderId);
+    }
+  });
+});
+
 function createBundle(databasePath: string): ReturnType<typeof createSqlitePersistence> {
   return createSqlitePersistence({
     databasePath,
@@ -2013,7 +2061,7 @@ function insertTransition(db: DatabaseSync, id: string, command: string): void {
 function insertOrder(
   db: DatabaseSync,
   id: string,
-  status: "OPEN" | "RECONCILIATION_REQUIRED",
+  status: "OPEN" | "RECONCILIATION_REQUIRED" | "FAILED" | "REJECTED",
 ): void {
   db.prepare(`
     INSERT INTO orders (

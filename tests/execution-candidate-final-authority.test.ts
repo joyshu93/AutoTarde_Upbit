@@ -169,7 +169,7 @@ test("candidate final authority keeps the sole send immediately behind the final
   const finalMethodEnd = source.indexOf("private async recordLeaseBlockedAndPause", finalMethodStart);
   const finalMethod = source.slice(finalMethodStart, finalMethodEnd);
   const orderedReads = [
-    "listCandidateSubmissionBlockingOrders",
+    "listSubmissionBlockingOrders",
     "findOrderById",
     "listOrderEvents",
     "getStrategyDecisionById",
@@ -260,11 +260,11 @@ class FinalAuthorityRepository extends InMemoryExecutionRepository {
     return this.mutation === "COMPETING_ORDER" ? [...orders, competingOrder()] : orders;
   }
 
-  async listCandidateSubmissionBlockingOrders(
+  override async listSubmissionBlockingOrders(
     exchangeAccountId: string,
     limit: number,
   ): Promise<OrderRecord[]> {
-    const orders = await super.listActiveOrders(exchangeAccountId, undefined, limit);
+    const orders = await super.listSubmissionBlockingOrders(exchangeAccountId, limit);
     if (!this.finalReadsArmed) return orders;
     this.trace.push("activeOrders");
     if (this.mutation === "COMPETING_ORDER") return [...orders, competingOrder()];
