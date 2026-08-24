@@ -24,19 +24,24 @@ import {
 } from "../../strategy/position-guard-candidate-state.js";
 import {
   candidateEvidenceMaterial,
+  buildCandidatePilotRollbackAuditEvent,
   buildCandidatePilotRecoveryFaultAuditEvent,
   candidatePilotRecoveryFaultReason,
   resolveCandidateIntentFaultOccurrence,
   toPositionGuardCandidateRoutingState,
+  isExactCandidateStateRollbackFlat,
   validateCandidateExecutionBinding,
   validateCandidateIntentFaultInput,
   validateCandidatePilotDeployment,
   validateCandidatePilotRecoveryFaultInput,
+  validateCandidatePilotRollbackChronology,
+  validateCandidatePilotRollbackInput,
   type AdvanceCandidatePilotStateInput,
   type AdvanceCandidatePilotStateResult,
   type ActivateCandidatePilotDeploymentInput,
   type CandidateEvidenceRecord,
   type CandidatePilotDeploymentInitializationResult,
+  type CandidatePilotRollbackInput,
   type CandidatePilotRecoveryIdentity,
   type CandidatePilotRepository,
   type CreateCandidatePilotDeploymentInput,
@@ -284,6 +289,73 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
       const activated = selectDeploymentRow(this.db, input.deploymentId);
       if (!activated) throw new Error(`Activated candidate deployment ${input.deploymentId} disappeared.`);
       return deploymentFromRow(activated);
+    });
+  }
+
+  async startRollback(input: CandidatePilotRollbackInput): Promise<PositionGuardPilotDeploymentRecord | null> {
+    const rollback = validateCandidatePilotRollbackInput(input);
+    return withImmediateTransaction(this.db, () => {
+      const deploymentRow = selectDeploymentRow(this.db, rollback.deploymentId);
+      const stateRow = selectStateRow(this.db, rollback.deploymentId);
+      if (!deploymentRow || !stateRow || stateRow.material_version !== "EXACT_V2" ||
+        rollback.expectedPhase !== "ACTIVE" || deploymentRow.phase !== "ACTIVE" ||
+        deploymentRow.updated_at !== rollback.expectedUpdatedAt || stateRow.state_version !== rollback.expectedStateVersion) {
+        return null;
+      }
+      const deployment = validateCandidatePilotDeployment(deploymentFromRow(deploymentRow));
+      const state = exactStateFromRow(stateRow);
+      validateCandidatePilotRollbackChronology(rollback, deployment, state);
+      const update = this.db.prepare(`
+        UPDATE strategy_pilot_deployments
+        SET phase = 'DRAINING', updated_at = ?
+        WHERE id = ? AND phase = 'ACTIVE' AND updated_at = ?
+      `).run(rollback.transitionAt, rollback.deploymentId, rollback.expectedUpdatedAt);
+      if (update.changes !== 1) return null;
+      insertAuditEvent(this.db, buildCandidatePilotRollbackAuditEvent({
+        rollback,
+        eventType: "ROLLBACK_STARTED",
+        fromPhase: deployment.phase,
+        toPhase: "DRAINING",
+        stateVersion: state.stateVersion,
+      }), rollback.transitionEpochNs);
+      const transitioned = selectDeploymentRow(this.db, rollback.deploymentId);
+      if (!transitioned) throw new Error(`Candidate rollback deployment ${rollback.deploymentId} disappeared.`);
+      return { ...validateCandidatePilotDeployment(deploymentFromRow(transitioned)) };
+    });
+  }
+
+  async completeRollback(input: CandidatePilotRollbackInput): Promise<PositionGuardPilotDeploymentRecord | null> {
+    const rollback = validateCandidatePilotRollbackInput(input);
+    return withImmediateTransaction(this.db, () => {
+      const deploymentRow = selectDeploymentRow(this.db, rollback.deploymentId);
+      const stateRow = selectStateRow(this.db, rollback.deploymentId);
+      if (!deploymentRow || !stateRow || stateRow.material_version !== "EXACT_V2" ||
+        !isRollbackCompletablePhase(rollback.expectedPhase) || deploymentRow.phase !== rollback.expectedPhase ||
+        deploymentRow.updated_at !== rollback.expectedUpdatedAt || stateRow.state_version !== rollback.expectedStateVersion) {
+        return null;
+      }
+      const deployment = validateCandidatePilotDeployment(deploymentFromRow(deploymentRow));
+      const state = exactStateFromRow(stateRow);
+      validateCandidatePilotRollbackChronology(rollback, deployment, state);
+      if (!isExactCandidateStateRollbackFlat(state)) {
+        throw new Error("Candidate pilot rollback completion requires an exact flat current episode state.");
+      }
+      const update = this.db.prepare(`
+        UPDATE strategy_pilot_deployments
+        SET phase = 'DISABLED', updated_at = ?
+        WHERE id = ? AND phase = ? AND updated_at = ?
+      `).run(rollback.transitionAt, rollback.deploymentId, rollback.expectedPhase, rollback.expectedUpdatedAt);
+      if (update.changes !== 1) return null;
+      insertAuditEvent(this.db, buildCandidatePilotRollbackAuditEvent({
+        rollback,
+        eventType: "ROLLBACK_COMPLETED",
+        fromPhase: deployment.phase,
+        toPhase: "DISABLED",
+        stateVersion: state.stateVersion,
+      }), rollback.transitionEpochNs);
+      const transitioned = selectDeploymentRow(this.db, rollback.deploymentId);
+      if (!transitioned) throw new Error(`Candidate rollback deployment ${rollback.deploymentId} disappeared.`);
+      return { ...validateCandidatePilotDeployment(deploymentFromRow(transitioned)) };
     });
   }
 
@@ -825,6 +897,12 @@ function sameBootstrapIdentity(
     left.market === right.market &&
     left.policyId === right.policyId &&
     left.policyVersion === right.policyVersion;
+}
+
+function isRollbackCompletablePhase(
+  phase: PositionGuardPilotDeploymentRecord["phase"],
+): phase is "PENDING_FLAT" | "ACTIVE" | "DRAINING" {
+  return phase === "PENDING_FLAT" || phase === "ACTIVE" || phase === "DRAINING";
 }
 
 function bootstrapAuthorityFromDatabase(

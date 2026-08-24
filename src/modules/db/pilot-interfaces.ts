@@ -100,6 +100,15 @@ export interface ActivateCandidatePilotDeploymentInput {
   activationEpochNs: bigint;
 }
 
+export interface CandidatePilotRollbackInput {
+  deploymentId: string;
+  expectedPhase: PositionGuardPilotDeploymentRecord["phase"];
+  expectedUpdatedAt: string;
+  expectedStateVersion: number;
+  transitionAt: string;
+  transitionEpochNs: bigint;
+}
+
 export interface AdvanceCandidatePilotStateInput {
   deploymentId: string;
   expectedStateVersion: number;
@@ -192,6 +201,8 @@ export interface CandidatePilotRepository {
   activateDeployment(
     input: ActivateCandidatePilotDeploymentInput,
   ): Promise<PositionGuardPilotDeploymentRecord | null>;
+  startRollback(input: CandidatePilotRollbackInput): Promise<PositionGuardPilotDeploymentRecord | null>;
+  completeRollback(input: CandidatePilotRollbackInput): Promise<PositionGuardPilotDeploymentRecord | null>;
   getState(deploymentId: string): Promise<Readonly<PositionGuardCandidateState> | null>;
   getExactState(deploymentId: string): Promise<Readonly<ExactCandidateState> | null>;
   listEvidenceAfter(
@@ -426,6 +437,97 @@ export function candidateEvidenceMaterial(
     epochNanoseconds,
     evidence: snapshot,
     materialVersion: "EXACT_V2",
+  };
+}
+
+const CANDIDATE_PILOT_ROLLBACK_KEYS = [
+  "deploymentId",
+  "expectedPhase",
+  "expectedUpdatedAt",
+  "expectedStateVersion",
+  "transitionAt",
+  "transitionEpochNs",
+] as const;
+
+export function validateCandidatePilotRollbackInput(
+  input: CandidatePilotRollbackInput,
+): Readonly<CandidatePilotRollbackInput> {
+  const record = exactOwnDataRecord(input, "candidate pilot rollback input", CANDIDATE_PILOT_ROLLBACK_KEYS);
+  requireNonEmpty(record.deploymentId as string, "candidate pilot rollback deploymentId");
+  if (typeof record.expectedPhase !== "string" || !PILOT_PHASES.includes(
+    record.expectedPhase as typeof PILOT_PHASES[number],
+  )) {
+    throw new Error("Candidate pilot rollback expected phase is invalid.");
+  }
+  parsePositionGuardCandidateTimestamp(record.expectedUpdatedAt as string, "candidate pilot rollback expectedUpdatedAt");
+  if (!Number.isSafeInteger(record.expectedStateVersion) || (record.expectedStateVersion as number) < 0) {
+    throw new Error("Candidate pilot rollback expected state version must be a non-negative safe integer.");
+  }
+  const transitionEpochNs = parsePositionGuardCandidateTimestamp(
+    record.transitionAt as string,
+    "candidate pilot rollback transitionAt",
+  );
+  if (transitionEpochNs < 0n || typeof record.transitionEpochNs !== "bigint" ||
+    transitionEpochNs !== record.transitionEpochNs) {
+    throw new Error("Candidate pilot rollback transition epoch does not match its timestamp.");
+  }
+  return Object.freeze({
+    deploymentId: record.deploymentId as string,
+    expectedPhase: record.expectedPhase as PositionGuardPilotDeploymentRecord["phase"],
+    expectedUpdatedAt: record.expectedUpdatedAt as string,
+    expectedStateVersion: record.expectedStateVersion as number,
+    transitionAt: record.transitionAt as string,
+    transitionEpochNs: record.transitionEpochNs as bigint,
+  });
+}
+
+export function validateCandidatePilotRollbackChronology(
+  input: Pick<CandidatePilotRollbackInput, "transitionEpochNs">,
+  deployment: PositionGuardPilotDeploymentRecord,
+  state: Readonly<ExactCandidateState>,
+): void {
+  const deploymentCreatedAt = parsePositionGuardCandidateTimestamp(
+    deployment.createdAt,
+    "candidate deployment createdAt",
+  );
+  const deploymentUpdatedAt = parsePositionGuardCandidateTimestamp(
+    deployment.updatedAt,
+    "candidate deployment updatedAt",
+  );
+  if (input.transitionEpochNs < deploymentCreatedAt || input.transitionEpochNs < deploymentUpdatedAt) {
+    throw new Error("Candidate pilot rollback cannot precede persisted deployment chronology.");
+  }
+  if (state.lastEvidenceAt !== null && input.transitionEpochNs < parsePositionGuardCandidateTimestamp(
+    state.lastEvidenceAt,
+    "candidate state lastEvidenceAt",
+  )) {
+    throw new Error("Candidate pilot rollback cannot precede persisted candidate evidence chronology.");
+  }
+}
+
+export function isExactCandidateStateRollbackFlat(state: Readonly<ExactCandidateState>): boolean {
+  return state.currentEpisodeAddCount === 0 &&
+    state.currentEpisodeCostBasisKrw === "0" &&
+    state.currentEpisodeInventoryQuantity === "0" &&
+    state.currentEpisodeRealizedPnlKrw === "0";
+}
+
+export function buildCandidatePilotRollbackAuditEvent(input: {
+  rollback: Readonly<CandidatePilotRollbackInput>;
+  eventType: "ROLLBACK_STARTED" | "ROLLBACK_COMPLETED";
+  fromPhase: PositionGuardPilotDeploymentRecord["phase"];
+  toPhase: PositionGuardPilotDeploymentRecord["phase"];
+  stateVersion: number;
+}): PositionGuardPilotAuditEventRecord {
+  return {
+    id: `${input.rollback.deploymentId}:${input.eventType.toLowerCase()}:${input.rollback.transitionEpochNs.toString()}`,
+    deploymentId: input.rollback.deploymentId,
+    eventType: input.eventType,
+    fromPhase: input.fromPhase,
+    toPhase: input.toPhase,
+    stateVersion: input.stateVersion,
+    payloadJson: JSON.stringify({ transitionAt: input.rollback.transitionAt }),
+    createdAt: input.rollback.transitionAt,
   };
 }
 

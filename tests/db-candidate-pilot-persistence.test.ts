@@ -14,6 +14,8 @@ import { SqliteAccountExecutionLeaseStore } from
   "../src/modules/db/repositories/sqlite-account-execution-lease-store.js";
 import { CandidateExecutionEvidenceService } from
   "../src/modules/execution/candidate-evidence-service.js";
+import { parsePositionGuardCandidateTimestamp } from
+  "../src/modules/strategy/position-guard-candidate-state.js";
 import { ReconciliationService } from "../src/modules/reconciliation/reconciliation-service.js";
 import { test } from "./harness.js";
 import {
@@ -23,6 +25,7 @@ import {
   verifyCandidatePilotRepositoryContract,
   verifyCandidatePilotIdentityValidation,
   verifyCandidateDeploymentActivationContract,
+  verifyCandidatePilotRollbackContract,
   verifyDeploymentScopedEvidenceIdentityContract,
   verifyMixedOffsetReplayContract,
   verifyPreEpochEvidenceRejectionContract,
@@ -51,6 +54,25 @@ test("sqlite candidate pilot repository satisfies the common contracts", async (
   await withFreshBundle("candidate-atomic-bootstrap", async (bundle) => {
     await verifyAtomicDeploymentInitializationContract(() => bundle.candidatePilots);
   });
+});
+
+test("sqlite candidate pilot rollback persistence satisfies the common contract", async () => {
+  const bundles: Array<ReturnType<typeof createSqlitePersistence>> = [];
+  const databasePaths: string[] = [];
+  try {
+    let sequence = 0;
+    await verifyCandidatePilotRollbackContract(async () => {
+      const databasePath = await createTempDatabasePath(`candidate-rollback-${sequence}`);
+      sequence += 1;
+      const bundle = createBundle(databasePath);
+      bundles.push(bundle);
+      databasePaths.push(databasePath);
+      return bundle.candidatePilots;
+    });
+  } finally {
+    for (const bundle of bundles) bundle.close();
+    await Promise.all(databasePaths.map((databasePath) => cleanupTempDatabase(databasePath)));
+  }
 });
 
 test("two sqlite candidate pilot connections initialize one deployment and preserve the existing authority", async () => {
@@ -1017,6 +1039,139 @@ test("candidate evidence insert, state CAS, and audit roll back as one transacti
     assert.deepEqual(await bundle.candidatePilots.listEvidenceAfter(deployment.id, null), []);
     assert.equal((await bundle.candidatePilots.listAuditEvents(deployment.id)).length, 1);
     assertDatabaseIntegrity(db);
+  });
+});
+
+test("sqlite rollback start reverts its deployment phase when the audit insert fails", async () => {
+  await withFreshBundle("rollback-audit-failure", async (bundle, _databasePath, db) => {
+    const deployment = await bundle.candidatePilots.createDeploymentWithInitialState(
+      initialDeploymentInput("rollback-audit-failure"),
+    );
+    const activationAt = "2026-08-21T00:00:01.000000000Z";
+    const activated = await bundle.candidatePilots.activateDeployment({
+      deploymentId: deployment.id,
+      expectedPhase: "PENDING_FLAT",
+      expectedUpdatedAt: deployment.updatedAt,
+      activationAt,
+      activationEpochNs: parsePositionGuardCandidateTimestamp(activationAt, "rollback audit failure activation"),
+    });
+    assert.ok(activated);
+    db.exec(`
+      CREATE TRIGGER fail_rollback_started_audit_for_test
+      BEFORE INSERT ON strategy_pilot_audit_events
+      WHEN NEW.event_type = 'ROLLBACK_STARTED'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected rollback audit failure');
+      END;
+    `);
+
+    await assert.rejects(
+      () => bundle.candidatePilots.startRollback({
+        deploymentId: activated.id,
+        expectedPhase: "ACTIVE",
+        expectedUpdatedAt: activated.updatedAt,
+        expectedStateVersion: 0,
+        transitionAt: "2026-08-21T00:00:02.000000000Z",
+        transitionEpochNs: parsePositionGuardCandidateTimestamp(
+          "2026-08-21T00:00:02.000000000Z",
+          "rollback audit failure transition",
+        ),
+      }),
+      /injected rollback audit failure/i,
+    );
+    assert.equal((await bundle.candidatePilots.getDeployment(deployment.id))?.phase, "ACTIVE");
+    assert.equal((await bundle.candidatePilots.listAuditEvents(deployment.id)).length, 2);
+    assertDatabaseIntegrity(db);
+  });
+});
+
+test("sqlite rollback completion reverts its deployment phase when the audit insert fails", async () => {
+  await withFreshBundle("rollback-completion-audit-failure", async (bundle, _databasePath, db) => {
+    const deployment = await bundle.candidatePilots.createDeploymentWithInitialState(
+      initialDeploymentInput("rollback-completion-audit-failure"),
+    );
+    const activationAt = "2026-08-21T00:00:01.000000000Z";
+    const activated = await bundle.candidatePilots.activateDeployment({
+      deploymentId: deployment.id,
+      expectedPhase: "PENDING_FLAT",
+      expectedUpdatedAt: deployment.updatedAt,
+      activationAt,
+      activationEpochNs: parsePositionGuardCandidateTimestamp(activationAt, "rollback completion audit failure activation"),
+    });
+    assert.ok(activated);
+    const draining = await bundle.candidatePilots.startRollback({
+      deploymentId: activated.id,
+      expectedPhase: "ACTIVE",
+      expectedUpdatedAt: activated.updatedAt,
+      expectedStateVersion: 0,
+      transitionAt: "2026-08-21T00:00:02.000000000Z",
+      transitionEpochNs: parsePositionGuardCandidateTimestamp(
+        "2026-08-21T00:00:02.000000000Z",
+        "rollback completion audit failure start",
+      ),
+    });
+    assert.ok(draining);
+    db.exec(`
+      CREATE TRIGGER fail_rollback_completed_audit_for_test
+      BEFORE INSERT ON strategy_pilot_audit_events
+      WHEN NEW.event_type = 'ROLLBACK_COMPLETED'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected rollback completion audit failure');
+      END;
+    `);
+
+    await assert.rejects(
+      () => bundle.candidatePilots.completeRollback({
+        deploymentId: draining.id,
+        expectedPhase: "DRAINING",
+        expectedUpdatedAt: draining.updatedAt,
+        expectedStateVersion: 0,
+        transitionAt: "2026-08-21T00:00:03.000000000Z",
+        transitionEpochNs: parsePositionGuardCandidateTimestamp(
+          "2026-08-21T00:00:03.000000000Z",
+          "rollback completion audit failure transition",
+        ),
+      }),
+      /injected rollback completion audit failure/i,
+    );
+    assert.equal((await bundle.candidatePilots.getDeployment(deployment.id))?.phase, "DRAINING");
+    assert.equal((await bundle.candidatePilots.listAuditEvents(deployment.id)).length, 3);
+    assertDatabaseIntegrity(db);
+  });
+});
+
+test("sqlite rollback completion rejects a persisted PAUSED_FAULT without mutation or audit", async () => {
+  await withFreshBundle("rollback-paused-fault", async (bundle) => {
+    const deployment = await bundle.candidatePilots.createDeploymentWithInitialState(
+      initialDeploymentInput("sqlite-rollback-paused-fault"),
+    );
+    await bundle.candidatePilots.pauseForRecoveryFault({
+      deploymentId: deployment.id,
+      exchangeAccountId: deployment.exchangeAccountId,
+      faultId: "sqlite-rollback-paused-fault",
+      reasonCode: "REPLAY_MISMATCH",
+      provenanceJson: "{}",
+      occurredAt: "2026-08-21T00:00:01.000000000Z",
+    });
+    const paused = await bundle.candidatePilots.getDeployment(deployment.id);
+    const exactState = await bundle.candidatePilots.getExactState(deployment.id);
+    assert.ok(paused);
+    assert.ok(exactState);
+    const auditCount = (await bundle.candidatePilots.listAuditEvents(deployment.id)).length;
+
+    assert.equal(await bundle.candidatePilots.completeRollback({
+      deploymentId: paused.id,
+      expectedPhase: paused.phase,
+      expectedUpdatedAt: paused.updatedAt,
+      expectedStateVersion: exactState.stateVersion,
+      transitionAt: "2026-08-21T00:00:02.000000000Z",
+      transitionEpochNs: parsePositionGuardCandidateTimestamp(
+        "2026-08-21T00:00:02.000000000Z",
+        "sqlite paused rollback completion",
+      ),
+    }), null);
+    assert.equal((await bundle.candidatePilots.getDeployment(deployment.id))?.phase, "PAUSED_FAULT");
+    assert.equal((await bundle.candidatePilots.listAuditEvents(deployment.id)).length, auditCount);
   });
 });
 

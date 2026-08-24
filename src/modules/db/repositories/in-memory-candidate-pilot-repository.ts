@@ -18,19 +18,24 @@ import {
 } from "../../strategy/position-guard-candidate-state.js";
 import {
   candidateEvidenceMaterial,
+  buildCandidatePilotRollbackAuditEvent,
   buildCandidatePilotRecoveryFaultAuditEvent,
   candidatePilotRecoveryFaultReason,
   resolveCandidateIntentFaultOccurrence,
   toPositionGuardCandidateRoutingState,
+  isExactCandidateStateRollbackFlat,
   validateCandidateExecutionBinding,
   validateCandidateIntentFaultInput,
   validateCandidatePilotDeployment,
   validateCandidatePilotRecoveryFaultInput,
+  validateCandidatePilotRollbackChronology,
+  validateCandidatePilotRollbackInput,
   type AdvanceCandidatePilotStateInput,
   type AdvanceCandidatePilotStateResult,
   type ActivateCandidatePilotDeploymentInput,
   type CandidateEvidenceRecord,
   type CandidatePilotDeploymentInitializationResult,
+  type CandidatePilotRollbackInput,
   type CandidatePilotRecoveryIdentity,
   type CandidatePilotRepository,
   type CreateCandidatePilotDeploymentInput,
@@ -229,6 +234,62 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
       createdAt: input.activationAt,
     }]);
     return { ...activated };
+  }
+
+  async startRollback(input: CandidatePilotRollbackInput): Promise<PositionGuardPilotDeploymentRecord | null> {
+    const rollback = validateCandidatePilotRollbackInput(input);
+    const deployment = this.deployments.get(rollback.deploymentId);
+    const state = this.exactStates.get(rollback.deploymentId);
+    if (!deployment || !state || rollback.expectedPhase !== "ACTIVE" || deployment.phase !== "ACTIVE" ||
+      deployment.updatedAt !== rollback.expectedUpdatedAt || state.stateVersion !== rollback.expectedStateVersion) {
+      return null;
+    }
+    validateCandidatePilotRollbackChronology(rollback, deployment, state);
+    const next: PositionGuardPilotDeploymentRecord = {
+      ...deployment,
+      phase: "DRAINING",
+      updatedAt: rollback.transitionAt,
+    };
+    const audit = buildCandidatePilotRollbackAuditEvent({
+      rollback,
+      eventType: "ROLLBACK_STARTED",
+      fromPhase: deployment.phase,
+      toPhase: next.phase,
+      stateVersion: state.stateVersion,
+    });
+    this.deployments.set(next.id, next);
+    this.auditEvents.set(next.id, [...(this.auditEvents.get(next.id) ?? []), audit]);
+    return { ...validateCandidatePilotDeployment(next) };
+  }
+
+  async completeRollback(input: CandidatePilotRollbackInput): Promise<PositionGuardPilotDeploymentRecord | null> {
+    const rollback = validateCandidatePilotRollbackInput(input);
+    const deployment = this.deployments.get(rollback.deploymentId);
+    const state = this.exactStates.get(rollback.deploymentId);
+    if (!deployment || !state || !isRollbackCompletablePhase(rollback.expectedPhase) ||
+      deployment.phase !== rollback.expectedPhase || deployment.updatedAt !== rollback.expectedUpdatedAt ||
+      state.stateVersion !== rollback.expectedStateVersion) {
+      return null;
+    }
+    validateCandidatePilotRollbackChronology(rollback, deployment, state);
+    if (!isExactCandidateStateRollbackFlat(state)) {
+      throw new Error("Candidate pilot rollback completion requires an exact flat current episode state.");
+    }
+    const next: PositionGuardPilotDeploymentRecord = {
+      ...deployment,
+      phase: "DISABLED",
+      updatedAt: rollback.transitionAt,
+    };
+    const audit = buildCandidatePilotRollbackAuditEvent({
+      rollback,
+      eventType: "ROLLBACK_COMPLETED",
+      fromPhase: deployment.phase,
+      toPhase: next.phase,
+      stateVersion: state.stateVersion,
+    });
+    this.deployments.set(next.id, next);
+    this.auditEvents.set(next.id, [...(this.auditEvents.get(next.id) ?? []), audit]);
+    return { ...validateCandidatePilotDeployment(next) };
   }
 
   async getState(deploymentId: string): Promise<Readonly<PositionGuardCandidateState> | null> {
@@ -615,6 +676,12 @@ function sameBootstrapIdentity(
 }
 
 function isFaultPausablePhase(phase: PositionGuardPilotDeploymentRecord["phase"]): boolean {
+  return phase === "PENDING_FLAT" || phase === "ACTIVE" || phase === "DRAINING";
+}
+
+function isRollbackCompletablePhase(
+  phase: PositionGuardPilotDeploymentRecord["phase"],
+): phase is "PENDING_FLAT" | "ACTIVE" | "DRAINING" {
   return phase === "PENDING_FLAT" || phase === "ACTIVE" || phase === "DRAINING";
 }
 
