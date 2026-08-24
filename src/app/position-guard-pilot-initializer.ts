@@ -706,6 +706,9 @@ function assertCanonicalRollbackStartedAudit(
     ? undefined
     : evidenceRecords[rollbackBoundaryStateVersion - 1];
   const firstDrainingEvidence = evidenceRecords[rollbackBoundaryStateVersion];
+  const latestDrainingEvidence = rollbackBoundaryStateVersion < evidenceRecords.length
+    ? evidenceRecords.at(-1)
+    : undefined;
   const activationEvent = auditEvents.find((event) => event.eventType === "PHASE_TRANSITION");
   if (
     rollbackAt < activationAt ||
@@ -716,6 +719,10 @@ function assertCanonicalRollbackStartedAudit(
     )) ||
     (firstDrainingEvidence !== undefined && rollbackAt > strictTimestamp(
       firstDrainingEvidence.evidence.executedAt,
+      "persisted evidence executedAt",
+    )) ||
+    (latestDrainingEvidence !== undefined && faultAt <= strictTimestamp(
+      latestDrainingEvidence.evidence.executedAt,
       "persisted evidence executedAt",
     )) ||
     activationEvent === undefined ||

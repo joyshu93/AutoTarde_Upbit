@@ -252,6 +252,66 @@ test("candidate initializer restarts DRAINING fault authority after canonical ri
   assert.equal(faultEvent(mutableAuthority(result)).stateVersion, 2);
 });
 
+test("candidate initializer restarts DRAINING fault authority at a zero-state rollback boundary", async () => {
+  const authority = pausedFaultFromDrainingWithoutEvidenceAuthority();
+  const fixture = createFixture({ result: authority });
+
+  const result = await fixture.initializer.initialize();
+
+  assert.equal(result.deployment.phase, "PAUSED_FAULT");
+  assert.equal(result.exactState.stateVersion, 0);
+  assert.deepEqual(
+    result.auditEvents
+      .filter((event) => event.eventType === "STATE_ADVANCED")
+      .map((event) => [event.fromPhase, event.toPhase, event.stateVersion]),
+    [],
+  );
+  assert.equal(rollbackEvent(mutableAuthority(result)).stateVersion, 0);
+  assert.equal(faultEvent(mutableAuthority(result)).stateVersion, 0);
+});
+
+test("candidate initializer restarts DRAINING fault authority after multiple risk-reducing advances", async () => {
+  const authority = pausedFaultFromDrainingWithMultipleExitAuthority();
+  const fixture = createFixture({ result: authority });
+
+  const result = await fixture.initializer.initialize();
+
+  assert.equal(result.deployment.phase, "PAUSED_FAULT");
+  assert.equal(result.exactState.stateVersion, 3);
+  assert.equal(result.exactState.currentEpisodeInventoryQuantity, "0");
+  assert.deepEqual(
+    result.auditEvents
+      .filter((event) => event.eventType === "STATE_ADVANCED")
+      .map((event) => [event.fromPhase, event.toPhase, event.stateVersion]),
+    [
+      ["ACTIVE", "ACTIVE", 1],
+      ["DRAINING", "DRAINING", 2],
+      ["DRAINING", "DRAINING", 3],
+    ],
+  );
+  assert.equal(rollbackEvent(mutableAuthority(result)).stateVersion, 1);
+  assert.equal(faultEvent(mutableAuthority(result)).stateVersion, 3);
+});
+
+test("candidate initializer restarts DRAINING fault authority after multiple active advances", async () => {
+  const authority = pausedFaultFromDrainingWithMultipleActiveAuthority();
+  const fixture = createFixture({ result: authority });
+
+  const result = await fixture.initializer.initialize();
+
+  assert.equal(result.deployment.phase, "PAUSED_FAULT");
+  assert.equal(result.exactState.stateVersion, 2);
+  assert.equal(result.exactState.currentEpisodeInventoryQuantity, "0.15");
+  assert.deepEqual(
+    result.auditEvents
+      .filter((event) => event.eventType === "STATE_ADVANCED")
+      .map((event) => [event.fromPhase, event.toPhase, event.stateVersion]),
+    [["ACTIVE", "ACTIVE", 1], ["ACTIVE", "ACTIVE", 2]],
+  );
+  assert.equal(rollbackEvent(mutableAuthority(result)).stateVersion, 2);
+  assert.equal(faultEvent(mutableAuthority(result)).stateVersion, 2);
+});
+
 test("candidate initializer rejects forged rollback boundaries around DRAINING state advances", async () => {
   const cases: Array<Readonly<{
     name: string;
@@ -334,6 +394,25 @@ test("candidate initializer rejects identical rollback and fault epochs regardle
     await assert.rejects(
       () => fixture.initializer.initialize(),
       /rollback|fault|chronology|precede/i,
+      faultId,
+    );
+  }
+});
+
+test("candidate initializer rejects fault at the latest DRAINING evidence epoch regardless of fault id", async () => {
+  for (const faultId of ["0000-low-arbitrary-fault-id", "zzzz-high-arbitrary-fault-id"] as const) {
+    const authority = pausedFaultFromDrainingWithExitAuthority();
+    const latestDrainingEvidenceAt = authority.evidenceRecords.at(-1)!.evidence.executedAt;
+    const fault = faultEvent(authority);
+    authority.deployment.updatedAt = latestDrainingEvidenceAt;
+    fault.createdAt = latestDrainingEvidenceAt;
+    fault.id = faultId;
+    authority.auditEvents.sort(compareAuditChronology);
+    const fixture = createFixture({ result: authority });
+
+    await assert.rejects(
+      () => fixture.initializer.initialize(),
+      /DRAINING|fault|evidence|chronology|strict/i,
       faultId,
     );
   }
@@ -912,6 +991,18 @@ function pausedFaultFromDrainingAuthority(): ReturnType<typeof mutableAuthority>
   return authority;
 }
 
+function pausedFaultFromDrainingWithoutEvidenceAuthority(): ReturnType<typeof mutableAuthority> {
+  const authority = mutableAuthority(validAuthority({
+    outcome: "EXISTING",
+    createdAt: CREATED_AT,
+    phase: "PAUSED_FAULT",
+    activationAt: "2026-08-23T23:59:59.500000001Z",
+  }));
+  faultEvent(authority).fromPhase = "DRAINING";
+  authority.auditEvents.splice(-1, 0, rollbackStartedAudit(authority.deployment, 0));
+  return authority;
+}
+
 function pausedFaultFromDrainingWithExitAuthority(): ReturnType<typeof mutableAuthority> {
   const authority = pausedFaultFromDrainingAuthority();
   const exitEvidence = executedExitEvidence();
@@ -928,6 +1019,63 @@ function pausedFaultFromDrainingWithExitAuthority(): ReturnType<typeof mutableAu
       toStateVersion: 2,
     }),
   );
+  faultEvent(authority).stateVersion = 2;
+  return authority;
+}
+
+function pausedFaultFromDrainingWithMultipleExitAuthority(): ReturnType<typeof mutableAuthority> {
+  const authority = pausedFaultFromDrainingAuthority();
+  const reduceEvidence = executedReduceEvidence();
+  const finalExitEvidence = executedFinalExitEvidence();
+  authority.evidenceRecords.push(
+    executedEvidenceRecord(authority.deployment.id, reduceEvidence),
+    executedEvidenceRecord(authority.deployment.id, finalExitEvidence),
+  );
+  authority.exactState = {
+    ...projectExactCandidateState([
+      executedEnterEvidence(),
+      reduceEvidence,
+      finalExitEvidence,
+    ]),
+  };
+  const fault = faultEvent(authority);
+  const faultIndex = authority.auditEvents.indexOf(fault);
+  authority.auditEvents.splice(
+    faultIndex,
+    0,
+    stateAdvancedAudit(authority.deployment, reduceEvidence, {
+      phase: "DRAINING",
+      fromStateVersion: 1,
+      toStateVersion: 2,
+    }),
+    stateAdvancedAudit(authority.deployment, finalExitEvidence, {
+      phase: "DRAINING",
+      fromStateVersion: 2,
+      toStateVersion: 3,
+    }),
+  );
+  fault.stateVersion = 3;
+  return authority;
+}
+
+function pausedFaultFromDrainingWithMultipleActiveAuthority(): ReturnType<typeof mutableAuthority> {
+  const authority = pausedFaultFromDrainingAuthority();
+  const addEvidence = executedActiveAddEvidence();
+  authority.evidenceRecords.push(executedEvidenceRecord(authority.deployment.id, addEvidence));
+  authority.exactState = {
+    ...projectExactCandidateState([executedEnterEvidence(), addEvidence]),
+  };
+  const rollback = rollbackEvent(authority);
+  authority.auditEvents.splice(
+    authority.auditEvents.indexOf(rollback),
+    0,
+    stateAdvancedAudit(authority.deployment, addEvidence, {
+      phase: "ACTIVE",
+      fromStateVersion: 1,
+      toStateVersion: 2,
+    }),
+  );
+  rollback.stateVersion = 2;
   faultEvent(authority).stateVersion = 2;
   return authority;
 }
@@ -1045,6 +1193,48 @@ function executedExitEvidence(): PositionGuardCandidateExecutionEvidence {
     grossQuoteValueKrw: "11000",
     confirmedFeeKrw: "5",
     remainingQuantity: "0",
+  };
+}
+
+function executedReduceEvidence(): PositionGuardCandidateExecutionEvidence {
+  return {
+    evidenceId: "candidate-reduce-2",
+    executedAt: "2026-08-23T23:59:59.870000001Z",
+    action: "REDUCE",
+    entryPath: "NONE",
+    terminalStatus: "FILLED",
+    executedQuantity: "0.04",
+    grossQuoteValueKrw: "4400",
+    confirmedFeeKrw: "2",
+    remainingQuantity: "0.06",
+  };
+}
+
+function executedFinalExitEvidence(): PositionGuardCandidateExecutionEvidence {
+  return {
+    evidenceId: "candidate-exit-3",
+    executedAt: "2026-08-23T23:59:59.880000001Z",
+    action: "EXIT",
+    entryPath: "NONE",
+    terminalStatus: "FILLED",
+    executedQuantity: "0.06",
+    grossQuoteValueKrw: "6600",
+    confirmedFeeKrw: "3",
+    remainingQuantity: "0",
+  };
+}
+
+function executedActiveAddEvidence(): PositionGuardCandidateExecutionEvidence {
+  return {
+    evidenceId: "candidate-active-add-2",
+    executedAt: "2026-08-23T23:59:59.800000001Z",
+    action: "ADD",
+    entryPath: "RECLAIM",
+    terminalStatus: "FILLED",
+    executedQuantity: "0.05",
+    grossQuoteValueKrw: "5000",
+    confirmedFeeKrw: "2.5",
+    remainingQuantity: "0.15",
   };
 }
 
