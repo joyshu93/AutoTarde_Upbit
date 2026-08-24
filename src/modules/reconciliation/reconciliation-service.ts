@@ -979,17 +979,12 @@ export class ReconciliationService {
       ];
     }
 
+    let snapshot: ExchangeOrderSnapshot | null;
     try {
-      const snapshot = await this.dependencies.orderReader.getOrder({
+      snapshot = await this.dependencies.orderReader.getOrder({
         ...(order.upbitUuid ? { uuid: order.upbitUuid } : {}),
         ...(order.identifier ? { identifier: order.identifier } : {}),
       });
-
-      if (!snapshot) {
-        return [await this.markOrderForRecovery(order, reconciledAt, "Exchange order snapshot could not be found.")];
-      }
-
-      return await this.applyExchangeSnapshot(order, snapshot, reconciledAt);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown reconciliation query failure.";
       if (isTypedTransientLookupError(error)) {
@@ -1012,6 +1007,20 @@ export class ReconciliationService {
       }
 
       return [await this.markOrderForRecovery(order, reconciledAt, `Exchange order lookup failed: ${message}`)];
+    }
+
+    if (!snapshot) {
+      return [await this.markOrderForRecovery(order, reconciledAt, "Exchange order snapshot could not be found.")];
+    }
+
+    try {
+      return await this.applyExchangeSnapshot(order, snapshot, reconciledAt);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown local reconciliation persistence failure.";
+      return [{
+        code: "OPEN_ORDER_NEEDS_REVIEW",
+        message: `Local reconciliation persistence failed for order ${order.id}. ${message}`,
+      }];
     }
   }
 
@@ -1039,28 +1048,12 @@ export class ReconciliationService {
       return [];
     }
 
+    let snapshot: ExchangeOrderSnapshot | null;
     try {
-      const snapshot = await this.dependencies.orderReader.getOrder({
+      snapshot = await this.dependencies.orderReader.getOrder({
         ...(order.upbitUuid ? { uuid: order.upbitUuid } : {}),
         ...(order.identifier ? { identifier: order.identifier } : {}),
       });
-
-      if (!snapshot) {
-        return [
-          await this.markOrderForRecovery(
-            order,
-            reconciledAt,
-            "Terminal order snapshot could not be found during reconciliation.",
-          ),
-        ];
-      }
-
-      const issues = await this.applyExchangeSnapshot(order, snapshot, reconciledAt);
-      issues.unshift({
-        code: "TERMINAL_ORDER_RECHECKED",
-        message: `Terminal order ${order.id} was rechecked against exchange state ${snapshot.state}.`,
-      });
-      return issues;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown terminal reconciliation query failure.";
       if (isTypedTransientLookupError(error)) {
@@ -1090,6 +1083,31 @@ export class ReconciliationService {
           `Terminal order lookup failed: ${message}`,
         ),
       ];
+    }
+
+    if (!snapshot) {
+      return [
+        await this.markOrderForRecovery(
+          order,
+          reconciledAt,
+          "Terminal order snapshot could not be found during reconciliation.",
+        ),
+      ];
+    }
+
+    try {
+      const issues = await this.applyExchangeSnapshot(order, snapshot, reconciledAt);
+      issues.unshift({
+        code: "TERMINAL_ORDER_RECHECKED",
+        message: `Terminal order ${order.id} was rechecked against exchange state ${snapshot.state}.`,
+      });
+      return issues;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown local reconciliation persistence failure.";
+      return [{
+        code: "OPEN_ORDER_NEEDS_REVIEW",
+        message: `Local reconciliation persistence failed for terminal order ${order.id}. ${message}`,
+      }];
     }
   }
 
@@ -1140,6 +1158,10 @@ export class ReconciliationService {
       fills: buildFillRecords(order, snapshot),
     });
 
+    if (persistence.outcome === "CONFLICT") {
+      return [await this.classifyConcurrentOrderChange(order)];
+    }
+
     if (orderChanged) {
       if (nextStatus !== order.status) {
         issues.push({
@@ -1186,8 +1208,14 @@ export class ReconciliationService {
       updatedAt: reconciledAt,
     };
 
-    await this.dependencies.repositories.updateOrder(nextOrder);
-    await this.dependencies.repositories.appendOrderEvent({
+    const persistRecovery = this.dependencies.repositories.persistReconciliationRecovery;
+    if (!persistRecovery) {
+      throw new Error("Atomic reconciliation recovery persistence is unavailable.");
+    }
+    const persistence = await persistRecovery.call(this.dependencies.repositories, {
+      expectedOrder: order,
+      order: nextOrder,
+      event: {
       id: createId("order_event"),
       orderId: order.id,
       eventType: "RECONCILIATION_RECOVERY_REQUIRED",
@@ -1196,12 +1224,32 @@ export class ReconciliationService {
         reason: message,
       }),
       createdAt: reconciledAt,
+      },
+      riskEvent: createRecoveryRiskEvent(order, message, reconciledAt),
     });
-    await this.dependencies.repositories.saveRiskEvent(createRecoveryRiskEvent(order, message, reconciledAt));
+    if (persistence.outcome === "CONFLICT") {
+      return this.classifyConcurrentOrderChange(order);
+    }
 
     return {
       code: issueCode,
       message: `Order ${order.id} marked RECONCILIATION_REQUIRED. ${message}`,
+    };
+  }
+
+  private async classifyConcurrentOrderChange(
+    order: OrderRecord,
+  ): Promise<ReconciliationSummary["issues"][number]> {
+    const current = await this.dependencies.repositories.findOrderById(order.exchangeAccountId, order.id);
+    if (!current) {
+      return {
+        code: "OPEN_ORDER_NEEDS_REVIEW",
+        message: `Order ${order.id} changed concurrently and is no longer available for reconciliation classification.`,
+      };
+    }
+    return {
+      code: "OPEN_ORDER_NEEDS_REVIEW",
+      message: `Order ${order.id} changed concurrently to ${current.status}; stale reconciliation material was not persisted.`,
     };
   }
 

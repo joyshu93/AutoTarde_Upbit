@@ -9,6 +9,7 @@ import type {
   FaultPauseInput,
   PersistExchangeSubmissionInput,
   PersistOrderIntentInput,
+  PersistReconciliationRecoveryInput,
   PersistReconciledExchangeSnapshotInput,
   PersistUncertainSubmissionInput,
 } from "../interfaces.js";
@@ -213,6 +214,41 @@ export function validateReconciledExchangeSnapshotInput(
     ids.add(fill.id);
     exchangeIdentities.add(exchangeIdentity);
   }
+}
+
+export function validateReconciliationRecoveryInput(input: PersistReconciliationRecoveryInput): void {
+  const { expectedOrder, order, event, riskEvent } = input;
+  validateOrderIdentity(expectedOrder, order);
+  if (order.status !== "RECONCILIATION_REQUIRED" || order.failureCode !== "RECONCILIATION_REQUIRED") {
+    throw new Error("Reconciliation recovery must set RECONCILIATION_REQUIRED status and failureCode.");
+  }
+  validateOrderEvent(order, event, "RECONCILIATION_RECOVERY_REQUIRED", "RECONCILIATION");
+  if (
+    riskEvent.level !== "WARN" || riskEvent.ruleCode !== "ORDER_RECOVERY_REQUIRED" ||
+    riskEvent.orderId !== order.id || riskEvent.exchangeAccountId !== order.exchangeAccountId ||
+    riskEvent.strategyDecisionId !== order.strategyDecisionId
+  ) throw new Error("Reconciliation recovery risk event must exactly link the blocked order.");
+}
+
+export function validateReconciliationRecoveryCompletion(
+  currentOrder: OrderRecord,
+  nextOrder: OrderRecord,
+  input: PersistReconciliationRecoveryInput,
+  existingEvents: OrderEventRecord[],
+  existingRiskEvents: RiskEventRecord[],
+): "APPLY" | "RETRY" {
+  validateOrderIdentity(currentOrder, nextOrder);
+  const recoveryEvents = existingEvents.filter((event) => event.eventType === "RECONCILIATION_RECOVERY_REQUIRED");
+  const recoveryRiskEvents = existingRiskEvents.filter((event) => event.ruleCode === "ORDER_RECOVERY_REQUIRED");
+  if (!recordsEqual(currentOrder, nextOrder)) {
+    if (recoveryEvents.length === 0 && recoveryRiskEvents.length === 0) return "APPLY";
+    throw new Error(`Corrupt partial reconciliation recovery children for order ${nextOrder.id}.`);
+  }
+  if (
+    recoveryEvents.length === 1 && recoveryRiskEvents.length === 1 &&
+    recordsEqual(recoveryEvents[0]!, input.event) && recordsEqual(recoveryRiskEvents[0]!, input.riskEvent)
+  ) return "RETRY";
+  throw new Error(`Conflicting reconciliation recovery for order ${nextOrder.id}.`);
 }
 
 export function validateFillForOrder(order: OrderRecord, fill: FillRecord): void {

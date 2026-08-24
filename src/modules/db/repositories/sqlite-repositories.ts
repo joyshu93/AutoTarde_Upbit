@@ -60,6 +60,8 @@ import type {
   PersistCandidateBoundOrderIntentRequest,
   PersistExchangeSubmissionInput,
   PersistOrderIntentInput,
+  PersistReconciliationRecoveryInput,
+  PersistReconciliationRecoveryResult,
   PersistReconciledExchangeSnapshotInput,
   PersistReconciledExchangeSnapshotResult,
   PersistUncertainSubmissionInput,
@@ -91,6 +93,8 @@ import {
   validateFaultPauseTimestamp,
   validateOrderIntentInput,
   validateFillForOrder,
+  validateReconciliationRecoveryCompletion,
+  validateReconciliationRecoveryInput,
   validateReconciledExchangeSnapshotInput,
   validateUncertainSubmissionCompletion,
   validateUncertainSubmissionInput,
@@ -452,7 +456,7 @@ export class SqliteExecutionRepository implements ExecutionRepository {
         throw new Error(`Cannot persist reconciliation for missing order ${normalizedInput.order.id}.`);
       }
       if (!recordsEqual(currentOrder, normalizedInput.expectedOrder)) {
-        throw new Error(`Reconciliation expected order ${normalizedInput.order.id} changed concurrently.`);
+        return { outcome: "CONFLICT", insertedFillCount: 0 };
       }
 
       const existingEvent = normalizedInput.event
@@ -479,6 +483,34 @@ export class SqliteExecutionRepository implements ExecutionRepository {
         outcome: orderChanged || eventInserted || insertedFills.length > 0 ? "APPLIED" : "DUPLICATE",
         insertedFillCount: insertedFills.length,
       };
+    });
+  }
+
+  async persistReconciliationRecovery(
+    input: PersistReconciliationRecoveryInput,
+  ): Promise<PersistReconciliationRecoveryResult> {
+    return withImmediateTransaction(this.db, () => {
+      validateReconciliationRecoveryInput(input);
+      const currentOrder = this.getOrderById(input.order.id);
+      if (!currentOrder) throw new Error(`Cannot persist reconciliation recovery for missing order ${input.order.id}.`);
+      if (!recordsEqual(currentOrder, input.expectedOrder)) return { outcome: "CONFLICT" };
+      assertSameAccount(currentOrder, input.order);
+      const existingEvent = this.getOrderEventById(input.event.id);
+      const existingRiskEvent = this.getRiskEventById(input.riskEvent.id);
+      assertNoConflictingRecord(existingEvent, input.event, "reconciliation recovery event");
+      assertNoConflictingRecord(existingRiskEvent, input.riskEvent, "reconciliation recovery risk event");
+      const completion = validateReconciliationRecoveryCompletion(
+        currentOrder,
+        input.order,
+        input,
+        this.getOrderEventsForOrder(input.order.id),
+        this.getRiskEventsForOrder(input.order.id),
+      );
+      if (completion === "RETRY") return { outcome: "DUPLICATE" };
+      this.upsertOrder(input.order);
+      this.insertOrderEvent(input.event);
+      this.upsertRiskEvent(input.riskEvent);
+      return { outcome: "APPLIED" };
     });
   }
 

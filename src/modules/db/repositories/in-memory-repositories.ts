@@ -39,6 +39,8 @@ import type {
   PersistCandidateBoundOrderIntentInput,
   PersistCandidateBoundOrderIntentRequest,
   PersistOrderIntentInput,
+  PersistReconciliationRecoveryInput,
+  PersistReconciliationRecoveryResult,
   PersistReconciledExchangeSnapshotInput,
   PersistReconciledExchangeSnapshotResult,
   PersistUncertainSubmissionInput,
@@ -66,6 +68,8 @@ import {
   validateNewOrderUniqueness,
   validateOrderIntentInput,
   validateFillForOrder,
+  validateReconciliationRecoveryCompletion,
+  validateReconciliationRecoveryInput,
   validateReconciledExchangeSnapshotInput,
   validateUncertainSubmissionCompletion,
   validateUncertainSubmissionInput,
@@ -307,7 +311,7 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       throw new Error(`Cannot persist reconciliation for missing order ${normalizedInput.order.id}.`);
     }
     if (!recordsEqual(currentOrder, normalizedInput.expectedOrder)) {
-      throw new Error(`Reconciliation expected order ${normalizedInput.order.id} changed concurrently.`);
+      return { outcome: "CONFLICT", insertedFillCount: 0 };
     }
 
     const existingEvent = normalizedInput.event
@@ -336,6 +340,32 @@ export class InMemoryExecutionRepository implements ExecutionRepository {
       outcome: orderChanged || eventInserted || insertedFills.length > 0 ? "APPLIED" : "DUPLICATE",
       insertedFillCount: insertedFills.length,
     };
+  }
+
+  async persistReconciliationRecovery(
+    input: PersistReconciliationRecoveryInput,
+  ): Promise<PersistReconciliationRecoveryResult> {
+    validateReconciliationRecoveryInput(input);
+    const currentOrder = this.orders.find((candidate) => candidate.id === input.order.id);
+    if (!currentOrder) throw new Error(`Cannot persist reconciliation recovery for missing order ${input.order.id}.`);
+    if (!recordsEqual(currentOrder, input.expectedOrder)) return { outcome: "CONFLICT" };
+    assertSameAccount(currentOrder, input.order);
+    const existingEvent = this.orderEvents.find((candidate) => candidate.id === input.event.id);
+    const existingRiskEvent = this.riskEvents.find((candidate) => candidate.id === input.riskEvent.id);
+    assertNoConflictingRecord(existingEvent, input.event, "reconciliation recovery event");
+    assertNoConflictingRecord(existingRiskEvent, input.riskEvent, "reconciliation recovery risk event");
+    const completion = validateReconciliationRecoveryCompletion(
+      currentOrder,
+      input.order,
+      input,
+      this.orderEvents.filter((candidate) => candidate.orderId === input.order.id),
+      this.riskEvents.filter((candidate) => candidate.orderId === input.order.id),
+    );
+    if (completion === "RETRY") return { outcome: "DUPLICATE" };
+    this.orders = this.orders.map((candidate) => candidate.id === input.order.id ? cloneRecord(input.order) : candidate);
+    this.orderEvents = [...this.orderEvents, cloneRecord(input.event)];
+    this.riskEvents = [...this.riskEvents, cloneRecord(input.riskEvent)];
+    return { outcome: "APPLIED" };
   }
 
   async persistUncertainSubmission(input: PersistUncertainSubmissionInput): Promise<void> {

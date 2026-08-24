@@ -51,6 +51,131 @@ function pausedUncertainSubmissionState() {
   });
 }
 
+function activeReconciliationRaceOrder(overrides: Partial<OrderRecord> = {}): OrderRecord {
+  return {
+    id: "active-reconciliation-race-order",
+    strategyDecisionId: "active-reconciliation-race-decision",
+    exchangeAccountId: "primary",
+    market: "KRW-BTC",
+    side: "bid",
+    ordType: "limit",
+    volume: "0.01",
+    price: "100000000",
+    timeInForce: null,
+    smpType: null,
+    identifier: "active-reconciliation-race-identifier",
+    idempotencyKey: "active-reconciliation-race-idempotency",
+    origin: "STRATEGY",
+    requestedAt: "2026-08-24T00:00:00.000Z",
+    upbitUuid: "active-reconciliation-race-uuid",
+    status: "OPEN",
+    executionMode: "DRY_RUN",
+    exchangeResponseJson: JSON.stringify({ state: "wait" }),
+    failureCode: null,
+    failureMessage: null,
+    createdAt: "2026-08-24T00:00:00.000Z",
+    updatedAt: "2026-08-24T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function activeReconciliationRaceState() {
+  return new InMemoryOperatorStateStore({
+    id: "active-reconciliation-race-state",
+    exchangeAccountId: "primary",
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-08-24T00:00:00.000Z",
+  });
+}
+
+test("active reconciliation CAS conflict preserves a concurrent terminal aggregate without stale projection", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = activeReconciliationRaceState();
+  const original = activeReconciliationRaceOrder();
+  const terminal = {
+    ...original,
+    status: "FILLED" as const,
+    exchangeResponseJson: JSON.stringify({ state: "done", executed_volume: "0.01" }),
+    updatedAt: "2026-08-24T00:01:00.000Z",
+  };
+  const terminalEvent = {
+    id: "active-reconciliation-race-terminal-event",
+    orderId: original.id,
+    eventType: "RECONCILIATION_STATUS_UPDATED" as const,
+    eventSource: "RECONCILIATION" as const,
+    payloadJson: JSON.stringify({ previousStatus: "OPEN", nextStatus: "FILLED" }),
+    createdAt: terminal.updatedAt,
+  };
+  const terminalFill = {
+    id: "active-reconciliation-race-terminal-fill",
+    orderId: original.id,
+    exchangeFillId: "active-reconciliation-race-exchange-fill",
+    market: original.market,
+    side: original.side,
+    price: original.price!,
+    volume: original.volume!,
+    feeCurrency: "KRW",
+    feeAmount: "500",
+    feeProvenance: "EXCHANGE_FILL_CONFIRMED" as const,
+    executionTimestampProvenance: "EXCHANGE_FILL_CONFIRMED" as const,
+    executionEpochNs: "1787529660000000000",
+    filledAt: terminal.updatedAt,
+    rawPayloadJson: JSON.stringify({ trade_uuid: "active-reconciliation-race-exchange-fill" }),
+  };
+  await repositories.saveOrder(original);
+  const projectedOrderIds: string[] = [];
+  const service = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: {
+      async getOrder() {
+        await repositories.persistReconciledExchangeSnapshot!({
+          expectedOrder: original,
+          order: terminal,
+          event: terminalEvent,
+          fills: [terminalFill],
+        });
+        return {
+          uuid: original.upbitUuid!,
+          identifier: original.identifier,
+          market: original.market,
+          side: original.side,
+          ordType: "limit",
+          state: "wait",
+          price: original.price,
+          volume: original.volume,
+          remainingVolume: original.volume!,
+          executedVolume: "0",
+          paidFee: "0",
+          createdAt: original.createdAt,
+          fills: [],
+          raw: { state: "wait" },
+        };
+      },
+    },
+    candidateEvidenceService: {
+      async processTerminalOrder(orderId) {
+        projectedOrderIds.push(orderId);
+        return { outcome: "ADVANCED" as const, orderId, detail: "unexpected stale projection" };
+      },
+    },
+  });
+
+  await service.run("primary");
+
+  assert.deepEqual(await repositories.findOrderById("primary", original.id), terminal);
+  assert.deepEqual(await repositories.listOrderEvents(original.id), [terminalEvent]);
+  assert.deepEqual(await repositories.listFills(original.id), [terminalFill]);
+  assert.deepEqual(await repositories.listRiskEvents("primary"), []);
+  assert.deepEqual(projectedOrderIds, []);
+});
+
 test("reconciliation runWithRecord returns its exact persisted record as a detached value", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = new InMemoryOperatorStateStore({

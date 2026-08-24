@@ -85,8 +85,19 @@ export interface PersistReconciledExchangeSnapshotInput {
 }
 
 export interface PersistReconciledExchangeSnapshotResult {
-  outcome: "APPLIED" | "DUPLICATE";
+  outcome: "APPLIED" | "DUPLICATE" | "CONFLICT";
   insertedFillCount: number;
+}
+
+export interface PersistReconciliationRecoveryInput {
+  expectedOrder: OrderRecord;
+  order: OrderRecord;
+  event: OrderEventRecord;
+  riskEvent: RiskEventRecord;
+}
+
+export interface PersistReconciliationRecoveryResult {
+  outcome: "APPLIED" | "DUPLICATE" | "CONFLICT";
 }
 
 export interface PersistUncertainSubmissionInput {
@@ -136,6 +147,9 @@ export interface ExecutionRepository {
   persistReconciledExchangeSnapshot?(
     input: PersistReconciledExchangeSnapshotInput,
   ): Promise<PersistReconciledExchangeSnapshotResult>;
+  persistReconciliationRecovery?(
+    input: PersistReconciliationRecoveryInput,
+  ): Promise<PersistReconciliationRecoveryResult>;
   persistUncertainSubmission(input: PersistUncertainSubmissionInput): Promise<void>;
   findOrderByIdempotencyKey(exchangeAccountId: string, idempotencyKey: string): Promise<OrderRecord | null>;
   findOrderById(exchangeAccountId: string, orderId: string): Promise<OrderRecord | null>;

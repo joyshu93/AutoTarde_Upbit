@@ -232,6 +232,90 @@ test("sqlite atomic lifecycle writes roll back conflicts and fault pauses stay s
   }
 });
 
+test("two SQLite connections preserve a terminal winner when missing reconciliation snapshot races recovery", async () => {
+  const databasePath = await createTempDatabasePath("reconciliation-recovery-cas-race");
+  const bootstrap = {
+    databasePath,
+    exchangeAccountId: "primary",
+    userId: "operator",
+    userTelegramId: "telegram-user",
+    userDisplayName: "Operator",
+    accessKeyRef: "ENV:UPBIT_ACCESS_KEY",
+    secretKeyRef: "ENV:UPBIT_SECRET_KEY",
+    executionMode: "DRY_RUN" as const,
+    liveExecutionGate: "DISABLED" as const,
+    killSwitchActive: false,
+  };
+  const first = createSqlitePersistence(bootstrap);
+  const second = createSqlitePersistence(bootstrap);
+  const original = createOrderRecord({
+    id: "sqlite-reconciliation-recovery-cas-order",
+    status: "OPEN",
+    upbitUuid: "sqlite-reconciliation-recovery-cas-uuid",
+    exchangeResponseJson: JSON.stringify({ state: "wait" }),
+  });
+  const terminal = {
+    ...original,
+    status: "CANCELED" as const,
+    exchangeResponseJson: JSON.stringify({ state: "cancel" }),
+    updatedAt: "2026-08-24T00:01:00.000Z",
+  };
+  const terminalEvent: OrderEventRecord = {
+    id: "sqlite-reconciliation-recovery-cas-terminal-event",
+    orderId: original.id,
+    eventType: "RECONCILIATION_STATUS_UPDATED",
+    eventSource: "RECONCILIATION",
+    payloadJson: JSON.stringify({ previousStatus: "OPEN", nextStatus: "CANCELED" }),
+    createdAt: terminal.updatedAt,
+  };
+  const terminalFill = {
+    ...createFill(original.id, "sqlite-reconciliation-recovery-cas-terminal-fill"),
+    exchangeFillId: "sqlite-reconciliation-recovery-cas-exchange-fill",
+    volume: "0.001",
+    feeProvenance: "LEGACY_UNVERIFIED" as const,
+    executionTimestampProvenance: "LEGACY_UNVERIFIED" as const,
+    executionEpochNs: null,
+  };
+
+  try {
+    await first.repositories.saveOrder(original);
+    const projectedOrderIds: string[] = [];
+    const service = new ReconciliationService({
+      repositories: first.repositories,
+      operatorState: first.operatorState,
+      orderReader: {
+        async getOrder() {
+          await second.repositories.persistReconciledExchangeSnapshot!({
+            expectedOrder: original,
+            order: terminal,
+            event: terminalEvent,
+            fills: [terminalFill],
+          });
+          return null;
+        },
+      },
+      candidateEvidenceService: {
+        async processTerminalOrder(orderId) {
+          projectedOrderIds.push(orderId);
+          return { outcome: "ADVANCED" as const, orderId, detail: "unexpected stale projection" };
+        },
+      },
+    });
+
+    await service.run("primary");
+
+    assert.deepEqual(await first.repositories.findOrderById("primary", original.id), terminal);
+    assert.deepEqual(await first.repositories.listOrderEvents(original.id), [terminalEvent]);
+    assert.deepEqual(await first.repositories.listFills(original.id), [terminalFill]);
+    assert.deepEqual(await first.repositories.listRiskEvents("primary"), []);
+    assert.deepEqual(projectedOrderIds, []);
+  } finally {
+    second.close();
+    first.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
 test("sqlite reconciliation aggregate rolls back a fill-prefix failure and completes after restart", async () => {
   const databasePath = await createTempDatabasePath("atomic-reconciliation-restart");
   const bootstrap = {
@@ -448,7 +532,7 @@ test("reconciliation stays lookup-eligible after atomic fill failure and project
     });
 
     const failedOrder = await bundle.repositories.findOrderById("primary", order.id);
-    assert.equal(failedOrder?.status, "RECONCILIATION_REQUIRED");
+    assert.equal(failedOrder?.status, "OPEN");
     assert.equal(failedOrder?.exchangeResponseJson, order.exchangeResponseJson);
     assert.deepEqual(await bundle.repositories.listFills(order.id), []);
     assert.deepEqual(projectedOrderIds, []);
@@ -2115,6 +2199,101 @@ async function assertAtomicLifecycleContract(repository: ExecutionRepository): P
     events: await repository.listOrderEvents(reconciledOrder.id),
     fills: await repository.listFills(reconciledOrder.id),
   }, completeAggregate);
+
+  assert.deepEqual(await persistReconciledSnapshot.call(repository, {
+    expectedOrder: reconciledOrder,
+    order: reconciledOrder,
+    event: null,
+    fills: [],
+  }), { outcome: "CONFLICT", insertedFillCount: 0 });
+  assert.deepEqual({
+    order: await repository.findOrderById("primary", reconciledOrder.id),
+    events: await repository.listOrderEvents(reconciledOrder.id),
+    fills: await repository.listFills(reconciledOrder.id),
+  }, completeAggregate);
+
+  const recoveryOrder = createOrderRecord({ id: "atomic-recovery-parity-order", status: "OPEN" });
+  await repository.saveOrder(recoveryOrder);
+  const recoveryNext = {
+    ...recoveryOrder,
+    status: "RECONCILIATION_REQUIRED" as const,
+    failureCode: "RECONCILIATION_REQUIRED",
+    failureMessage: "Exchange snapshot is unavailable.",
+    updatedAt: "2026-08-21T00:03:00.000Z",
+  };
+  const atomicRecoveryEvent: OrderEventRecord = {
+    id: "atomic-recovery-parity-event",
+    orderId: recoveryOrder.id,
+    eventType: "RECONCILIATION_RECOVERY_REQUIRED",
+    eventSource: "RECONCILIATION",
+    payloadJson: JSON.stringify({ reason: recoveryNext.failureMessage }),
+    createdAt: recoveryNext.updatedAt,
+  };
+  const atomicRecoveryRisk: RiskEventRecord = {
+    id: "atomic-recovery-parity-risk",
+    exchangeAccountId: recoveryOrder.exchangeAccountId,
+    strategyDecisionId: recoveryOrder.strategyDecisionId,
+    orderId: recoveryOrder.id,
+    level: "WARN",
+    ruleCode: "ORDER_RECOVERY_REQUIRED",
+    message: recoveryNext.failureMessage,
+    payloadJson: JSON.stringify({ orderId: recoveryOrder.id }),
+    createdAt: recoveryNext.updatedAt,
+  };
+  const persistRecovery = repository.persistReconciliationRecovery;
+  assert.ok(persistRecovery);
+  assert.deepEqual(await persistRecovery.call(repository, {
+    expectedOrder: recoveryOrder,
+    order: recoveryNext,
+    event: atomicRecoveryEvent,
+    riskEvent: atomicRecoveryRisk,
+  }), { outcome: "APPLIED" });
+  const recoveryAggregate = {
+    order: await repository.findOrderById("primary", recoveryOrder.id),
+    events: await repository.listOrderEvents(recoveryOrder.id),
+    risks: (await repository.listRiskEvents("primary")).filter((risk) => risk.orderId === recoveryOrder.id),
+  };
+  assert.deepEqual(await persistRecovery.call(repository, {
+    expectedOrder: recoveryNext,
+    order: recoveryNext,
+    event: atomicRecoveryEvent,
+    riskEvent: atomicRecoveryRisk,
+  }), { outcome: "DUPLICATE" });
+  await assert.rejects(persistRecovery.call(repository, {
+    expectedOrder: recoveryNext,
+    order: recoveryNext,
+    event: atomicRecoveryEvent,
+    riskEvent: { ...atomicRecoveryRisk, message: "conflicting retry material" },
+  }));
+  assert.deepEqual({
+    order: await repository.findOrderById("primary", recoveryOrder.id),
+    events: await repository.listOrderEvents(recoveryOrder.id),
+    risks: (await repository.listRiskEvents("primary")).filter((risk) => risk.orderId === recoveryOrder.id),
+  }, recoveryAggregate);
+
+  const recoveryConflictOrder = createOrderRecord({ id: "atomic-recovery-conflict-order", status: "OPEN" });
+  await repository.saveOrder(recoveryConflictOrder);
+  const recoveryWinner = {
+    ...recoveryConflictOrder,
+    status: "FILLED" as const,
+    updatedAt: "2026-08-21T00:04:00.000Z",
+  };
+  await repository.updateOrder(recoveryWinner);
+  assert.deepEqual(await persistRecovery.call(repository, {
+    expectedOrder: recoveryConflictOrder,
+    order: {
+      ...recoveryConflictOrder,
+      status: "RECONCILIATION_REQUIRED",
+      failureCode: "RECONCILIATION_REQUIRED",
+      failureMessage: "stale recovery",
+      updatedAt: "2026-08-21T00:05:00.000Z",
+    },
+    event: { ...atomicRecoveryEvent, id: "atomic-recovery-conflict-event", orderId: recoveryConflictOrder.id },
+    riskEvent: { ...atomicRecoveryRisk, id: "atomic-recovery-conflict-risk", orderId: recoveryConflictOrder.id },
+  }), { outcome: "CONFLICT" });
+  assert.deepEqual(await repository.findOrderById("primary", recoveryConflictOrder.id), recoveryWinner);
+  assert.deepEqual(await repository.listOrderEvents(recoveryConflictOrder.id), []);
+  assert.deepEqual((await repository.listRiskEvents("primary")).filter((risk) => risk.orderId === recoveryConflictOrder.id), []);
 
   const immutableFillOrder = createOrderRecord({ id: "immutable-fill-order", status: "PERSISTED" });
   await repository.persistOrderIntent({
