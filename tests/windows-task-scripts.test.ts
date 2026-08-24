@@ -202,6 +202,18 @@ test("BTC pilot readiness example requires explicit read-only inspection inputs"
   assert.match(script, /PCS-2026-001\.DEPLOYMENT_READINESS_V1/);
 });
 
+test("BTC pilot readiness example defaults policy selection to BASELINE", () => {
+  const script = readPilotReadinessScript();
+
+  assert.match(script, /APP_EXECUTION_MODE\s*=\s*"DRY_RUN"/);
+  assert.match(script, /Remove-Item\s+Env:\\POSITION_GUARD_PILOT_ID\b/);
+  assert.match(script, /Remove-Item\s+Env:\\POSITION_GUARD_PILOT_CONFIRMATION\b/);
+  assert.doesNotMatch(script, /APP_EXECUTION_MODE\s*=\s*"LIVE"/);
+  assert.doesNotMatch(script, /\$env:POSITION_GUARD_PILOT_ID\s*=/);
+  assert.doesNotMatch(script, /\$env:POSITION_GUARD_PILOT_CONFIRMATION\s*=/);
+  assert.doesNotMatch(script, /I_UNDERSTAND_BTC_CANDIDATE_LIVE_PILOT/);
+});
+
 test("BTC pilot readiness example cannot activate or mutate trading paths", () => {
   const script = readPilotReadinessScript();
 

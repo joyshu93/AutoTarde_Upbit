@@ -1,5 +1,6 @@
-# Read-only BTC candidate pilot readiness inspection.
+# Read-only BTC candidate pilot readiness inspection with BASELINE policy selection.
 # This example requires an existing SQLite database and explicit persisted identity inputs.
+# Candidate selection, confirmation, and activation belong in a separate local procedure.
 # It does not start the app, activate the pilot, call Upbit or Telegram, or enable LIVE orders.
 
 [CmdletBinding()]
@@ -38,17 +39,18 @@ $PilotMarket = "KRW-BTC"
 $PilotPolicy = "COMBINED_CONSERVATIVE"
 $PilotPolicyVersion = "PCS-2026-001.DEPLOYMENT_READINESS_V1"
 
-# Candidate selection is explicit for inspection, but order transmission remains disabled.
-$env:APP_EXECUTION_MODE = "LIVE"
+# Keep the checked-in example on the default BASELINE selection even when the
+# parent PowerShell process contains candidate-pilot environment variables.
+$env:APP_EXECUTION_MODE = "DRY_RUN"
 $env:ENABLE_LIVE_ORDERS = "false"
-$env:POSITION_GUARD_PILOT_ID = $PilotId
-$env:POSITION_GUARD_PILOT_CONFIRMATION = "I_UNDERSTAND_BTC_CANDIDATE_LIVE_PILOT"
+Remove-Item Env:\POSITION_GUARD_PILOT_ID -ErrorAction SilentlyContinue
+Remove-Item Env:\POSITION_GUARD_PILOT_CONFIRMATION -ErrorAction SilentlyContinue
 $env:ENABLE_TELEGRAM_INBOUND_POLLING = "false"
 $env:ENABLE_TELEGRAM_DELIVERY = "false"
 $env:STRATEGY_SCHEDULER_ENABLED = "false"
 $env:STRATEGY_SCHEDULER_RUN_ON_START = "false"
 
-Write-Host "Inspecting persisted BTC pilot readiness without activation."
+Write-Host "Inspecting persisted BTC pilot readiness with BASELINE policy selection and without activation."
 Write-Host "pilot=$PilotId market=$PilotMarket policy=$PilotPolicy version=$PilotPolicyVersion"
 Write-Host "database=$DatabasePath deployment=$DeploymentId account=$ExchangeAccountId"
 

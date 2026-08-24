@@ -130,7 +130,7 @@ The persisted pilot lifecycle is distinct from an order lifecycle. `DISABLED` me
 
 Persisted deployment, state, terminal execution evidence, and audit records are authoritative and must replay to the exact same candidate state. Uncertain submission pauses global execution and remains reconciliation work; recovery faults the pilot and never automatically resumes or resends. Rollback begins only while globally paused, remains `DRAINING` while inventory exists, reaches `DISABLED` only after exchange-backed flat evidence, and requires a later explicit operator resume.
 
-`inspect:btc-pilot:readiness` and its `scripts/inspect-btc-pilot-readiness.example.ps1` wrapper inspect an explicit existing database and explicit candidate identity/configuration read-only. They do not create, submit, cancel, retry, reconcile, or mutate orders; do not start the app or scheduler; do not call Upbit or Telegram; do not enable LIVE orders; and do not activate or change the pilot. Inspection and activation are separate lifecycle events.
+`inspect:btc-pilot:readiness` and its `scripts/inspect-btc-pilot-readiness.example.ps1` wrapper inspect an explicit existing database and explicit account/deployment identity read-only. The checked-in wrapper forces the default `BASELINE` policy selection and contains no candidate selection or confirmation. They do not create, submit, cancel, retry, reconcile, or mutate orders; do not start the app or scheduler; do not call Upbit or Telegram; do not enable LIVE orders; and do not activate or change the pilot. Candidate selection and confirmation require separate local configuration, no-order validation, operator review, and a later explicit activation request; inspection and activation are separate lifecycle events.
 
 ## Idempotency
 
