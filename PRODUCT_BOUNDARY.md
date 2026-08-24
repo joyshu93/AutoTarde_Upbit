@@ -48,6 +48,16 @@ Live mode requires both:
 The application may wire the live Upbit adapter only when `APP_EXECUTION_MODE=LIVE`, `ENABLE_LIVE_ORDERS=true`, and Upbit credentials are configured. If any condition is missing, the runtime must fall back to the dry-run send path.
 The execution adapter itself carries the required live/dry discriminant; callers cannot supply a separate path label. A live adapter requires the persisted `LIVE`/`ENABLED` tuple both initially and immediately before its sole send. A dry adapter accepts any non-fully-live persisted tuple, but the exact initial mode-and-gate tuple must remain unchanged at the final check. Order mode, event source, simulated-fill behavior, and submission outcome follow that adapter discriminant.
 
+## BTC Candidate Pilot Boundary
+
+The default policy remains baseline and the default execution mode remains `DRY_RUN`; implemented candidate code does not select, approve, activate, or transmit for the pilot by itself. The only candidate identity in this pilot is `BTC_COMBINED_CONSERVATIVE_PILOT_V1`, market `KRW-BTC`, policy `COMBINED_CONSERVATIVE`, version `PCS-2026-001.DEPLOYMENT_READINESS_V1`. ETH always remains on the baseline policy.
+
+The persisted pilot phases have these safety meanings: `DISABLED` means baseline-only; `PENDING_FLAT` means selected but not active, with new BTC `ENTER` and `ADD` suppressed pending exchange-backed flat evidence; `ACTIVE` means the candidate may influence BTC decisions only under valid persisted authority and all normal execution gates; `DRAINING` means rollback is in progress with no new BTC risk while remaining inventory may only reduce or exit; and `PAUSED_FAULT` means candidate execution is blocked pending explicit operator review. No phase independently enables LIVE orders.
+
+Persisted deployment, state, execution-evidence, and audit records are authoritative. Candidate state must replay exactly from persisted evidence, and every executable account decision still requires the account execution lease. An uncertain submission pauses global execution; recovery faults the pilot; neither condition automatically resumes. Rollback starts only while globally paused, uses `DRAINING` while candidate inventory remains, reaches `DISABLED` only after exchange-backed flat evidence, and never resumes global execution automatically.
+
+`inspect:btc-pilot:readiness` and `scripts/inspect-btc-pilot-readiness.example.ps1` perform direct read-only inspection of an explicit existing database and explicit candidate identity/configuration. Inspection is separate from activation: it does not migrate or mutate the database, call Upbit or Telegram, start the app or scheduler, run sync/strategy/order paths, enable LIVE orders, or change the pilot phase.
+
 ## Asset And Market Limits
 - assets: `BTC`, `ETH`
 - markets: `KRW-BTC`, `KRW-ETH`

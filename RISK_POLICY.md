@@ -18,6 +18,16 @@ Live trading is considered allowed only when both conditions are true:
 
 If either condition is missing, the system must behave as non-live, and risk evaluation should block any attempt to treat the run as live.
 
+## BTC Candidate Pilot Safety
+
+Baseline and `DRY_RUN` remain the defaults; candidate implementation availability is not activation or approval. The only allowed pilot identity is `BTC_COMBINED_CONSERVATIVE_PILOT_V1` on `KRW-BTC` with policy `COMBINED_CONSERVATIVE` and version `PCS-2026-001.DEPLOYMENT_READINESS_V1`. ETH always remains baseline for this pilot.
+
+Persisted phases fail closed: `DISABLED` is baseline-only; `PENDING_FLAT` suppresses new BTC `ENTER` and `ADD` until exchange-backed flat proof; `ACTIVE` allows candidate influence only while all persisted authority and ordinary risk/execution gates remain valid; `DRAINING` allows only risk-reducing `REDUCE` or `EXIT` while rollback inventory remains; and `PAUSED_FAULT` blocks the pilot pending explicit investigation. A phase change never enables LIVE transmission by itself.
+
+Persisted deployment, state, execution-evidence, and audit records are authoritative. Exact state replay is mandatory, and every executable decision remains protected by the account execution lease. Submission uncertainty pauses global execution. Recovery inconsistency faults the pilot. Neither path automatically resumes. Rollback may start only while global execution is paused, must remain `DRAINING` while inventory remains, may reach `DISABLED` only after exchange-backed flat evidence, and requires a separate explicit resume after readiness review.
+
+`inspect:btc-pilot:readiness` is a direct read-only inspection command, and `scripts/inspect-btc-pilot-readiness.example.ps1` requires an explicit existing database path plus explicit account, deployment, and candidate configuration. It must not contain secrets, mutate a local script or database, activate a phase, call Upbit or Telegram, start runtime or scheduler services, invoke sync/strategy/order paths, or enable LIVE orders. Inspection does not grant activation authority.
+
 ## Guardrail Set
 
 ### Global Kill Switch

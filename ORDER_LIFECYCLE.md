@@ -122,6 +122,16 @@ The adapter carries the live/dry discriminant; it is not paired with an independ
 Upbit `price` market buys may return exchange state `cancel` after a successful fill when only dust-sized KRW or fee lock remains. In that specific filled `bid`/`price` case, the local lifecycle records the order as `FILLED` and preserves the raw exchange `cancel` payload plus fill and fee evidence. Ordinary canceled orders without this filled market-buy pattern remain `CANCELED`.
 If an older local row already stored that filled market-buy dust-cancel pattern as `CANCELED`, terminal reconciliation must recheck the order and repair it to local `FILLED` rather than leaving misleading operator evidence.
 
+## BTC Candidate Pilot Lifecycle Authority
+
+The baseline policy and `DRY_RUN` execution remain the defaults; implemented pilot code cannot activate or approve itself. The candidate identity is exactly `BTC_COMBINED_CONSERVATIVE_PILOT_V1`, market `KRW-BTC`, policy `COMBINED_CONSERVATIVE`, version `PCS-2026-001.DEPLOYMENT_READINESS_V1`. ETH remains baseline throughout this pilot.
+
+The persisted pilot lifecycle is distinct from an order lifecycle. `DISABLED` means baseline-only. `PENDING_FLAT` suppresses new BTC `ENTER` and `ADD` until exchange-backed flat evidence exists. `ACTIVE` allows candidate influence but still requires the complete order lifecycle, risk gates, live-send gates, and account execution lease. `DRAINING` is rollback with no new risk and only inventory-reducing or exit orders. `PAUSED_FAULT` blocks candidate execution pending explicit operator review. No pilot phase is an order or proof that an order was sent.
+
+Persisted deployment, state, terminal execution evidence, and audit records are authoritative and must replay to the exact same candidate state. Uncertain submission pauses global execution and remains reconciliation work; recovery faults the pilot and never automatically resumes or resends. Rollback begins only while globally paused, remains `DRAINING` while inventory exists, reaches `DISABLED` only after exchange-backed flat evidence, and requires a later explicit operator resume.
+
+`inspect:btc-pilot:readiness` and its `scripts/inspect-btc-pilot-readiness.example.ps1` wrapper inspect an explicit existing database and explicit candidate identity/configuration read-only. They do not create, submit, cancel, retry, reconcile, or mutate orders; do not start the app or scheduler; do not call Upbit or Telegram; do not enable LIVE orders; and do not activate or change the pilot. Inspection and activation are separate lifecycle events.
+
 ## Idempotency
 
 Every order intent requires:

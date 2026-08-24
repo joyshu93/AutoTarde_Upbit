@@ -370,6 +370,16 @@ Static dependency characterization walks the prospective graph recursively. It f
 
 Candidate policy and state modules remain pure, configuration-free, and execution-disconnected. The separately bounded candidate evidence projector is reconciliation-only: it consumes durable terminal evidence, never sends or resumes an order, and does not alter current percentage-based sizing or execution guards.
 
+## BTC Candidate Pilot Runtime Authority
+
+Baseline remains the default selection and `DRY_RUN` remains the default execution mode. The presence of candidate modules does not activate them. The sole pilot identity is `BTC_COMBINED_CONSERVATIVE_PILOT_V1` for `KRW-BTC`, policy `COMBINED_CONSERVATIVE`, version `PCS-2026-001.DEPLOYMENT_READINESS_V1`; ETH always routes through baseline during this pilot.
+
+The persisted phase machine is safety authority: `DISABLED` is baseline-only; `PENDING_FLAT` suppresses new BTC `ENTER` and `ADD` until exchange-backed flat-start proof; `ACTIVE` permits candidate influence only through the existing guarded execution graph; `DRAINING` permits only risk reduction or exit while rollback inventory remains; and `PAUSED_FAULT` blocks candidate execution for explicit investigation. None of these phases bypasses the separate LIVE gates.
+
+Deployment, state, terminal execution evidence, and audit rows are authoritative and must reproduce the exact candidate state on replay. Account execution still requires the persisted account lease. Uncertain submission pauses global execution, recovery faults transition the pilot to `PAUSED_FAULT`, and no recovery path automatically resumes. Rollback begins only under a global pause, remains `DRAINING` while inventory exists, reaches `DISABLED` only after exchange-backed flat evidence, and leaves resume to a separate explicit operator action.
+
+The `inspect:btc-pilot:readiness` composition root, including `scripts/inspect-btc-pilot-readiness.example.ps1`, directly opens only an explicit existing SQLite database through the read-only inspector and requires explicit account, deployment, and candidate configuration. It does not activate or mutate the pilot, run migrations, start runtime or scheduler services, invoke sync/strategy/order paths, call Upbit or Telegram, or enable LIVE orders. Readiness inspection and activation are separate operations.
+
 The prospective CLI `preview` path is stricter than registration inspection: it samples the clock once and uses only pure registration construction and serialization. It has no writer or read adapter, performs no Git, network, database, runtime, or operational call, and returns `NOT_REGISTERED` with explicit zero-side-effect flags. A later `register` invocation independently samples its clock and is the only path that may create the canonical registration and registry files.
 
 ## Failure Posture

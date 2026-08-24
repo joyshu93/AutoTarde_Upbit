@@ -23,6 +23,8 @@ const localRuntimeScriptNames = [
   "smoke-live-readiness.example.ps1",
 ] as const;
 
+const pilotReadinessScriptName = "inspect-btc-pilot-readiness.example.ps1";
+
 const forbiddenSecretAssignments =
   /\$env:(UPBIT_ACCESS_KEY|UPBIT_SECRET_KEY|TELEGRAM_BOT_TOKEN|TELEGRAM_OPERATOR_CHAT_ID)\s*=/;
 const forbiddenAutostartTriggers =
@@ -184,10 +186,42 @@ test("LIVE scheduler startup script refuses to start when scheduler preflight sm
   assert.match(script, /npm\.cmd run start/);
 });
 
+test("BTC pilot readiness example requires explicit read-only inspection inputs", () => {
+  const script = readPilotReadinessScript();
+
+  assert.match(script, /inspect:btc-pilot:readiness/);
+  assert.match(script, /Mandatory\s*=\s*\$true[\s\S]*\$DatabasePath/);
+  assert.match(script, /Test-Path[\s\S]*\$DatabasePath[\s\S]*PathType\s+Leaf/);
+  assert.match(script, /--database-path[\s\S]*\$DatabasePath/);
+  assert.match(script, /--exchange-account-id[\s\S]*\$ExchangeAccountId/);
+  assert.match(script, /--deployment-id[\s\S]*\$DeploymentId/);
+  assert.match(script, /--freshness-threshold-ms[\s\S]*\$FreshnessThresholdMs/);
+  assert.match(script, /BTC_COMBINED_CONSERVATIVE_PILOT_V1/);
+  assert.match(script, /KRW-BTC/);
+  assert.match(script, /COMBINED_CONSERVATIVE/);
+  assert.match(script, /PCS-2026-001\.DEPLOYMENT_READINESS_V1/);
+});
+
+test("BTC pilot readiness example cannot activate or mutate trading paths", () => {
+  const script = readPilotReadinessScript();
+
+  assert.match(script, /ENABLE_LIVE_ORDERS\s*=\s*"false"/);
+  assert.doesNotMatch(script, /ENABLE_LIVE_ORDERS\s*=\s*"true"/);
+  assert.doesNotMatch(script, /STRATEGY_SCHEDULER_(?:ENABLED|RUN_ON_START)\s*=\s*"true"/);
+  assert.doesNotMatch(script, /npm\.cmd\s+run\s+(?:start|smoke:[^\s]*(?:sync|operator)|[^\s]*order)/i);
+  assert.doesNotMatch(script, /\/(?:sync|run|order)\b/i);
+  assert.doesNotMatch(script, /\$env:(?:UPBIT_ACCESS_KEY|UPBIT_SECRET_KEY|TELEGRAM_BOT_TOKEN|TELEGRAM_OPERATOR_CHAT_ID)\s*=/);
+  assert.doesNotMatch(script, /(?:Set-Content|Add-Content|Out-File|Copy-Item|Move-Item|Remove-Item)[^\r\n]*\.local\.ps1/i);
+});
+
 function readTaskScript(scriptName: (typeof taskScriptNames)[number]): string {
   return readFileSync(join(scriptsDirectory, scriptName), "utf8");
 }
 
 function readLocalRuntimeScript(scriptName: (typeof localRuntimeScriptNames)[number]): string {
   return readFileSync(join(scriptsDirectory, scriptName), "utf8");
+}
+
+function readPilotReadinessScript(): string {
+  return readFileSync(join(scriptsDirectory, pilotReadinessScriptName), "utf8");
 }

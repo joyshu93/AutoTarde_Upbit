@@ -119,6 +119,24 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 
 ## Runtime Shape
 
+### BTC Candidate Pilot Is Available, Not Activated
+
+Baseline remains the default policy and `DRY_RUN` remains the default execution mode. Candidate code availability does not approve or activate the pilot. The exact pilot identity is `BTC_COMBINED_CONSERVATIVE_PILOT_V1`, market `KRW-BTC`, policy `COMBINED_CONSERVATIVE`, version `PCS-2026-001.DEPLOYMENT_READINESS_V1`; ETH always remains baseline during this pilot.
+
+The persisted phases are safety states: `DISABLED` is baseline-only; `PENDING_FLAT` is selected but inactive and suppresses new BTC `ENTER` and `ADD` until exchange-backed flat proof; `ACTIVE` permits candidate influence only through all existing runtime, risk, lease, and LIVE gates; `DRAINING` permits only risk reduction or exit while rollback inventory remains; and `PAUSED_FAULT` blocks candidate execution pending explicit operator review. No phase enables LIVE orders by itself.
+
+Persisted deployment, state, execution-evidence, and audit records are authoritative. Candidate state must replay exactly, and every executable account decision still requires the account execution lease. Submission uncertainty pauses global execution, recovery faults the pilot, and neither automatically resumes. Rollback starts only while globally paused, uses `DRAINING` while inventory remains, reaches `DISABLED` only after exchange-backed flat evidence, and leaves resume to a separate explicit operator action.
+
+Use `scripts/inspect-btc-pilot-readiness.example.ps1` only with an explicit existing SQLite path, exchange-account ID, deployment ID, and freshness threshold. It calls `inspect:btc-pilot:readiness` for direct read-only inspection with explicit candidate configuration and no secrets. It does not activate the pilot, mutate the database or a `.local.ps1` file, call Upbit or Telegram, start the app or scheduler, invoke sync/strategy/order paths, or enable LIVE orders. Inspection is separate from any later explicit approval/configuration event.
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\inspect-btc-pilot-readiness.example.ps1 `
+  -DatabasePath C:\approved-copy\autotrade-upbit.sqlite `
+  -ExchangeAccountId <exchange-account-id> `
+  -DeploymentId <deployment-id> `
+  -FreshnessThresholdMs 3600000
+```
+
 Runtime startup constructs the app first. Baseline selection exposes a null candidate initializer and makes no candidate-storage call. A validated candidate selection is initialized immediately after `createApp` and before startup recovery or exchange-backed reads, notification delivery, operator-state/preflight reads, scheduler startup/reporting, Telegram polling or menu setup, and signal installation. Only a newly `CREATED` deployment is initialized as pristine `PENDING_FLAT`; valid existing `PENDING_FLAT`, `ACTIVE`, or `PAUSED_FAULT` authority is validated and retained unchanged. The initializer never activates a deployment.
 
 1. A deterministic strategy emits a `StrategyDecision`.
