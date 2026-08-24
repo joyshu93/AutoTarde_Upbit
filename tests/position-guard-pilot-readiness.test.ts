@@ -252,6 +252,50 @@ test("pilot audit authority is rejected when append-only triggers are missing", 
   });
 });
 
+test("pilot audit authority rejects a conditionally disabled UPDATE immutability trigger", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE");
+    seedHealth(db);
+    db.exec(`
+      DROP TRIGGER strategy_pilot_audit_events_no_update;
+      CREATE TRIGGER strategy_pilot_audit_events_no_update
+      BEFORE UPDATE ON strategy_pilot_audit_events
+      WHEN 0
+      BEGIN
+        SELECT RAISE(ABORT, 'strategy pilot audit events are append-only');
+      END;
+    `);
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+    assert.equal(report.status, "BLOCK");
+    assert.equal(check(report, "required_schema").status, "BLOCK");
+    assert.equal(check(report, "audit_chain").status, "BLOCK");
+    assert.match(check(report, "required_schema").detail, /append-only|trigger|immutable/u);
+  });
+});
+
+test("pilot audit authority rejects a conditionally disabled DELETE immutability trigger", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE");
+    seedHealth(db);
+    db.exec(`
+      DROP TRIGGER strategy_pilot_audit_events_no_delete;
+      CREATE TRIGGER strategy_pilot_audit_events_no_delete
+      BEFORE DELETE ON strategy_pilot_audit_events
+      WHEN 0
+      BEGIN
+        SELECT RAISE(ABORT, 'strategy pilot audit events are append-only');
+      END;
+    `);
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+    assert.equal(report.status, "BLOCK");
+    assert.equal(check(report, "required_schema").status, "BLOCK");
+    assert.equal(check(report, "audit_chain").status, "BLOCK");
+    assert.match(check(report, "required_schema").detail, /append-only|trigger|immutable/u);
+  });
+});
+
 test("canonical audit event identity is required even when payload and timestamps match", async () => {
   await withMigratedFixture(async ({ databasePath, db }) => {
     seedDeployment(db, "ACTIVE", { audit: false });
@@ -286,6 +330,51 @@ test("canonical audit event identity is required even when payload and timestamp
     assert.equal(check(report, "state_replay").status, "PASS");
     assert.equal(check(report, "audit_chain").status, "BLOCK");
     assert.match(check(report, "audit_chain").detail, /DEPLOYMENT_CREATED|identity/u);
+  });
+});
+
+test("deployment creation must be the first lifecycle event when activation has the same timestamp", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE", { audit: false });
+    seedHealth(db);
+    const activationAt = "2026-08-23T23:59:30.000Z";
+    const activationEpochNs = BigInt(epochMs(activationAt)) * 1_000_000n;
+    db.prepare(`
+      UPDATE strategy_pilot_deployments
+      SET created_at = ?
+      WHERE id = ?
+    `).run(activationAt, IDENTITY.deploymentId);
+    seedAudit(db, {
+      id: `${IDENTITY.deploymentId}:created`,
+      eventType: "DEPLOYMENT_CREATED",
+      fromPhase: null,
+      toPhase: "PENDING_FLAT",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({
+        pilotId: IDENTITY.pilotId,
+        market: IDENTITY.market,
+        policyId: IDENTITY.policyId,
+        policyVersion: IDENTITY.policyVersion,
+      }),
+      createdAt: activationAt,
+    });
+    seedAudit(db, {
+      id: `${IDENTITY.deploymentId}:activation:${activationEpochNs.toString()}`,
+      eventType: "PHASE_TRANSITION",
+      fromPhase: "PENDING_FLAT",
+      toPhase: "ACTIVE",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({
+        activationAt,
+        activationEpochNs: activationEpochNs.toString(),
+      }),
+      createdAt: activationAt,
+    });
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+    assert.equal(check(report, "state_replay").status, "PASS");
+    assert.equal(check(report, "audit_chain").status, "BLOCK");
+    assert.match(check(report, "audit_chain").detail, /DEPLOYMENT_CREATED|first|creation/u);
   });
 });
 

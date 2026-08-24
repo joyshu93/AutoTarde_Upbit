@@ -268,8 +268,8 @@ const RECOVERY_FAULT_REASONS = new Set([
   "ACTIVATION_CAS_CONFLICT",
 ]);
 const REQUIRED_AUDIT_IMMUTABILITY_TRIGGERS = Object.freeze({
-  strategy_pilot_audit_events_no_update: /BEFORE\s+UPDATE\s+ON\s+strategy_pilot_audit_events[\s\S]*RAISE\s*\(\s*ABORT\s*,\s*'strategy pilot audit events are append-only'\s*\)/iu,
-  strategy_pilot_audit_events_no_delete: /BEFORE\s+DELETE\s+ON\s+strategy_pilot_audit_events[\s\S]*RAISE\s*\(\s*ABORT\s*,\s*'strategy pilot audit events are append-only'\s*\)/iu,
+  strategy_pilot_audit_events_no_update: /^\s*CREATE\s+TRIGGER\s+strategy_pilot_audit_events_no_update\s+BEFORE\s+UPDATE\s+ON\s+strategy_pilot_audit_events\s+BEGIN\s+SELECT\s+RAISE\s*\(\s*ABORT\s*,\s*'strategy pilot audit events are append-only'\s*\)\s*;\s*END\s*;?\s*$/iu,
+  strategy_pilot_audit_events_no_delete: /^\s*CREATE\s+TRIGGER\s+strategy_pilot_audit_events_no_delete\s+BEFORE\s+DELETE\s+ON\s+strategy_pilot_audit_events\s+BEGIN\s+SELECT\s+RAISE\s*\(\s*ABORT\s*,\s*'strategy pilot audit events are append-only'\s*\)\s*;\s*END\s*;?\s*$/iu,
 });
 
 export function inspectPositionGuardPilotReadiness(
@@ -994,6 +994,9 @@ function assertCanonicalCreationEvent(
     event.payloadJson !== expectedPayload || event.createdAt !== deployment.createdAt) {
     throw new Error("canonical DEPLOYMENT_CREATED audit authority is missing or malformed");
   }
+  if (events[0]?.id !== event.id) {
+    throw new Error("canonical DEPLOYMENT_CREATED must be the first pilot lifecycle event");
+  }
 }
 
 function assertCanonicalActivationEvent(
@@ -1015,6 +1018,9 @@ function assertCanonicalActivationEvent(
     event.createdAt !== deployment.activationAt ||
     parseCandidatePilotTimestamp(deployment.activationAt, "deployment activationAt") !== deployment.activationEpochNs) {
     throw new Error("canonical activation PHASE_TRANSITION audit authority is missing or malformed");
+  }
+  if (deployment.activationEpochNs <= parseCandidatePilotTimestamp(deployment.createdAt, "deployment createdAt")) {
+    throw new Error("canonical activation must occur after deployment creation");
   }
 }
 
