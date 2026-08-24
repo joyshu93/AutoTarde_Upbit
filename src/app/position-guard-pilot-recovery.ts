@@ -51,7 +51,7 @@ export type PositionGuardPilotRecoveryResult =
       status: "READY";
       verificationOnly: true;
       deployment: Readonly<PositionGuardPilotDeploymentRecord>;
-      phase: "PENDING_FLAT" | "ACTIVE";
+      phase: "PENDING_FLAT" | "ACTIVE" | "DRAINING" | "DISABLED";
       activation: Readonly<{
         activationAt: string;
         activationEpochNs: bigint;
@@ -786,23 +786,42 @@ export class PositionGuardPilotRecovery {
     const inventory = this.readInventory(readback.balanceSnapshot, readback.positionSnapshot);
     this.verifyExchangeInventoryAgreement(inventory.balanceQuantity, inventory.positionQuantity);
 
-    if (readback.deployment.phase === "PENDING_FLAT") {
-      this.verifyPendingFlatState(state, readback.evidenceRecords);
-    } else if (readback.deployment.phase === "ACTIVE") {
-      this.verifyActiveChronology(
-        readback.deployment,
-        readback.evidenceRecords,
-        readback.auditEvents,
-        state,
-        nowEpochNanoseconds,
-      );
-      this.verifyReplayInventoryAgreement(
-        state.currentEpisodeInventoryQuantity,
-        inventory.balanceQuantity,
-        inventory.positionQuantity,
-      );
-    } else {
-      throw recoveryFault("IDENTITY_MISMATCH", `Candidate phase ${readback.deployment.phase} is not recoverable.`);
+    switch (readback.deployment.phase) {
+      case "PENDING_FLAT":
+        this.verifyPendingFlatState(state, readback.evidenceRecords);
+        break;
+      case "ACTIVE":
+        this.verifyActiveChronology(
+          readback.deployment,
+          readback.evidenceRecords,
+          readback.auditEvents,
+          state,
+          nowEpochNanoseconds,
+        );
+        this.verifyReplayInventoryAgreement(
+          state.currentEpisodeInventoryQuantity,
+          inventory.balanceQuantity,
+          inventory.positionQuantity,
+        );
+        break;
+      case "DRAINING":
+        this.verifyDrainingChronology(readback.deployment, readback.evidenceRecords, readback.auditEvents, state);
+        this.verifyReplayInventoryAgreement(
+          state.currentEpisodeInventoryQuantity,
+          inventory.balanceQuantity,
+          inventory.positionQuantity,
+        );
+        break;
+      case "DISABLED":
+        this.verifyDisabledRollback(readback.deployment, readback.auditEvents, state);
+        this.verifyReplayInventoryAgreement(
+          state.currentEpisodeInventoryQuantity,
+          inventory.balanceQuantity,
+          inventory.positionQuantity,
+        );
+        break;
+      default:
+        throw recoveryFault("IDENTITY_MISMATCH", `Candidate phase ${readback.deployment.phase} is not recoverable.`);
     }
     return { state, inventory };
   }
@@ -1367,7 +1386,12 @@ export class PositionGuardPilotRecovery {
     state: Readonly<ExactCandidateState>,
     receipt: Readonly<PositionGuardPilotRefreshReceipt>,
   ): PositionGuardPilotRecoveryResult {
-    if (deployment.phase !== "PENDING_FLAT" && deployment.phase !== "ACTIVE") {
+    if (
+      deployment.phase !== "PENDING_FLAT"
+      && deployment.phase !== "ACTIVE"
+      && deployment.phase !== "DRAINING"
+      && deployment.phase !== "DISABLED"
+    ) {
       throw new Error(`Candidate recovery cannot return READY for phase ${deployment.phase}.`);
     }
     const activation = deployment.activationAt !== null && deployment.activationEpochNs !== null

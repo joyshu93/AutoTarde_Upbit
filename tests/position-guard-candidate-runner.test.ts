@@ -58,6 +58,77 @@ test("candidate runner routes a verified BTC decision exactly once", async () =>
   assert.equal(routeCalls, 1);
 });
 
+test("default runner router covers ACTIVE, DRAINING, DISABLED, and ETH baseline routes", async () => {
+  const active = createHarness({
+    buildDecision: () => decisionBundle(engineDecision("ENTER", { targetNotionalKrw: 123_456 })),
+  });
+  const activeResult = await active.runner.runOnce(candidateRunInput());
+  assert.deepEqual(
+    [activeResult.strategyDecision.action, readPolicyRoute(activeResult.strategyDecisionRecord).reasonCode],
+    ["ENTER", "CANDIDATE_ALLOWED"],
+  );
+  assert.ok(active.submitted[0]?.candidateAuthority);
+
+  for (const [action, expectedAction, expectedReason] of [
+    ["ADD", "HOLD", "DRAINING_NEW_RISK_SUPPRESSED"],
+    ["HOLD", "HOLD", "DRAINING_BASELINE_HOLD_PRESERVED"],
+    ["REDUCE", "REDUCE", "DRAINING_RISK_REDUCTION_PRESERVED"],
+    ["EXIT", "EXIT", "DRAINING_RISK_REDUCTION_PRESERVED"],
+  ] as const) {
+    const draining = createHarness({
+      buildDecision: () => decisionBundle(
+        engineDecision(action, action === "ADD" ? { targetNotionalKrw: 123_456 } : {
+          targetQuantityFraction: action === "REDUCE" ? 0.5 : action === "EXIT" ? 1 : null,
+        }),
+        action === "ADD" ? flatContext() : openContext(),
+      ),
+      verify: () => readyVerification("DRAINING"),
+    });
+    const drainingResult = await draining.runner.runOnce(candidateRunInput());
+    assert.deepEqual(
+      [drainingResult.strategyDecision.action, readPolicyRoute(drainingResult.strategyDecisionRecord).reasonCode],
+      [expectedAction, expectedReason],
+    );
+    assert.equal(draining.submitted[0]?.candidateAuthority, undefined);
+  }
+
+  const disabled = createHarness({
+    buildDecision: () => decisionBundle(engineDecision("ENTER", { targetNotionalKrw: 123_456 })),
+    verify: () => readyVerification("DISABLED"),
+  });
+  const disabledResult = await disabled.runner.runOnce(candidateRunInput());
+  assert.deepEqual(
+    [disabledResult.strategyDecision.action, readPolicyRoute(disabledResult.strategyDecisionRecord).reasonCode],
+    ["ENTER", "PILOT_DISABLED"],
+  );
+  assert.equal(disabled.submitted[0]?.candidateAuthority, undefined);
+
+  const preActivationDisabled = createHarness({
+    buildDecision: () => decisionBundle(engineDecision("ENTER", { targetNotionalKrw: 123_456 })),
+    verify: () => readyVerification("DISABLED", "NONE"),
+  });
+  const preActivationDisabledResult = await preActivationDisabled.runner.runOnce(candidateRunInput());
+  assert.deepEqual(
+    [
+      preActivationDisabledResult.strategyDecision.action,
+      readPolicyRoute(preActivationDisabledResult.strategyDecisionRecord).reasonCode,
+    ],
+    ["ENTER", "PILOT_DISABLED"],
+  );
+  assert.equal(preActivationDisabled.submitted[0]?.candidateAuthority, undefined);
+
+  const eth = createHarness({
+    market: "KRW-ETH",
+    buildDecision: () => decisionBundle(engineDecision("ADD", { targetNotionalKrw: 123_456 }), ethContext()),
+  });
+  const ethResult = await eth.runner.runOnce({ market: "KRW-ETH", generatedAt: GENERATED_AT });
+  assert.deepEqual(
+    [ethResult.strategyDecision.action, readPolicyRoute(ethResult.strategyDecisionRecord).reasonCode],
+    ["ADD", "ETH_BASELINE"],
+  );
+  assert.equal(eth.submitted[0]?.candidateAuthority, undefined);
+});
+
 test("blocked candidate verification stops before routing persistence and execution", async () => {
   let routeCalls = 0;
   const harness = createHarness({
@@ -191,6 +262,7 @@ test("effective decision columns agree with the complete detached policy-route a
   const baseline = engineDecision("ADD", { targetNotionalKrw: 200_000 });
   const exit = engineDecision("EXIT", { targetQuantityFraction: 1 });
   const verification = readyVerification();
+  if (verification.activation === null) throw new Error("expected ACTIVE verification fixture");
   const harness = createHarness({
     buildDecision: () => decisionBundle(baseline, openContext()),
     verify: () => verification,
@@ -475,7 +547,7 @@ function createHarness(options: HarnessOptions = {}) {
         return options.verify?.() ?? readyVerification();
       },
     },
-    policyRouter: options.route ?? ((input: RouteInput) => activeRoute(input.baselineDecision)),
+    ...(options.route === undefined ? {} : { policyRouter: options.route }),
   };
   const runner = new PositionGuardStrategyRunner(dependencies as never);
   Object.defineProperty(runner, "buildDecision", {
@@ -510,12 +582,15 @@ function refreshReceipt() {
   };
 }
 
-function readyVerification() {
+function readyVerification(
+  phase: "PENDING_FLAT" | "ACTIVE" | "DRAINING" | "DISABLED" = "ACTIVE",
+  activation: "ACTIVE" | "NONE" = phase === "PENDING_FLAT" ? "NONE" : "ACTIVE",
+) {
   return Object.freeze({
     status: "READY" as const,
-    deployment: deployment("ACTIVE"),
-    phase: "ACTIVE" as const,
-    activation: Object.freeze({
+    deployment: deployment(phase, activation),
+    phase,
+    activation: activation === "NONE" ? null : Object.freeze({
       activationAt: "2026-08-21T23:00:00.000Z",
       activationEpochNs: 1_787_353_200_000_000_000n,
     }),
@@ -537,7 +612,10 @@ function pendingFlatVerification() {
   });
 }
 
-function deployment(phase: "ACTIVE" | "PENDING_FLAT"): PositionGuardPilotDeploymentRecord {
+function deployment(
+  phase: "ACTIVE" | "PENDING_FLAT" | "DRAINING" | "DISABLED",
+  activation: "ACTIVE" | "NONE" = phase === "PENDING_FLAT" ? "NONE" : "ACTIVE",
+): PositionGuardPilotDeploymentRecord {
   return Object.freeze({
     id: "deployment-1",
     exchangeAccountId: "primary",
@@ -546,10 +624,10 @@ function deployment(phase: "ACTIVE" | "PENDING_FLAT"): PositionGuardPilotDeploym
     policyId: "COMBINED_CONSERVATIVE",
     policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
     phase,
-    activationAt: phase === "ACTIVE" ? "2026-08-21T23:00:00.000Z" : null,
-    activationEpochNs: phase === "ACTIVE" ? 1_787_353_200_000_000_000n : null,
+    activationAt: activation === "NONE" ? null : "2026-08-21T23:00:00.000Z",
+    activationEpochNs: activation === "NONE" ? null : 1_787_353_200_000_000_000n,
     createdAt: "2026-08-21T20:00:00.000Z",
-    updatedAt: phase === "ACTIVE" ? "2026-08-21T23:00:00.000Z" : "2026-08-21T22:00:00.000Z",
+    updatedAt: phase === "PENDING_FLAT" ? "2026-08-21T22:00:00.000Z" : "2026-08-21T23:00:00.000Z",
   });
 }
 

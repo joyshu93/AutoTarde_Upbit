@@ -73,7 +73,7 @@ export type PositionGuardRunnerPilotVerificationResult =
       status: "READY";
       verificationOnly?: true;
       deployment: Readonly<PositionGuardPilotDeploymentRecord>;
-      phase: "PENDING_FLAT" | "ACTIVE";
+      phase: "PENDING_FLAT" | "ACTIVE" | "DRAINING" | "DISABLED";
       activation: Readonly<{ activationAt: string; activationEpochNs: bigint }> | null;
       state: Readonly<ExactCandidateState>;
       stateVersion: number;
@@ -477,16 +477,27 @@ function canonicalReadyVerification(input: {
   if (!sameRefreshReceipt(receipt, refreshProvenance)) {
     throw new Error("Verified BTC candidate refresh provenance does not match the exact run receipt.");
   }
-  if (phase === "ACTIVE") {
+  if (phase === "ACTIVE" || phase === "DRAINING") {
     if (
       activation === null ||
       deployment.activationAt !== activation.activationAt ||
       deployment.activationEpochNs !== activation.activationEpochNs
     ) {
-      throw new Error("Verified ACTIVE BTC candidate authority requires exact activation provenance.");
+      throw new Error(`Verified ${phase} BTC candidate authority requires exact activation provenance.`);
     }
-  } else if (activation !== null) {
+  } else if (phase === "PENDING_FLAT" && activation !== null) {
     throw new Error("PENDING_FLAT BTC candidate authority cannot carry activation provenance.");
+  } else if (phase === "DISABLED") {
+    if (activation === null) {
+      if (deployment.activationAt !== null || deployment.activationEpochNs !== null) {
+        throw new Error("Verified DISABLED BTC candidate authority activation provenance is invalid.");
+      }
+    } else if (
+      deployment.activationAt !== activation.activationAt
+      || deployment.activationEpochNs !== activation.activationEpochNs
+    ) {
+      throw new Error("Verified DISABLED BTC candidate authority activation provenance is invalid.");
+    }
   }
   return Object.freeze({
     status: "READY",
@@ -665,9 +676,9 @@ function exactOwnDataRecord<
   return result;
 }
 
-function requirePilotReadyPhase(value: unknown): "PENDING_FLAT" | "ACTIVE" {
-  if (value !== "PENDING_FLAT" && value !== "ACTIVE") {
-    throw new Error("Verified BTC candidate phase must be PENDING_FLAT or ACTIVE.");
+function requirePilotReadyPhase(value: unknown): "PENDING_FLAT" | "ACTIVE" | "DRAINING" | "DISABLED" {
+  if (value !== "PENDING_FLAT" && value !== "ACTIVE" && value !== "DRAINING" && value !== "DISABLED") {
+    throw new Error("Verified BTC candidate phase must be PENDING_FLAT, ACTIVE, DRAINING, or DISABLED.");
   }
   return value;
 }

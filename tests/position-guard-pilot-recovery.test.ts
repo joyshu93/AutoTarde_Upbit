@@ -1462,6 +1462,55 @@ test("non-flat rollback enters DRAINING and retries do not duplicate audit or no
   );
 });
 
+test("recovery preserves validated DRAINING and rollback-completed DISABLED routing authority", async () => {
+  const drainingFixture = await createFixture({
+    phase: "ACTIVE",
+    evidenceQuantity: "0.1",
+    balanceFree: "0.1",
+    positionQuantity: "0.1",
+  });
+  await drainingFixture.recovery.requestRollback(drainingFixture.receipt);
+
+  const draining = await drainingFixture.recovery.verifyAndPrepareBtcRun(drainingFixture.receipt);
+
+  assert.equal(draining.status, "READY");
+  if (draining.status === "READY") {
+    assert.equal(draining.phase, "DRAINING");
+    assert.equal(draining.stateVersion, 1);
+  }
+  assert.equal((await drainingFixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "DRAINING");
+
+  const disabledFixture = await createFixture({ phase: "ACTIVE" });
+  await disabledFixture.recovery.requestRollback(disabledFixture.receipt);
+
+  const disabled = await disabledFixture.recovery.verifyAndPrepareBtcRun(disabledFixture.receipt);
+
+  assert.equal(disabled.status, "READY");
+  if (disabled.status === "READY") {
+    assert.equal(disabled.phase, "DISABLED");
+    assert.equal(disabled.stateVersion, 0);
+  }
+  assert.equal((await disabledFixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "DISABLED");
+
+  const preActivationDisabledFixture = await createFixture();
+  await preActivationDisabledFixture.recovery.requestRollback(preActivationDisabledFixture.receipt);
+
+  const preActivationDisabled = await preActivationDisabledFixture.recovery.verifyAndPrepareBtcRun(
+    preActivationDisabledFixture.receipt,
+  );
+
+  assert.equal(preActivationDisabled.status, "READY");
+  if (preActivationDisabled.status === "READY") {
+    assert.equal(preActivationDisabled.phase, "DISABLED");
+    assert.equal(preActivationDisabled.activation, null);
+    assert.equal(preActivationDisabled.stateVersion, 0);
+  }
+  assert.equal(
+    (await preActivationDisabledFixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase,
+    "DISABLED",
+  );
+});
+
 test("completeRollback on ACTIVE non-flat authority never starts rollback or mutates pilot state", async () => {
   const fixture = await createFixture({
     phase: "ACTIVE",
