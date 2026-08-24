@@ -2,6 +2,7 @@ import { pathToFileURL } from "node:url";
 
 import { createApp, type AppServices } from "../app/create-app.js";
 import type { AppConfig } from "../app/env.js";
+import { createRuntimeShutdown, runRuntimeStartupGate } from "../app/runtime-lifecycle.js";
 import type { ExecutionStateRecord, ReconciliationRunRecord } from "../domain/types.js";
 import { detectExecutionStateSeedMismatches } from "../modules/db/interfaces.js";
 
@@ -89,87 +90,91 @@ export async function runLiveReadinessSmoke(
   createApplication: () => AppServices = createApp,
 ): Promise<LiveReadinessSmokeResult> {
   const app = createApplication();
+  const runtimeShutdown = createRuntimeShutdown(app);
 
   try {
-    await app.candidatePilotInitializer?.initialize();
-    const [executionState, activeOrders, latestBalanceSnapshot, latestPositionSnapshot, reconciliationRuns] =
-      await Promise.all([
-        app.operatorState.getState(),
-        app.repositories.listActiveOrders("primary", undefined, 20),
-        app.repositories.getLatestBalanceSnapshot("primary"),
-        app.repositories.getLatestPositionSnapshot("primary"),
-        app.repositories.listReconciliationRuns("primary", 1),
-      ]);
-    const latestReconciliationRun = reconciliationRuns[0] ?? null;
-    const latestReconciliationIssueCodes = parseReconciliationIssueCodes(
-      latestReconciliationRun?.summaryJson ?? null,
-    );
-    const latestReconciliationBlockingIssueCodes = latestReconciliationIssueCodes.filter((code) =>
-      BLOCKING_RECONCILIATION_ISSUE_CODES.has(code)
-    );
-    const seedMismatches = detectExecutionStateSeedMismatches(executionState, {
-      executionMode: app.config.executionMode,
-      liveExecutionGate: app.config.liveExecutionGate,
-      killSwitchActive: app.config.globalKillSwitch,
-    });
-    const checks = buildLiveReadinessSmokeChecks({
-      app,
-      executionState,
-      seedMismatches,
-      activeOrderCount: activeOrders.length,
-      latestBalanceSnapshotAt: latestBalanceSnapshot?.capturedAt ?? null,
-      latestPositionSnapshotAt: latestPositionSnapshot?.capturedAt ?? null,
-      latestReconciliationRun,
-      latestReconciliationIssueCodes,
-      latestReconciliationBlockingIssueCodes,
-    });
+    return await runRuntimeStartupGate({
+      initializer: app.candidatePilotInitializer,
+      shutdown: runtimeShutdown,
+      continueStartup: async () => {
+        const [executionState, activeOrders, latestBalanceSnapshot, latestPositionSnapshot, reconciliationRuns] =
+          await Promise.all([
+            app.operatorState.getState(),
+            app.repositories.listActiveOrders("primary", undefined, 20),
+            app.repositories.getLatestBalanceSnapshot("primary"),
+            app.repositories.getLatestPositionSnapshot("primary"),
+            app.repositories.listReconciliationRuns("primary", 1),
+          ]);
+        const latestReconciliationRun = reconciliationRuns[0] ?? null;
+        const latestReconciliationIssueCodes = parseReconciliationIssueCodes(
+          latestReconciliationRun?.summaryJson ?? null,
+        );
+        const latestReconciliationBlockingIssueCodes = latestReconciliationIssueCodes.filter((code) =>
+          BLOCKING_RECONCILIATION_ISSUE_CODES.has(code)
+        );
+        const seedMismatches = detectExecutionStateSeedMismatches(executionState, {
+          executionMode: app.config.executionMode,
+          liveExecutionGate: app.config.liveExecutionGate,
+          killSwitchActive: app.config.globalKillSwitch,
+        });
+        const checks = buildLiveReadinessSmokeChecks({
+          app,
+          executionState,
+          seedMismatches,
+          activeOrderCount: activeOrders.length,
+          latestBalanceSnapshotAt: latestBalanceSnapshot?.capturedAt ?? null,
+          latestPositionSnapshotAt: latestPositionSnapshot?.capturedAt ?? null,
+          latestReconciliationRun,
+          latestReconciliationIssueCodes,
+          latestReconciliationBlockingIssueCodes,
+        });
 
-    return {
-      service: app.config.serviceName,
-      status: summarizeLiveReadinessSmokeStatus(checks),
-      executionMode: app.config.executionMode,
-      liveExecutionGate: app.config.liveExecutionGate,
-      liveSendPath: app.liveSendPath,
-      databasePath: app.config.databasePath,
-      exchangeBackedReadEnabled: app.exchangeBackedReadEnabled,
-      schedulerEnabled: app.config.strategySchedulerEnabled,
-      schedulerRunOnStart: app.config.strategySchedulerRunOnStart,
-      telegramInboundPollingEnabled: app.config.telegramInboundPollingEnabled,
-      telegramInboundPollingConfigured: app.telegramInboundPolling.isConfigured(),
-      telegramDeliveryEnabled: app.config.telegramDeliveryEnabled,
-      telegramDeliveryConfigured: app.notificationDelivery.isConfigured(),
-      telegramBotTokenConfigured: Boolean(app.config.telegramBotToken),
-      telegramOperatorChatIdConfigured: Boolean(app.config.telegramOperatorChatId),
-      systemStatus: executionState.systemStatus,
-      killSwitchActive: executionState.killSwitchActive,
-      degradedReason: executionState.degradedReason,
-      operatorStateUpdatedAt: executionState.updatedAt,
-      nonMutationBoundary: createNonMutationBoundary(),
-      orderTransmissionAttempted: false,
-      strategyRunAttempted: false,
-      syncAttempted: false,
-      schedulerStarted: false,
-      telegramPollingStarted: false,
-      exchangeProbeAttempted: false,
-      notificationDeliveryAttempted: false,
-      readOnlyDataSources: READ_ONLY_DATA_SOURCES,
-      activeOrderCount: activeOrders.length,
-      latestBalanceSnapshotAt: latestBalanceSnapshot?.capturedAt ?? null,
-      latestPositionSnapshotAt: latestPositionSnapshot?.capturedAt ?? null,
-      latestReconciliationStatus: latestReconciliationRun?.status ?? null,
-      latestReconciliationCompletedAt: latestReconciliationRun?.completedAt ?? null,
-      latestReconciliationIssueCodes,
-      latestReconciliationBlockingIssueCodes,
-      seedMismatches,
-      blockingCheckNames: getCheckNamesByStatus(checks, "BLOCK"),
-      warningCheckNames: getCheckNamesByStatus(checks, "WARN"),
-      nextActions: buildLiveReadinessNextActions(checks),
-      checks,
-    };
+        return {
+          service: app.config.serviceName,
+          status: summarizeLiveReadinessSmokeStatus(checks),
+          executionMode: app.config.executionMode,
+          liveExecutionGate: app.config.liveExecutionGate,
+          liveSendPath: app.liveSendPath,
+          databasePath: app.config.databasePath,
+          exchangeBackedReadEnabled: app.exchangeBackedReadEnabled,
+          schedulerEnabled: app.config.strategySchedulerEnabled,
+          schedulerRunOnStart: app.config.strategySchedulerRunOnStart,
+          telegramInboundPollingEnabled: app.config.telegramInboundPollingEnabled,
+          telegramInboundPollingConfigured: app.telegramInboundPolling.isConfigured(),
+          telegramDeliveryEnabled: app.config.telegramDeliveryEnabled,
+          telegramDeliveryConfigured: app.notificationDelivery.isConfigured(),
+          telegramBotTokenConfigured: Boolean(app.config.telegramBotToken),
+          telegramOperatorChatIdConfigured: Boolean(app.config.telegramOperatorChatId),
+          systemStatus: executionState.systemStatus,
+          killSwitchActive: executionState.killSwitchActive,
+          degradedReason: executionState.degradedReason,
+          operatorStateUpdatedAt: executionState.updatedAt,
+          nonMutationBoundary: createNonMutationBoundary(),
+          orderTransmissionAttempted: false,
+          strategyRunAttempted: false,
+          syncAttempted: false,
+          schedulerStarted: false,
+          telegramPollingStarted: false,
+          exchangeProbeAttempted: false,
+          notificationDeliveryAttempted: false,
+          readOnlyDataSources: READ_ONLY_DATA_SOURCES,
+          activeOrderCount: activeOrders.length,
+          latestBalanceSnapshotAt: latestBalanceSnapshot?.capturedAt ?? null,
+          latestPositionSnapshotAt: latestPositionSnapshot?.capturedAt ?? null,
+          latestReconciliationStatus: latestReconciliationRun?.status ?? null,
+          latestReconciliationCompletedAt: latestReconciliationRun?.completedAt ?? null,
+          latestReconciliationIssueCodes,
+          latestReconciliationBlockingIssueCodes,
+          seedMismatches,
+          blockingCheckNames: getCheckNamesByStatus(checks, "BLOCK"),
+          warningCheckNames: getCheckNamesByStatus(checks, "WARN"),
+          nextActions: buildLiveReadinessNextActions(checks),
+          checks,
+        };
+      },
+    });
   } finally {
-    app.telegramInboundPolling.stop();
-    app.strategyScheduler.stop();
-    app.persistence.close();
+    runtimeShutdown();
   }
 }
 

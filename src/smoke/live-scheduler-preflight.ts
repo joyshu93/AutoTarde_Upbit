@@ -2,6 +2,7 @@ import { pathToFileURL } from "node:url";
 
 import { createApp, type AppServices } from "../app/create-app.js";
 import type { AppConfig } from "../app/env.js";
+import { createRuntimeShutdown, runRuntimeStartupGate } from "../app/runtime-lifecycle.js";
 import { buildStrategySchedulerStartupPreflight } from "../app/scheduler-preflight.js";
 import type { StrategySchedulerStartupPreflight } from "../domain/types.js";
 
@@ -65,14 +66,16 @@ export async function runLiveSchedulerPreflightSmoke(
   createApplication: () => AppServices = createApp,
 ): Promise<LiveSchedulerPreflightSmokeResult> {
   const app = createApplication();
+  const runtimeShutdown = createRuntimeShutdown(app);
 
   try {
-    await app.candidatePilotInitializer?.initialize();
-    return await buildLiveSchedulerPreflightSmokeResult(app);
+    return await runRuntimeStartupGate({
+      initializer: app.candidatePilotInitializer,
+      shutdown: runtimeShutdown,
+      continueStartup: () => buildLiveSchedulerPreflightSmokeResult(app),
+    });
   } finally {
-    app.telegramInboundPolling.stop();
-    app.strategyScheduler.stop();
-    app.persistence.close();
+    runtimeShutdown();
   }
 }
 

@@ -63,6 +63,28 @@ test("live scheduler preflight smoke preserves candidate initialization failure 
   ]);
 });
 
+test("live scheduler preflight smoke preserves candidate initialization failure when every cleanup step throws", async () => {
+  const events: string[] = [];
+  const originalError = new Error("candidate_initializer_failed");
+
+  await assert.rejects(
+    () => runLiveSchedulerPreflightSmoke(() => createSmokeApp(events, {
+      async initialize() {
+        events.push("initializer:start");
+        throw originalError;
+      },
+    }, ["telegram", "scheduler", "persistence"])),
+    (error) => error === originalError,
+  );
+
+  assert.deepEqual(events, [
+    "initializer:start",
+    "telegram:stop",
+    "scheduler:stop",
+    "persistence:close",
+  ]);
+});
+
 test("live scheduler preflight smoke blocks non-live invocation", () => {
   const checks = buildLiveSchedulerPreflightSmokeChecks({
     app: {
@@ -243,6 +265,7 @@ function createPreflight(
 function createSmokeApp(
   events: string[],
   candidatePilotInitializer: CandidatePilotInitializer,
+  failingCleanupSteps: readonly CleanupStep[] = [],
 ): AppServices {
   return {
     candidatePilotInitializer: candidatePilotInitializer as AppServices["candidatePilotInitializer"],
@@ -279,19 +302,30 @@ function createSmokeApp(
     telegramInboundPolling: {
       stop() {
         events.push("telegram:stop");
+        throwWhenRequested("telegram", failingCleanupSteps);
       },
     } as never,
     strategyScheduler: {
       stop() {
         events.push("scheduler:stop");
+        throwWhenRequested("scheduler", failingCleanupSteps);
       },
     } as never,
     persistence: {
       close() {
         events.push("persistence:close");
+        throwWhenRequested("persistence", failingCleanupSteps);
       },
     } as never,
   } as unknown as AppServices;
+}
+
+type CleanupStep = "telegram" | "scheduler" | "persistence";
+
+function throwWhenRequested(step: CleanupStep, failingCleanupSteps: readonly CleanupStep[]): void {
+  if (failingCleanupSteps.includes(step)) {
+    throw new Error(`${step}_cleanup_failed`);
+  }
 }
 
 function createExecutionState(): ExecutionStateRecord {
