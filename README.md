@@ -119,7 +119,7 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 
 ## Runtime Shape
 
-Runtime startup constructs the app first. Baseline selection exposes a null candidate initializer and makes no candidate-storage call. A validated candidate selection is initialized immediately after `createApp` and before startup recovery or exchange-backed reads, notification delivery, operator-state/preflight reads, scheduler startup/reporting, Telegram polling or menu setup, and signal installation. Initialization only creates or reuses the candidate's pristine `PENDING_FLAT` deployment authority; it never activates the deployment.
+Runtime startup constructs the app first. Baseline selection exposes a null candidate initializer and makes no candidate-storage call. A validated candidate selection is initialized immediately after `createApp` and before startup recovery or exchange-backed reads, notification delivery, operator-state/preflight reads, scheduler startup/reporting, Telegram polling or menu setup, and signal installation. Only a newly `CREATED` deployment is initialized as pristine `PENDING_FLAT`; valid existing `PENDING_FLAT`, `ACTIVE`, or `PAUSED_FAULT` authority is validated and retained unchanged. The initializer never activates a deployment.
 
 1. A deterministic strategy emits a `StrategyDecision`.
 2. If Upbit read credentials are configured, startup runs an exchange-backed recovery sweep before showing the banner.
@@ -468,7 +468,7 @@ This diagnostic was designed after an observed holdout outcome, so it is retrosp
 
 `PCS-2026-001` is publicly registered. Its immutable no-peek observation window is `[2026-08-23T08:00:00.000Z,2026-12-21T08:00:00.000Z)`, equivalent to 2026-08-23 17:00 KST through 2026-12-21 17:00 KST. Before `window.from` it is registered and awaiting observation; from `window.from` until `window.to`, reports remain `COLLECTING` and expose no outcome metrics. Registration does not grant deployment, `DRY_RUN`, scheduler, order, or `LIVE` authority.
 
-Candidate policy and state modules are pure, execution-disconnected, configuration-free, and have no runtime reachability. They exist only for post-closure deployment readiness; current percentage-based sizing and all execution guards are unchanged.
+The prospective candidate policy and evaluation graph is pure, execution-disconnected, configuration-free, and has no runtime reachability. This isolation statement does not apply to persisted candidate deployment/state repositories or the runtime candidate initializer. The prospective graph exists only for post-closure deployment readiness; current percentage-based sizing and all execution guards are unchanged.
 
 The public authority chain is:
 

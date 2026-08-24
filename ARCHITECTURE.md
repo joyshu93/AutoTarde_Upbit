@@ -333,7 +333,7 @@ Readiness-local health metrics are likewise bounded persisted summaries only: ac
 
 ## Runtime Flow
 
-1. Bootstrap configuration and construct the app. Baseline selection exposes a null candidate initializer and makes no candidate-storage call. A validated candidate selection is initialized immediately after `createApp`; initialization only creates or reuses pristine `PENDING_FLAT` deployment authority and never activates it.
+1. Bootstrap configuration and construct the app. Baseline selection exposes a null candidate initializer and makes no candidate-storage call. A validated candidate selection is initialized immediately after `createApp`. Only a newly `CREATED` deployment is initialized as pristine `PENDING_FLAT`; valid existing `PENDING_FLAT`, `ACTIVE`, or `PAUSED_FAULT` authority is validated and retained unchanged. The initializer never activates a deployment.
 2. Only after candidate initialization completes, optionally run an exchange-backed startup recovery sweep when Upbit read credentials are configured. Notification delivery, operator-state and scheduler-preflight reads, scheduler startup/reporting, Telegram inbound polling and command-menu setup, and signal installation are likewise reachable only after the initializer gate.
 3. During startup recovery, persist fresh balance and position snapshots, reconcile orders/fills, detect unexplained portfolio drift, then apply the bootstrap-only `DEGRADED` policy if needed.
 4. Load execution policy and operator state.
