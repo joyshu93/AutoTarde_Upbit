@@ -233,6 +233,112 @@ test("candidate initializer restarts PAUSED_FAULT authority faulted from canonic
   assert.deepEqual(result.exactState, authority.exactState);
 });
 
+test("candidate initializer restarts DRAINING fault authority after canonical risk-reducing EXIT evidence", async () => {
+  const authority = pausedFaultFromDrainingWithExitAuthority();
+  const fixture = createFixture({ result: authority });
+
+  const result = await fixture.initializer.initialize();
+
+  assert.equal(result.deployment.phase, "PAUSED_FAULT");
+  assert.equal(result.exactState.stateVersion, 2);
+  assert.equal(result.exactState.currentEpisodeInventoryQuantity, "0");
+  assert.deepEqual(
+    result.auditEvents
+      .filter((event) => event.eventType === "STATE_ADVANCED")
+      .map((event) => [event.fromPhase, event.toPhase, event.stateVersion]),
+    [["ACTIVE", "ACTIVE", 1], ["DRAINING", "DRAINING", 2]],
+  );
+  assert.equal(rollbackEvent(mutableAuthority(result)).stateVersion, 1);
+  assert.equal(faultEvent(mutableAuthority(result)).stateVersion, 2);
+});
+
+test("candidate initializer rejects forged rollback boundaries around DRAINING state advances", async () => {
+  const cases: Array<Readonly<{
+    name: string;
+    mutate(authority: ReturnType<typeof pausedFaultFromDrainingWithExitAuthority>): void;
+  }>> = [
+    {
+      name: "pre-rollback state advance claims DRAINING",
+      mutate(authority) {
+        const event = stateAdvanceEvents(authority)[0]!;
+        event.fromPhase = "DRAINING";
+        event.toPhase = "DRAINING";
+      },
+    },
+    {
+      name: "post-rollback state advance claims ACTIVE",
+      mutate(authority) {
+        const event = stateAdvanceEvents(authority)[1]!;
+        event.fromPhase = "ACTIVE";
+        event.toPhase = "ACTIVE";
+      },
+    },
+    {
+      name: "rollback state version is too low",
+      mutate(authority) {
+        rollbackEvent(authority).stateVersion = 0;
+      },
+    },
+    {
+      name: "rollback state version is too high",
+      mutate(authority) {
+        rollbackEvent(authority).stateVersion = 2;
+      },
+    },
+    {
+      name: "rollback is ordered after a DRAINING state advance",
+      mutate(authority) {
+        const rollback = rollbackEvent(authority);
+        authority.auditEvents.splice(authority.auditEvents.indexOf(rollback), 1);
+        rollback.createdAt = "2026-08-23T23:59:59.880000001Z";
+        rollback.payloadJson = JSON.stringify({ transitionAt: rollback.createdAt });
+        rollback.id = `${authority.deployment.id}:rollback_started:1787529599880000001`;
+        authority.auditEvents.splice(-1, 0, rollback);
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    const authority = pausedFaultFromDrainingWithExitAuthority();
+    testCase.mutate(authority);
+    const fixture = createFixture({ result: authority });
+    await assert.rejects(
+      () => fixture.initializer.initialize(),
+      /rollback|STATE_ADVANCED|phase|stateVersion|chronology/i,
+      testCase.name,
+    );
+  }
+});
+
+test("candidate initializer rejects non-risk-reducing evidence after rollback starts", async () => {
+  const authority = pausedFaultFromDrainingWithAddAuthority();
+  const fixture = createFixture({ result: authority });
+
+  await assert.rejects(
+    () => fixture.initializer.initialize(),
+    /DRAINING|risk-reducing|ADD|evidence/i,
+  );
+});
+
+test("candidate initializer rejects identical rollback and fault epochs regardless of fault id ordering", async () => {
+  for (const faultId of ["0000-low-fault-id", "zzzz-high-fault-id"] as const) {
+    const authority = pausedFaultFromDrainingAuthority();
+    const rollback = rollbackEvent(authority);
+    const fault = faultEvent(authority);
+    authority.deployment.updatedAt = rollback.createdAt;
+    fault.createdAt = rollback.createdAt;
+    fault.id = faultId;
+    authority.auditEvents.sort(compareAuditChronology);
+    const fixture = createFixture({ result: authority });
+
+    await assert.rejects(
+      () => fixture.initializer.initialize(),
+      /rollback|fault|chronology|precede/i,
+      faultId,
+    );
+  }
+});
+
 test("candidate initializer rejects forged DRAINING rollback restart authority", async () => {
   const cases: Array<Readonly<{
     name: string;
@@ -764,21 +870,26 @@ function validAuthority(input: Readonly<{
 function stateAdvancedAudit(
   deployment: PositionGuardPilotDeploymentRecord,
   evidence: PositionGuardCandidateExecutionEvidence,
+  transition: Readonly<{
+    phase: "ACTIVE" | "DRAINING";
+    fromStateVersion: number;
+    toStateVersion: number;
+  }> = { phase: "ACTIVE", fromStateVersion: 0, toStateVersion: 1 },
 ): PositionGuardPilotAuditEventRecord {
   const material = candidateEvidenceMaterial(deployment.id, evidence);
   return {
     id: `${deployment.id}:evidence:${material.evidence.evidenceId}`,
     deploymentId: deployment.id,
     eventType: "STATE_ADVANCED",
-    fromPhase: "ACTIVE",
-    toPhase: "ACTIVE",
-    stateVersion: 1,
+    fromPhase: transition.phase,
+    toPhase: transition.phase,
+    stateVersion: transition.toStateVersion,
     payloadJson: JSON.stringify({
       evidenceId: material.evidence.evidenceId,
       materialHash: material.hash,
       materialVersion: material.materialVersion,
-      fromStateVersion: 0,
-      toStateVersion: 1,
+      fromStateVersion: transition.fromStateVersion,
+      toStateVersion: transition.toStateVersion,
     }),
     createdAt: material.evidence.executedAt,
   };
@@ -798,6 +909,43 @@ function pausedFaultFromDrainingAuthority(): ReturnType<typeof mutableAuthority>
     0,
     rollbackStartedAudit(authority.deployment, authority.exactState.stateVersion),
   );
+  return authority;
+}
+
+function pausedFaultFromDrainingWithExitAuthority(): ReturnType<typeof mutableAuthority> {
+  const authority = pausedFaultFromDrainingAuthority();
+  const exitEvidence = executedExitEvidence();
+  authority.evidenceRecords.push(executedEvidenceRecord(authority.deployment.id, exitEvidence));
+  authority.exactState = {
+    ...projectExactCandidateState([executedEnterEvidence(), exitEvidence]),
+  };
+  authority.auditEvents.splice(
+    -1,
+    0,
+    stateAdvancedAudit(authority.deployment, exitEvidence, {
+      phase: "DRAINING",
+      fromStateVersion: 1,
+      toStateVersion: 2,
+    }),
+  );
+  faultEvent(authority).stateVersion = 2;
+  return authority;
+}
+
+function pausedFaultFromDrainingWithAddAuthority(): ReturnType<typeof mutableAuthority> {
+  const authority = pausedFaultFromDrainingWithExitAuthority();
+  const addEvidence = executedAddEvidence();
+  authority.evidenceRecords[1] = executedEvidenceRecord(authority.deployment.id, addEvidence);
+  authority.exactState = {
+    ...projectExactCandidateState([executedEnterEvidence(), addEvidence]),
+  };
+  const addAudit = stateAdvancedAudit(authority.deployment, addEvidence, {
+    phase: "DRAINING",
+    fromStateVersion: 1,
+    toStateVersion: 2,
+  });
+  const secondStateEvent = stateAdvanceEvents(authority)[1]!;
+  authority.auditEvents[authority.auditEvents.indexOf(secondStateEvent)] = addAudit;
   return authority;
 }
 
@@ -833,6 +981,23 @@ function faultEvent(
   return event;
 }
 
+function stateAdvanceEvents(
+  authority: ReturnType<typeof mutableAuthority>,
+): PositionGuardPilotAuditEventRecord[] {
+  return authority.auditEvents.filter((event) => event.eventType === "STATE_ADVANCED");
+}
+
+function compareAuditChronology(
+  left: PositionGuardPilotAuditEventRecord,
+  right: PositionGuardPilotAuditEventRecord,
+): number {
+  const leftEpochNs = parseCandidatePilotTimestamp(left.createdAt, "test audit createdAt");
+  const rightEpochNs = parseCandidatePilotTimestamp(right.createdAt, "test audit createdAt");
+  if (leftEpochNs < rightEpochNs) return -1;
+  if (leftEpochNs > rightEpochNs) return 1;
+  return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+}
+
 function creationAudit(deployment: PositionGuardPilotDeploymentRecord): PositionGuardPilotAuditEventRecord {
   return {
     id: `${deployment.id}:created`,
@@ -866,6 +1031,34 @@ function executedEnterEvidence(): PositionGuardCandidateExecutionEvidence {
     grossQuoteValueKrw: "10000",
     confirmedFeeKrw: "5",
     remainingQuantity: "0.1",
+  };
+}
+
+function executedExitEvidence(): PositionGuardCandidateExecutionEvidence {
+  return {
+    evidenceId: "candidate-exit-2",
+    executedAt: "2026-08-23T23:59:59.870000001Z",
+    action: "EXIT",
+    entryPath: "NONE",
+    terminalStatus: "FILLED",
+    executedQuantity: "0.1",
+    grossQuoteValueKrw: "11000",
+    confirmedFeeKrw: "5",
+    remainingQuantity: "0",
+  };
+}
+
+function executedAddEvidence(): PositionGuardCandidateExecutionEvidence {
+  return {
+    evidenceId: "candidate-add-2",
+    executedAt: "2026-08-23T23:59:59.870000001Z",
+    action: "ADD",
+    entryPath: "RECLAIM",
+    terminalStatus: "FILLED",
+    executedQuantity: "0.1",
+    grossQuoteValueKrw: "10000",
+    confirmedFeeKrw: "5",
+    remainingQuantity: "0.2",
   };
 }
 

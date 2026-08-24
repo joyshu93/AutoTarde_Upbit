@@ -517,17 +517,32 @@ function assertRetainedLifecycleAuthority(
   }
 
   const stateEvents = auditEvents.filter((event) => event.eventType === "STATE_ADVANCED");
+  const faultEvents = auditEvents.filter((event) => event.eventType === "FAULT_PAUSED");
+  const rollbackEvents = auditEvents.filter((event) => event.eventType === "ROLLBACK_STARTED");
   if (stateEvents.length !== evidenceRecords.length) {
     throw new Error("PositionGuard pilot STATE_ADVANCED audit count does not match evidence authority.");
   }
+  const rollbackBoundaryStateVersion = rollbackEvents.length === 1
+    ? assertRollbackBoundaryStateVersion(auditEvents, stateEvents, rollbackEvents[0]!)
+    : null;
   for (let index = 0; index < evidenceRecords.length; index += 1) {
     const record = evidenceRecords[index]!;
+    const statePhase = rollbackBoundaryStateVersion !== null && index >= rollbackBoundaryStateVersion
+      ? "DRAINING"
+      : "ACTIVE";
+    if (
+      statePhase === "DRAINING" &&
+      record.evidence.action !== "REDUCE" &&
+      record.evidence.action !== "EXIT"
+    ) {
+      throw new Error("DRAINING PositionGuard pilot evidence must be risk-reducing REDUCE or EXIT authority.");
+    }
     const expectedStateEvent = {
       id: `${deployment.id}:evidence:${record.evidence.evidenceId}`,
       deploymentId: deployment.id,
       eventType: "STATE_ADVANCED",
-      fromPhase: "ACTIVE",
-      toPhase: "ACTIVE",
+      fromPhase: statePhase,
+      toPhase: statePhase,
       stateVersion: index + 1,
       payloadJson: JSON.stringify({
         evidenceId: record.evidence.evidenceId,
@@ -543,8 +558,6 @@ function assertRetainedLifecycleAuthority(
     }
   }
 
-  const faultEvents = auditEvents.filter((event) => event.eventType === "FAULT_PAUSED");
-  const rollbackEvents = auditEvents.filter((event) => event.eventType === "ROLLBACK_STARTED");
   if (deployment.phase === "ACTIVE") {
     if (faultEvents.length !== 0 || rollbackEvents.length !== 0) {
       throw new Error("ACTIVE PositionGuard pilot must not contain fault-pause or rollback authority.");
@@ -563,11 +576,11 @@ function assertRetainedLifecycleAuthority(
     if (rollbackEvents.length !== 0) {
       assertCanonicalRollbackStartedAudit(
         deployment,
-        exactState,
         evidenceRecords,
         auditEvents,
         rollbackEvents,
         faultEvents[0]!,
+        rollbackBoundaryStateVersion!,
       );
     }
   }
@@ -577,6 +590,23 @@ function assertRetainedLifecycleAuthority(
   if (auditEvents.length !== expectedAuditCount) {
     throw new Error("PositionGuard pilot lifecycle contains unsupported audit authority.");
   }
+}
+
+function assertRollbackBoundaryStateVersion(
+  auditEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+  stateEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+  rollbackEvent: Readonly<PositionGuardPilotAuditEventRecord>,
+): number {
+  const rollbackIndex = auditEvents.indexOf(rollbackEvent);
+  const precedingStateEventCount = stateEvents.filter(
+    (event) => auditEvents.indexOf(event) < rollbackIndex,
+  ).length;
+  if (rollbackIndex < 0 || rollbackEvent.stateVersion !== precedingStateEventCount) {
+    throw new Error(
+      "PositionGuard pilot rollback stateVersion must equal the exact preceding STATE_ADVANCED count.",
+    );
+  }
+  return precedingStateEventCount;
 }
 
 function assertCanonicalFaultAudit(
@@ -629,11 +659,11 @@ function assertCanonicalFaultAudit(
 
 function assertCanonicalRollbackStartedAudit(
   deployment: Readonly<PositionGuardPilotDeploymentRecord>,
-  exactState: Readonly<ExactCandidateState>,
   evidenceRecords: readonly Readonly<CandidateEvidenceRecord>[],
   auditEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
   rollbackEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
   faultEvent: Readonly<PositionGuardPilotAuditEventRecord>,
+  rollbackBoundaryStateVersion: number,
 ): void {
   if (
     rollbackEvents.length !== 1 ||
@@ -661,7 +691,7 @@ function assertCanonicalRollbackStartedAudit(
     eventType: "ROLLBACK_STARTED",
     fromPhase: "ACTIVE",
     toPhase: "DRAINING",
-    stateVersion: exactState.stateVersion,
+    stateVersion: rollbackBoundaryStateVersion,
     payloadJson: JSON.stringify({ transitionAt: payload.transitionAt }),
     createdAt: payload.transitionAt,
   } as const;
@@ -672,14 +702,24 @@ function assertCanonicalRollbackStartedAudit(
   const rollbackAt = strictTimestamp(rollback.createdAt, "persisted rollback audit createdAt");
   const faultAt = strictTimestamp(faultEvent.createdAt, "persisted fault audit createdAt");
   const activationAt = strictTimestamp(deployment.activationAt, "persisted deployment activationAt");
-  const latestEvidence = evidenceRecords.at(-1);
+  const latestActiveEvidence = rollbackBoundaryStateVersion === 0
+    ? undefined
+    : evidenceRecords[rollbackBoundaryStateVersion - 1];
+  const firstDrainingEvidence = evidenceRecords[rollbackBoundaryStateVersion];
+  const activationEvent = auditEvents.find((event) => event.eventType === "PHASE_TRANSITION");
   if (
     rollbackAt < activationAt ||
-    rollbackAt > faultAt ||
-    (latestEvidence !== undefined && rollbackAt < strictTimestamp(
-      latestEvidence.evidence.executedAt,
+    rollbackAt >= faultAt ||
+    (latestActiveEvidence !== undefined && rollbackAt < strictTimestamp(
+      latestActiveEvidence.evidence.executedAt,
       "persisted evidence executedAt",
     )) ||
+    (firstDrainingEvidence !== undefined && rollbackAt > strictTimestamp(
+      firstDrainingEvidence.evidence.executedAt,
+      "persisted evidence executedAt",
+    )) ||
+    activationEvent === undefined ||
+    auditEvents.indexOf(activationEvent) >= auditEvents.indexOf(rollback) ||
     auditEvents.indexOf(rollback) >= auditEvents.indexOf(faultEvent)
   ) {
     throw new Error("PositionGuard pilot rollback-start audit violates exact lifecycle chronology.");
