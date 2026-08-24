@@ -7,6 +7,10 @@ import type {
 } from "../../../domain/types.js";
 import { formatTelegramTimestamp } from "./common.js";
 import type { TelegramLocale } from "./locale.js";
+import {
+  describePilot,
+  type BtcCandidatePilotVisibility,
+} from "./status.js";
 
 export type ReadinessStatus = "PASS" | "WARN" | "BLOCK";
 
@@ -27,6 +31,7 @@ export interface ReadinessPresentationInput {
   recentRiskBlockCount: number;
   pendingNotificationCount: number;
   checks: readonly ReadinessPresentationCheck[];
+  btcPilot?: BtcCandidatePilotVisibility | null;
 }
 
 export function formatReadinessPresentation(
@@ -60,6 +65,7 @@ function buildKoreanReadinessLines(input: ReadinessPresentationInput): string[] 
     `활성 주문: ${input.activeOrderCount}건`,
     `최근 위험 차단: ${input.recentRiskBlockCount}건`,
     `대기 알림: ${input.pendingNotificationCount}건`,
+    ...(input.btcPilot === undefined ? [] : describePilot(input.btcPilot, "ko-KR")),
     ...(issueChecks.length === 0
       ? ["주의/차단 점검: 없음"]
       : [
@@ -95,6 +101,7 @@ function buildEnglishReadinessLines(input: ReadinessPresentationInput): string[]
     `Active orders: ${input.activeOrderCount}`,
     `Recent risk blocks: ${input.recentRiskBlockCount}`,
     `Pending notifications: ${input.pendingNotificationCount}`,
+    ...(input.btcPilot === undefined ? [] : describePilot(input.btcPilot, "en-US")),
     ...(issueChecks.length === 0
       ? ["Warnings/blocks: none"]
       : [

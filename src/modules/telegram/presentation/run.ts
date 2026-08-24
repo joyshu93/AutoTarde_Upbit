@@ -2,6 +2,11 @@ import type { OrderLifecycleStatus } from "../../../domain/types.js";
 import type { TelegramStrategyRunResult } from "../interfaces.js";
 import { formatTelegramTimestamp } from "./common.js";
 import type { TelegramLocale } from "./locale.js";
+import {
+  describePilot,
+  formatPilotTechnicalVisibility,
+  type BtcCandidatePilotVisibility,
+} from "./status.js";
 
 interface RunStatusCopy {
   readonly label: string;
@@ -112,6 +117,7 @@ const OPERATOR_BOUNDARY =
 export function formatStrategyRunPresentation(
   result: TelegramStrategyRunResult,
   locale: TelegramLocale,
+  btcPilot?: BtcCandidatePilotVisibility | null,
 ): string {
   const copy = locale === "ko-KR"
     ? KOREAN_STATUS_COPY[result.status]
@@ -122,6 +128,7 @@ export function formatStrategyRunPresentation(
 
   return [
     ...readableLines,
+    ...(btcPilot === undefined ? [] : describePilot(btcPilot, locale)),
     "",
     `status: ${result.status}`,
     `requested_at: ${result.requestedAt}`,
@@ -132,6 +139,7 @@ export function formatStrategyRunPresentation(
     `order_id: ${result.orderId ?? "none"}`,
     `order_status: ${result.orderStatus ?? "none"}`,
     `detail: ${result.detail}`,
+    ...(btcPilot === undefined || btcPilot === null ? [] : [formatPilotTechnicalVisibility(btcPilot)]),
     OPERATOR_BOUNDARY,
   ].join("\n");
 }

@@ -29,10 +29,7 @@ import {
   formatStateHistoryMessage,
   formatStrategySchedulerRunsMessage,
   formatStrategySchedulerRunsSummaryMessage,
-  formatStrategyPreviewMessage,
-  formatStrategyRunMessage,
   formatStatusMessage,
-  formatStatusSummaryMessage,
   formatSyncMessage,
   formatTelegramInboundMessage,
   formatTelegramInboundSummaryMessage,
@@ -70,6 +67,15 @@ import {
   sortTelegramAlertsNewestFirst,
   TELEGRAM_ALERT_PAGE_SIZE,
 } from "./presentation/alerts.js";
+import {
+  describePilot,
+  formatPilotTechnicalVisibility,
+  formatStatusPresentation,
+  type BtcCandidatePilotVisibility,
+} from "./presentation/status.js";
+import { formatStrategyRunPresentation } from "./presentation/run.js";
+import { formatStrategyPreviewPresentation } from "./presentation/preview.js";
+import type { StrategyDecisionRecord } from "../../domain/types.js";
 
 export class TelegramCommandRouter {
   constructor(private readonly dependencies: TelegramRouterDependencies) {}
@@ -194,19 +200,9 @@ export class TelegramCommandRouter {
           ),
         };
       case "/preview":
-        return {
-          text: formatStrategyPreviewMessage(
-            await this.requestStrategyPreview(parsed.args, exchangeAccountId),
-            normalizeTelegramLocale(this.dependencies.locale),
-          ),
-        };
+        return this.buildStrategyPreviewResponse(parsed.args, exchangeAccountId);
       case "/run":
-        return {
-          text: formatStrategyRunMessage(
-            await this.requestStrategyRun(parsed.args, exchangeAccountId),
-            normalizeTelegramLocale(this.dependencies.locale),
-          ),
-        };
+        return this.buildStrategyRunResponse(parsed.args, exchangeAccountId);
       default:
         return {
           text: buildUnsupportedCommandMessage(input),
@@ -535,12 +531,47 @@ export class TelegramCommandRouter {
     });
   }
 
+  private async buildStrategyPreviewResponse(
+    args: readonly string[],
+    exchangeAccountId: string,
+  ): Promise<TelegramResponse> {
+    const result = await this.requestStrategyPreview(args, exchangeAccountId);
+    const btcPilot = result.market === "KRW-BTC"
+      ? await this.readBtcPilotVisibility(exchangeAccountId)
+      : null;
+    return {
+      text: formatStrategyPreviewPresentation(
+        result,
+        normalizeTelegramLocale(this.dependencies.locale),
+        btcPilot,
+      ),
+    };
+  }
+
+  private async buildStrategyRunResponse(
+    args: readonly string[],
+    exchangeAccountId: string,
+  ): Promise<TelegramResponse> {
+    const result = await this.requestStrategyRun(args, exchangeAccountId);
+    const btcPilot = result.market === "KRW-BTC"
+      ? await this.readBtcPilotVisibility(exchangeAccountId, result.strategyDecisionId)
+      : null;
+    return {
+      text: formatStrategyRunPresentation(
+        result,
+        normalizeTelegramLocale(this.dependencies.locale),
+        btcPilot,
+      ),
+    };
+  }
+
   private async buildStatusResponse(exchangeAccountId: string, detail: boolean): Promise<TelegramResponse> {
-    const [state, transitions, runs, schedulerRuns] = await Promise.all([
+    const [state, transitions, runs, schedulerRuns, btcPilot] = await Promise.all([
       this.dependencies.operatorState.getState(),
       this.dependencies.operatorState.listTransitions(3),
       this.dependencies.repositories.listReconciliationRuns(exchangeAccountId, 1),
       this.dependencies.repositories.listStrategySchedulerRuns(exchangeAccountId, 5),
+      this.readBtcPilotVisibility(exchangeAccountId),
     ]);
 
     const options = buildStatusFormatOptions(
@@ -552,15 +583,16 @@ export class TelegramCommandRouter {
 
     return detail
       ? {
-          text: formatStatusMessage(state, options),
+          text: appendPilotTechnicalVisibility(formatStatusMessage(state, options), btcPilot),
         }
       : {
-          text: formatStatusSummaryMessage(
-            state,
+          text: formatStatusPresentation(
             {
+              state,
               liveSendPath: options?.liveSendPath ?? "DRY_RUN_ADAPTER",
               latestReconciliationRun: options?.latestReconciliationRun ?? null,
               schedulerStatus: options?.schedulerStatus ?? null,
+              btcPilot,
             },
             normalizeTelegramLocale(this.dependencies.locale),
           ),
@@ -579,6 +611,7 @@ export class TelegramCommandRouter {
       activeOrders,
       recentRiskEvents,
       pendingNotifications,
+      btcPilot,
     ] = await Promise.all([
       this.dependencies.operatorState.getState(),
       this.dependencies.repositories.getLatestBalanceSnapshot(exchangeAccountId),
@@ -587,6 +620,7 @@ export class TelegramCommandRouter {
       this.dependencies.repositories.listActiveOrders(exchangeAccountId, undefined, 20),
       this.dependencies.repositories.listRiskEvents(exchangeAccountId, 20),
       this.dependencies.repositories.listPendingOperatorNotifications(exchangeAccountId, { limit: 20 }),
+      this.readBtcPilotVisibility(exchangeAccountId),
     ]);
 
     const readinessInput = {
@@ -605,12 +639,27 @@ export class TelegramCommandRouter {
 
     return {
       text: detail
-        ? formatReadinessMessage(readinessInput)
-        : formatReadinessSummaryMessage(
-            readinessInput,
+        ? appendPilotTechnicalVisibility(formatReadinessMessage(readinessInput), btcPilot)
+        : appendPilotSummaryVisibility(
+            formatReadinessSummaryMessage(
+              readinessInput,
+              normalizeTelegramLocale(this.dependencies.locale),
+            ),
+            btcPilot,
             normalizeTelegramLocale(this.dependencies.locale),
           ),
     };
+  }
+
+  private async readBtcPilotVisibility(
+    exchangeAccountId: string,
+    preferredDecisionId: string | null = null,
+  ): Promise<BtcCandidatePilotVisibility | null> {
+    const decision = preferredDecisionId && this.dependencies.repositories.getStrategyDecisionById
+      ? await this.dependencies.repositories.getStrategyDecisionById(preferredDecisionId)
+      : await this.dependencies.repositories.getLatestStrategyDecision(exchangeAccountId, "KRW-BTC");
+    if (decision?.exchangeAccountId !== exchangeAccountId || decision.market !== "KRW-BTC") return null;
+    return parseBtcPilotVisibility(decision);
   }
 
   private async buildStateHistoryResponse(): Promise<TelegramResponse> {
@@ -789,6 +838,117 @@ export class TelegramCommandRouter {
       ),
     };
   }
+}
+
+const PILOT_PHASES = new Set([
+  "DISABLED",
+  "PENDING_FLAT",
+  "ACTIVE",
+  "PAUSED_FAULT",
+  "DRAINING",
+] as const);
+
+const PILOT_ROUTE_REASON_CODES = new Set([
+  "BASELINE_SELECTION",
+  "ETH_BASELINE",
+  "PILOT_DISABLED",
+  "PENDING_FLAT_NEW_RISK_SUPPRESSED",
+  "PENDING_FLAT_RISK_REDUCTION_PRESERVED",
+  "PENDING_FLAT_BASELINE_HOLD_PRESERVED",
+  "DRAINING_NEW_RISK_SUPPRESSED",
+  "DRAINING_RISK_REDUCTION_PRESERVED",
+  "DRAINING_BASELINE_HOLD_PRESERVED",
+  "PAUSED_FAULT_BLOCKED",
+  "CANDIDATE_ALLOWED",
+  "CANDIDATE_SUPPRESSED",
+  "CANDIDATE_EARLY_THESIS_FAILURE",
+] as const);
+
+function parseBtcPilotVisibility(
+  decision: StrategyDecisionRecord | null,
+): BtcCandidatePilotVisibility | null {
+  if (decision === null || decision.market !== "KRW-BTC") return null;
+
+  let basis: unknown;
+  try {
+    basis = JSON.parse(decision.decisionBasisJson) as unknown;
+  } catch {
+    return null;
+  }
+  if (!isPlainRecord(basis) || !isPlainRecord(basis.policyRoute)) return null;
+
+  const route = basis.policyRoute;
+  if (
+    route.schemaVersion !== "POSITION_GUARD_POLICY_ROUTE_AUDIT_V1" ||
+    route.pilotId !== "BTC_COMBINED_CONSERVATIVE_PILOT_V1" ||
+    route.policyVersion !== "PCS-2026-001.DEPLOYMENT_READINESS_V1" ||
+    typeof route.phase !== "string" ||
+    !PILOT_PHASES.has(route.phase as never) ||
+    typeof route.reasonCode !== "string" ||
+    !PILOT_ROUTE_REASON_CODES.has(route.reasonCode as never) ||
+    typeof route.executionBlocked !== "boolean" ||
+    !isNullableNonNegativeSafeInteger(route.stateVersion)
+  ) {
+    return null;
+  }
+
+  const refresh = isPlainRecord(route.refreshProvenance) ? route.refreshProvenance : null;
+  const reconciliationRunId = readNullableNonEmptyString(refresh?.reconciliationRunId);
+  const routeVerified = refresh === null ? "UNAVAILABLE" as const : "VERIFIED_BY_ROUTE" as const;
+
+  return {
+    deploymentId: readNullableNonEmptyString(route.deploymentId),
+    pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+    phase: route.phase as BtcCandidatePilotVisibility["phase"],
+    policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+    stateVersion: route.stateVersion as number | null,
+    activationAt: readNullableNonEmptyString(route.activationAt),
+    lastEvidenceAt: null,
+    lastEvidenceId: null,
+    exactFlatCheck: "UNAVAILABLE",
+    replayCheck: routeVerified,
+    leaseCheck: routeVerified,
+    reconciliationCheck: reconciliationRunId === null ? "UNAVAILABLE" : "VERIFIED_BY_ROUTE",
+    reconciliationRunId,
+    latestOutcome: {
+      strategyDecisionId: decision.id,
+      action: decision.action,
+      reasonCode: route.reasonCode,
+      executionBlocked: route.executionBlocked,
+      createdAt: decision.createdAt,
+    },
+  };
+}
+
+function appendPilotSummaryVisibility(
+  message: string,
+  pilot: BtcCandidatePilotVisibility | null,
+  locale: ReturnType<typeof normalizeTelegramLocale>,
+): string {
+  return `${message}\n${describePilot(pilot, locale).join("\n")}`;
+}
+
+function appendPilotTechnicalVisibility(
+  message: string,
+  pilot: BtcCandidatePilotVisibility | null,
+): string {
+  return pilot === null ? message : `${message}\n${formatPilotTechnicalVisibility(pilot)}`;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNullableNonNegativeSafeInteger(value: unknown): boolean {
+  return value === null || (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  );
+}
+
+function readNullableNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
 function buildPagedKeyboard(

@@ -5416,7 +5416,122 @@ test("telegram router calls a wired strategy run controller for supported assets
   assert.match(response.text, /submission_accepted: none/);
 });
 
-test("router localizes run, calls BTC and ETH exactly once, rejects invalid requests, and performs no extra reads", async () => {
+test("telegram router exposes persisted BTC pilot audit on status, readiness, run, and preview", async () => {
+  const repository = new InMemoryExecutionRepository();
+  const decisionBasisJson = JSON.stringify({
+    policyRoute: {
+      schemaVersion: "POSITION_GUARD_POLICY_ROUTE_AUDIT_V1",
+      configuredSelection: {
+        kind: "BTC_CANDIDATE_PILOT",
+        pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+        market: "KRW-BTC",
+        policyId: "COMBINED_CONSERVATIVE",
+        policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+        liveOperatorConfirmed: true,
+      },
+      resolvedSelection: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+      executionBlocked: false,
+      deploymentId: "deployment-pilot-1",
+      pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+      policyId: "COMBINED_CONSERVATIVE",
+      policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+      phase: "ACTIVE",
+      activationAt: "2026-08-21T03:00:00.000Z",
+      stateVersion: 4,
+      reasonCode: "CANDIDATE_ALLOWED",
+      refreshProvenance: {
+        reconciliationRunId: "reconciliation-pilot-1",
+      },
+    },
+    localConfirmation: "I_UNDERSTAND_BTC_CANDIDATE_LIVE_PILOT",
+    ownerToken: "owner-token-must-not-render",
+  });
+  await repository.saveStrategyDecision({
+    id: "strategy-decision-pilot-1",
+    exchangeAccountId: "primary",
+    strategyKey: "position_guard.paper_core.v1",
+    market: "KRW-BTC",
+    action: "ADD",
+    status: "READY",
+    decisionBasisJson,
+    intendedNotionalKrw: "5000",
+    intendedQuantity: null,
+    referencePrice: "100000000",
+    createdAt: "2026-08-21T03:30:00.000Z",
+  });
+  const router = new TelegramCommandRouter({
+    repositories: repository,
+    operatorState: new InMemoryOperatorStateStore({
+      id: "state-pilot-visibility",
+      exchangeAccountId: "primary",
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      systemStatus: "RUNNING",
+      killSwitchActive: false,
+      pauseReason: null,
+      degradedReason: null,
+      degradedAt: null,
+      updatedAt: "2026-08-21T03:31:00.000Z",
+    }),
+    liveSendPath: "LIVE_ADAPTER",
+    strategyRunController: {
+      async requestRun(request) {
+        return {
+          status: "COMPLETED",
+          requestedAt: "2026-08-21T03:31:00.000Z",
+          market: request.market,
+          strategyDecisionId: "strategy-decision-pilot-1",
+          action: "ADD",
+          orderId: null,
+          orderStatus: null,
+          submissionAccepted: null,
+          detail: "Candidate decision persisted.",
+        };
+      },
+      async requestPreview(request) {
+        return {
+          status: "COMPLETED",
+          requestedAt: "2026-08-21T03:31:00.000Z",
+          market: request.market,
+          action: "ADD",
+          executionDisposition: "IMMEDIATE",
+          referencePrice: 100_000_000,
+          requestedNotionalKrw: 5_000,
+          requestedQuantity: null,
+          orderSide: "bid",
+          orderType: "price",
+          orderPrice: "5000",
+          orderVolume: null,
+          detail: "Candidate preview computed.",
+        };
+      },
+    },
+    now: () => "2026-08-21T03:31:00.000Z",
+  });
+
+  const responses = await Promise.all([
+    router.route("/status"),
+    router.route("/status detail"),
+    router.route("/readiness"),
+    router.route("/readiness detail"),
+    router.route("/run BTC"),
+    router.route("/preview BTC"),
+  ]);
+
+  for (const response of responses) {
+    assert.match(response.text, /BTC_COMBINED_CONSERVATIVE_PILOT_V1/u);
+    assert.match(response.text, /PCS-2026-001\.DEPLOYMENT_READINESS_V1/u);
+    assert.match(response.text, /ACTIVE/u);
+    assert.match(response.text, /BASELINE/u);
+    assert.doesNotMatch(response.text, /I_UNDERSTAND_BTC_CANDIDATE_LIVE_PILOT/u);
+    assert.doesNotMatch(response.text, /owner-token-must-not-render/u);
+  }
+  assert.match(responses[0]!.text, /최근 BTC 후보 결과: 추가 매수 · CANDIDATE_ALLOWED/u);
+  assert.match(responses[1]!.text, /btc_pilot_latest_reason_code: CANDIDATE_ALLOWED/u);
+  assert.match(responses[3]!.text, /btc_pilot_replay_check: VERIFIED_BY_ROUTE/u);
+});
+
+test("router localizes run, calls BTC and ETH exactly once, and adds one bounded BTC audit read", async () => {
   const baseRepositories = new InMemoryExecutionRepository();
   const baseOperatorState = new InMemoryOperatorStateStore({
     id: "run-state",
@@ -5430,16 +5545,14 @@ test("router localizes run, calls BTC and ETH exactly once, rejects invalid requ
     degradedAt: null,
     updatedAt: "2026-04-20T00:00:00.000Z",
   });
-  let repositoryReads = 0;
+  let candidateAuditReads = 0;
   let operatorStateReads = 0;
   let runCalls = 0;
   const markets: string[] = [];
-  const repositories = new Proxy(baseRepositories, {
-    get(target, property, receiver) {
-      repositoryReads += 1;
-      return Reflect.get(target, property, receiver);
-    },
-  });
+  baseRepositories.getStrategyDecisionById = async () => {
+    candidateAuditReads += 1;
+    return null;
+  };
   const operatorState = new Proxy(baseOperatorState, {
     get(target, property, receiver) {
       operatorStateReads += 1;
@@ -5447,7 +5560,7 @@ test("router localizes run, calls BTC and ETH exactly once, rejects invalid requ
     },
   });
   const router = new TelegramCommandRouter({
-    repositories,
+    repositories: baseRepositories,
     operatorState,
     locale: "ko-KR",
     strategyRunController: {
@@ -5479,7 +5592,7 @@ test("router localizes run, calls BTC and ETH exactly once, rejects invalid requ
 
   assert.equal(runCalls, 2);
   assert.deepEqual(markets, ["KRW-BTC", "KRW-ETH"]);
-  assert.equal(repositoryReads, 0);
+  assert.equal(candidateAuditReads, 1);
   assert.equal(operatorStateReads, 0);
   assert.match(btc.text, /전략 실행 결과 \(Strategy Run\)/);
   assert.match(btc.text, /시장\/자산: KRW-BTC \/ BTC/);
@@ -5494,7 +5607,7 @@ test("router localizes run, calls BTC and ETH exactly once, rejects invalid requ
   );
 });
 
-test("router localizes preview, invokes its controller once, and performs no extra state reads", async () => {
+test("router localizes ETH preview, invokes its controller once, and performs no candidate audit read", async () => {
   const baseRepositories = new InMemoryExecutionRepository();
   const baseOperatorState = new InMemoryOperatorStateStore({
     id: "preview-state",
@@ -5508,15 +5621,11 @@ test("router localizes preview, invokes its controller once, and performs no ext
     degradedAt: null,
     updatedAt: "2026-04-20T00:00:00.000Z",
   });
-  let repositoryReads = 0;
   let operatorStateReads = 0;
   let previewCalls = 0;
-  const repositories = new Proxy(baseRepositories, {
-    get(target, property, receiver) {
-      repositoryReads += 1;
-      return Reflect.get(target, property, receiver);
-    },
-  });
+  baseRepositories.getLatestStrategyDecision = async () => {
+    throw new Error("ETH preview must not read the BTC candidate audit");
+  };
   const operatorState = new Proxy(baseOperatorState, {
     get(target, property, receiver) {
       operatorStateReads += 1;
@@ -5524,7 +5633,7 @@ test("router localizes preview, invokes its controller once, and performs no ext
     },
   });
   const router = new TelegramCommandRouter({
-    repositories,
+    repositories: baseRepositories,
     operatorState,
     locale: "ko-KR",
     strategyRunController: {
@@ -5555,7 +5664,6 @@ test("router localizes preview, invokes its controller once, and performs no ext
   const response = await router.route("/preview ETH");
 
   assert.equal(previewCalls, 1);
-  assert.equal(repositoryReads, 0);
   assert.equal(operatorStateReads, 0);
   assert.match(response.text, /전략 미리보기 \(Strategy Preview\)/);
   assert.match(response.text, /시장\/자산: KRW-ETH \/ ETH/);

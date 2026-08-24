@@ -270,6 +270,16 @@ test("manual input commands are rejected by the operator contract", () => {
   assert.match(message, /\/help \/config \/readiness \/status \/statehistory \/synchistory \/recovery \/alerts \/risks \/balances \/positions \/orders \/order \/scheduler \/inbound \/pause \/resume \/killswitch \/sync \/preview \/run/);
 });
 
+test("Telegram exposes no BTC pilot activation, rollback, or phase mutation command", () => {
+  const commands = listTelegramCommandContracts().map((contract) => contract.command);
+
+  assert.equal(commands.includes("/pilot" as never), false);
+  assert.equal(commands.includes("/activatepilot" as never), false);
+  assert.equal(commands.includes("/rollbackpilot" as never), false);
+  assert.equal(parseTelegramCommand("/pilot activate"), null);
+  assert.match(buildUnsupportedCommandMessage("/pilot activate"), /^Unsupported command\./u);
+});
+
 test("no-argument commands return usage guidance when extra arguments are supplied", () => {
   const helpParsed = parseTelegramCommand("/help now");
   const configParsed = parseTelegramCommand("/config now");

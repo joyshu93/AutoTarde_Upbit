@@ -1,18 +1,46 @@
 import type {
   ExecutionStateRecord,
   ReconciliationRunRecord,
+  StrategyDecisionAction,
   StrategySchedulerStatus,
 } from "../../../domain/types.js";
+import type { PositionGuardPilotPhase } from "../../../domain/pilot-types.js";
 import { formatTelegramTimestamp } from "./common.js";
 import type { TelegramLocale } from "./locale.js";
 
 export type LiveSendPath = "DRY_RUN_ADAPTER" | "LIVE_ADAPTER";
+
+export type PilotVisibilityCheck = "VERIFIED_BY_ROUTE" | "UNAVAILABLE";
+
+export interface BtcCandidatePilotVisibility {
+  readonly deploymentId?: string | null;
+  readonly pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1";
+  readonly phase: PositionGuardPilotPhase;
+  readonly policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1";
+  readonly stateVersion: number | null;
+  readonly activationAt?: string | null;
+  readonly lastEvidenceAt: string | null;
+  readonly lastEvidenceId: string | null;
+  readonly exactFlatCheck: PilotVisibilityCheck;
+  readonly replayCheck: PilotVisibilityCheck;
+  readonly leaseCheck: PilotVisibilityCheck;
+  readonly reconciliationCheck: PilotVisibilityCheck;
+  readonly reconciliationRunId?: string | null;
+  readonly latestOutcome: Readonly<{
+    strategyDecisionId: string;
+    action: StrategyDecisionAction;
+    reasonCode: string;
+    executionBlocked: boolean;
+    createdAt: string;
+  }> | null;
+}
 
 export interface StatusPresentationInput {
   state: ExecutionStateRecord;
   liveSendPath: LiveSendPath;
   schedulerStatus: StrategySchedulerStatus | null;
   latestReconciliationRun: ReconciliationRunRecord | null;
+  btcPilot?: BtcCandidatePilotVisibility | null;
 }
 
 export function formatStatusPresentation(
@@ -69,6 +97,7 @@ function buildKoreanStatusLines(
     ...(input.state.degradedReason ? [`점검 사유: ${input.state.degradedReason}`] : []),
     ...describeScheduler(input.schedulerStatus, "ko-KR"),
     `최근 동기화: ${describeReconciliation(input.latestReconciliationRun, "ko-KR")}`,
+    ...(input.btcPilot === undefined ? [] : describePilot(input.btcPilot, "ko-KR")),
     `업데이트: ${formatTelegramTimestamp(input.state.updatedAt, "ko-KR")}`,
     "기술 상세: /status detail",
   ];
@@ -92,9 +121,104 @@ function buildEnglishStatusLines(
     ...(input.state.degradedReason ? [`Degraded reason: ${input.state.degradedReason}`] : []),
     ...describeScheduler(input.schedulerStatus, "en-US"),
     `Latest reconciliation: ${describeReconciliation(input.latestReconciliationRun, "en-US")}`,
+    ...(input.btcPilot === undefined ? [] : describePilot(input.btcPilot, "en-US")),
     `Updated: ${formatTelegramTimestamp(input.state.updatedAt, "en-US")}`,
     "Technical details: /status detail",
   ];
+}
+
+export function formatPilotTechnicalVisibility(
+  pilot: BtcCandidatePilotVisibility,
+): string {
+  return [
+    `btc_pilot_id: ${pilot.pilotId}`,
+    `btc_pilot_deployment_id: ${pilot.deploymentId ?? "none"}`,
+    `btc_pilot_phase: ${pilot.phase}`,
+    `btc_pilot_policy_version: ${pilot.policyVersion}`,
+    `btc_pilot_state_version: ${pilot.stateVersion ?? "none"}`,
+    `btc_pilot_activation_at: ${pilot.activationAt ?? "none"}`,
+    `btc_pilot_last_evidence_at: ${pilot.lastEvidenceAt ?? "unavailable"}`,
+    `btc_pilot_last_evidence_id: ${pilot.lastEvidenceId ?? "unavailable"}`,
+    `btc_pilot_exact_flat_check: ${pilot.exactFlatCheck}`,
+    `btc_pilot_replay_check: ${pilot.replayCheck}`,
+    `btc_pilot_lease_check: ${pilot.leaseCheck}`,
+    `btc_pilot_reconciliation_check: ${pilot.reconciliationCheck}`,
+    `btc_pilot_reconciliation_run_id: ${pilot.reconciliationRunId ?? "none"}`,
+    `btc_pilot_latest_decision_id: ${pilot.latestOutcome?.strategyDecisionId ?? "none"}`,
+    `btc_pilot_latest_action: ${pilot.latestOutcome?.action ?? "none"}`,
+    `btc_pilot_latest_reason_code: ${pilot.latestOutcome?.reasonCode ?? "none"}`,
+    `btc_pilot_latest_execution_blocked: ${pilot.latestOutcome?.executionBlocked ?? "none"}`,
+    `btc_pilot_latest_decision_at: ${pilot.latestOutcome?.createdAt ?? "none"}`,
+    "eth_policy: BASELINE",
+  ].join("\n");
+}
+
+export function describePilot(
+  pilot: BtcCandidatePilotVisibility | null,
+  locale: TelegramLocale,
+): string[] {
+  if (pilot === null) {
+    return locale === "ko-KR"
+      ? ["BTC 후보 파일럿: 저장된 후보 판단 없음", "ETH 정책: 기존 기준 전략 (BASELINE)"]
+      : ["BTC candidate pilot: no persisted candidate decision", "ETH policy: existing baseline strategy (BASELINE)"];
+  }
+
+  const outcome = pilot.latestOutcome === null
+    ? localizedNone(locale)
+    : locale === "ko-KR"
+      ? `${describeAction(pilot.latestOutcome.action, locale)} · ${pilot.latestOutcome.reasonCode}`
+      : `${describeAction(pilot.latestOutcome.action, locale)} · ${pilot.latestOutcome.reasonCode}`;
+  const lastEvidence = pilot.lastEvidenceAt === null || pilot.lastEvidenceId === null
+    ? locale === "ko-KR" ? "제공되지 않음 (현재 Telegram DTO에 없음)" : "unavailable (not provided by the current Telegram DTO)"
+    : `${formatTelegramTimestamp(pilot.lastEvidenceAt, locale)} · ${pilot.lastEvidenceId}`;
+
+  return locale === "ko-KR"
+    ? [
+        `BTC 후보 파일럿: ${describePhase(pilot.phase, locale)} (phase: ${pilot.phase})`,
+        `파일럿 ID: ${pilot.pilotId}`,
+        `정책 버전: ${pilot.policyVersion}`,
+        `상태 버전: ${pilot.stateVersion ?? "없음"}`,
+        `마지막 증거: ${lastEvidence}`,
+        `검증 상태: exact_flat=${pilot.exactFlatCheck}, replay=${pilot.replayCheck}, lease=${pilot.leaseCheck}, reconciliation=${pilot.reconciliationCheck}`,
+        `최근 BTC 후보 결과: ${outcome}`,
+        "ETH 정책: 기존 기준 전략 (BASELINE)",
+      ]
+    : [
+        `BTC candidate pilot: ${describePhase(pilot.phase, locale)} (phase: ${pilot.phase})`,
+        `Pilot ID: ${pilot.pilotId}`,
+        `Policy version: ${pilot.policyVersion}`,
+        `State version: ${pilot.stateVersion ?? "none"}`,
+        `Last evidence: ${lastEvidence}`,
+        `Checks: exact_flat=${pilot.exactFlatCheck}, replay=${pilot.replayCheck}, lease=${pilot.leaseCheck}, reconciliation=${pilot.reconciliationCheck}`,
+        `Latest BTC candidate outcome: ${outcome}`,
+        "ETH policy: existing baseline strategy (BASELINE)",
+      ];
+}
+
+function describePhase(phase: PositionGuardPilotPhase, locale: TelegramLocale): string {
+  const labels: Record<PositionGuardPilotPhase, readonly [string, string]> = {
+    DISABLED: ["비활성", "disabled"],
+    PENDING_FLAT: ["평탄화 대기", "pending flat"],
+    ACTIVE: ["활성", "active"],
+    PAUSED_FAULT: ["오류로 일시정지", "paused on fault"],
+    DRAINING: ["위험 축소 중", "draining"],
+  };
+  return labels[phase][locale === "ko-KR" ? 0 : 1];
+}
+
+function describeAction(action: StrategyDecisionAction, locale: TelegramLocale): string {
+  const labels: Record<StrategyDecisionAction, readonly [string, string]> = {
+    ENTER: ["신규 매수", "new buy"],
+    ADD: ["추가 매수", "additional buy"],
+    HOLD: ["관망", "hold"],
+    REDUCE: ["일부 매도", "partial sell"],
+    EXIT: ["매도 종료", "exit sell"],
+  };
+  return labels[action][locale === "ko-KR" ? 0 : 1];
+}
+
+function localizedNone(locale: TelegramLocale): string {
+  return locale === "ko-KR" ? "없음" : "none";
 }
 
 function describeSystemStatus(

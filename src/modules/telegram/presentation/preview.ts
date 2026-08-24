@@ -5,6 +5,11 @@ import {
   formatTelegramTimestamp,
 } from "./common.js";
 import type { TelegramLocale } from "./locale.js";
+import {
+  describePilot,
+  formatPilotTechnicalVisibility,
+  type BtcCandidatePilotVisibility,
+} from "./status.js";
 
 interface PreviewStatusCopy {
   readonly label: string;
@@ -98,6 +103,7 @@ const OPERATOR_BOUNDARY =
 export function formatStrategyPreviewPresentation(
   result: TelegramStrategyPreviewResult,
   locale: TelegramLocale,
+  btcPilot?: BtcCandidatePilotVisibility | null,
 ): string {
   const copy = locale === "ko-KR"
     ? KOREAN_STATUS_COPY[result.status]
@@ -150,6 +156,7 @@ export function formatStrategyPreviewPresentation(
 
   return [
     ...readableLines,
+    ...(btcPilot === undefined ? [] : describePilot(btcPilot, locale)),
     "",
     `status: ${result.status}`,
     `requested_at: ${result.requestedAt}`,
@@ -164,6 +171,7 @@ export function formatStrategyPreviewPresentation(
     `order_price: ${result.orderPrice ?? "none"}`,
     `order_volume: ${result.orderVolume ?? "none"}`,
     `detail: ${result.detail}`,
+    ...(btcPilot === undefined || btcPilot === null ? [] : [formatPilotTechnicalVisibility(btcPilot)]),
     NO_MUTATION_BOUNDARY,
     OPERATOR_BOUNDARY,
   ].join("\n");
