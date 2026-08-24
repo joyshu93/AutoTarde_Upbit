@@ -4486,6 +4486,11 @@ test("telegram alerts summary maps every notification and delivery enum in Engli
     "SCHEDULER_RUN_FAILED",
     "SCHEDULER_RUN_SKIPPED",
     "SYNC_FAILED",
+    "POSITION_GUARD_PILOT_ACTIVATED",
+    "POSITION_GUARD_PILOT_FAULT_PAUSED",
+    "POSITION_GUARD_PILOT_UNCERTAIN_SUBMISSION",
+    "POSITION_GUARD_PILOT_ROLLBACK_STARTED",
+    "POSITION_GUARD_PILOT_ROLLBACK_COMPLETED",
   ];
   const severities = ["INFO", "WARN", "ERROR"] as const;
   const deliveryStatuses = ["PENDING", "SENT", "FAILED"] as const;
@@ -4515,6 +4520,11 @@ test("telegram alerts summary maps every notification and delivery enum in Engli
       "Scheduled run failed",
       "Scheduled run skipped",
       "Sync failed",
+      "BTC candidate pilot activated",
+      "BTC candidate pilot fault paused",
+      "BTC candidate pilot submission uncertain",
+      "BTC candidate pilot rollback started",
+      "BTC candidate pilot rollback completed",
     ][index]!)));
     assert.match(message, new RegExp(escapeRegExp(["Info", "Warning", "Error"][index % 3]!)));
     assert.match(message, new RegExp(escapeRegExp(["Pending", "Sent", "Failed"][index % 3]!)));

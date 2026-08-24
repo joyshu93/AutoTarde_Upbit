@@ -44,6 +44,26 @@ const NOTIFICATION_TYPE_LABELS: Readonly<Record<OperatorNotificationType, Locali
   SCHEDULER_RUN_FAILED: label("스케줄 실행 실패", "Scheduled run failed"),
   SCHEDULER_RUN_SKIPPED: label("스케줄 실행 건너뜀", "Scheduled run skipped"),
   SYNC_FAILED: label("동기화 실패", "Sync failed"),
+  POSITION_GUARD_PILOT_ACTIVATED: label(
+    "BTC 후보 파일럿 활성화",
+    "BTC candidate pilot activated",
+  ),
+  POSITION_GUARD_PILOT_FAULT_PAUSED: label(
+    "BTC 후보 파일럿 장애 일시정지",
+    "BTC candidate pilot fault paused",
+  ),
+  POSITION_GUARD_PILOT_UNCERTAIN_SUBMISSION: label(
+    "BTC 후보 파일럿 주문 상태 불확실",
+    "BTC candidate pilot submission uncertain",
+  ),
+  POSITION_GUARD_PILOT_ROLLBACK_STARTED: label(
+    "BTC 후보 파일럿 롤백 시작",
+    "BTC candidate pilot rollback started",
+  ),
+  POSITION_GUARD_PILOT_ROLLBACK_COMPLETED: label(
+    "BTC 후보 파일럿 롤백 완료",
+    "BTC candidate pilot rollback completed",
+  ),
 };
 
 const SEVERITY_LABELS: Readonly<Record<OperatorNotificationSeverity, LocalizedLabel>> = {
