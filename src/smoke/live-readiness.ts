@@ -2,7 +2,11 @@ import { pathToFileURL } from "node:url";
 
 import { createApp, type AppServices } from "../app/create-app.js";
 import type { AppConfig } from "../app/env.js";
-import { createRuntimeShutdown, runRuntimeStartupGate } from "../app/runtime-lifecycle.js";
+import {
+  createRuntimeShutdown,
+  runRuntimeStartupGate,
+  type RuntimeStopSummary,
+} from "../app/runtime-lifecycle.js";
 import type { ExecutionStateRecord, ReconciliationRunRecord } from "../domain/types.js";
 import { detectExecutionStateSeedMismatches } from "../modules/db/interfaces.js";
 
@@ -91,6 +95,7 @@ export async function runLiveReadinessSmoke(
 ): Promise<LiveReadinessSmokeResult> {
   const app = createApplication();
   const runtimeShutdown = createRuntimeShutdown(app);
+  let primaryFailure = false;
 
   try {
     return await runRuntimeStartupGate({
@@ -173,9 +178,22 @@ export async function runLiveReadinessSmoke(
         };
       },
     });
+  } catch (error) {
+    primaryFailure = true;
+    throw error;
   } finally {
-    runtimeShutdown();
+    const shutdownSummary = runtimeShutdown();
+    if (!primaryFailure && shutdownSummary.status === "PARTIAL_FAILURE") {
+      throw createLiveSmokeCleanupError(shutdownSummary);
+    }
   }
+}
+
+function createLiveSmokeCleanupError(summary: RuntimeStopSummary): Error {
+  const failures = summary.steps
+    .filter((step) => step.status === "FAILED")
+    .map((step) => `${step.name}: ${step.errorMessage ?? "unknown error"}`);
+  return new Error(`Live smoke cleanup failed: ${failures.join("; ")}`);
 }
 
 export function buildLiveReadinessSmokeChecks(input: {

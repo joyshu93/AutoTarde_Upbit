@@ -24,8 +24,13 @@ test("live readiness smoke awaits candidate initialization before reading persis
     },
   }));
 
-  assert.equal(events.indexOf("initializer:complete") < events.indexOf("operator_state"), true);
-  assert.equal(events.indexOf("initializer:complete") < events.indexOf("active_orders"), true);
+  const initializerCompletedAt = events.indexOf("initializer:complete");
+  assert.notEqual(initializerCompletedAt, -1);
+  assert.equal(initializerCompletedAt < events.indexOf("operator_state"), true);
+  assert.equal(initializerCompletedAt < events.indexOf("active_orders"), true);
+  assert.equal(initializerCompletedAt < events.indexOf("balance_snapshot"), true);
+  assert.equal(initializerCompletedAt < events.indexOf("position_snapshot"), true);
+  assert.equal(initializerCompletedAt < events.indexOf("reconciliation_runs"), true);
   assert.equal(events.filter((event) => event === "telegram:stop").length, 1);
   assert.equal(events.filter((event) => event === "scheduler:stop").length, 1);
   assert.equal(events.filter((event) => event === "persistence:close").length, 1);
@@ -82,6 +87,39 @@ test("live readiness smoke preserves candidate initialization failure when every
     "scheduler:stop",
     "persistence:close",
   ]);
+});
+
+test("live readiness smoke rejects successful result when one cleanup step fails", async () => {
+  const events: string[] = [];
+
+  await assert.rejects(
+    () => runLiveReadinessSmoke(() => createSmokeApp(events, null, ["telegram"])),
+    (error) => error instanceof Error &&
+      error.message === "Live smoke cleanup failed: telegram_inbound_polling: telegram_cleanup_failed",
+  );
+
+  assert.equal(events.filter((event) => event === "telegram:stop").length, 1);
+  assert.equal(events.filter((event) => event === "scheduler:stop").length, 1);
+  assert.equal(events.filter((event) => event === "persistence:close").length, 1);
+});
+
+test("live readiness smoke rejects successful result with every cleanup failure", async () => {
+  const events: string[] = [];
+
+  await assert.rejects(
+    () => runLiveReadinessSmoke(() => createSmokeApp(
+      events,
+      null,
+      ["telegram", "scheduler", "persistence"],
+    )),
+    (error) => error instanceof Error && error.message ===
+      "Live smoke cleanup failed: telegram_inbound_polling: telegram_cleanup_failed; " +
+      "strategy_scheduler: scheduler_cleanup_failed; sqlite_persistence: persistence_cleanup_failed",
+  );
+
+  assert.equal(events.filter((event) => event === "telegram:stop").length, 1);
+  assert.equal(events.filter((event) => event === "scheduler:stop").length, 1);
+  assert.equal(events.filter((event) => event === "persistence:close").length, 1);
 });
 
 test("live readiness smoke checks block default dry-run wiring", () => {
