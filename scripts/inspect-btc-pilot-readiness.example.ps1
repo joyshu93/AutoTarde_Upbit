@@ -32,6 +32,7 @@ if (-not (Test-Path -LiteralPath $DatabasePath -PathType Leaf)) {
 }
 
 $DatabasePath = (Resolve-Path -LiteralPath $DatabasePath).ProviderPath
+$RepositoryRoot = ([System.IO.DirectoryInfo]$PSScriptRoot).Parent.FullName
 $checkedAt = [DateTimeOffset]::UtcNow.ToString("o")
 
 $PilotId = "BTC_COMBINED_CONSERVATIVE_PILOT_V1"
@@ -54,10 +55,21 @@ Write-Host "Inspecting persisted BTC pilot readiness with BASELINE policy select
 Write-Host "pilot=$PilotId market=$PilotMarket policy=$PilotPolicy version=$PilotPolicyVersion"
 Write-Host "database=$DatabasePath deployment=$DeploymentId account=$ExchangeAccountId"
 
-npm.cmd run inspect:btc-pilot:readiness -- `
-  --database-path "$DatabasePath" `
-  --format $Format `
-  --exchange-account-id $ExchangeAccountId `
-  --deployment-id $DeploymentId `
-  --checked-at $checkedAt `
-  --freshness-threshold-ms $FreshnessThresholdMs
+$inspectionExitCode = 1
+Push-Location -LiteralPath $RepositoryRoot
+try {
+  npm.cmd run inspect:btc-pilot:readiness -- `
+    --database-path "$DatabasePath" `
+    --format $Format `
+    --exchange-account-id $ExchangeAccountId `
+    --deployment-id $DeploymentId `
+    --checked-at $checkedAt `
+    --freshness-threshold-ms $FreshnessThresholdMs
+  $inspectionExitCode = $LASTEXITCODE
+} finally {
+  Pop-Location
+}
+
+if ($inspectionExitCode -ne 0) {
+  exit $inspectionExitCode
+}

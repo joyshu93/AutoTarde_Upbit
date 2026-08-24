@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { test } from "./harness.js";
@@ -214,6 +223,175 @@ test("BTC pilot readiness example defaults policy selection to BASELINE", () => 
   assert.doesNotMatch(script, /I_UNDERSTAND_BTC_CANDIDATE_LIVE_PILOT/);
 });
 
+test("BTC pilot readiness example exposes exactly one allowlisted readiness executable", () => {
+  assertPilotReadinessAstSafe(join(scriptsDirectory, pilotReadinessScriptName));
+});
+
+test("BTC pilot readiness AST allowlist rejects unsafe executable mutations", () => {
+  const original = readPilotReadinessScript();
+  const mutations = [
+    {
+      name: "database removal",
+      source: `${original}\nRemove-Item -LiteralPath $DatabasePath\n`,
+    },
+    {
+      name: "wrong Test-Path target",
+      source: original.replace(
+        "Test-Path -LiteralPath $DatabasePath -PathType Leaf",
+        "Test-Path -LiteralPath $PSScriptRoot -PathType Leaf",
+      ),
+    },
+    {
+      name: "wrong Resolve-Path target",
+      source: original.replace(
+        "Resolve-Path -LiteralPath $DatabasePath",
+        "Resolve-Path -LiteralPath $PSScriptRoot",
+      ),
+    },
+    {
+      name: "wrong Push-Location target",
+      source: original.replace(
+        "Push-Location -LiteralPath $RepositoryRoot",
+        "Push-Location -LiteralPath $DatabasePath",
+      ),
+    },
+    {
+      name: "altered Pop-Location",
+      source: original.replace("Pop-Location", "Pop-Location -StackName unsafe"),
+    },
+    {
+      name: "static file deletion",
+      source: `${original}\n[IO.File]::Delete($DatabasePath)\n`,
+    },
+    {
+      name: "dynamic member invocation",
+      source: `${original}\n$unsafeMember = "Delete"\n[IO.File]::$unsafeMember($DatabasePath)\n`,
+    },
+    {
+      name: "different npm run",
+      source: original.replace(
+        "npm.cmd run inspect:btc-pilot:readiness",
+        "npm.cmd run start",
+      ),
+    },
+  ] as const;
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "autotrade-pilot-ast-mutations-"));
+
+  try {
+    for (const mutation of mutations) {
+      assert.notEqual(mutation.source, original, `${mutation.name} mutation must change the fixture`);
+      const scriptPath = join(temporaryRoot, `${mutation.name.replaceAll(" ", "-")}.ps1`);
+      writeFileSync(scriptPath, mutation.source, "utf8");
+      assert.throws(
+        () => assertPilotReadinessAstSafe(scriptPath),
+        `${mutation.name} must be rejected by the AST allowlist`,
+      );
+    }
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+function assertPilotReadinessAstSafe(scriptPath: string): void {
+  const ast = inspectPowerShellAst(scriptPath);
+  const commands = ast.commands.map((command) => ({
+    name: command.name,
+    text: normalizePowerShellExtent(command.text),
+  }));
+
+  assert.deepEqual(commands, [
+    {
+      name: "Test-Path",
+      text: "Test-Path -LiteralPath $DatabasePath -PathType Leaf",
+    },
+    {
+      name: "Resolve-Path",
+      text: "Resolve-Path -LiteralPath $DatabasePath",
+    },
+    {
+      name: "Remove-Item",
+      text: "Remove-Item Env:\\POSITION_GUARD_PILOT_ID -ErrorAction SilentlyContinue",
+    },
+    {
+      name: "Remove-Item",
+      text: "Remove-Item Env:\\POSITION_GUARD_PILOT_CONFIRMATION -ErrorAction SilentlyContinue",
+    },
+    {
+      name: "Write-Host",
+      text: 'Write-Host "Inspecting persisted BTC pilot readiness with BASELINE policy selection and without activation."',
+    },
+    {
+      name: "Write-Host",
+      text: 'Write-Host "pilot=$PilotId market=$PilotMarket policy=$PilotPolicy version=$PilotPolicyVersion"',
+    },
+    {
+      name: "Write-Host",
+      text: 'Write-Host "database=$DatabasePath deployment=$DeploymentId account=$ExchangeAccountId"',
+    },
+    {
+      name: "Push-Location",
+      text: "Push-Location -LiteralPath $RepositoryRoot",
+    },
+    {
+      name: "npm.cmd",
+      text: "npm.cmd run inspect:btc-pilot:readiness -- --database-path \"$DatabasePath\" --format $Format --exchange-account-id $ExchangeAccountId --deployment-id $DeploymentId --checked-at $checkedAt --freshness-threshold-ms $FreshnessThresholdMs",
+    },
+    {
+      name: "Pop-Location",
+      text: "Pop-Location",
+    },
+  ]);
+  assert.deepEqual(ast.finallyCommands, ["Pop-Location"]);
+  assert.deepEqual(
+    ast.memberInvocations.map((invocation) => ({
+      member: invocation.member,
+      text: normalizePowerShellExtent(invocation.text),
+    })),
+    [
+      {
+        member: "ToString",
+        text: '[DateTimeOffset]::UtcNow.ToString("o")',
+      },
+    ],
+  );
+}
+
+test("BTC pilot readiness example runs its single npm command from the repository root", () => {
+  const fixture = createPilotReadinessFixture(0);
+
+  try {
+    const result = runPilotReadinessFixture(fixture);
+    const capture = readFileSync(fixture.capturePath, "utf8").trim().split(/\r?\n/);
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(capture.length, 2, "the readiness npm command must run exactly once");
+    assert.equal(capture[0], `cwd=${fixture.repositoryRoot}`);
+    assert.match(
+      capture[1]!,
+      new RegExp(
+        `^args=run inspect:btc-pilot:readiness -- --database-path ${escapeRegExp(fixture.databasePath)} --format TEXT `
+          + "--exchange-account-id account_fixture --deployment-id deployment_fixture --checked-at \\S+ --freshness-threshold-ms 60000$",
+      ),
+    );
+  } finally {
+    rmSync(fixture.temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("BTC pilot readiness example returns the native npm failure exit code", () => {
+  const fixture = createPilotReadinessFixture(37);
+
+  try {
+    const result = runPilotReadinessFixture(fixture);
+    const capture = readFileSync(fixture.capturePath, "utf8").trim().split(/\r?\n/);
+
+    assert.equal(result.status, 37, result.stderr || result.stdout);
+    assert.equal(capture.length, 2, "the readiness npm command must run exactly once");
+  } finally {
+    rmSync(fixture.temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("BTC pilot readiness example cannot activate or mutate trading paths", () => {
   const script = readPilotReadinessScript();
 
@@ -236,4 +414,143 @@ function readLocalRuntimeScript(scriptName: (typeof localRuntimeScriptNames)[num
 
 function readPilotReadinessScript(): string {
   return readFileSync(join(scriptsDirectory, pilotReadinessScriptName), "utf8");
+}
+
+type PowerShellAstInspection = {
+  commands: Array<{ name: string | null; text: string }>;
+  finallyCommands: Array<string | null>;
+  memberInvocations: Array<{ member: string | null; text: string }>;
+};
+
+function inspectPowerShellAst(scriptPath: string): PowerShellAstInspection {
+  const inspector = String.raw`
+$TargetPath = $env:AUTOTRADE_AST_TARGET_PATH
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($TargetPath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) {
+  foreach ($parseError in $parseErrors) { Write-Error $parseError.Message }
+  exit 1
+}
+$commands = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object {
+  [pscustomobject]@{ name = $_.GetCommandName(); text = $_.Extent.Text }
+})
+$members = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true) | ForEach-Object {
+  $memberName = if ($_.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $_.Member.Value } else { $null }
+  [pscustomobject]@{ member = $memberName; text = $_.Extent.Text }
+})
+$finallyCommands = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.TryStatementAst] }, $true) | ForEach-Object {
+  if ($null -ne $_.Finally) {
+    $_.Finally.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object {
+      $_.GetCommandName()
+    }
+  }
+})
+[pscustomobject]@{ commands = $commands; finallyCommands = $finallyCommands; memberInvocations = $members } | ConvertTo-Json -Depth 5 -Compress
+`;
+  const result = spawnSync(
+    "powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-Command", inspector],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        AUTOTRADE_AST_TARGET_PATH: scriptPath,
+      },
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return JSON.parse(result.stdout) as PowerShellAstInspection;
+}
+
+type PilotReadinessFixture = {
+  temporaryRoot: string;
+  repositoryRoot: string;
+  callerDirectory: string;
+  databasePath: string;
+  scriptPath: string;
+  shimDirectory: string;
+  capturePath: string;
+  nativeExitCode: number;
+};
+
+function createPilotReadinessFixture(nativeExitCode: number): PilotReadinessFixture {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "autotrade-pilot-readiness-"));
+  const repositoryRoot = join(temporaryRoot, "repository");
+  const scriptsRoot = join(repositoryRoot, "scripts");
+  const callerDirectory = join(temporaryRoot, "caller");
+  const shimDirectory = join(temporaryRoot, "shim");
+  const databasePath = join(temporaryRoot, "fixture.sqlite");
+  const capturePath = join(temporaryRoot, "npm-capture.txt");
+  const scriptPath = join(scriptsRoot, pilotReadinessScriptName);
+
+  mkdirSync(scriptsRoot, { recursive: true });
+  mkdirSync(callerDirectory, { recursive: true });
+  mkdirSync(shimDirectory, { recursive: true });
+  copyFileSync(join(scriptsDirectory, pilotReadinessScriptName), scriptPath);
+  writeFileSync(databasePath, "fixture", "utf8");
+  writeFileSync(
+    join(shimDirectory, "npm.cmd"),
+    [
+      "@echo off",
+      ">>\"%FAKE_NPM_CAPTURE_PATH%\" echo cwd=%CD%",
+      ">>\"%FAKE_NPM_CAPTURE_PATH%\" echo args=%*",
+      "exit /b %FAKE_NPM_EXIT_CODE%",
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+
+  return {
+    temporaryRoot,
+    repositoryRoot,
+    callerDirectory,
+    databasePath,
+    scriptPath,
+    shimDirectory,
+    capturePath,
+    nativeExitCode,
+  };
+}
+
+function runPilotReadinessFixture(fixture: PilotReadinessFixture): SpawnSyncReturns<string> {
+  const env = { ...process.env };
+  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "Path";
+  env[pathKey] = `${fixture.shimDirectory};${env[pathKey] ?? ""}`;
+  env.FAKE_NPM_CAPTURE_PATH = fixture.capturePath;
+  env.FAKE_NPM_EXIT_CODE = String(fixture.nativeExitCode);
+
+  return spawnSync(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      fixture.scriptPath,
+      "-DatabasePath",
+      fixture.databasePath,
+      "-ExchangeAccountId",
+      "account_fixture",
+      "-DeploymentId",
+      "deployment_fixture",
+      "-FreshnessThresholdMs",
+      "60000",
+    ],
+    {
+      cwd: fixture.callerDirectory,
+      encoding: "utf8",
+      env,
+    },
+  );
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizePowerShellExtent(value: string): string {
+  return value.replace(/`\r?\n\s*/g, " ").replace(/\s+/g, " ").trim();
 }
