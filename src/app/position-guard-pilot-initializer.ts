@@ -109,6 +109,17 @@ const AUDIT_EVENT_TYPES = [
   "ROLLBACK_COMPLETED",
 ] as const;
 const PILOT_PHASES = ["DISABLED", "PENDING_FLAT", "ACTIVE", "PAUSED_FAULT", "DRAINING"] as const;
+const RECOVERY_FAULT_REASONS = [
+  "SNAPSHOT_PROVENANCE_INVALID",
+  "STALE_SNAPSHOT",
+  "IDENTITY_MISMATCH",
+  "REPLAY_MISMATCH",
+  "INVENTORY_MISMATCH",
+  "BLOCKING_RECONCILIATION",
+  "ACTIVE_ORDER",
+  "UNCERTAIN_ORDER",
+  "ACTIVATION_CAS_CONFLICT",
+] as const;
 
 export class PositionGuardPilotInitializer {
   readonly identity: Readonly<PositionGuardPilotInitializerIdentity>;
@@ -176,6 +187,7 @@ export class PositionGuardPilotInitializer {
       initialization,
       identity: this.identity,
       deploymentId: this.deploymentId,
+      now,
       nowEpochNs,
     });
   }
@@ -201,6 +213,7 @@ function validateAndSnapshotAuthority(input: Readonly<{
   initialization: CandidatePilotDeploymentInitializationResult;
   identity: Readonly<PositionGuardPilotInitializerIdentity>;
   deploymentId: string;
+  now: string;
   nowEpochNs: bigint;
 }>): PositionGuardPilotInitializationResult {
   const result = exactOwnDataRecord(
@@ -231,8 +244,13 @@ function validateAndSnapshotAuthority(input: Readonly<{
   );
   assertCanonicalCreationAudit(deployment, auditEvents);
 
-  if (result.outcome === "CREATED" && deployment.phase !== "PENDING_FLAT") {
-    throw new Error("A newly created PositionGuard pilot deployment must be PENDING_FLAT.");
+  if (result.outcome === "CREATED") {
+    if (deployment.phase !== "PENDING_FLAT") {
+      throw new Error("A newly created PositionGuard pilot deployment must be PENDING_FLAT.");
+    }
+    if (deployment.createdAt !== input.now || deployment.updatedAt !== input.now) {
+      throw new Error("CREATED PositionGuard pilot timestamps must equal the single initializer clock snapshot.");
+    }
   }
   switch (deployment.phase) {
     case "PENDING_FLAT":
@@ -240,6 +258,7 @@ function validateAndSnapshotAuthority(input: Readonly<{
       break;
     case "ACTIVE":
     case "PAUSED_FAULT":
+      assertRetainedLifecycleAuthority(deployment, exactState, evidenceRecords, auditEvents);
       break;
     case "DISABLED":
       throw new Error("Selected PositionGuard candidate conflicts with a DISABLED deployment.");
@@ -306,6 +325,9 @@ function snapshotDeployment(
   const updatedAt = strictTimestamp(deployment.updatedAt, "persisted deployment updatedAt");
   assertNotFuture(createdAt, authority.nowEpochNs, "persisted deployment createdAt");
   assertNotFuture(updatedAt, authority.nowEpochNs, "persisted deployment updatedAt");
+  if (updatedAt < createdAt) {
+    throw new Error("PositionGuard pilot updatedAt cannot precede deployment creation.");
+  }
   if (deployment.activationAt !== null) {
     const activationAt = strictTimestamp(deployment.activationAt, "persisted deployment activationAt");
     if (activationAt < createdAt || activationAt > updatedAt) {
@@ -339,14 +361,14 @@ function snapshotEvidenceRecords(
   deployment: Readonly<PositionGuardPilotDeploymentRecord>,
   nowEpochNs: bigint,
 ): readonly Readonly<CandidateEvidenceRecord>[] {
-  if (!Array.isArray(value)) {
-    throw new Error("PositionGuard pilot evidence authority must be an array.");
-  }
+  const items = exactDensePlainArray(value, "PositionGuard pilot evidence authority");
   const ids = new Set<string>();
+  let previousEpochNs: bigint | null = null;
+  let previousEvidenceId: string | null = null;
   const activationEpochNs = deployment.activationAt === null
     ? null
     : strictTimestamp(deployment.activationAt, "persisted deployment activationAt");
-  const records = value.map((item, index) => {
+  const records = items.map((item, index) => {
     const record = exactOwnDataRecord(item, `PositionGuard pilot evidence record ${index}`, EVIDENCE_RECORD_KEYS);
     const evidenceRecord = exactOwnDataRecord(
       record.evidence,
@@ -377,6 +399,15 @@ function snapshotEvidenceRecords(
     if (activationEpochNs === null || evidenceAt < activationEpochNs) {
       throw new Error("PositionGuard pilot execution evidence requires prior activation authority.");
     }
+    if (
+      previousEpochNs !== null &&
+      (evidenceAt < previousEpochNs ||
+        (evidenceAt === previousEpochNs && material.evidence.evidenceId <= previousEvidenceId!))
+    ) {
+      throw new Error("PositionGuard pilot evidence authority is not in exact persisted chronology.");
+    }
+    previousEpochNs = evidenceAt;
+    previousEvidenceId = material.evidence.evidenceId;
     return Object.freeze({
       evidence: Object.freeze({ ...material.evidence }),
       materialHash: material.hash,
@@ -392,12 +423,12 @@ function snapshotAuditEvents(
   exactState: Readonly<ExactCandidateState>,
   nowEpochNs: bigint,
 ): readonly Readonly<PositionGuardPilotAuditEventRecord>[] {
-  if (!Array.isArray(value)) {
-    throw new Error("PositionGuard pilot audit authority must be an array.");
-  }
+  const items = exactDensePlainArray(value, "PositionGuard pilot audit authority");
   const createdAt = strictTimestamp(deployment.createdAt, "persisted deployment createdAt");
   const ids = new Set<string>();
-  const events = value.map((item, index) => {
+  let previousEpochNs: bigint | null = null;
+  let previousEventId: string | null = null;
+  const events = items.map((item, index) => {
     const record = exactOwnDataRecord(item, `PositionGuard pilot audit event ${index}`, AUDIT_KEYS);
     if (typeof record.id !== "string" || record.id.trim() === "" || ids.has(record.id)) {
       throw new Error("PositionGuard pilot audit event id is invalid or duplicated.");
@@ -432,6 +463,14 @@ function snapshotAuditEvents(
       throw new Error("PositionGuard pilot audit event precedes deployment creation.");
     }
     assertNotFuture(eventAt, nowEpochNs, "persisted audit createdAt");
+    if (
+      previousEpochNs !== null &&
+      (eventAt < previousEpochNs || (eventAt === previousEpochNs && (record.id as string) <= previousEventId!))
+    ) {
+      throw new Error("PositionGuard pilot audit authority is not in exact persisted chronology.");
+    }
+    previousEpochNs = eventAt;
+    previousEventId = record.id as string;
     return Object.freeze({
       id: record.id,
       deploymentId: deployment.id,
@@ -444,6 +483,129 @@ function snapshotAuditEvents(
     } as PositionGuardPilotAuditEventRecord);
   });
   return Object.freeze(events);
+}
+
+function assertRetainedLifecycleAuthority(
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  exactState: Readonly<ExactCandidateState>,
+  evidenceRecords: readonly Readonly<CandidateEvidenceRecord>[],
+  auditEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+): void {
+  const activationEvents = auditEvents.filter((event) => event.eventType === "PHASE_TRANSITION");
+  if (deployment.activationAt === null || deployment.activationEpochNs === null) {
+    if (deployment.phase === "ACTIVE" || activationEvents.length !== 0 || evidenceRecords.length !== 0) {
+      throw new Error("PositionGuard pilot lifecycle requires canonical activation authority.");
+    }
+  } else {
+    const expectedActivation = {
+      id: `${deployment.id}:activation:${deployment.activationEpochNs.toString()}`,
+      deploymentId: deployment.id,
+      eventType: "PHASE_TRANSITION",
+      fromPhase: "PENDING_FLAT",
+      toPhase: "ACTIVE",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({
+        activationAt: deployment.activationAt,
+        activationEpochNs: deployment.activationEpochNs.toString(),
+      }),
+      createdAt: deployment.activationAt,
+    } as const;
+    if (activationEvents.length !== 1 || !recordsEqual(activationEvents[0]!, expectedActivation, AUDIT_KEYS)) {
+      throw new Error("PositionGuard pilot canonical activation audit authority is invalid.");
+    }
+    if (deployment.phase === "ACTIVE" && deployment.updatedAt !== deployment.activationAt) {
+      throw new Error("ACTIVE PositionGuard pilot must preserve its canonical activation update timestamp.");
+    }
+  }
+
+  const stateEvents = auditEvents.filter((event) => event.eventType === "STATE_ADVANCED");
+  if (stateEvents.length !== evidenceRecords.length) {
+    throw new Error("PositionGuard pilot STATE_ADVANCED audit count does not match evidence authority.");
+  }
+  for (let index = 0; index < evidenceRecords.length; index += 1) {
+    const record = evidenceRecords[index]!;
+    const expectedStateEvent = {
+      id: `${deployment.id}:evidence:${record.evidence.evidenceId}`,
+      deploymentId: deployment.id,
+      eventType: "STATE_ADVANCED",
+      fromPhase: "ACTIVE",
+      toPhase: "ACTIVE",
+      stateVersion: index + 1,
+      payloadJson: JSON.stringify({
+        evidenceId: record.evidence.evidenceId,
+        materialHash: record.materialHash,
+        materialVersion: record.materialVersion,
+        fromStateVersion: index,
+        toStateVersion: index + 1,
+      }),
+      createdAt: record.evidence.executedAt,
+    } as const;
+    if (!recordsEqual(stateEvents[index]!, expectedStateEvent, AUDIT_KEYS)) {
+      throw new Error("PositionGuard pilot STATE_ADVANCED audit does not link exact evidence chronology.");
+    }
+  }
+
+  const faultEvents = auditEvents.filter((event) => event.eventType === "FAULT_PAUSED");
+  if (deployment.phase === "ACTIVE") {
+    if (faultEvents.length !== 0) {
+      throw new Error("ACTIVE PositionGuard pilot must not contain fault-pause authority.");
+    }
+  } else {
+    assertCanonicalFaultAudit(deployment, exactState, evidenceRecords, faultEvents);
+  }
+
+  const expectedAuditCount = 1 + activationEvents.length + stateEvents.length + faultEvents.length;
+  if (auditEvents.length !== expectedAuditCount) {
+    throw new Error("PositionGuard pilot lifecycle contains unsupported audit authority.");
+  }
+}
+
+function assertCanonicalFaultAudit(
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  exactState: Readonly<ExactCandidateState>,
+  evidenceRecords: readonly Readonly<CandidateEvidenceRecord>[],
+  faultEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+): void {
+  if (faultEvents.length !== 1) {
+    throw new Error("PAUSED_FAULT PositionGuard pilot requires exactly one canonical fault audit.");
+  }
+  const fault = faultEvents[0]!;
+  const expectedFromPhase = deployment.activationAt === null ? "PENDING_FLAT" : "ACTIVE";
+  if (
+    fault.fromPhase !== expectedFromPhase ||
+    fault.toPhase !== "PAUSED_FAULT" ||
+    fault.stateVersion !== exactState.stateVersion ||
+    fault.createdAt !== deployment.updatedAt
+  ) {
+    throw new Error("PositionGuard pilot canonical fault transition audit is invalid.");
+  }
+  const payload = parseExactJsonObject(
+    fault.payloadJson,
+    "PositionGuard pilot canonical fault audit payload",
+    ["reasonCode", "provenanceJson"] as const,
+  );
+  if (
+    typeof payload.reasonCode !== "string" ||
+    !RECOVERY_FAULT_REASONS.includes(payload.reasonCode as typeof RECOVERY_FAULT_REASONS[number]) ||
+    typeof payload.provenanceJson !== "string"
+  ) {
+    throw new Error("PositionGuard pilot canonical fault audit payload is invalid.");
+  }
+  parseExactJsonObject(payload.provenanceJson, "PositionGuard pilot fault provenance", null);
+  if (fault.payloadJson !== JSON.stringify({
+    reasonCode: payload.reasonCode,
+    provenanceJson: payload.provenanceJson,
+  })) {
+    throw new Error("PositionGuard pilot canonical fault audit payload is not canonical JSON.");
+  }
+  const faultAt = strictTimestamp(fault.createdAt, "persisted fault audit createdAt");
+  const latestEvidence = evidenceRecords.at(-1);
+  if (
+    latestEvidence !== undefined &&
+    faultAt < strictTimestamp(latestEvidence.evidence.executedAt, "persisted evidence executedAt")
+  ) {
+    throw new Error("PositionGuard pilot fault audit precedes exact evidence chronology.");
+  }
 }
 
 function assertExactStateMatchesEvidence(
@@ -502,6 +664,65 @@ function assertPristinePendingAuthority(
   if (auditEvents.length !== 1) {
     throw new Error("PENDING_FLAT PositionGuard pilot requires exactly one creation audit event.");
   }
+}
+
+function exactDensePlainArray(value: unknown, label: string): readonly unknown[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) {
+    throw new Error(`${label} must be an exact dense plain array.`);
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (
+    lengthDescriptor === undefined ||
+    !("value" in lengthDescriptor) ||
+    lengthDescriptor.enumerable ||
+    lengthDescriptor.configurable ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    (lengthDescriptor.value as number) < 0
+  ) {
+    throw new Error(`${label} must contain an exact ordinary length data property.`);
+  }
+  const length = lengthDescriptor.value as number;
+  const expectedKeys = [...Array.from({ length }, (_, index) => String(index)), "length"];
+  const actualKeys = Reflect.ownKeys(value);
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    actualKeys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))
+  ) {
+    throw new Error(`${label} must be dense and contain no extra own properties.`);
+  }
+  const descriptors = Array.from({ length }, (_, index) =>
+    Object.getOwnPropertyDescriptor(value, String(index))
+  );
+  if (descriptors.some((descriptor) =>
+    descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)
+  )) {
+    throw new Error(`${label} must contain ordinary enumerable own data index properties.`);
+  }
+  return Object.freeze(descriptors.map((descriptor) => descriptor!.value));
+}
+
+function parseExactJsonObject<K extends readonly string[]>(
+  value: string,
+  label: string,
+  expectedKeys: K | null,
+): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw new Error(`${label} must be valid JSON.`);
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    Object.getPrototypeOf(parsed) !== Object.prototype
+  ) {
+    throw new Error(`${label} must contain a plain object.`);
+  }
+  return expectedKeys === null
+    ? parsed as Record<string, unknown>
+    : exactOwnDataRecord(parsed, label, expectedKeys);
 }
 
 function exactOwnDataRecord<K extends readonly string[]>(

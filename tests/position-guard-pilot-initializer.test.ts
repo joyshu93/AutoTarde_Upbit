@@ -171,6 +171,160 @@ test("candidate initializer accepts structurally intact ACTIVE and PAUSED_FAULT 
   }
 });
 
+test("candidate initializer rejects malformed ACTIVE and PAUSED_FAULT lifecycle audit authority", async () => {
+  const active = () => mutableAuthority(validAuthority({
+    outcome: "EXISTING",
+    createdAt: CREATED_AT,
+    phase: "ACTIVE",
+    activationAt: "2026-08-23T23:59:59.500000001Z",
+    evidence: executedEnterEvidence(),
+  }));
+  const paused = () => mutableAuthority(validAuthority({
+    outcome: "EXISTING",
+    createdAt: CREATED_AT,
+    phase: "PAUSED_FAULT",
+    activationAt: "2026-08-23T23:59:59.500000001Z",
+    evidence: executedEnterEvidence(),
+  }));
+  const cases = [
+    (() => {
+      const authority = active();
+      authority.auditEvents = authority.auditEvents.filter((event) => event.eventType !== "PHASE_TRANSITION");
+      return authority;
+    })(),
+    (() => {
+      const authority = active();
+      const activation = authority.auditEvents.find((event) => event.eventType === "PHASE_TRANSITION")!;
+      activation.payloadJson = "{}";
+      return authority;
+    })(),
+    (() => {
+      const authority = paused();
+      authority.auditEvents = authority.auditEvents.filter((event) => event.eventType !== "FAULT_PAUSED");
+      return authority;
+    })(),
+    (() => {
+      const authority = paused();
+      const fault = authority.auditEvents.find((event) => event.eventType === "FAULT_PAUSED")!;
+      fault.fromPhase = "PENDING_FLAT";
+      return authority;
+    })(),
+  ];
+
+  for (const authority of cases) {
+    const fixture = createFixture({ result: authority });
+    await assert.rejects(() => fixture.initializer.initialize(), /activation|fault|lifecycle|audit/i);
+  }
+});
+
+test("candidate initializer requires canonical STATE_ADVANCED linkage for every evidence record", async () => {
+  const base = () => mutableAuthority(validAuthority({
+    outcome: "EXISTING",
+    createdAt: CREATED_AT,
+    phase: "ACTIVE",
+    activationAt: "2026-08-23T23:59:59.500000001Z",
+    evidence: executedEnterEvidence(),
+  }));
+  const cases = [
+    (() => {
+      const authority = base();
+      authority.auditEvents = authority.auditEvents.filter((event) => event.eventType !== "STATE_ADVANCED");
+      return authority;
+    })(),
+    (() => {
+      const authority = base();
+      const stateEvent = authority.auditEvents.find((event) => event.eventType === "STATE_ADVANCED")!;
+      stateEvent.payloadJson = JSON.stringify({
+        ...JSON.parse(stateEvent.payloadJson) as Record<string, unknown>,
+        materialHash: "0".repeat(64),
+      });
+      return authority;
+    })(),
+    (() => {
+      const authority = base();
+      const stateEvent = authority.auditEvents.find((event) => event.eventType === "STATE_ADVANCED")!;
+      stateEvent.createdAt = "2026-08-23T23:59:59.800000001Z";
+      return authority;
+    })(),
+    (() => {
+      const authority = base();
+      const duplicate = authority.auditEvents.find((event) => event.eventType === "STATE_ADVANCED")!;
+      authority.auditEvents.push({ ...duplicate, id: `${duplicate.id}:duplicate` });
+      return authority;
+    })(),
+  ];
+
+  for (const authority of cases) {
+    const fixture = createFixture({ result: authority });
+    await assert.rejects(() => fixture.initializer.initialize(), /STATE_ADVANCED|evidence|chronology|audit/i);
+  }
+});
+
+test("candidate initializer rejects non-exact evidence and audit arrays without invoking getters", async () => {
+  const active = () => mutableAuthority(validAuthority({
+    outcome: "EXISTING",
+    createdAt: CREATED_AT,
+    phase: "ACTIVE",
+    activationAt: "2026-08-23T23:59:59.500000001Z",
+    evidence: executedEnterEvidence(),
+  }));
+  let getterCalls = 0;
+  const evidenceAccessor = active();
+  const evidenceValue = evidenceAccessor.evidenceRecords[0]!;
+  Object.defineProperty(evidenceAccessor.evidenceRecords, "0", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return evidenceValue;
+    },
+  });
+  const auditAccessor = active();
+  const auditValue = auditAccessor.auditEvents[0]!;
+  Object.defineProperty(auditAccessor.auditEvents, "0", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return auditValue;
+    },
+  });
+  const sparseEvidence = active();
+  sparseEvidence.evidenceRecords.length = 2;
+  const sparseAudit = active();
+  sparseAudit.auditEvents.length += 1;
+  const extraProperty = active();
+  Object.defineProperty(extraProperty.auditEvents, "extra", { value: true, enumerable: true });
+  const symbolProperty = active();
+  Object.defineProperty(symbolProperty.evidenceRecords, Symbol("extra"), { value: true });
+  const exoticPrototype = active();
+  Object.setPrototypeOf(exoticPrototype.auditEvents, Object.create(Array.prototype));
+
+  for (const authority of [
+    evidenceAccessor,
+    auditAccessor,
+    sparseEvidence,
+    sparseAudit,
+    extraProperty,
+    symbolProperty,
+    exoticPrototype,
+  ]) {
+    const fixture = createFixture({ result: authority });
+    await assert.rejects(() => fixture.initializer.initialize(), /exact|dense|plain|array|data/i);
+  }
+  assert.equal(getterCalls, 0);
+});
+
+test("candidate initializer requires CREATED timestamps to equal its single clock snapshot", async () => {
+  const fixture = createFixture({
+    result: validAuthority({ outcome: "CREATED", createdAt: CREATED_AT }),
+  });
+
+  await assert.rejects(() => fixture.initializer.initialize(), /CREATED|clock|createdAt|updatedAt/i);
+  assert.equal(fixture.clockCalls(), 1);
+  assert.equal(fixture.repositoryCalls(), 1);
+});
+
 test("candidate initializer rejects disabled, draining, unsupported, and created non-pending phases", async () => {
   const cases: Array<{
     label: string;
@@ -394,7 +548,9 @@ function validAuthority(input: Readonly<{
       ? null
       : parseCandidatePilotTimestamp(activationAt, "test activationAt"),
     createdAt: input.createdAt,
-    updatedAt: activationAt ?? input.createdAt,
+    updatedAt: phase === "PAUSED_FAULT"
+      ? "2026-08-23T23:59:59.900000001Z"
+      : activationAt ?? input.createdAt,
   };
   const evidenceRecords = input.evidence
     ? [executedEvidenceRecord(deployment.id, input.evidence)]
@@ -405,25 +561,49 @@ function validAuthority(input: Readonly<{
   const auditEvents: PositionGuardPilotAuditEventRecord[] = [creationAudit(deployment)];
   if (phase === "ACTIVE" || phase === "DRAINING") {
     auditEvents.push({
-      id: `${deployment.id}:active`,
+      id: `${deployment.id}:activation:${deployment.activationEpochNs!.toString()}`,
       deploymentId: deployment.id,
       eventType: "PHASE_TRANSITION",
       fromPhase: "PENDING_FLAT",
       toPhase: "ACTIVE",
       stateVersion: 0,
-      payloadJson: JSON.stringify({ activationAt }),
+      payloadJson: JSON.stringify({
+        activationAt,
+        activationEpochNs: deployment.activationEpochNs!.toString(),
+      }),
       createdAt: activationAt!,
     });
   }
+  if (phase === "PAUSED_FAULT" && activationAt !== null) {
+    auditEvents.push({
+      id: `${deployment.id}:activation:${deployment.activationEpochNs!.toString()}`,
+      deploymentId: deployment.id,
+      eventType: "PHASE_TRANSITION",
+      fromPhase: "PENDING_FLAT",
+      toPhase: "ACTIVE",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({
+        activationAt,
+        activationEpochNs: deployment.activationEpochNs!.toString(),
+      }),
+      createdAt: activationAt,
+    });
+  }
+  if (input.evidence) {
+    auditEvents.push(stateAdvancedAudit(deployment, input.evidence));
+  }
   if (phase === "PAUSED_FAULT") {
     auditEvents.push({
-      id: `${deployment.id}:paused`,
+      id: `${deployment.id}:fault:test`,
       deploymentId: deployment.id,
       eventType: "FAULT_PAUSED",
       fromPhase: activationAt === null ? "PENDING_FLAT" : "ACTIVE",
       toPhase: "PAUSED_FAULT",
       stateVersion: exactState.stateVersion,
-      payloadJson: JSON.stringify({ reasonCode: "TEST" }),
+      payloadJson: JSON.stringify({
+        reasonCode: "REPLAY_MISMATCH",
+        provenanceJson: JSON.stringify({ source: "initializer-test" }),
+      }),
       createdAt: deployment.updatedAt,
     });
   }
@@ -433,6 +613,29 @@ function validAuthority(input: Readonly<{
     exactState,
     evidenceRecords,
     auditEvents,
+  };
+}
+
+function stateAdvancedAudit(
+  deployment: PositionGuardPilotDeploymentRecord,
+  evidence: PositionGuardCandidateExecutionEvidence,
+): PositionGuardPilotAuditEventRecord {
+  const material = candidateEvidenceMaterial(deployment.id, evidence);
+  return {
+    id: `${deployment.id}:evidence:${material.evidence.evidenceId}`,
+    deploymentId: deployment.id,
+    eventType: "STATE_ADVANCED",
+    fromPhase: "ACTIVE",
+    toPhase: "ACTIVE",
+    stateVersion: 1,
+    payloadJson: JSON.stringify({
+      evidenceId: material.evidence.evidenceId,
+      materialHash: material.hash,
+      materialVersion: material.materialVersion,
+      fromStateVersion: 0,
+      toStateVersion: 1,
+    }),
+    createdAt: material.evidence.executedAt,
   };
 }
 
