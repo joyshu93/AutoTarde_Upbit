@@ -26,6 +26,7 @@
     "research:candles": "npm run build && node dist/src/research/upbit-candle-dataset.js",
     "research:no-trade-evidence": "npm run build && node dist/src/research/upbit-no-trade-evidence.js",
     "research:prospective-shadow": "npm run build && node dist/src/research/prospective-component-shadow.js",
+    "inspect:btc-pilot:readiness": "npm run build && node dist/src/inspection/position-guard-pilot-readiness.js",
     "build:prospective-commitment-bundle": "esbuild ./src/research/prospective-shadow-commitment.ts --bundle --platform=node --format=esm --target=node20 --outfile=./.github/scripts/prospective-shadow-commitment.mjs --banner:js=\"// Generated validator bundle. Source: src/research/prospective-shadow-commitment.ts\"",
     "check:prospective-commitment-bundle": "node scripts/check-prospective-commitment-bundle.mjs",
     "check": "npm run typecheck && npm run check:prospective-commitment-bundle && npm run test"
