@@ -33,6 +33,19 @@ if (-not (Test-Path -LiteralPath $DatabasePath -PathType Leaf)) {
 
 $DatabasePath = (Resolve-Path -LiteralPath $DatabasePath).ProviderPath
 $RepositoryRoot = ([System.IO.DirectoryInfo]$PSScriptRoot).Parent.FullName
+$NpmApplications = @(Microsoft.PowerShell.Core\Get-Command -Name "npm.cmd" -CommandType Application -All -ErrorAction Stop)
+if ($NpmApplications.Count -lt 1) {
+  throw "BTC pilot readiness requires npm.cmd to resolve to an application."
+}
+$NpmResolvedPath = Microsoft.PowerShell.Management\Resolve-Path -LiteralPath $NpmApplications[0].Path -ErrorAction Stop
+if (
+  $NpmResolvedPath.Provider.Name -ne "FileSystem" -or
+  $NpmResolvedPath.ProviderPath -notmatch '(?i)[\\/]npm\.cmd$' -or
+  -not (Microsoft.PowerShell.Management\Test-Path -LiteralPath $NpmResolvedPath.ProviderPath -PathType Leaf)
+) {
+  throw "BTC pilot readiness requires npm.cmd to resolve to one canonical filesystem application path."
+}
+$NpmCommandPath = $NpmResolvedPath.ProviderPath
 $checkedAt = [DateTimeOffset]::UtcNow.ToString("o")
 
 $PilotId = "BTC_COMBINED_CONSERVATIVE_PILOT_V1"
@@ -58,7 +71,7 @@ Write-Host "database=$DatabasePath deployment=$DeploymentId account=$ExchangeAcc
 $inspectionExitCode = 1
 Push-Location -LiteralPath $RepositoryRoot
 try {
-  npm.cmd run inspect:btc-pilot:readiness -- `
+  & $NpmCommandPath run inspect:btc-pilot:readiness -- `
     --database-path "$DatabasePath" `
     --format $Format `
     --exchange-account-id $ExchangeAccountId `

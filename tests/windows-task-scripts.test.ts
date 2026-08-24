@@ -270,8 +270,8 @@ test("BTC pilot readiness AST allowlist rejects unsafe executable mutations", ()
     {
       name: "different npm run",
       source: original.replace(
-        "npm.cmd run inspect:btc-pilot:readiness",
-        "npm.cmd run start",
+        "$NpmCommandPath run inspect:btc-pilot:readiness",
+        "$NpmCommandPath run start",
       ),
     },
   ] as const;
@@ -322,8 +322,8 @@ test("BTC pilot readiness AST shape rejects a function-definition command shadow
 test("BTC pilot readiness AST shape ignores comments without relaxing executable structure", () => {
   const original = readPilotReadinessScript();
   const mutation = original.replace(
-    "try {\n  npm.cmd",
-    "try {\n  # Review comments may change without changing executable behavior.\n  npm.cmd",
+    "try {\n  & $NpmCommandPath",
+    "try {\n  # Review comments may change without changing executable behavior.\n  & $NpmCommandPath",
   );
   const temporaryRoot = mkdtempSync(join(tmpdir(), "autotrade-pilot-ast-comments-"));
   const scriptPath = join(temporaryRoot, "comment-only-change.ps1");
@@ -335,6 +335,13 @@ test("BTC pilot readiness AST shape ignores comments without relaxing executable
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
+});
+
+test("BTC pilot readiness AST shape rejects semantically active Requires directives", () => {
+  const original = readPilotReadinessScript();
+  const mutation = `#Requires -Modules UnsafeFixtureModule\n${original}`;
+
+  assertPilotReadinessMutationRejected("requires-module-directive", mutation, original);
 });
 
 function assertPilotReadinessMutationRejected(
@@ -374,6 +381,18 @@ function assertPilotReadinessAstSafe(scriptPath: string): void {
       text: "Resolve-Path -LiteralPath $DatabasePath",
     },
     {
+      name: "Microsoft.PowerShell.Core\\Get-Command",
+      text: 'Microsoft.PowerShell.Core\\Get-Command -Name "npm.cmd" -CommandType Application -All -ErrorAction Stop',
+    },
+    {
+      name: "Microsoft.PowerShell.Management\\Resolve-Path",
+      text: "Microsoft.PowerShell.Management\\Resolve-Path -LiteralPath $NpmApplications[0].Path -ErrorAction Stop",
+    },
+    {
+      name: "Microsoft.PowerShell.Management\\Test-Path",
+      text: "Microsoft.PowerShell.Management\\Test-Path -LiteralPath $NpmResolvedPath.ProviderPath -PathType Leaf",
+    },
+    {
       name: "Remove-Item",
       text: "Remove-Item Env:\\POSITION_GUARD_PILOT_ID -ErrorAction SilentlyContinue",
     },
@@ -398,8 +417,8 @@ function assertPilotReadinessAstSafe(scriptPath: string): void {
       text: "Push-Location -LiteralPath $RepositoryRoot",
     },
     {
-      name: "npm.cmd",
-      text: "npm.cmd run inspect:btc-pilot:readiness -- --database-path \"$DatabasePath\" --format $Format --exchange-account-id $ExchangeAccountId --deployment-id $DeploymentId --checked-at $checkedAt --freshness-threshold-ms $FreshnessThresholdMs",
+      name: null,
+      text: "& $NpmCommandPath run inspect:btc-pilot:readiness -- --database-path \"$DatabasePath\" --format $Format --exchange-account-id $ExchangeAccountId --deployment-id $DeploymentId --checked-at $checkedAt --freshness-threshold-ms $FreshnessThresholdMs",
     },
     {
       name: "Pop-Location",
@@ -407,6 +426,7 @@ function assertPilotReadinessAstSafe(scriptPath: string): void {
     },
   ]);
   assert.deepEqual(ast.finallyCommands, ["Pop-Location"]);
+  assert.deepEqual(ast.directiveComments, []);
   assert.deepEqual(
     ast.memberInvocations.map((invocation) => ({
       member: invocation.member,
@@ -476,6 +496,37 @@ const expectedPilotReadinessAstShape = {
     ),
     astFingerprint(
       "AssignmentStatementAst",
+      "$NpmApplications", "=", "@(",
+      "Microsoft.PowerShell.Core\\Get-Command", "-Name", '"npm.cmd"',
+      "-CommandType", "Application", "-All", "-ErrorAction", "Stop", ")",
+    ),
+    astFingerprint(
+      "IfStatementAst",
+      "if", "(", "$NpmApplications", ".", "Count", "-lt", "1", ")", "{",
+      "throw", '"BTC pilot readiness requires npm.cmd to resolve to an application."', "}",
+    ),
+    astFingerprint(
+      "AssignmentStatementAst",
+      "$NpmResolvedPath", "=", "Microsoft.PowerShell.Management\\Resolve-Path",
+      "-LiteralPath", "$NpmApplications", "[", "0", "]", ".", "Path", "-ErrorAction", "Stop",
+    ),
+    astFingerprint(
+      "IfStatementAst",
+      "if", "(",
+      "$NpmResolvedPath", ".", "Provider", ".", "Name", "-ne", '"FileSystem"', "-or",
+      "$NpmResolvedPath", ".", "ProviderPath", "-notmatch", "'(?i)[\\\\/]npm\\.cmd$'", "-or",
+      "-not", "(", "Microsoft.PowerShell.Management\\Test-Path", "-LiteralPath",
+      "$NpmResolvedPath", ".", "ProviderPath", "-PathType", "Leaf", ")",
+      ")", "{",
+      "throw", '"BTC pilot readiness requires npm.cmd to resolve to one canonical filesystem application path."',
+      "}",
+    ),
+    astFingerprint(
+      "AssignmentStatementAst",
+      "$NpmCommandPath", "=", "$NpmResolvedPath", ".", "ProviderPath",
+    ),
+    astFingerprint(
+      "AssignmentStatementAst",
       "$checkedAt", "=", "[", "DateTimeOffset", "]", "::", "UtcNow", ".", "ToString", "(", '"o"', ")",
     ),
     astFingerprint("AssignmentStatementAst", "$PilotId", "=", '"BTC_COMBINED_CONSERVATIVE_PILOT_V1"'),
@@ -522,7 +573,7 @@ const expectedPilotReadinessAstShape = {
     astFingerprint(
       "TryStatementAst",
       "try", "{",
-      "npm.cmd", "run", "inspect:btc-pilot:readiness", "--",
+      "&", "$NpmCommandPath", "run", "inspect:btc-pilot:readiness", "--",
       "--database-path", '"$DatabasePath"',
       "--format", "$Format",
       "--exchange-account-id", "$ExchangeAccountId",
@@ -583,6 +634,20 @@ test("BTC pilot readiness example returns the native npm failure exit code", () 
   }
 });
 
+test("BTC pilot readiness example ignores an inherited npm function shadow", () => {
+  const fixture = createPilotReadinessFixture(37);
+
+  try {
+    const result = runPilotReadinessFixture(fixture, { shadowNpmCommand: true });
+
+    assert.equal(result.status, 37, result.stderr || result.stdout);
+    const capture = readFileSync(fixture.capturePath, "utf8").trim().split(/\r?\n/);
+    assert.equal(capture.length, 2, "the resolved npm application must run exactly once");
+  } finally {
+    rmSync(fixture.temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("BTC pilot readiness example cannot activate or mutate trading paths", () => {
   const script = readPilotReadinessScript();
 
@@ -609,6 +674,7 @@ function readPilotReadinessScript(): string {
 
 type PowerShellAstInspection = {
   commands: Array<{ name: string | null; text: string }>;
+  directiveComments: string[];
   executableTokens: string[];
   finallyCommands: Array<string | null>;
   memberInvocations: Array<{ member: string | null; text: string }>;
@@ -658,11 +724,15 @@ function Get-ExecutableNodeFingerprint($node) {
 $paramAttributes = @($ast.ParamBlock.Attributes | ForEach-Object { Get-ExecutableNodeFingerprint $_ })
 $paramBlock = Get-ExecutableNodeFingerprint $ast.ParamBlock
 $topLevelStatements = @($ast.EndBlock.Statements | ForEach-Object { Get-ExecutableNodeFingerprint $_ })
+$directiveComments = @($tokens | Where-Object {
+  $_.Kind.ToString() -eq "Comment" -and $_.Text -match '^\s*#requires(?:\s|$)'
+} | ForEach-Object { $_.Text })
 $executableTokens = @($tokens | Where-Object {
   $_.Kind.ToString() -notin @("Comment", "NewLine", "LineContinuation", "EndOfInput")
 } | ForEach-Object { $_.Text })
 [pscustomobject]@{
   commands = $commands
+  directiveComments = $directiveComments
   executableTokens = $executableTokens
   finallyCommands = $finallyCommands
   memberInvocations = $members
@@ -737,12 +807,38 @@ function createPilotReadinessFixture(nativeExitCode: number): PilotReadinessFixt
   };
 }
 
-function runPilotReadinessFixture(fixture: PilotReadinessFixture): SpawnSyncReturns<string> {
+function runPilotReadinessFixture(
+  fixture: PilotReadinessFixture,
+  options: { shadowNpmCommand?: boolean } = {},
+): SpawnSyncReturns<string> {
   const env = { ...process.env };
   const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "Path";
   env[pathKey] = `${fixture.shimDirectory};${env[pathKey] ?? ""}`;
   env.FAKE_NPM_CAPTURE_PATH = fixture.capturePath;
   env.FAKE_NPM_EXIT_CODE = String(fixture.nativeExitCode);
+  env.AUTOTRADE_PILOT_SCRIPT_PATH = fixture.scriptPath;
+  env.AUTOTRADE_PILOT_DATABASE_PATH = fixture.databasePath;
+
+  const scriptArguments = [
+    "-DatabasePath",
+    fixture.databasePath,
+    "-ExchangeAccountId",
+    "account_fixture",
+    "-DeploymentId",
+    "deployment_fixture",
+    "-FreshnessThresholdMs",
+    "60000",
+  ];
+  const invocation = options.shadowNpmCommand
+    ? [
+        "-Command",
+        [
+          "function npm.cmd { $global:LASTEXITCODE = 0 }",
+          "& $env:AUTOTRADE_PILOT_SCRIPT_PATH -DatabasePath $env:AUTOTRADE_PILOT_DATABASE_PATH -ExchangeAccountId account_fixture -DeploymentId deployment_fixture -FreshnessThresholdMs 60000",
+          "exit $LASTEXITCODE",
+        ].join("\n"),
+      ]
+    : ["-File", fixture.scriptPath, ...scriptArguments];
 
   return spawnSync(
     "powershell.exe",
@@ -751,16 +847,7 @@ function runPilotReadinessFixture(fixture: PilotReadinessFixture): SpawnSyncRetu
       "-NonInteractive",
       "-ExecutionPolicy",
       "Bypass",
-      "-File",
-      fixture.scriptPath,
-      "-DatabasePath",
-      fixture.databasePath,
-      "-ExchangeAccountId",
-      "account_fixture",
-      "-DeploymentId",
-      "deployment_fixture",
-      "-FreshnessThresholdMs",
-      "60000",
+      ...invocation,
     ],
     {
       cwd: fixture.callerDirectory,
