@@ -479,6 +479,20 @@ test("in-memory candidate pilot repository atomically initializes a frozen deplo
   await verifyAtomicDeploymentInitializationContract(() => new InMemoryCandidatePilotRepository());
 });
 
+test("in-memory candidate pilot initialization snapshots caller input before queued work", async () => {
+  const repository = new InMemoryCandidatePilotRepository();
+  const input = initialDeploymentInput("deployment-input-snapshot");
+  const requestedCreatedAt = input.deployment.createdAt;
+
+  const initialization = repository.initializeDeploymentWithInitialState(input);
+  input.deployment.createdAt = "2026-08-22T00:00:00.000Z";
+  input.deployment.updatedAt = "2026-08-22T00:00:00.000Z";
+
+  const result = await initialization;
+  assert.equal(result.deployment.createdAt, requestedCreatedAt);
+  assert.equal(result.deployment.updatedAt, requestedCreatedAt);
+});
+
 test("in-memory exact recovery lookup ignores an earlier foreign-account deployment", async () => {
   const repository = new InMemoryCandidatePilotRepository();
   await repository.createDeploymentWithInitialState(

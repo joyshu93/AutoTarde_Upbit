@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { mkdir, readFile, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { Worker } from "node:worker_threads";
 
+import type { CandidatePilotDeploymentInitializationResult } from
+  "../src/modules/db/pilot-interfaces.js";
 import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
 import { openSqliteDatabase } from "../src/modules/db/repositories/sqlite-database.js";
 import { SqliteCandidatePilotRepository } from
@@ -54,33 +57,87 @@ test("two sqlite candidate pilot connections initialize one deployment and prese
   const databasePath = await createTempDatabasePath("candidate-bootstrap-concurrency");
   const bootstrap = createBundle(databasePath);
   bootstrap.close();
-  const firstHandle = openSqliteDatabase(databasePath);
-  const secondHandle = openSqliteDatabase(databasePath);
+  const setup = openSqliteDatabase(databasePath);
+  setup.db.exec(`
+    CREATE TRIGGER hold_candidate_bootstrap_write_lock
+    AFTER INSERT ON strategy_pilot_deployments
+    BEGIN
+      SELECT hold_candidate_bootstrap_lock();
+    END;
+  `);
+  setup.close();
+  const startBarrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const lockHoldCounter = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const input = initialDeploymentInput("candidate-bootstrap-concurrency");
   try {
-    const first = new SqliteCandidatePilotRepository(firstHandle.db);
-    const second = new SqliteCandidatePilotRepository(secondHandle.db);
-    const input = initialDeploymentInput("candidate-bootstrap-concurrency");
     const results = await Promise.all([
-      first.initializeDeploymentWithInitialState(input),
-      second.initializeDeploymentWithInitialState(input),
+      runCandidateBootstrapWorker({ databasePath, input, startBarrier, lockHoldCounter }),
+      runCandidateBootstrapWorker({ databasePath, input, startBarrier, lockHoldCounter }),
     ]);
-
-    assert.deepEqual(results.map((result) => result.outcome).sort(), ["CREATED", "EXISTING"]);
-    assert.equal(
-      (firstHandle.db.prepare("SELECT COUNT(*) AS count FROM strategy_pilot_deployments").get() as { count: number }).count,
-      1,
-    );
-    assert.deepEqual(results[0].deployment, results[1].deployment);
-    assert.deepEqual(results[0].exactState, results[1].exactState);
-    assert.deepEqual(results[0].evidenceRecords, results[1].evidenceRecords);
-    assert.deepEqual(results[0].auditEvents, results[1].auditEvents);
-    assertDatabaseIntegrity(firstHandle.db);
+    const inspection = openSqliteDatabase(databasePath);
+    try {
+      assert.equal(Atomics.load(new Int32Array(lockHoldCounter), 0), 1);
+      assert.deepEqual(results.map((result) => result.outcome).sort(), ["CREATED", "EXISTING"]);
+      assert.equal(
+        (inspection.db.prepare("SELECT COUNT(*) AS count FROM strategy_pilot_deployments").get() as { count: number }).count,
+        1,
+      );
+      assert.deepEqual(results[0].deployment, results[1].deployment);
+      assert.deepEqual(results[0].exactState, results[1].exactState);
+      assert.deepEqual(results[0].evidenceRecords, results[1].evidenceRecords);
+      assert.deepEqual(results[0].auditEvents, results[1].auditEvents);
+      assertDatabaseIntegrity(inspection.db);
+    } finally {
+      inspection.close();
+    }
   } finally {
-    firstHandle.close();
-    secondHandle.close();
     await cleanupTempDatabase(databasePath);
   }
 });
+
+function runCandidateBootstrapWorker(input: {
+  databasePath: string;
+  input: ReturnType<typeof initialDeploymentInput>;
+  startBarrier: SharedArrayBuffer;
+  lockHoldCounter: SharedArrayBuffer;
+}): Promise<CandidatePilotDeploymentInitializationResult> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(
+      new URL("./fixtures/candidate-pilot-bootstrap-worker.js", import.meta.url),
+      {
+        workerData: input,
+        execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")),
+      },
+    );
+    let result: CandidatePilotDeploymentInitializationResult | null = null;
+    let failure: Error | null = null;
+    worker.once("message", (message: Readonly<{
+      ok: boolean;
+      result?: CandidatePilotDeploymentInitializationResult;
+      error?: string;
+    }>) => {
+      if (message.ok && message.result) {
+        result = message.result;
+      } else {
+        failure = new Error(message.error ?? "Candidate bootstrap worker failed without an error.");
+      }
+    });
+    worker.once("error", (error) => {
+      failure = error;
+    });
+    worker.once("exit", (code) => {
+      if (failure) {
+        reject(failure);
+      } else if (code !== 0) {
+        reject(new Error(`Candidate bootstrap worker exited with code ${code}.`));
+      } else if (result) {
+        resolve(result);
+      } else {
+        reject(new Error(`Candidate bootstrap worker exited without a result (code ${code}).`));
+      }
+    });
+  });
+}
 
 test("sqlite candidate bootstrap rolls back every partial row when initial state persistence fails", async () => {
   await withFreshBundle("candidate-bootstrap-rollback", async (bundle, _databasePath, db) => {

@@ -80,11 +80,11 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
   async initializeDeploymentWithInitialState(
     input: CreateCandidatePilotDeploymentInput,
   ): Promise<CandidatePilotDeploymentInitializationResult> {
+    const deployment = this.validateInitialDeployment(input);
+    if (deployment.phase !== "PENDING_FLAT") {
+      throw new Error("Candidate pilot deployment initialization requires PENDING_FLAT phase.");
+    }
     return this.serializeInitialization(async () => {
-      const deployment = this.validateInitialDeployment(input);
-      if (deployment.phase !== "PENDING_FLAT") {
-        throw new Error("Candidate pilot deployment initialization requires PENDING_FLAT phase.");
-      }
       const existingById = this.deployments.get(deployment.id);
       if (existingById && !sameBootstrapIdentity(existingById, deployment)) {
         throw new Error(`Candidate pilot deployment ${deployment.id} identity collision.`);
