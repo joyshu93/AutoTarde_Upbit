@@ -11,6 +11,8 @@ import {
   type LiveExecutionAdapter,
 } from "../src/modules/exchange/interfaces.js";
 import { createEmptyPositionGuardCandidateState } from "../src/modules/strategy/position-guard-candidate-state.js";
+import type { PositionGuardPublicMarketDataReader } from
+  "../src/modules/strategy/position-guard-snapshot.js";
 import { createDryRunOperatorMarketDataReader } from "../src/smoke/dryrun-operator.js";
 import { test } from "./harness.js";
 
@@ -22,6 +24,7 @@ test("createApp keeps dry-run adapter as the default live send path", async () =
   assert.equal(app.strategyScheduler.getStatus().liveSendPath, "DRY_RUN_ADAPTER");
   assert.equal(app.telegramCommandMenuSetup.isConfigured(), false);
   assert.equal(app.candidatePilotInitializer, null);
+  assert.equal((app as typeof app & { candidatePilotRecovery?: unknown }).candidatePilotRecovery, null);
 
   app.persistence.close();
   await cleanupTempDatabase(databasePath);
@@ -53,6 +56,7 @@ test("createApp baseline never invokes candidate authority or constructs candida
     assert.equal(observerCalls, 0);
     assert.equal(app.candidateEvidenceService, null);
     assert.equal(app.candidatePilotInitializer, null);
+    assert.equal((app as typeof app & { candidatePilotRecovery?: unknown }).candidatePilotRecovery, null);
     assert.equal(initializationRepositoryCalls, 0);
   } finally {
     (app as ReturnType<typeof createApp> | null)?.persistence.close();
@@ -96,6 +100,127 @@ test("createApp exposes but does not invoke the candidate initializer", async ()
     assert.equal(initializationRepositoryCalls, 0);
   } finally {
     app?.persistence.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("createApp exposes candidate rollback with bound operator authority and construction sends no order", async () => {
+  const databasePath = await createTempDatabasePath("candidate-recovery-exposure");
+  const privateAdapter = createCountingLiveExecutionAdapterFake();
+  let app: ReturnType<typeof createApp> | null = null;
+
+  try {
+    app = createApp(
+      createConfig({
+        databasePath,
+        executionMode: "LIVE",
+        liveExecutionGate: "ENABLED",
+        positionGuardPolicySelection: candidatePolicySelection(),
+      }),
+      {
+        privateExchangeAdapter: privateAdapter.adapter,
+        publicMarketDataReader: createDryRunOperatorMarketDataReader(),
+      },
+    );
+
+    const recovery = (app as typeof app & {
+      candidatePilotRecovery?: {
+        requestRollback(receipt: {
+          exchangeAccountId: string;
+          requestedAt: string;
+          balanceSnapshotId: string;
+          balanceCapturedAt: string;
+          positionSnapshotId: string;
+          positionCapturedAt: string;
+          reconciliationRunId: string;
+          reconciliationStartedAt: string;
+          reconciliationCompletedAt: string;
+          reconciliationSource: "SCHEDULER_PREFLIGHT";
+        }): Promise<{ status: string }>;
+      } | null;
+    }).candidatePilotRecovery;
+    assert.notEqual(recovery, null);
+    assert.notEqual(recovery, undefined);
+    assert.equal(privateAdapter.getCreateOrderCallCount(), 0);
+
+    const result = await recovery?.requestRollback({
+      exchangeAccountId: "primary",
+      requestedAt: "2026-08-24T00:00:00.000Z",
+      balanceSnapshotId: "missing-balance",
+      balanceCapturedAt: "2026-08-24T00:00:00.000Z",
+      positionSnapshotId: "missing-position",
+      positionCapturedAt: "2026-08-24T00:00:00.000Z",
+      reconciliationRunId: "missing-reconciliation",
+      reconciliationStartedAt: "2026-08-24T00:00:00.000Z",
+      reconciliationCompletedAt: "2026-08-24T00:00:01.000Z",
+      reconciliationSource: "SCHEDULER_PREFLIGHT",
+    });
+    await app.notificationDelivery.deliverPending("primary");
+
+    assert.equal(result?.status, "BLOCKED_FAULT");
+    assert.equal((await app.operatorState.getState()).systemStatus, "PAUSED");
+    assert.equal(privateAdapter.getCreateOrderCallCount(), 0);
+  } finally {
+    app?.persistence.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("candidate createApp construction invokes no exchange, market, Telegram, or timer side effect", async () => {
+  const databasePath = await createTempDatabasePath("candidate-construction-side-effects");
+  const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
+  const previousSecretKey = process.env.UPBIT_SECRET_KEY;
+  const previousFetch = globalThis.fetch;
+  const previousSetTimeout = globalThis.setTimeout;
+  const previousSetInterval = globalThis.setInterval;
+  const fakes = createConstructionSideEffectFakes();
+  let app: ReturnType<typeof createApp> | null = null;
+  process.env.UPBIT_ACCESS_KEY = "fake-access-key";
+  process.env.UPBIT_SECRET_KEY = "fake-secret-key";
+  globalThis.fetch = (async () => {
+    fakes.counts.telegramClient += 1;
+    throw new Error("createApp construction must not call a Telegram client");
+  }) as typeof fetch;
+  globalThis.setTimeout = ((..._args: Parameters<typeof setTimeout>) => {
+    fakes.counts.timeoutInstall += 1;
+    return {} as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout;
+  globalThis.setInterval = ((..._args: Parameters<typeof setInterval>) => {
+    fakes.counts.intervalInstall += 1;
+    return {} as ReturnType<typeof setInterval>;
+  }) as typeof setInterval;
+
+  try {
+    app = createApp(
+      createConfig({
+        databasePath,
+        executionMode: "LIVE",
+        liveExecutionGate: "ENABLED",
+        positionGuardPolicySelection: candidatePolicySelection(),
+        strategySchedulerEnabled: true,
+        strategySchedulerRunOnStart: true,
+        telegramDeliveryEnabled: true,
+        telegramBotToken: "fake-bot-token",
+        telegramOperatorChatId: "fake-chat-id",
+        telegramInboundPollingEnabled: true,
+      }),
+      {
+        privateExchangeAdapter: fakes.privateAdapter,
+        publicMarketDataReader: fakes.publicMarketDataReader,
+      },
+    );
+
+    assert.deepEqual(fakes.counts, emptyConstructionSideEffectCounts());
+    assert.equal(app.strategyScheduler.getStatus().started, false);
+    assert.equal(app.strategyScheduler.getStatus().markets.every((market) => !market.running), true);
+    assert.equal(app.telegramInboundPolling.getStatus().running, false);
+  } finally {
+    app?.persistence.close();
+    globalThis.fetch = previousFetch;
+    globalThis.setTimeout = previousSetTimeout;
+    globalThis.setInterval = previousSetInterval;
+    restoreOptionalEnv("UPBIT_ACCESS_KEY", previousAccessKey);
+    restoreOptionalEnv("UPBIT_SECRET_KEY", previousSecretKey);
     await cleanupTempDatabase(databasePath);
   }
 });
@@ -544,6 +669,68 @@ test("createApp wires the live adapter only when live mode, live gate, and Upbit
   }
 });
 
+test("createApp passes en-US into operator notification push delivery", async () => {
+  const databasePath = await createTempDatabasePath("notification-delivery-locale");
+  const previousFetch = globalThis.fetch;
+  const sentBodies: Array<Record<string, unknown>> = [];
+  let app: ReturnType<typeof createApp> | null = null;
+  globalThis.fetch = (async (_input, init) => {
+    sentBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    app = createApp(createConfig({
+      databasePath,
+      telegramLocale: "en-US",
+      telegramDeliveryEnabled: true,
+      telegramBotToken: "test-bot-token",
+      telegramOperatorChatId: "chat-1",
+    }));
+    await app.repositories.saveOperatorNotification({
+      id: "create-app-locale-notification",
+      exchangeAccountId: "primary",
+      channel: "TELEGRAM",
+      notificationType: "POSITION_GUARD_PILOT_FAULT_PAUSED",
+      severity: "ERROR",
+      title: "Raw title must not be delivered",
+      message: "Raw message must not be delivered",
+      payloadJson: JSON.stringify({
+        deploymentId: "deployment-create-app-locale",
+        phase: "PAUSED_FAULT",
+        reasonCode: "UNCERTAIN_ORDER",
+        faultId: "fault-create-app-locale",
+      }),
+      deliveryStatus: "PENDING",
+      attemptCount: 0,
+      lastAttemptAt: null,
+      nextAttemptAt: null,
+      failureClass: null,
+      leaseToken: null,
+      leaseExpiresAt: null,
+      createdAt: "2026-08-24T00:00:00.000Z",
+      deliveredAt: null,
+      lastError: null,
+    });
+
+    await app.notificationDelivery.deliverPending("primary", 1);
+
+    assert.equal(sentBodies.length, 1);
+    const text = sentBodies[0]?.text;
+    assert.equal(typeof text, "string");
+    assert.match(String(text), /BTC candidate pilot fault paused/u);
+    assert.match(String(text), /Notification code: POSITION_GUARD_PILOT_FAULT_PAUSED/u);
+    assert.doesNotMatch(String(text), /BTC 후보 파일럿/u);
+  } finally {
+    app?.persistence.close();
+    globalThis.fetch = previousFetch;
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
 test("createApp refreshes live scheduler account health before before-run preflight", async () => {
   const databasePath = await createTempDatabasePath("live-scheduler-preflight");
   const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
@@ -790,5 +977,105 @@ function createCountingLiveExecutionAdapterFake(): Readonly<{
     },
     getBalanceCallCount: () => balanceCallCount,
     getCreateOrderCallCount: () => createOrderCallCount,
+  };
+}
+
+type ConstructionSideEffectCounts = {
+  getBalances: number;
+  getOrderChance: number;
+  testOrder: number;
+  createOrder: number;
+  cancelOrder: number;
+  getOrder: number;
+  listOpenOrders: number;
+  listClosedOrders: number;
+  getTickers: number;
+  getMinuteCandles: number;
+  getDayCandles: number;
+  telegramClient: number;
+  timeoutInstall: number;
+  intervalInstall: number;
+};
+
+function emptyConstructionSideEffectCounts(): ConstructionSideEffectCounts {
+  return {
+    getBalances: 0,
+    getOrderChance: 0,
+    testOrder: 0,
+    createOrder: 0,
+    cancelOrder: 0,
+    getOrder: 0,
+    listOpenOrders: 0,
+    listClosedOrders: 0,
+    getTickers: 0,
+    getMinuteCandles: 0,
+    getDayCandles: 0,
+    telegramClient: 0,
+    timeoutInstall: 0,
+    intervalInstall: 0,
+  };
+}
+
+function createConstructionSideEffectFakes(): Readonly<{
+  counts: ConstructionSideEffectCounts;
+  privateAdapter: LiveExecutionAdapter;
+  publicMarketDataReader: PositionGuardPublicMarketDataReader;
+}> {
+  const counts = emptyConstructionSideEffectCounts();
+  const privateBase = new DryRunExchangeAdapter();
+  const publicBase = createDryRunOperatorMarketDataReader();
+  return {
+    counts,
+    privateAdapter: {
+      sendPath: "LIVE_ADAPTER",
+      async getBalances() {
+        counts.getBalances += 1;
+        return privateBase.getBalances();
+      },
+      async getOrderChance(market) {
+        counts.getOrderChance += 1;
+        return privateBase.getOrderChance(market);
+      },
+      async testOrder(request) {
+        counts.testOrder += 1;
+        return privateBase.testOrder(request);
+      },
+      async createOrder(request) {
+        counts.createOrder += 1;
+        return privateBase.createOrder(request);
+      },
+      async cancelOrder(query) {
+        counts.cancelOrder += 1;
+        return privateBase.cancelOrder(query);
+      },
+      async getOrder(query) {
+        counts.getOrder += 1;
+        return privateBase.getOrder(query);
+      },
+      async listOpenOrders(query) {
+        counts.listOpenOrders += 1;
+        void query;
+        return privateBase.listOpenOrders();
+      },
+      async listClosedOrders(query) {
+        counts.listClosedOrders += 1;
+        void query;
+        return privateBase.listClosedOrders();
+      },
+    },
+    publicMarketDataReader: {
+      async getTickers(markets) {
+        counts.getTickers += 1;
+        return publicBase.getTickers(markets);
+      },
+      async getMinuteCandles(request) {
+        counts.getMinuteCandles += 1;
+        return publicBase.getMinuteCandles(request);
+      },
+      async getDayCandles(request) {
+        counts.getDayCandles += 1;
+        return publicBase.getDayCandles(request);
+      },
+    },
   };
 }

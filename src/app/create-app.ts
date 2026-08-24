@@ -62,6 +62,7 @@ export interface AppServices {
   executionService: ExecutionService;
   candidateEvidenceService: CandidateExecutionEvidenceService | null;
   candidatePilotInitializer: PositionGuardPilotInitializer | null;
+  candidatePilotRecovery: PositionGuardPilotRecovery | null;
   reconciliationService: ReconciliationService;
   portfolioSyncService: PortfolioSyncService;
   telegramRouter: TelegramCommandRouter;
@@ -165,6 +166,7 @@ export function createApp(
     baseBackoffMs: config.telegramDeliveryBaseBackoffMs,
     maxBackoffMs: config.telegramDeliveryMaxBackoffMs,
     leaseDurationMs: config.telegramDeliveryLeaseMs,
+    locale: telegramLocale,
   });
   const telegramCommandMenuSetup = new TelegramCommandMenuSetupService({
     client: telegramMessageClient,
@@ -206,12 +208,13 @@ export function createApp(
         },
       })
     : null;
-  const candidateRunVerifier = candidatePolicySelection
+  const candidatePilotRecovery = candidatePolicySelection
     ? createCandidateRunVerifier({
         candidatePolicySelection,
         repositories,
         candidatePilots: persistence.candidatePilots,
         operatorState,
+        notificationDelivery,
         freshnessThresholdMs: Math.min(
           config.strategySchedulerBtcIntervalMs,
           config.strategySchedulerEthIntervalMs,
@@ -223,10 +226,10 @@ export function createApp(
     executionService,
     marketDataReader: publicMarketDataReader,
     config: createDefaultPositionGuardRunnerConfig("primary"),
-    ...(candidatePolicySelection && candidateRunVerifier
+    ...(candidatePolicySelection && candidatePilotRecovery
       ? {
           policySelection: candidatePolicySelection,
-          candidateRunVerifier,
+          candidateRunVerifier: candidatePilotRecovery,
         }
       : {}),
   });
@@ -417,6 +420,7 @@ export function createApp(
     executionService,
     candidateEvidenceService,
     candidatePilotInitializer,
+    candidatePilotRecovery,
     reconciliationService,
     portfolioSyncService,
     telegramRouter,
@@ -442,6 +446,7 @@ function createCandidateRunVerifier(input: {
   repositories: ExecutionRepository;
   candidatePilots: SqlitePersistenceBundle["candidatePilots"];
   operatorState: OperatorStateStore;
+  notificationDelivery: OperatorNotificationDeliveryService;
   freshnessThresholdMs: number;
 }): PositionGuardPilotRecovery {
   const getTransitionById = input.operatorState.getTransitionById;
@@ -470,7 +475,10 @@ function createCandidateRunVerifier(input: {
     operatorState: {
       pauseForFault: input.operatorState.pauseForFault.bind(input.operatorState),
       getTransitionById: getTransitionById.bind(input.operatorState),
+      getState: input.operatorState.getState.bind(input.operatorState),
+      pause: input.operatorState.pause.bind(input.operatorState),
     },
+    notificationDelivery: input.notificationDelivery,
   });
 }
 

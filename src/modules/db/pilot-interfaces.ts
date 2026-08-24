@@ -105,9 +105,15 @@ export interface CandidatePilotRollbackInput {
   expectedPhase: PositionGuardPilotDeploymentRecord["phase"];
   expectedUpdatedAt: string;
   expectedStateVersion: number;
+  expectedOperatorState: CandidatePilotRollbackOperatorState;
   transitionAt: string;
   transitionEpochNs: bigint;
 }
+
+export type CandidatePilotRollbackOperatorState = Readonly<Pick<
+  ExecutionStateRecord,
+  "id" | "exchangeAccountId" | "systemStatus" | "updatedAt"
+>>;
 
 export interface AdvanceCandidatePilotStateInput {
   deploymentId: string;
@@ -174,7 +180,15 @@ export interface InMemoryAtomicFaultPauseStore {
   listTransitions(limit?: number): Promise<ExecutionStateTransitionRecord[]>;
   getTransitionById?(id: string): Promise<ExecutionStateTransitionRecord | null>;
   applyFaultPauseAtomically(input: FaultPauseInput): ExecutionStateRecord;
+  runWithCandidatePilotRollbackAuthority(
+    expected: CandidatePilotRollbackOperatorState,
+    operation: () => PositionGuardPilotDeploymentRecord | null,
+  ): InMemoryCandidatePilotRollbackAuthorityResult;
 }
+
+export type InMemoryCandidatePilotRollbackAuthorityResult =
+  | Readonly<{ authorityMatched: false }>
+  | Readonly<{ authorityMatched: true; value: PositionGuardPilotDeploymentRecord | null }>;
 
 export type CandidatePilotRecoveryIdentity = Readonly<{
   exchangeAccountId: string;
@@ -445,8 +459,16 @@ const CANDIDATE_PILOT_ROLLBACK_KEYS = [
   "expectedPhase",
   "expectedUpdatedAt",
   "expectedStateVersion",
+  "expectedOperatorState",
   "transitionAt",
   "transitionEpochNs",
+] as const;
+
+const CANDIDATE_PILOT_ROLLBACK_OPERATOR_STATE_KEYS = [
+  "id",
+  "exchangeAccountId",
+  "systemStatus",
+  "updatedAt",
 ] as const;
 
 export function validateCandidatePilotRollbackInput(
@@ -463,6 +485,9 @@ export function validateCandidatePilotRollbackInput(
   if (!Number.isSafeInteger(record.expectedStateVersion) || (record.expectedStateVersion as number) < 0) {
     throw new Error("Candidate pilot rollback expected state version must be a non-negative safe integer.");
   }
+  const expectedOperatorState = validateCandidatePilotRollbackOperatorState(
+    record.expectedOperatorState,
+  );
   const transitionEpochNs = parsePositionGuardCandidateTimestamp(
     record.transitionAt as string,
     "candidate pilot rollback transitionAt",
@@ -476,9 +501,51 @@ export function validateCandidatePilotRollbackInput(
     expectedPhase: record.expectedPhase as PositionGuardPilotDeploymentRecord["phase"],
     expectedUpdatedAt: record.expectedUpdatedAt as string,
     expectedStateVersion: record.expectedStateVersion as number,
+    expectedOperatorState,
     transitionAt: record.transitionAt as string,
     transitionEpochNs: record.transitionEpochNs as bigint,
   });
+}
+
+export function validateCandidatePilotRollbackOperatorState(
+  value: unknown,
+): CandidatePilotRollbackOperatorState {
+  const record = exactOwnDataRecord(
+    value,
+    "candidate pilot rollback expected operator state",
+    CANDIDATE_PILOT_ROLLBACK_OPERATOR_STATE_KEYS,
+  );
+  requireNonEmpty(record.id as string, "candidate pilot rollback execution state id");
+  requireNonEmpty(
+    record.exchangeAccountId as string,
+    "candidate pilot rollback execution state exchangeAccountId",
+  );
+  if (record.systemStatus !== "PAUSED" && record.systemStatus !== "KILL_SWITCHED") {
+    throw new Error("Candidate pilot rollback expected operator state must be PAUSED or KILL_SWITCHED.");
+  }
+  parsePositionGuardCandidateTimestamp(
+    record.updatedAt as string,
+    "candidate pilot rollback expected operator state updatedAt",
+  );
+  return Object.freeze({
+    id: record.id as string,
+    exchangeAccountId: record.exchangeAccountId as string,
+    systemStatus: record.systemStatus,
+    updatedAt: record.updatedAt as string,
+  });
+}
+
+export function matchesCandidatePilotRollbackOperatorState(
+  current: ExecutionStateRecord,
+  expected: CandidatePilotRollbackOperatorState,
+  deploymentExchangeAccountId: string,
+): boolean {
+  return expected.exchangeAccountId === deploymentExchangeAccountId &&
+    current.id === expected.id &&
+    current.exchangeAccountId === expected.exchangeAccountId &&
+    current.systemStatus === expected.systemStatus &&
+    current.updatedAt === expected.updatedAt &&
+    (current.systemStatus === "PAUSED" || current.systemStatus === "KILL_SWITCHED");
 }
 
 export function validateCandidatePilotRollbackChronology(

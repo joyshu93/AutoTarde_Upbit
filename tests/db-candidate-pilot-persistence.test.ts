@@ -5,11 +5,13 @@ import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 
 import type { PositionGuardPilotDeploymentRecord } from "../src/domain/pilot-types.js";
+import type { ExecutionStateRecord } from "../src/domain/types.js";
 import type {
   CandidatePilotDeploymentInitializationResult,
   CandidatePilotRollbackInput,
 } from "../src/modules/db/pilot-interfaces.js";
 import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
+import { SqliteOperatorStateStore } from "../src/modules/db/repositories/sqlite-repositories.js";
 import { openSqliteDatabase } from "../src/modules/db/repositories/sqlite-database.js";
 import { SqliteCandidatePilotRepository } from
   "../src/modules/db/repositories/sqlite-candidate-pilot-repository.js";
@@ -71,7 +73,11 @@ test("sqlite candidate pilot rollback persistence satisfies the common contract"
       const bundle = createBundle(databasePath);
       bundles.push(bundle);
       databasePaths.push(databasePath);
-      return bundle.candidatePilots;
+      const paused = await bundle.operatorState.pause("rollback-contract");
+      return {
+        repository: bundle.candidatePilots,
+        expectedOperatorState: rollbackOperatorAuthority(paused),
+      };
     });
   } finally {
     for (const bundle of bundles) bundle.close();
@@ -81,6 +87,7 @@ test("sqlite candidate pilot rollback persistence satisfies the common contract"
 
 test("sqlite draining recovery faults require strict forward chronology without partial mutation", async () => {
   await withFreshBundle("draining-fault-chronology", async (bundle) => {
+    await bundle.operatorState.pause("draining-fault-chronology");
     await verifyCandidatePilotDrainingFaultChronology({
       repository: bundle.candidatePilots,
       getExecutionState: () => bundle.operatorState.getState(),
@@ -106,6 +113,8 @@ test("two sqlite connections produce one rollback start and completion CAS winne
       activationEpochNs: parsePositionGuardCandidateTimestamp(activationAt, "rollback race activation"),
     });
     assert.ok(activated);
+    const paused = await bootstrap.operatorState.pause("rollback-two-connection-race");
+    const expectedOperatorState = rollbackOperatorAuthority(paused);
     bootstrap.close();
     bootstrapClosed = true;
 
@@ -115,6 +124,7 @@ test("two sqlite connections produce one rollback start and completion CAS winne
       expectedPhase: "ACTIVE",
       expectedUpdatedAt: activated.updatedAt,
       expectedStateVersion: 0,
+      expectedOperatorState,
       transitionAt: rollbackAt,
       transitionEpochNs: parsePositionGuardCandidateTimestamp(rollbackAt, "rollback race start"),
     };
@@ -141,6 +151,7 @@ test("two sqlite connections produce one rollback start and completion CAS winne
         expectedPhase: "DRAINING",
         expectedUpdatedAt: draining.updatedAt,
         expectedStateVersion: state.stateVersion,
+        expectedOperatorState,
         transitionAt: completionAt,
         transitionEpochNs: parsePositionGuardCandidateTimestamp(completionAt, "rollback race completion"),
       };
@@ -169,6 +180,54 @@ test("two sqlite connections produce one rollback start and completion CAS winne
     }
   } finally {
     if (!bootstrapClosed) bootstrap.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("sqlite rollback transaction rejects a resume from an independent connection without phase or audit mutation", async () => {
+  const databasePath = await createTempDatabasePath("rollback-operator-state-race");
+  const bundle = createBundle(databasePath);
+  const secondConnection = openSqliteDatabase(databasePath);
+  try {
+    const deployment = await bundle.candidatePilots.createDeploymentWithInitialState(
+      initialDeploymentInput("rollback-operator-state-race"),
+    );
+    const activationAt = "2026-08-21T00:00:01.000000000Z";
+    const activated = await bundle.candidatePilots.activateDeployment({
+      deploymentId: deployment.id,
+      expectedPhase: "PENDING_FLAT",
+      expectedUpdatedAt: deployment.updatedAt,
+      activationAt,
+      activationEpochNs: parsePositionGuardCandidateTimestamp(
+        activationAt,
+        "rollback operator-state race activation",
+      ),
+    });
+    assert.ok(activated);
+    const paused = await bundle.operatorState.pause("rollback-race-precheck");
+    const auditsBefore = await bundle.candidatePilots.listAuditEvents(deployment.id);
+    const independentOperatorState = new SqliteOperatorStateStore(secondConnection.db, "primary");
+
+    await independentOperatorState.resume();
+    const transitionAt = "2026-08-21T00:00:02.000000000Z";
+    assert.equal(await bundle.candidatePilots.startRollback({
+      deploymentId: activated.id,
+      expectedPhase: "ACTIVE",
+      expectedUpdatedAt: activated.updatedAt,
+      expectedStateVersion: 0,
+      expectedOperatorState: rollbackOperatorAuthority(paused),
+      transitionAt,
+      transitionEpochNs: parsePositionGuardCandidateTimestamp(
+        transitionAt,
+        "rollback operator-state race transition",
+      ),
+    }), null);
+    assert.equal((await bundle.candidatePilots.getDeployment(deployment.id))?.phase, "ACTIVE");
+    assert.deepEqual(await bundle.candidatePilots.listAuditEvents(deployment.id), auditsBefore);
+    assertDatabaseIntegrity(secondConnection.db);
+  } finally {
+    secondConnection.close();
+    bundle.close();
     await cleanupTempDatabase(databasePath);
   }
 });
@@ -383,6 +442,15 @@ function startCandidateRollbackWorker(input: {
     });
   });
   return { worker, result };
+}
+
+function rollbackOperatorAuthority(state: ExecutionStateRecord) {
+  return {
+    id: state.id,
+    exchangeAccountId: state.exchangeAccountId,
+    systemStatus: state.systemStatus,
+    updatedAt: state.updatedAt,
+  };
 }
 
 async function runCandidateRollbackConnectionRace(
@@ -1273,6 +1341,9 @@ test("sqlite rollback start reverts its deployment phase when the audit insert f
       activationEpochNs: parsePositionGuardCandidateTimestamp(activationAt, "rollback audit failure activation"),
     });
     assert.ok(activated);
+    const expectedOperatorState = rollbackOperatorAuthority(
+      await bundle.operatorState.pause("rollback-audit-failure"),
+    );
     db.exec(`
       CREATE TRIGGER fail_rollback_started_audit_for_test
       BEFORE INSERT ON strategy_pilot_audit_events
@@ -1288,6 +1359,7 @@ test("sqlite rollback start reverts its deployment phase when the audit insert f
         expectedPhase: "ACTIVE",
         expectedUpdatedAt: activated.updatedAt,
         expectedStateVersion: 0,
+        expectedOperatorState,
         transitionAt: "2026-08-21T00:00:02.000000000Z",
         transitionEpochNs: parsePositionGuardCandidateTimestamp(
           "2026-08-21T00:00:02.000000000Z",
@@ -1316,11 +1388,15 @@ test("sqlite rollback completion reverts its deployment phase when the audit ins
       activationEpochNs: parsePositionGuardCandidateTimestamp(activationAt, "rollback completion audit failure activation"),
     });
     assert.ok(activated);
+    const expectedOperatorState = rollbackOperatorAuthority(
+      await bundle.operatorState.pause("rollback-completion-audit-failure"),
+    );
     const draining = await bundle.candidatePilots.startRollback({
       deploymentId: activated.id,
       expectedPhase: "ACTIVE",
       expectedUpdatedAt: activated.updatedAt,
       expectedStateVersion: 0,
+      expectedOperatorState,
       transitionAt: "2026-08-21T00:00:02.000000000Z",
       transitionEpochNs: parsePositionGuardCandidateTimestamp(
         "2026-08-21T00:00:02.000000000Z",
@@ -1343,6 +1419,7 @@ test("sqlite rollback completion reverts its deployment phase when the audit ins
         expectedPhase: "DRAINING",
         expectedUpdatedAt: draining.updatedAt,
         expectedStateVersion: 0,
+        expectedOperatorState,
         transitionAt: "2026-08-21T00:00:03.000000000Z",
         transitionEpochNs: parsePositionGuardCandidateTimestamp(
           "2026-08-21T00:00:03.000000000Z",
@@ -1374,6 +1451,7 @@ test("sqlite rollback completion rejects a persisted PAUSED_FAULT without mutati
     const exactState = await bundle.candidatePilots.getExactState(deployment.id);
     assert.ok(paused);
     assert.ok(exactState);
+    const expectedOperatorState = rollbackOperatorAuthority(await bundle.operatorState.getState());
     const auditCount = (await bundle.candidatePilots.listAuditEvents(deployment.id)).length;
 
     assert.equal(await bundle.candidatePilots.completeRollback({
@@ -1381,6 +1459,7 @@ test("sqlite rollback completion rejects a persisted PAUSED_FAULT without mutati
       expectedPhase: paused.phase,
       expectedUpdatedAt: paused.updatedAt,
       expectedStateVersion: exactState.stateVersion,
+      expectedOperatorState,
       transitionAt: "2026-08-21T00:00:02.000000000Z",
       transitionEpochNs: parsePositionGuardCandidateTimestamp(
         "2026-08-21T00:00:02.000000000Z",

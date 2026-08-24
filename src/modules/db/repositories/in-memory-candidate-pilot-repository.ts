@@ -64,6 +64,7 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
   private readonly bindingsByOrderId = new Map<string, CandidateExecutionBindingRecord>();
   private recoveryFaultSerialization: Promise<void> = Promise.resolve();
   private initializationSerialization: Promise<void> = Promise.resolve();
+  private rollbackSerialization: Promise<void> = Promise.resolve();
 
   constructor(private readonly atomicFaultPauseStore?: InMemoryAtomicFaultPauseStore) {}
 
@@ -239,58 +240,81 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
 
   async startRollback(input: CandidatePilotRollbackInput): Promise<PositionGuardPilotDeploymentRecord | null> {
     const rollback = validateCandidatePilotRollbackInput(input);
-    const deployment = this.deployments.get(rollback.deploymentId);
-    const state = this.exactStates.get(rollback.deploymentId);
-    if (!deployment || !state || rollback.expectedPhase !== "ACTIVE" || deployment.phase !== "ACTIVE" ||
-      deployment.updatedAt !== rollback.expectedUpdatedAt || state.stateVersion !== rollback.expectedStateVersion) {
-      return null;
-    }
-    validateCandidatePilotRollbackChronology(rollback, deployment, state);
-    const next: PositionGuardPilotDeploymentRecord = {
-      ...deployment,
-      phase: "DRAINING",
-      updatedAt: rollback.transitionAt,
-    };
-    const audit = buildCandidatePilotRollbackAuditEvent({
-      rollback,
-      eventType: "ROLLBACK_STARTED",
-      fromPhase: deployment.phase,
-      toPhase: next.phase,
-      stateVersion: state.stateVersion,
+    return this.serializeRollback(() => {
+      const authorityStore = this.atomicFaultPauseStore;
+      if (!authorityStore || typeof authorityStore.runWithCandidatePilotRollbackAuthority !== "function") return null;
+      const authority = authorityStore.runWithCandidatePilotRollbackAuthority(
+        rollback.expectedOperatorState,
+        () => {
+          const deployment = this.deployments.get(rollback.deploymentId);
+          const state = this.exactStates.get(rollback.deploymentId);
+          if (!deployment || !state || rollback.expectedPhase !== "ACTIVE" || deployment.phase !== "ACTIVE" ||
+            deployment.exchangeAccountId !== rollback.expectedOperatorState.exchangeAccountId ||
+            deployment.updatedAt !== rollback.expectedUpdatedAt ||
+            state.stateVersion !== rollback.expectedStateVersion) {
+            return null;
+          }
+          validateCandidatePilotRollbackChronology(rollback, deployment, state);
+          const next: PositionGuardPilotDeploymentRecord = {
+            ...deployment,
+            phase: "DRAINING",
+            updatedAt: rollback.transitionAt,
+          };
+          const audit = buildCandidatePilotRollbackAuditEvent({
+            rollback,
+            eventType: "ROLLBACK_STARTED",
+            fromPhase: deployment.phase,
+            toPhase: next.phase,
+            stateVersion: state.stateVersion,
+          });
+          this.deployments.set(next.id, next);
+          this.auditEvents.set(next.id, [...(this.auditEvents.get(next.id) ?? []), audit]);
+          return { ...validateCandidatePilotDeployment(next) };
+        },
+      );
+      return authority?.authorityMatched ? authority.value : null;
     });
-    this.deployments.set(next.id, next);
-    this.auditEvents.set(next.id, [...(this.auditEvents.get(next.id) ?? []), audit]);
-    return { ...validateCandidatePilotDeployment(next) };
   }
 
   async completeRollback(input: CandidatePilotRollbackInput): Promise<PositionGuardPilotDeploymentRecord | null> {
     const rollback = validateCandidatePilotRollbackInput(input);
-    const deployment = this.deployments.get(rollback.deploymentId);
-    const state = this.exactStates.get(rollback.deploymentId);
-    if (!deployment || !state || !isRollbackCompletablePhase(rollback.expectedPhase) ||
-      deployment.phase !== rollback.expectedPhase || deployment.updatedAt !== rollback.expectedUpdatedAt ||
-      state.stateVersion !== rollback.expectedStateVersion) {
-      return null;
-    }
-    validateCandidatePilotRollbackChronology(rollback, deployment, state);
-    if (!isExactCandidateStateRollbackFlat(state)) {
-      throw new Error("Candidate pilot rollback completion requires an exact flat current episode state.");
-    }
-    const next: PositionGuardPilotDeploymentRecord = {
-      ...deployment,
-      phase: "DISABLED",
-      updatedAt: rollback.transitionAt,
-    };
-    const audit = buildCandidatePilotRollbackAuditEvent({
-      rollback,
-      eventType: "ROLLBACK_COMPLETED",
-      fromPhase: deployment.phase,
-      toPhase: next.phase,
-      stateVersion: state.stateVersion,
+    return this.serializeRollback(() => {
+      const authorityStore = this.atomicFaultPauseStore;
+      if (!authorityStore || typeof authorityStore.runWithCandidatePilotRollbackAuthority !== "function") return null;
+      const authority = authorityStore.runWithCandidatePilotRollbackAuthority(
+        rollback.expectedOperatorState,
+        () => {
+          const deployment = this.deployments.get(rollback.deploymentId);
+          const state = this.exactStates.get(rollback.deploymentId);
+          if (!deployment || !state || !isRollbackCompletablePhase(rollback.expectedPhase) ||
+            deployment.exchangeAccountId !== rollback.expectedOperatorState.exchangeAccountId ||
+            deployment.phase !== rollback.expectedPhase || deployment.updatedAt !== rollback.expectedUpdatedAt ||
+            state.stateVersion !== rollback.expectedStateVersion) {
+            return null;
+          }
+          validateCandidatePilotRollbackChronology(rollback, deployment, state);
+          if (!isExactCandidateStateRollbackFlat(state)) {
+            throw new Error("Candidate pilot rollback completion requires an exact flat current episode state.");
+          }
+          const next: PositionGuardPilotDeploymentRecord = {
+            ...deployment,
+            phase: "DISABLED",
+            updatedAt: rollback.transitionAt,
+          };
+          const audit = buildCandidatePilotRollbackAuditEvent({
+            rollback,
+            eventType: "ROLLBACK_COMPLETED",
+            fromPhase: deployment.phase,
+            toPhase: next.phase,
+            stateVersion: state.stateVersion,
+          });
+          this.deployments.set(next.id, next);
+          this.auditEvents.set(next.id, [...(this.auditEvents.get(next.id) ?? []), audit]);
+          return { ...validateCandidatePilotDeployment(next) };
+        },
+      );
+      return authority?.authorityMatched ? authority.value : null;
     });
-    this.deployments.set(next.id, next);
-    this.auditEvents.set(next.id, [...(this.auditEvents.get(next.id) ?? []), audit]);
-    return { ...validateCandidatePilotDeployment(next) };
   }
 
   async getState(deploymentId: string): Promise<Readonly<PositionGuardCandidateState> | null> {
@@ -642,6 +666,20 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
     const previous = this.initializationSerialization;
     let release!: () => void;
     this.initializationSerialization = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async serializeRollback<T>(operation: () => T | Promise<T>): Promise<T> {
+    const previous = this.rollbackSerialization;
+    let release!: () => void;
+    this.rollbackSerialization = new Promise<void>((resolve) => {
       release = resolve;
     });
     await previous;

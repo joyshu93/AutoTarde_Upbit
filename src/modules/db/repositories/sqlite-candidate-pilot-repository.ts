@@ -30,6 +30,7 @@ import {
   resolveCandidateIntentFaultOccurrence,
   toPositionGuardCandidateRoutingState,
   isExactCandidateStateRollbackFlat,
+  matchesCandidatePilotRollbackOperatorState,
   validateCandidateExecutionBinding,
   validateCandidateIntentFaultInput,
   validateCandidatePilotDeployment,
@@ -303,6 +304,16 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
         deploymentRow.updated_at !== rollback.expectedUpdatedAt || stateRow.state_version !== rollback.expectedStateVersion) {
         return null;
       }
+      if (rollback.expectedOperatorState.exchangeAccountId !== deploymentRow.exchange_account_id) return null;
+      const operatorState = selectExecutionState(
+        this.db,
+        rollback.expectedOperatorState.exchangeAccountId,
+      );
+      if (!matchesCandidatePilotRollbackOperatorState(
+        operatorState,
+        rollback.expectedOperatorState,
+        deploymentRow.exchange_account_id,
+      )) return null;
       const deployment = validateCandidatePilotDeployment(deploymentFromRow(deploymentRow));
       const state = exactStateFromRow(stateRow);
       validateCandidatePilotRollbackChronology(rollback, deployment, state);
@@ -335,6 +346,16 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
         deploymentRow.updated_at !== rollback.expectedUpdatedAt || stateRow.state_version !== rollback.expectedStateVersion) {
         return null;
       }
+      if (rollback.expectedOperatorState.exchangeAccountId !== deploymentRow.exchange_account_id) return null;
+      const operatorState = selectExecutionState(
+        this.db,
+        rollback.expectedOperatorState.exchangeAccountId,
+      );
+      if (!matchesCandidatePilotRollbackOperatorState(
+        operatorState,
+        rollback.expectedOperatorState,
+        deploymentRow.exchange_account_id,
+      )) return null;
       const deployment = validateCandidatePilotDeployment(deploymentFromRow(deploymentRow));
       const state = exactStateFromRow(stateRow);
       validateCandidatePilotRollbackChronology(rollback, deployment, state);

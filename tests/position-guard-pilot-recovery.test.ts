@@ -1522,6 +1522,35 @@ test("rollback revalidates the global pause immediately before candidate reposit
   assert.equal(completeCalls, 0);
 });
 
+test("rollback rejects a resume after the recovery pre-check without changing candidate phase or audit", async () => {
+  const fixture = await createFixture({
+    phase: "ACTIVE",
+    evidenceQuantity: "0.1",
+    balanceFree: "0.1",
+    positionQuantity: "0.1",
+  });
+  const deploymentBefore = await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID);
+  const auditsBefore = await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  let repositoryCalls = 0;
+  const candidatePilots = overrideCandidatePilots(fixture.candidatePilots, {
+    startRollback: async (input) => {
+      repositoryCalls += 1;
+      await fixture.operatorState.resume();
+      return fixture.candidatePilots.startRollback(input);
+    },
+  });
+
+  await assert.rejects(
+    () => fixture.createRecovery(candidatePilots).requestRollback(fixture.receipt),
+    /global pause authority changed before rollback persistence/u,
+  );
+
+  assert.equal(repositoryCalls, 1);
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "RUNNING");
+  assert.deepEqual(await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID), deploymentBefore);
+  assert.deepEqual(await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID), auditsBefore);
+});
+
 test("DRAINING rollback completes only after exact flat exit evidence and remains globally paused", async () => {
   const fixture = await createFixture({
     phase: "ACTIVE",
@@ -1669,6 +1698,29 @@ test("candidate activation and recovery fault notifications are durable and idem
   );
 });
 
+test("candidate notification persistence stays idempotent and requests configured delivery once", async () => {
+  const fixture = await createFixture();
+  const kickedAccounts: string[] = [];
+  const recovery = new PositionGuardPilotRecovery({
+    ...recoveryDependencies(fixture),
+    notificationDelivery: {
+      kick(exchangeAccountId: string) {
+        kickedAccounts.push(exchangeAccountId);
+      },
+    },
+  } as unknown as RecoveryDependencies);
+
+  const ready = await recovery.verifyAndPrepareBtcRun(fixture.receipt);
+  const retried = await recovery.verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(ready.status, "READY");
+  assert.equal(retried.status, "READY");
+  const notifications = await fixture.repositories.listOperatorNotifications(ACCOUNT_ID);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.createdAt, NOW);
+  assert.deepEqual(kickedAccounts, [ACCOUNT_ID]);
+});
+
 interface FixtureOptions {
   createDeployment?: boolean;
   deploymentAccountId?: string;
@@ -1801,6 +1853,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<RecoveryFixt
       repositories: executionRepositories,
       candidatePilots: pilotRepository,
       operatorState,
+      notificationDelivery: null,
     } as const;
     return new PositionGuardPilotRecovery(dependencies);
   };
@@ -2096,6 +2149,7 @@ function recoveryDependencies(
     repositories: fixture.repositories,
     candidatePilots: fixture.candidatePilots,
     operatorState: fixture.operatorState,
+    notificationDelivery: null,
     ...overrides,
   };
 }

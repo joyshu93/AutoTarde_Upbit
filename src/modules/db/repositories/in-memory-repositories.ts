@@ -26,6 +26,7 @@ import type {
 import type {
   CandidateExecutionBindingRecord,
   OrderSubmissionRecoveryObservationRecord,
+  PositionGuardPilotDeploymentRecord,
 } from "../../../domain/pilot-types.js";
 import type {
   ExecutionRepository,
@@ -41,6 +42,12 @@ import type {
   PersistUncertainSubmissionInput,
   TelegramInboundOffsetStore,
 } from "../interfaces.js";
+import {
+  matchesCandidatePilotRollbackOperatorState,
+  validateCandidatePilotRollbackOperatorState,
+  type CandidatePilotRollbackOperatorState,
+  type InMemoryCandidatePilotRollbackAuthorityResult,
+} from "../pilot-interfaces.js";
 import {
   validateCandidateBoundOrderIntent,
   validateCandidateBoundOrderIntentRequestShape,
@@ -896,6 +903,27 @@ export class InMemoryOperatorStateStore implements OperatorStateStore {
       input.faultId,
     );
     return { ...this.state };
+  }
+
+  runWithCandidatePilotRollbackAuthority(
+    expected: CandidatePilotRollbackOperatorState,
+    operation: () => PositionGuardPilotDeploymentRecord | null,
+  ): InMemoryCandidatePilotRollbackAuthorityResult {
+    const authority = validateCandidatePilotRollbackOperatorState(expected);
+    if (!matchesCandidatePilotRollbackOperatorState(
+      this.state,
+      authority,
+      authority.exchangeAccountId,
+    )) {
+      return Object.freeze({ authorityMatched: false });
+    }
+    if (typeof operation !== "function") {
+      throw new Error("Candidate pilot rollback authority operation must be callable.");
+    }
+    return Object.freeze({
+      authorityMatched: true,
+      value: operation(),
+    });
   }
 
   async pause(reason?: string): Promise<ExecutionStateRecord> {

@@ -9,6 +9,7 @@ import type {
 } from "../domain/pilot-types.js";
 import type {
   BalanceSnapshotRecord,
+  ExecutionStateRecord,
   OperatorNotificationType,
   OrderEventRecord,
   OrderRecord,
@@ -39,6 +40,7 @@ import {
   type ExactDecimal,
 } from "../modules/execution/candidate-evidence-decimals.js";
 import { DurableTelegramReporter } from "../modules/telegram/reporter.js";
+import type { OperatorNotificationDeliveryService } from "../modules/telegram/delivery.js";
 
 export interface PositionGuardPilotRecoveryClock {
   now(): { occurredAt: string; occurredAtEpochMs: number };
@@ -128,6 +130,7 @@ interface PositionGuardPilotRecoveryDependencies extends CandidatePilotRecoveryI
   repositories: RecoveryExecutionReads;
   candidatePilots: RecoveryCandidateRepository;
   operatorState: RecoveryOperatorState;
+  notificationDelivery?: Pick<OperatorNotificationDeliveryService, "kick"> | null;
 }
 
 interface RecoveryFault extends Error {
@@ -241,7 +244,12 @@ const RECOVERY_DEPENDENCY_KEYS = [
   "repositories",
   "candidatePilots",
   "operatorState",
+  "notificationDelivery",
 ] as const;
+
+const RECOVERY_DEPENDENCY_KEYS_WITHOUT_DELIVERY = RECOVERY_DEPENDENCY_KEYS.filter(
+  (key) => key !== "notificationDelivery",
+);
 
 const QUANTITY_TOLERANCE = parseCanonicalNonNegativeDecimal(
   EXACT_CANDIDATE_QUANTITY_TOLERANCE,
@@ -359,17 +367,18 @@ export class PositionGuardPilotRecovery {
       }
 
       if (isExactCandidateStateRollbackFlat(verified.state)) {
-        await this.assertGlobalRollbackPause();
+        const expectedOperatorState = rollbackOperatorState(await this.assertGlobalRollbackPause());
         const disabled = await this.dependencies.candidatePilots.completeRollback({
           deploymentId: deployment.id,
           expectedPhase: deployment.phase,
           expectedUpdatedAt: deployment.updatedAt,
           expectedStateVersion: verified.state.stateVersion,
+          expectedOperatorState,
           transitionAt: clock.occurredAt,
           transitionEpochNs: clock.epochNanoseconds,
         });
         if (!disabled) {
-          return this.blockForFault("ACTIVATION_CAS_CONFLICT", receipt, readback, clock);
+          throw rollbackControlError("Candidate rollback global pause authority changed before rollback persistence.");
         }
         await this.reportRollbackNotification("POSITION_GUARD_PILOT_ROLLBACK_COMPLETED", disabled, clock);
         return rollbackResult("DISABLED", disabled, verified.state);
@@ -390,17 +399,18 @@ export class PositionGuardPilotRecovery {
         throw recoveryFault("REPLAY_MISMATCH", `Candidate phase ${deployment.phase} cannot begin rollback.`);
       }
 
-      await this.assertGlobalRollbackPause();
+      const expectedOperatorState = rollbackOperatorState(await this.assertGlobalRollbackPause());
       const draining = await this.dependencies.candidatePilots.startRollback({
         deploymentId: deployment.id,
         expectedPhase: "ACTIVE",
         expectedUpdatedAt: deployment.updatedAt,
         expectedStateVersion: verified.state.stateVersion,
+        expectedOperatorState,
         transitionAt: clock.occurredAt,
         transitionEpochNs: clock.epochNanoseconds,
       });
       if (!draining) {
-        return this.blockForFault("ACTIVATION_CAS_CONFLICT", receipt, readback, clock);
+        throw rollbackControlError("Candidate rollback global pause authority changed before rollback persistence.");
       }
       await this.reportRollbackNotification("POSITION_GUARD_PILOT_ROLLBACK_STARTED", draining, clock);
       return rollbackResult("DRAINING", draining, verified.state);
@@ -432,7 +442,7 @@ export class PositionGuardPilotRecovery {
     }
   }
 
-  private async assertGlobalRollbackPause(): Promise<void> {
+  private async assertGlobalRollbackPause(): Promise<ExecutionStateRecord> {
     const getState = this.dependencies.operatorState.getState;
     if (!getState) {
       throw recoveryFault("IDENTITY_MISMATCH", "Candidate rollback lost global pause read authority.");
@@ -441,6 +451,7 @@ export class PositionGuardPilotRecovery {
     if (state.systemStatus !== "PAUSED" && state.systemStatus !== "KILL_SWITCHED") {
       throw recoveryFault("IDENTITY_MISMATCH", "Candidate rollback global pause changed before persistence.");
     }
+    return state;
   }
 
   private verifyRollbackAuthority(
@@ -1556,6 +1567,9 @@ export class PositionGuardPilotRecovery {
   }): Promise<void> {
     const reporter = new DurableTelegramReporter({
       repositories: this.dependencies.repositories,
+      ...(this.dependencies.notificationDelivery
+        ? { deliveryService: this.dependencies.notificationDelivery }
+        : {}),
       now: () => input.createdAt,
     });
     try {
@@ -2523,7 +2537,12 @@ function canonicalValue(value: unknown): unknown {
 function snapshotRecoveryDependencies(
   value: PositionGuardPilotRecoveryDependencies,
 ): Readonly<PositionGuardPilotRecoveryDependencies> {
-  const record = exactOwnDataRecord(value, "candidate recovery dependencies", RECOVERY_DEPENDENCY_KEYS);
+  const hasNotificationDelivery = Object.prototype.hasOwnProperty.call(value, "notificationDelivery");
+  const record = exactOwnDataRecord(
+    value,
+    "candidate recovery dependencies",
+    hasNotificationDelivery ? RECOVERY_DEPENDENCY_KEYS : RECOVERY_DEPENDENCY_KEYS_WITHOUT_DELIVERY,
+  );
   const exchangeAccountId = requireNonEmptyString(
     record.exchangeAccountId,
     "candidate recovery exchangeAccountId",
@@ -2581,6 +2600,21 @@ function snapshotRecoveryDependencies(
       record.operatorState,
       "candidate recovery operatorState",
     ),
+    notificationDelivery: !hasNotificationDelivery || record.notificationDelivery === null
+      ? null
+      : requireObjectReference<Pick<OperatorNotificationDeliveryService, "kick">>(
+          record.notificationDelivery,
+          "candidate recovery notificationDelivery",
+        ),
+  });
+}
+
+function rollbackOperatorState(state: ExecutionStateRecord) {
+  return Object.freeze({
+    id: state.id,
+    exchangeAccountId: state.exchangeAccountId,
+    systemStatus: state.systemStatus as "PAUSED" | "KILL_SWITCHED",
+    updatedAt: state.updatedAt,
   });
 }
 
