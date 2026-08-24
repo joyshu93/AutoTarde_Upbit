@@ -82,7 +82,14 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
   ): Promise<CandidatePilotDeploymentInitializationResult> {
     return this.serializeInitialization(async () => {
       const deployment = this.validateInitialDeployment(input);
-      const existing = this.deployments.get(deployment.id) ?? [...this.deployments.values()]
+      if (deployment.phase !== "PENDING_FLAT") {
+        throw new Error("Candidate pilot deployment initialization requires PENDING_FLAT phase.");
+      }
+      const existingById = this.deployments.get(deployment.id);
+      if (existingById && !sameBootstrapIdentity(existingById, deployment)) {
+        throw new Error(`Candidate pilot deployment ${deployment.id} identity collision.`);
+      }
+      const existing = existingById ?? [...this.deployments.values()]
         .find((candidate) =>
           candidate.exchangeAccountId === deployment.exchangeAccountId && candidate.pilotId === deployment.pilotId,
         );
@@ -590,6 +597,17 @@ export class InMemoryCandidatePilotRepository implements CandidatePilotRepositor
       release();
     }
   }
+}
+
+function sameBootstrapIdentity(
+  left: PositionGuardPilotDeploymentRecord,
+  right: PositionGuardPilotDeploymentRecord,
+): boolean {
+  return left.exchangeAccountId === right.exchangeAccountId &&
+    left.pilotId === right.pilotId &&
+    left.market === right.market &&
+    left.policyId === right.policyId &&
+    left.policyVersion === right.policyVersion;
 }
 
 function isFaultPausablePhase(phase: PositionGuardPilotDeploymentRecord["phase"]): boolean {

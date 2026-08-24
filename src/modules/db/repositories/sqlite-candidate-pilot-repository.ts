@@ -175,6 +175,9 @@ export class SqliteCandidatePilotRepository implements CandidatePilotRepository 
     input: CreateCandidatePilotDeploymentInput,
   ): Promise<CandidatePilotDeploymentInitializationResult> {
     const bootstrap = prepareInitialDeployment(input);
+    if (bootstrap.deployment.phase !== "PENDING_FLAT") {
+      throw new Error("Candidate pilot deployment initialization requires PENDING_FLAT phase.");
+    }
     return withImmediateTransaction(this.db, () => {
       const existing = selectBootstrapExistingDeploymentRow(this.db, bootstrap.deployment);
       if (existing) {
@@ -792,7 +795,13 @@ function selectBootstrapExistingDeploymentRow(
   requested: PositionGuardPilotDeploymentRecord,
 ): DeploymentRow | undefined {
   const byId = selectDeploymentRow(db, requested.id);
-  if (byId) return byId;
+  if (byId) {
+    const existing = deploymentFromRow(byId);
+    if (!sameBootstrapIdentity(existing, requested)) {
+      throw new Error(`Candidate pilot deployment ${requested.id} identity collision.`);
+    }
+    return byId;
+  }
   return db.prepare(`
     SELECT id, exchange_account_id, pilot_id, market, policy_id, policy_version,
       phase, activation_at, activation_epoch_ns, created_at, updated_at
@@ -801,6 +810,17 @@ function selectBootstrapExistingDeploymentRow(
     ORDER BY created_at ASC, id ASC
     LIMIT 1
   `).get(requested.exchangeAccountId, requested.pilotId) as DeploymentRow | undefined;
+}
+
+function sameBootstrapIdentity(
+  left: PositionGuardPilotDeploymentRecord,
+  right: PositionGuardPilotDeploymentRecord,
+): boolean {
+  return left.exchangeAccountId === right.exchangeAccountId &&
+    left.pilotId === right.pilotId &&
+    left.market === right.market &&
+    left.policyId === right.policyId &&
+    left.policyVersion === right.policyVersion;
 }
 
 function bootstrapAuthorityFromDatabase(

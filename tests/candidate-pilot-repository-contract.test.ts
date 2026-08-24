@@ -135,6 +135,31 @@ export async function verifyAtomicDeploymentInitializationContract(
   assert.deepEqual(restoredAuthority(existing), restoredAuthority(created));
   assert.equal((await repository.getDeployment(differentRequestedAuthority.deployment.id)), null);
 
+  await assert.rejects(
+    () => repository.initializeDeploymentWithInitialState(
+      initialDeploymentInput(input.deployment.id, "foreign-account"),
+    ),
+    /identity|collision|exchange account/i,
+  );
+
+  const activeRepository = await create();
+  const activeInput = initialDeploymentInput("deployment-active-bootstrap-rejected");
+  const activationAt = "2026-08-21T00:00:01.000Z";
+  activeInput.deployment.phase = "ACTIVE";
+  activeInput.deployment.activationAt = activationAt;
+  activeInput.deployment.activationEpochNs = parsePositionGuardCandidateTimestamp(
+    activationAt,
+    "active bootstrap rejection",
+  );
+  await assert.rejects(
+    () => activeRepository.initializeDeploymentWithInitialState(activeInput),
+    /PENDING_FLAT/i,
+  );
+  assert.equal(
+    await activeRepository.getDeployment(activeInput.deployment.id),
+    null,
+  );
+
   const accessorInput = initialDeploymentInput("deployment-accessor-rejected", "secondary");
   const accessorId = accessorInput.deployment.id;
   Object.defineProperty(accessorInput.deployment, "id", {
