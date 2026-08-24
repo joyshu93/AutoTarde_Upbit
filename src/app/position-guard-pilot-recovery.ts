@@ -9,6 +9,7 @@ import type {
 } from "../domain/pilot-types.js";
 import type {
   BalanceSnapshotRecord,
+  OperatorNotificationType,
   OrderEventRecord,
   OrderRecord,
   PositionSnapshotRecord,
@@ -18,6 +19,7 @@ import type { ExecutionRepository, OperatorStateStore } from "../modules/db/inte
 import {
   candidateEvidenceMaterial,
   candidatePilotRecoveryFaultReason,
+  isExactCandidateStateRollbackFlat,
   validateCandidatePilotDeployment,
   type CandidateEvidenceRecord,
   type CandidatePilotRecoveryIdentity,
@@ -36,6 +38,7 @@ import {
   type ExactCandidateState,
   type ExactDecimal,
 } from "../modules/execution/candidate-evidence-decimals.js";
+import { DurableTelegramReporter } from "../modules/telegram/reporter.js";
 
 export interface PositionGuardPilotRecoveryClock {
   now(): { occurredAt: string; occurredAtEpochMs: number };
@@ -62,6 +65,16 @@ export type PositionGuardPilotRecoveryResult =
       executableAuthority: false;
     }>;
 
+export type PositionGuardPilotRollbackResult =
+  | Readonly<{
+      status: "DRAINING" | "DISABLED";
+      deployment: Readonly<PositionGuardPilotDeploymentRecord>;
+      state: Readonly<ExactCandidateState>;
+      stateVersion: number;
+      executableAuthority: false;
+    }>
+  | Extract<PositionGuardPilotRecoveryResult, { status: "BLOCKED_FAULT" }>;
+
 type RecoveryExecutionReads = Pick<
   ExecutionRepository,
   | "getLatestBalanceSnapshot"
@@ -70,6 +83,8 @@ type RecoveryExecutionReads = Pick<
   | "listOrders"
   | "listOrderEvents"
   | "listOrderSubmissionRecoveryObservations"
+  | "saveOperatorNotification"
+  | "listOperatorNotifications"
 >;
 
 type RecoveryCandidateRepository = Pick<
@@ -80,11 +95,14 @@ type RecoveryCandidateRepository = Pick<
   | "listEvidenceRecords"
   | "listAuditEvents"
   | "activateDeployment"
+  | "startRollback"
+  | "completeRollback"
   | "pauseForRecoveryFault"
 >;
 
 type RecoveryOperatorState = Pick<OperatorStateStore, "pauseForFault"> &
-  Required<Pick<OperatorStateStore, "getTransitionById">>;
+  Required<Pick<OperatorStateStore, "getTransitionById">> &
+  Partial<Pick<OperatorStateStore, "getState" | "pause">>;
 
 interface RecoveryReadback {
   resolvedDeploymentId: string | null;
@@ -114,6 +132,14 @@ interface PositionGuardPilotRecoveryDependencies extends CandidatePilotRecoveryI
 
 interface RecoveryFault extends Error {
   reasonCode: CandidatePilotRecoveryFaultReason;
+}
+
+interface RollbackControlError extends Error {
+  rollbackControlError: true;
+}
+
+interface NotificationPersistenceError extends Error {
+  notificationPersistenceError: true;
 }
 
 interface PersistenceReadFault extends Error {
@@ -244,7 +270,10 @@ export class PositionGuardPilotRecovery {
       await this.readCandidateAuthority(readback, "INITIAL_AUTHORITY_READ");
 
       const existingFault = await this.readExistingPersistedFault(readback);
-      if (existingFault) return existingFault;
+      if (existingFault) {
+        await this.reportFaultNotification(existingFault, readback, clock.occurredAt);
+        return existingFault;
+      }
 
       const verified = this.verifyReadyAuthority(readback, receipt, clock.epochNanoseconds);
 
@@ -252,15 +281,319 @@ export class PositionGuardPilotRecovery {
         if (!withinTolerance(verified.inventory.balanceQuantity, zeroDecimal())) {
           return await this.confirmStableReady(readback, receipt, clock);
         }
-        return await this.activatePendingFlat(readback, verified.state, receipt, clock);
+        const activated = await this.activatePendingFlat(readback, verified.state, receipt, clock);
+        await this.reportActivationNotification(activated);
+        return activated;
       }
-      return await this.confirmStableReady(readback, receipt, clock);
+      const ready = await this.confirmStableReady(readback, receipt, clock);
+      await this.reportActivationNotification(ready);
+      return ready;
     } catch (error) {
+      if (isNotificationPersistenceError(error)) throw error;
       if (isPersistenceReadFault(error)) {
         return this.blockForReadFailure(error, receipt, readback, clock);
       }
       const fault = asRecoveryFault(error);
       return this.blockForFault(fault.reasonCode, receipt, readback, clock);
+    }
+  }
+
+  async requestRollback(
+    refreshReceipt: PositionGuardPilotRefreshReceipt,
+  ): Promise<PositionGuardPilotRollbackResult> {
+    return this.transitionRollback(refreshReceipt, "REQUEST");
+  }
+
+  async completeRollback(
+    refreshReceipt: PositionGuardPilotRefreshReceipt,
+  ): Promise<PositionGuardPilotRollbackResult> {
+    return this.transitionRollback(refreshReceipt, "COMPLETE");
+  }
+
+  private async transitionRollback(
+    refreshReceipt: PositionGuardPilotRefreshReceipt,
+    operation: "REQUEST" | "COMPLETE",
+  ): Promise<PositionGuardPilotRollbackResult> {
+    const clock = this.readClock();
+    const receipt = snapshotReceipt(refreshReceipt);
+    const readback = emptyRecoveryReadback();
+
+    await this.ensureGlobalRollbackPause();
+
+    try {
+      await this.readPersistedAccountEvidence(readback, "INITIAL_AUTHORITY_READ", null);
+      if (!hasEstablishedDeploymentIdentity(readback, this.dependencies)) {
+        return this.blockForFault("IDENTITY_MISMATCH", receipt, readback, clock);
+      }
+      await this.readCandidateAuthority(readback, "INITIAL_AUTHORITY_READ");
+
+      const existingFault = await this.readExistingPersistedFault(readback);
+      if (existingFault) {
+        await this.reportFaultNotification(existingFault, readback, clock.occurredAt);
+        return existingFault;
+      }
+
+      const verified = this.verifyRollbackAuthority(readback, receipt, clock.epochNanoseconds);
+      const deployment = readback.deployment;
+      if (!deployment) {
+        throw recoveryFault("IDENTITY_MISMATCH", "Configured candidate deployment is missing.");
+      }
+
+      if (deployment.phase === "DISABLED") {
+        await this.reportRollbackNotification("POSITION_GUARD_PILOT_ROLLBACK_COMPLETED", deployment, {
+          occurredAt: deployment.updatedAt,
+          epochNanoseconds: parseTimestamp(
+            deployment.updatedAt,
+            "candidate rollback completedAt",
+            "IDENTITY_MISMATCH",
+          ),
+        });
+        return rollbackResult("DISABLED", deployment, verified.state);
+      }
+
+      if (operation === "COMPLETE" && deployment.phase !== "DRAINING") {
+        throw rollbackControlError("completeRollback requires an existing DRAINING deployment.");
+      }
+      if (operation === "COMPLETE" && !isExactCandidateStateRollbackFlat(verified.state)) {
+        throw rollbackControlError("completeRollback requires exact-flat DRAINING authority.");
+      }
+
+      if (isExactCandidateStateRollbackFlat(verified.state)) {
+        await this.assertGlobalRollbackPause();
+        const disabled = await this.dependencies.candidatePilots.completeRollback({
+          deploymentId: deployment.id,
+          expectedPhase: deployment.phase,
+          expectedUpdatedAt: deployment.updatedAt,
+          expectedStateVersion: verified.state.stateVersion,
+          transitionAt: clock.occurredAt,
+          transitionEpochNs: clock.epochNanoseconds,
+        });
+        if (!disabled) {
+          return this.blockForFault("ACTIVATION_CAS_CONFLICT", receipt, readback, clock);
+        }
+        await this.reportRollbackNotification("POSITION_GUARD_PILOT_ROLLBACK_COMPLETED", disabled, clock);
+        return rollbackResult("DISABLED", disabled, verified.state);
+      }
+
+      if (deployment.phase === "DRAINING") {
+        await this.reportRollbackNotification("POSITION_GUARD_PILOT_ROLLBACK_STARTED", deployment, {
+          occurredAt: deployment.updatedAt,
+          epochNanoseconds: parseTimestamp(
+            deployment.updatedAt,
+            "candidate rollback transitionAt",
+            "IDENTITY_MISMATCH",
+          ),
+        });
+        return rollbackResult("DRAINING", deployment, verified.state);
+      }
+      if (deployment.phase !== "ACTIVE") {
+        throw recoveryFault("REPLAY_MISMATCH", `Candidate phase ${deployment.phase} cannot begin rollback.`);
+      }
+
+      await this.assertGlobalRollbackPause();
+      const draining = await this.dependencies.candidatePilots.startRollback({
+        deploymentId: deployment.id,
+        expectedPhase: "ACTIVE",
+        expectedUpdatedAt: deployment.updatedAt,
+        expectedStateVersion: verified.state.stateVersion,
+        transitionAt: clock.occurredAt,
+        transitionEpochNs: clock.epochNanoseconds,
+      });
+      if (!draining) {
+        return this.blockForFault("ACTIVATION_CAS_CONFLICT", receipt, readback, clock);
+      }
+      await this.reportRollbackNotification("POSITION_GUARD_PILOT_ROLLBACK_STARTED", draining, clock);
+      return rollbackResult("DRAINING", draining, verified.state);
+    } catch (error) {
+      if (isRollbackControlError(error) || isNotificationPersistenceError(error)) throw error;
+      if (isPersistenceReadFault(error)) {
+        return this.blockForReadFailure(error, receipt, readback, clock);
+      }
+      const fault = asRecoveryFault(error);
+      return this.blockForFault(fault.reasonCode, receipt, readback, clock);
+    }
+  }
+
+  private async ensureGlobalRollbackPause(): Promise<void> {
+    const getState = this.dependencies.operatorState.getState;
+    const pause = this.dependencies.operatorState.pause;
+    if (!getState || !pause) {
+      throw new Error("Candidate rollback requires global operator pause authority.");
+    }
+    const current = await getState.call(this.dependencies.operatorState);
+    if (current.systemStatus === "PAUSED" || current.systemStatus === "KILL_SWITCHED") return;
+
+    const paused = await pause.call(
+      this.dependencies.operatorState,
+      "position_guard_pilot_rollback_requested",
+    );
+    if (paused.systemStatus !== "PAUSED" && paused.systemStatus !== "KILL_SWITCHED") {
+      throw new Error("Candidate rollback could not establish a global execution pause.");
+    }
+  }
+
+  private async assertGlobalRollbackPause(): Promise<void> {
+    const getState = this.dependencies.operatorState.getState;
+    if (!getState) {
+      throw recoveryFault("IDENTITY_MISMATCH", "Candidate rollback lost global pause read authority.");
+    }
+    const state = await getState.call(this.dependencies.operatorState);
+    if (state.systemStatus !== "PAUSED" && state.systemStatus !== "KILL_SWITCHED") {
+      throw recoveryFault("IDENTITY_MISMATCH", "Candidate rollback global pause changed before persistence.");
+    }
+  }
+
+  private verifyRollbackAuthority(
+    readback: RecoveryReadback,
+    receipt: Readonly<PositionGuardPilotRefreshReceipt>,
+    nowEpochNanoseconds: bigint,
+  ): {
+    state: Readonly<ExactCandidateState>;
+    inventory: { balanceQuantity: ExactDecimal; positionQuantity: ExactDecimal };
+  } {
+    if (!hasEstablishedDeploymentIdentity(readback, this.dependencies)) {
+      throw recoveryFault("IDENTITY_MISMATCH", "Configured candidate deployment is missing.");
+    }
+    this.verifyDeploymentIdentity(readback, nowEpochNanoseconds);
+    this.verifyRefreshCorrelation(receipt, readback, nowEpochNanoseconds);
+    this.verifyReconciliation(receipt, readback.reconciliationRun, nowEpochNanoseconds);
+    this.verifyAuditAuthority(readback.deployment, readback.auditEvents, nowEpochNanoseconds);
+    this.verifyOrders(readback, nowEpochNanoseconds);
+    const state = this.verifyEvidenceAndState(readback, nowEpochNanoseconds);
+    const inventory = this.readInventory(readback.balanceSnapshot, readback.positionSnapshot);
+    this.verifyExchangeInventoryAgreement(inventory.balanceQuantity, inventory.positionQuantity);
+
+    switch (readback.deployment.phase) {
+      case "PENDING_FLAT":
+        this.verifyPendingFlatState(state, readback.evidenceRecords);
+        break;
+      case "ACTIVE":
+        this.verifyActiveChronology(
+          readback.deployment,
+          readback.evidenceRecords,
+          readback.auditEvents,
+          state,
+          nowEpochNanoseconds,
+        );
+        this.verifyReplayInventoryAgreement(
+          state.currentEpisodeInventoryQuantity,
+          inventory.balanceQuantity,
+          inventory.positionQuantity,
+        );
+        break;
+      case "DRAINING":
+        this.verifyDrainingChronology(readback.deployment, readback.evidenceRecords, readback.auditEvents, state);
+        this.verifyReplayInventoryAgreement(
+          state.currentEpisodeInventoryQuantity,
+          inventory.balanceQuantity,
+          inventory.positionQuantity,
+        );
+        break;
+      case "DISABLED":
+        this.verifyDisabledRollback(readback.deployment, readback.auditEvents, state);
+        this.verifyReplayInventoryAgreement(
+          state.currentEpisodeInventoryQuantity,
+          inventory.balanceQuantity,
+          inventory.positionQuantity,
+        );
+        break;
+      default:
+        throw recoveryFault(
+          "IDENTITY_MISMATCH",
+          `Candidate phase ${readback.deployment.phase} is not rollback-authoritative.`,
+        );
+    }
+    return { state, inventory };
+  }
+
+  private verifyDrainingChronology(
+    deployment: PositionGuardPilotDeploymentRecord,
+    evidenceRecords: Array<Readonly<CandidateEvidenceRecord>>,
+    auditEvents: PositionGuardPilotAuditEventRecord[],
+    state: Readonly<ExactCandidateState>,
+  ): void {
+    if (deployment.activationAt === null || deployment.activationEpochNs === null) {
+      throw recoveryFault("IDENTITY_MISMATCH", "DRAINING deployment has no persisted activation instant.");
+    }
+    const rollbackEvents = auditEvents.filter((event) => event.eventType === "ROLLBACK_STARTED");
+    const completedEvents = auditEvents.filter((event) => event.eventType === "ROLLBACK_COMPLETED");
+    if (rollbackEvents.length !== 1 || completedEvents.length !== 0) {
+      throw recoveryFault("IDENTITY_MISMATCH", "DRAINING requires one rollback-start audit and no completion.");
+    }
+    const rollback = rollbackEvents[0]!;
+    const rollbackAt = parseTimestamp(rollback.createdAt, "rollback startedAt", "IDENTITY_MISMATCH");
+    if (
+      rollback.id !== `${deployment.id}:rollback_started:${rollbackAt.toString()}` ||
+      rollback.deploymentId !== deployment.id ||
+      rollback.eventType !== "ROLLBACK_STARTED" ||
+      rollback.fromPhase !== "ACTIVE" ||
+      rollback.toPhase !== "DRAINING" ||
+      rollback.createdAt !== deployment.updatedAt ||
+      !Number.isSafeInteger(rollback.stateVersion) ||
+      rollback.stateVersion < 0 ||
+      rollback.stateVersion > evidenceRecords.length
+    ) {
+      throw recoveryFault("IDENTITY_MISMATCH", "DRAINING rollback-start audit is invalid.");
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(rollback.payloadJson) as unknown;
+    } catch {
+      throw recoveryFault("IDENTITY_MISMATCH", "DRAINING rollback-start payload is malformed.");
+    }
+    if (!isPlainRecord(payload) || !hasExactOwnKeys(payload, ["transitionAt"]) ||
+      payload.transitionAt !== rollback.createdAt) {
+      throw recoveryFault("IDENTITY_MISMATCH", "DRAINING rollback-start payload is invalid.");
+    }
+
+    const stateEvents = auditEvents.filter((event) => event.eventType === "STATE_ADVANCED");
+    if (stateEvents.length !== evidenceRecords.length || state.stateVersion !== evidenceRecords.length) {
+      throw recoveryFault("REPLAY_MISMATCH", "DRAINING evidence and audit counts do not match.");
+    }
+    for (const [index, record] of evidenceRecords.entries()) {
+      const phase = index < rollback.stateVersion ? "ACTIVE" : "DRAINING";
+      if (phase === "DRAINING" && record.evidence.action !== "REDUCE" && record.evidence.action !== "EXIT") {
+        throw recoveryFault("REPLAY_MISMATCH", "DRAINING evidence must be REDUCE or EXIT.");
+      }
+      const event = stateEvents[index];
+      if (!event || event.id !== `${deployment.id}:evidence:${record.evidence.evidenceId}` ||
+        event.fromPhase !== phase || event.toPhase !== phase || event.stateVersion !== index + 1 ||
+        event.createdAt !== record.evidence.executedAt) {
+        throw recoveryFault("REPLAY_MISMATCH", "DRAINING evidence audit chain is invalid.");
+      }
+      const evidenceAt = parseTimestamp(record.evidence.executedAt, "candidate evidence executedAt", "REPLAY_MISMATCH");
+      if ((index < rollback.stateVersion && evidenceAt > rollbackAt) ||
+        (index >= rollback.stateVersion && evidenceAt < rollbackAt)) {
+        throw recoveryFault("REPLAY_MISMATCH", "DRAINING evidence crosses the rollback boundary.");
+      }
+    }
+  }
+
+  private verifyDisabledRollback(
+    deployment: PositionGuardPilotDeploymentRecord,
+    auditEvents: PositionGuardPilotAuditEventRecord[],
+    state: Readonly<ExactCandidateState>,
+  ): void {
+    if (!isExactCandidateStateRollbackFlat(state)) {
+      throw recoveryFault("REPLAY_MISMATCH", "DISABLED rollback authority must be exactly flat.");
+    }
+    const completions = auditEvents.filter((event) => event.eventType === "ROLLBACK_COMPLETED");
+    if (completions.length !== 1) {
+      throw recoveryFault("IDENTITY_MISMATCH", "DISABLED rollback authority requires one completion audit.");
+    }
+    const completion = completions[0]!;
+    const completedAt = parseTimestamp(completion.createdAt, "rollback completedAt", "IDENTITY_MISMATCH");
+    if (
+      completion.id !== `${deployment.id}:rollback_completed:${completedAt.toString()}` ||
+      completion.deploymentId !== deployment.id ||
+      completion.toPhase !== "DISABLED" ||
+      completion.createdAt !== deployment.updatedAt ||
+      completion.stateVersion !== state.stateVersion ||
+      (completion.fromPhase !== "PENDING_FLAT" &&
+        completion.fromPhase !== "ACTIVE" &&
+        completion.fromPhase !== "DRAINING")
+    ) {
+      throw recoveryFault("IDENTITY_MISMATCH", "DISABLED rollback completion audit is invalid.");
     }
   }
 
@@ -1050,7 +1383,7 @@ export class PositionGuardPilotRecovery {
     readback: RecoveryReadback,
     clock: { occurredAt: string; epochNanoseconds: bigint },
     _cause?: unknown,
-  ): Promise<PositionGuardPilotRecoveryResult> {
+  ): Promise<Extract<PositionGuardPilotRecoveryResult, { status: "BLOCKED_FAULT" }>> {
     const provenanceJson = buildFaultProvenanceJson({
       reasonCode,
       configured: this.dependencies,
@@ -1065,7 +1398,7 @@ export class PositionGuardPilotRecovery {
     receipt: Readonly<PositionGuardPilotRefreshReceipt>,
     readback: RecoveryReadback,
     clock: { occurredAt: string; epochNanoseconds: bigint },
-  ): Promise<PositionGuardPilotRecoveryResult> {
+  ): Promise<Extract<PositionGuardPilotRecoveryResult, { status: "BLOCKED_FAULT" }>> {
     const reasonCode = "SNAPSHOT_PROVENANCE_INVALID" as const;
     const provenanceJson = buildReadFailureProvenanceJson({
       reasonCode,
@@ -1084,7 +1417,7 @@ export class PositionGuardPilotRecovery {
     provenanceJson: string,
     readback: RecoveryReadback,
     clock: { occurredAt: string; epochNanoseconds: bigint },
-  ): Promise<PositionGuardPilotRecoveryResult> {
+  ): Promise<Extract<PositionGuardPilotRecoveryResult, { status: "BLOCKED_FAULT" }>> {
     const faultId = `candidate-pilot-recovery:${createHash("sha256")
       .update(`${reasonCode}\n${provenanceJson}`, "utf8")
       .digest("hex")}`;
@@ -1107,6 +1440,7 @@ export class PositionGuardPilotRecovery {
       } else if (readback.deployment.phase === "PAUSED_FAULT") {
         fault.occurredAt = readback.deployment.updatedAt;
       }
+      occurredAt = fault.occurredAt;
       const persisted = await this.dependencies.candidatePilots.pauseForRecoveryFault(fault);
       if (persisted.auditEvent.id !== faultId || persisted.deployment.phase !== "PAUSED_FAULT") {
         throw new Error("Candidate recovery fault pause did not persist the expected atomic authority.");
@@ -1128,17 +1462,120 @@ export class PositionGuardPilotRecovery {
       });
     }
 
-    return deepFreeze({
+    const result = deepFreeze({
       status: "BLOCKED_FAULT" as const,
       reasonCode,
       faultId,
       executableAuthority: false as const,
     });
+    await this.reportFaultNotification(result, readback, occurredAt);
+    return result;
+  }
+
+  private async reportActivationNotification(result: PositionGuardPilotRecoveryResult): Promise<void> {
+    if (result.status !== "READY" || result.phase !== "ACTIVE" || result.activation === null) return;
+    await this.reportPilotNotification({
+      notificationType: "POSITION_GUARD_PILOT_ACTIVATED",
+      severity: "INFO",
+      eventIdentity: `${result.deployment.id}:activation:${result.activation.activationEpochNs.toString()}`,
+      createdAt: result.activation.activationAt,
+      title: "Candidate pilot activated",
+      message: "The BTC candidate pilot entered ACTIVE after persisted recovery verification.",
+      payload: {
+        deploymentId: result.deployment.id,
+        phase: result.phase,
+        activationAt: result.activation.activationAt,
+        activationEpochNs: result.activation.activationEpochNs.toString(),
+      },
+    });
+  }
+
+  private async reportFaultNotification(
+    result: Extract<PositionGuardPilotRecoveryResult, { status: "BLOCKED_FAULT" }>,
+    readback: RecoveryReadback,
+    fallbackCreatedAt: string,
+  ): Promise<void> {
+    const audit = readback.auditEvents.find((event) => event.id === result.faultId);
+    const notificationType = result.reasonCode === "UNCERTAIN_ORDER"
+      ? "POSITION_GUARD_PILOT_UNCERTAIN_SUBMISSION"
+      : "POSITION_GUARD_PILOT_FAULT_PAUSED";
+    await this.reportPilotNotification({
+      notificationType,
+      severity: "ERROR",
+      eventIdentity: result.faultId,
+      createdAt: audit?.createdAt ?? fallbackCreatedAt,
+      title: result.reasonCode === "UNCERTAIN_ORDER"
+        ? "Candidate order submission is uncertain"
+        : "Candidate pilot paused for recovery fault",
+      message: result.reasonCode === "UNCERTAIN_ORDER"
+        ? "Candidate authority is paused because persisted order evidence is uncertain."
+        : `Candidate authority is paused for recovery fault ${result.reasonCode}.`,
+      payload: {
+        deploymentId: readback.resolvedDeploymentId,
+        faultId: result.faultId,
+        reasonCode: result.reasonCode,
+        executableAuthority: false,
+      },
+    });
+  }
+
+  private async reportRollbackNotification(
+    notificationType:
+      | "POSITION_GUARD_PILOT_ROLLBACK_STARTED"
+      | "POSITION_GUARD_PILOT_ROLLBACK_COMPLETED",
+    deployment: PositionGuardPilotDeploymentRecord,
+    clock: { occurredAt: string; epochNanoseconds: bigint },
+  ): Promise<void> {
+    const started = notificationType === "POSITION_GUARD_PILOT_ROLLBACK_STARTED";
+    await this.reportPilotNotification({
+      notificationType,
+      severity: started ? "WARN" : "INFO",
+      eventIdentity: `${deployment.id}:${started ? "rollback_started" : "rollback_completed"}:${clock.epochNanoseconds.toString()}`,
+      createdAt: clock.occurredAt,
+      title: started ? "Candidate pilot rollback started" : "Candidate pilot rollback completed",
+      message: started
+        ? "The BTC candidate pilot entered DRAINING; only reduction or exit authority remains."
+        : "The BTC candidate pilot is flat and DISABLED; global execution remains paused.",
+      payload: {
+        deploymentId: deployment.id,
+        phase: deployment.phase,
+        transitionAt: clock.occurredAt,
+        transitionEpochNs: clock.epochNanoseconds.toString(),
+      },
+    });
+  }
+
+  private async reportPilotNotification(input: {
+    notificationType: OperatorNotificationType;
+    severity: "INFO" | "WARN" | "ERROR";
+    eventIdentity: string;
+    createdAt: string;
+    title: string;
+    message: string;
+    payload: Record<string, unknown>;
+  }): Promise<void> {
+    const reporter = new DurableTelegramReporter({
+      repositories: this.dependencies.repositories,
+      now: () => input.createdAt,
+    });
+    try {
+      await reporter.report({
+        notificationId: `operator_notification:${input.notificationType.toLowerCase()}:${input.eventIdentity}`,
+        exchangeAccountId: this.dependencies.exchangeAccountId,
+        notificationType: input.notificationType,
+        severity: input.severity,
+        title: input.title,
+        message: input.message,
+        payload: input.payload,
+      });
+    } catch (error) {
+      throw notificationPersistenceError(error);
+    }
   }
 
   private async readExistingPersistedFault(
     readback: RecoveryReadback,
-  ): Promise<PositionGuardPilotRecoveryResult | null> {
+  ): Promise<Extract<PositionGuardPilotRecoveryResult, { status: "BLOCKED_FAULT" }> | null> {
     if (readback.deployment?.phase !== "PAUSED_FAULT") return null;
     const faultEvents = readback.auditEvents
       .filter((event) => event.eventType === "FAULT_PAUSED")
@@ -1185,6 +1622,23 @@ export class PositionGuardPilotRecovery {
     }
     return { ...value, epochNanoseconds };
   }
+}
+
+function rollbackResult(
+  status: "DRAINING" | "DISABLED",
+  deployment: PositionGuardPilotDeploymentRecord,
+  state: Readonly<ExactCandidateState>,
+): PositionGuardPilotRollbackResult {
+  if (deployment.phase !== status) {
+    throw new Error(`Candidate rollback result ${status} does not match phase ${deployment.phase}.`);
+  }
+  return deepFreeze({
+    status,
+    deployment: { ...deployment },
+    state: { ...state },
+    stateVersion: state.stateVersion,
+    executableAuthority: false as const,
+  });
 }
 
 function snapshotReceipt(value: PositionGuardPilotRefreshReceipt): Readonly<PositionGuardPilotRefreshReceipt> {
@@ -1929,6 +2383,26 @@ function parseTimestamp(
 
 function recoveryFault(reasonCode: CandidatePilotRecoveryFaultReason, message: string): RecoveryFault {
   return Object.assign(new Error(message), { reasonCode });
+}
+
+function rollbackControlError(message: string): RollbackControlError {
+  return Object.assign(new Error(message), { rollbackControlError: true as const });
+}
+
+function isRollbackControlError(error: unknown): error is RollbackControlError {
+  return error instanceof Error && "rollbackControlError" in error && error.rollbackControlError === true;
+}
+
+function notificationPersistenceError(cause: unknown): NotificationPersistenceError {
+  return Object.assign(new Error("candidate pilot notification persistence failed.", { cause }), {
+    notificationPersistenceError: true as const,
+  });
+}
+
+function isNotificationPersistenceError(error: unknown): error is NotificationPersistenceError {
+  return error instanceof Error &&
+    "notificationPersistenceError" in error &&
+    error.notificationPersistenceError === true;
 }
 
 function persistenceReadFault(context: PersistenceReadContext, cause: unknown): PersistenceReadFault {

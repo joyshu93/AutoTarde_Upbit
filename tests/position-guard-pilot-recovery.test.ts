@@ -1421,6 +1421,254 @@ test("successful recovery never resumes a pre-existing operator pause", async ()
   assert.deepEqual(await fixture.operatorState.listTransitions(100), beforeTransitions);
 });
 
+test("flat rollback globally pauses before atomically returning the candidate to DISABLED", async () => {
+  const fixture = await createFixture({ phase: "ACTIVE" });
+
+  const result = await fixture.recovery.requestRollback(fixture.receipt);
+
+  assert.equal(result.status, "DISABLED");
+  assert.equal(result.deployment.phase, "DISABLED");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  const audits = await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  assert.equal(audits.filter((event) => event.eventType === "ROLLBACK_COMPLETED").length, 1);
+  const notifications = await fixture.repositories.listOperatorNotifications(ACCOUNT_ID);
+  assert.deepEqual(
+    notifications.map((notification) => notification.notificationType),
+    ["POSITION_GUARD_PILOT_ROLLBACK_COMPLETED"],
+  );
+});
+
+test("non-flat rollback enters DRAINING and retries do not duplicate audit or notification evidence", async () => {
+  const fixture = await createFixture({
+    phase: "ACTIVE",
+    evidenceQuantity: "0.1",
+    balanceFree: "0.1",
+    positionQuantity: "0.1",
+  });
+
+  const first = await fixture.recovery.requestRollback(fixture.receipt);
+  const retried = await fixture.recovery.requestRollback(fixture.receipt);
+
+  assert.equal(first.status, "DRAINING");
+  assert.equal(retried.status, "DRAINING");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  const audits = await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  assert.equal(audits.filter((event) => event.eventType === "ROLLBACK_STARTED").length, 1);
+  const notifications = await fixture.repositories.listOperatorNotifications(ACCOUNT_ID);
+  assert.equal(
+    notifications.filter((notification) =>
+      notification.notificationType === "POSITION_GUARD_PILOT_ROLLBACK_STARTED").length,
+    1,
+  );
+});
+
+test("completeRollback on ACTIVE non-flat authority never starts rollback or mutates pilot state", async () => {
+  const fixture = await createFixture({
+    phase: "ACTIVE",
+    evidenceQuantity: "0.1",
+    balanceFree: "0.1",
+    positionQuantity: "0.1",
+  });
+  const beforeDeployment = await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID);
+  const beforeAudits = await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+
+  await assert.rejects(
+    fixture.recovery.completeRollback(fixture.receipt),
+    /completeRollback requires an existing DRAINING deployment/u,
+  );
+
+  assert.deepEqual(await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID), beforeDeployment);
+  assert.deepEqual(await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID), beforeAudits);
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("rollback revalidates the global pause immediately before candidate repository mutation", async () => {
+  const fixture = await createFixture({
+    phase: "ACTIVE",
+    evidenceQuantity: "0.1",
+    balanceFree: "0.1",
+    positionQuantity: "0.1",
+  });
+  const originalGetState = fixture.operatorState.getState.bind(fixture.operatorState);
+  let getStateCount = 0;
+  fixture.operatorState.getState = async () => {
+    getStateCount += 1;
+    const state = await originalGetState();
+    return getStateCount >= 2 ? { ...state, systemStatus: "RUNNING", pauseReason: null } : state;
+  };
+  fixture.operatorState.pause = async () => ({
+    ...(await originalGetState()),
+    systemStatus: "PAUSED",
+    pauseReason: "position_guard_pilot_rollback_requested",
+  });
+  let startCalls = 0;
+  let completeCalls = 0;
+  const candidatePilots = overrideCandidatePilots(fixture.candidatePilots, {
+    startRollback: async (input) => {
+      startCalls += 1;
+      return fixture.candidatePilots.startRollback(input);
+    },
+    completeRollback: async (input) => {
+      completeCalls += 1;
+      return fixture.candidatePilots.completeRollback(input);
+    },
+  });
+  const recovery = fixture.createRecovery(candidatePilots);
+
+  const result = await recovery.requestRollback(fixture.receipt);
+
+  assert.equal(result.status, "BLOCKED_FAULT");
+  assert.equal(startCalls, 0);
+  assert.equal(completeCalls, 0);
+});
+
+test("DRAINING rollback completes only after exact flat exit evidence and remains globally paused", async () => {
+  const fixture = await createFixture({
+    phase: "ACTIVE",
+    evidenceQuantity: "0.1",
+    balanceFree: "0.1",
+    positionQuantity: "0.1",
+  });
+  const started = await fixture.recovery.requestRollback(fixture.receipt);
+  assert.equal(started.status, "DRAINING");
+  await fixture.candidatePilots.advanceStateWithEvidence({
+    deploymentId: DEPLOYMENT_ID,
+    expectedStateVersion: 1,
+    evidence: {
+      evidenceId: "evidence-exit-rollback",
+      executedAt: "2026-08-21T00:01:10.000Z",
+      action: "EXIT",
+      entryPath: "NONE",
+      terminalStatus: "FILLED",
+      executedQuantity: "0.1",
+      grossQuoteValueKrw: "10000000",
+      confirmedFeeKrw: "5000",
+      remainingQuantity: "0",
+    },
+  });
+  const flatSnapshotAt = "2026-08-21T00:01:20.000Z";
+  const flatCompletedAt = "2026-08-21T00:01:21.000Z";
+  await fixture.repositories.saveBalanceSnapshot(balanceSnapshot({
+    id: "balance-rollback-flat",
+    capturedAt: flatSnapshotAt,
+    balanceFree: "0",
+  }));
+  await fixture.repositories.savePositionSnapshot({
+    ...positionSnapshot({ capturedAt: flatSnapshotAt, quantity: "0" }),
+    id: "position-rollback-flat",
+  });
+  await fixture.repositories.saveReconciliationRun({
+    ...reconciliationRun({ startedAt: flatSnapshotAt, completedAt: flatCompletedAt }),
+    id: "reconciliation-rollback-flat",
+  });
+  const flatReceipt: PositionGuardPilotRefreshReceipt = {
+    exchangeAccountId: ACCOUNT_ID,
+    requestedAt: flatSnapshotAt,
+    balanceSnapshotId: "balance-rollback-flat",
+    balanceCapturedAt: flatSnapshotAt,
+    positionSnapshotId: "position-rollback-flat",
+    positionCapturedAt: flatSnapshotAt,
+    reconciliationRunId: "reconciliation-rollback-flat",
+    reconciliationStartedAt: flatSnapshotAt,
+    reconciliationCompletedAt: flatCompletedAt,
+    reconciliationSource: "SCHEDULER_PREFLIGHT",
+  };
+
+  const completed = await fixture.createRecovery(
+    undefined,
+    undefined,
+    undefined,
+    "2026-08-21T00:01:30.000Z",
+  ).completeRollback(flatReceipt);
+
+  assert.equal(completed.status, "DISABLED");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  const audits = await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  assert.deepEqual(
+    audits.filter((event) => event.eventType.startsWith("ROLLBACK_"))
+      .map((event) => event.eventType),
+    ["ROLLBACK_STARTED", "ROLLBACK_COMPLETED"],
+  );
+});
+
+test("DISABLED retry repairs a rollback-completed notification after post-commit persistence failure", async () => {
+  const fixture = await createFixture({ phase: "ACTIVE" });
+  const failingRepositories = overrideExecutionRepositories(fixture.repositories, {
+    async saveOperatorNotification(record) {
+      if (record.notificationType === "POSITION_GUARD_PILOT_ROLLBACK_COMPLETED") {
+        throw new Error("simulated notification persistence failure");
+      }
+      return fixture.repositories.saveOperatorNotification(record);
+    },
+  });
+
+  await assert.rejects(
+    fixture.createRecovery(undefined, failingRepositories).requestRollback(fixture.receipt),
+    /candidate pilot notification persistence failed/u,
+  );
+  assert.equal((await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "DISABLED");
+
+  const retried = await fixture.createRecovery().requestRollback(fixture.receipt);
+
+  assert.equal(retried.status, "DISABLED");
+  assert.equal(
+    (await fixture.repositories.listOperatorNotifications(ACCOUNT_ID))
+      .filter((notification) =>
+        notification.notificationType === "POSITION_GUARD_PILOT_ROLLBACK_COMPLETED").length,
+    1,
+  );
+});
+
+test("rollback with an uncertain order fails closed and never claims completion", async () => {
+  const fixture = await createFixture({ phase: "ACTIVE" });
+  await fixture.repositories.saveOrder(orderRecord({
+    id: "order-uncertain-rollback",
+    status: "RECONCILIATION_REQUIRED",
+  }));
+
+  const result = await fixture.recovery.requestRollback(fixture.receipt);
+
+  assert.equal(result.status, "BLOCKED_FAULT");
+  if (result.status !== "BLOCKED_FAULT") return;
+  assert.equal(result.reasonCode, "UNCERTAIN_ORDER");
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  assert.equal((await fixture.candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "PAUSED_FAULT");
+  const audits = await fixture.candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  assert.equal(audits.filter((event) => event.eventType === "ROLLBACK_COMPLETED").length, 0);
+  const notifications = await fixture.repositories.listOperatorNotifications(ACCOUNT_ID);
+  assert.deepEqual(
+    notifications.map((notification) => notification.notificationType),
+    ["POSITION_GUARD_PILOT_UNCERTAIN_SUBMISSION"],
+  );
+});
+
+test("candidate activation and recovery fault notifications are durable and idempotent", async () => {
+  const activated = await createFixture();
+
+  const ready = await activated.recovery.verifyAndPrepareBtcRun(activated.receipt);
+  const readyRetry = await activated.recovery.verifyAndPrepareBtcRun(activated.receipt);
+
+  assert.equal(ready.status, "READY");
+  assert.equal(readyRetry.status, "READY");
+  assert.deepEqual(
+    (await activated.repositories.listOperatorNotifications(ACCOUNT_ID))
+      .map((notification) => notification.notificationType),
+    ["POSITION_GUARD_PILOT_ACTIVATED"],
+  );
+
+  const faulted = await createFixture({ snapshotAt: "2026-08-20T23:00:00.000Z" });
+  const fault = await faulted.recovery.verifyAndPrepareBtcRun(faulted.receipt);
+  const faultRetry = await faulted.recovery.verifyAndPrepareBtcRun(faulted.receipt);
+
+  assert.equal(fault.status, "BLOCKED_FAULT");
+  assert.equal(faultRetry.status, "BLOCKED_FAULT");
+  assert.deepEqual(
+    (await faulted.repositories.listOperatorNotifications(ACCOUNT_ID))
+      .map((notification) => notification.notificationType),
+    ["POSITION_GUARD_PILOT_FAULT_PAUSED"],
+  );
+});
+
 interface FixtureOptions {
   createDeployment?: boolean;
   deploymentAccountId?: string;

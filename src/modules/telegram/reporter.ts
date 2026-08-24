@@ -9,6 +9,7 @@ import type { OperatorNotificationDeliveryService } from "./delivery.js";
 
 export interface OperatorNotificationReporter {
   report(input: {
+    notificationId?: string;
     exchangeAccountId: string;
     notificationType: OperatorNotificationType;
     severity: OperatorNotificationSeverity;
@@ -21,13 +22,15 @@ export interface OperatorNotificationReporter {
 export class DurableTelegramReporter implements OperatorNotificationReporter {
   constructor(
     private readonly dependencies: {
-      repositories: Pick<ExecutionRepository, "saveOperatorNotification">;
+      repositories: Pick<ExecutionRepository, "saveOperatorNotification"> &
+        Partial<Pick<ExecutionRepository, "listOperatorNotifications">>;
       deliveryService?: Pick<OperatorNotificationDeliveryService, "kick">;
       now?: () => string;
     },
   ) {}
 
   async report(input: {
+    notificationId?: string;
     exchangeAccountId: string;
     notificationType: OperatorNotificationType;
     severity: OperatorNotificationSeverity;
@@ -37,7 +40,7 @@ export class DurableTelegramReporter implements OperatorNotificationReporter {
   }): Promise<void> {
     const createdAt = this.dependencies.now?.() ?? new Date().toISOString();
     const record: OperatorNotificationRecord = {
-      id: createId("operator_notification"),
+      id: input.notificationId ?? createId("operator_notification"),
       exchangeAccountId: input.exchangeAccountId,
       channel: "TELEGRAM",
       notificationType: input.notificationType,
@@ -57,7 +60,52 @@ export class DurableTelegramReporter implements OperatorNotificationReporter {
       lastError: null,
     };
 
-    await this.dependencies.repositories.saveOperatorNotification(record);
+    const listNotifications = this.dependencies.repositories.listOperatorNotifications;
+    if (input.notificationId) {
+      if (!listNotifications) {
+        throw new Error("Deterministic operator notifications require persisted notification readback.");
+      }
+      const existing = (await listNotifications.call(
+        this.dependencies.repositories,
+        input.exchangeAccountId,
+      ))
+        .find((candidate) => candidate.id === input.notificationId);
+      if (existing) {
+        assertSameNotificationMaterial(existing, record);
+        return;
+      }
+    }
+
+    try {
+      await this.dependencies.repositories.saveOperatorNotification(record);
+    } catch (error) {
+      if (!input.notificationId || !listNotifications) throw error;
+      const existing = (await listNotifications.call(
+        this.dependencies.repositories,
+        input.exchangeAccountId,
+      )).find((candidate) => candidate.id === input.notificationId);
+      if (!existing) throw error;
+      assertSameNotificationMaterial(existing, record);
+      return;
+    }
     this.dependencies.deliveryService?.kick(input.exchangeAccountId);
+  }
+}
+
+function assertSameNotificationMaterial(
+  existing: OperatorNotificationRecord,
+  expected: OperatorNotificationRecord,
+): void {
+  if (
+    existing.exchangeAccountId !== expected.exchangeAccountId ||
+    existing.channel !== expected.channel ||
+    existing.notificationType !== expected.notificationType ||
+    existing.severity !== expected.severity ||
+    existing.title !== expected.title ||
+    existing.message !== expected.message ||
+    existing.payloadJson !== expected.payloadJson ||
+    existing.createdAt !== expected.createdAt
+  ) {
+    throw new Error(`Conflicting deterministic operator notification ${expected.id}.`);
   }
 }

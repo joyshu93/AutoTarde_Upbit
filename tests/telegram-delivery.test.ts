@@ -929,6 +929,104 @@ test("durable reporter queues notifications and kicks the delivery service witho
   assert.equal(notifications[0]?.deliveredAt, null);
 });
 
+test("durable reporter persists a deterministic pilot notification only once across retries", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const kickedExchangeAccounts: string[] = [];
+  const reporter = new DurableTelegramReporter({
+    repositories,
+    deliveryService: {
+      kick(exchangeAccountId) {
+        kickedExchangeAccounts.push(exchangeAccountId);
+      },
+    },
+    now: () => "2026-08-21T00:01:00.000Z",
+  });
+  const notification = {
+    notificationId: "operator_notification:position_guard_pilot_rollback_started:deployment-1:1",
+    exchangeAccountId: "primary",
+    notificationType: "POSITION_GUARD_PILOT_ROLLBACK_STARTED" as const,
+    severity: "WARN" as const,
+    title: "Candidate pilot rollback started",
+    message: "The candidate pilot entered DRAINING.",
+    payload: {
+      deploymentId: "deployment-1",
+      phase: "DRAINING",
+    },
+  };
+
+  await reporter.report(notification);
+  await reporter.report(notification);
+
+  const notifications = await repositories.listOperatorNotifications("primary");
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0]?.id, notification.notificationId);
+  assert.equal(notifications[0]?.notificationType, "POSITION_GUARD_PILOT_ROLLBACK_STARTED");
+  assert.deepEqual(kickedExchangeAccounts, ["primary"]);
+});
+
+test("durable reporter resolves a concurrent deterministic insert race by exact immutable readback", async () => {
+  const stored = new Map<string, OperatorNotificationRecord>();
+  let saveCalls = 0;
+  const kickedExchangeAccounts: string[] = [];
+  const repositories = {
+    async listOperatorNotifications(): Promise<OperatorNotificationRecord[]> {
+      return [...stored.values()].map((record) => ({ ...record }));
+    },
+    async saveOperatorNotification(record: OperatorNotificationRecord): Promise<void> {
+      saveCalls += 1;
+      await Promise.resolve();
+      if (stored.has(record.id)) throw new Error("UNIQUE constraint failed: operator_notifications.id");
+      stored.set(record.id, { ...record });
+    },
+  };
+  const reporter = new DurableTelegramReporter({
+    repositories,
+    deliveryService: {
+      kick(exchangeAccountId) {
+        kickedExchangeAccounts.push(exchangeAccountId);
+      },
+    },
+    now: () => "2026-08-21T00:01:00.000Z",
+  });
+  const input = {
+    notificationId: "operator_notification:position_guard_pilot_activated:deployment-1:1",
+    exchangeAccountId: "primary",
+    notificationType: "POSITION_GUARD_PILOT_ACTIVATED" as const,
+    severity: "INFO" as const,
+    title: "Candidate pilot activated",
+    message: "Candidate authority is ACTIVE.",
+    payload: { deploymentId: "deployment-1" },
+  };
+
+  await Promise.all([reporter.report(input), reporter.report(input)]);
+
+  assert.equal(saveCalls, 2);
+  assert.equal(stored.get(input.notificationId)?.id, input.notificationId);
+  assert.deepEqual(kickedExchangeAccounts, ["primary"]);
+});
+
+test("nondeterministic reporter calls do not require notification listing support", async () => {
+  const saved: OperatorNotificationRecord[] = [];
+  const reporter = new DurableTelegramReporter({
+    repositories: {
+      async saveOperatorNotification(record) {
+        saved.push(record);
+      },
+    },
+    now: () => "2026-08-21T00:01:00.000Z",
+  });
+
+  await reporter.report({
+    exchangeAccountId: "primary",
+    notificationType: "ORDER_REJECTED",
+    severity: "WARN",
+    title: "Order rejected",
+    message: "Risk policy rejected the order.",
+  });
+
+  assert.equal(saved.length, 1);
+});
+
 function createTelegramClientWithResponse(rawBody: string): TelegramBotApiClient {
   return new TelegramBotApiClient({
     botToken: "token-1",
