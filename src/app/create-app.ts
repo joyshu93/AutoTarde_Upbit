@@ -2,6 +2,11 @@ import { createHash } from "node:crypto";
 import { buildExecutionRiskLimits, loadAppConfig, type AppConfig } from "./env.js";
 import { CandidateBtcRunPreparationService } from "./candidate-btc-run-preparation.js";
 import { PositionGuardPilotRecovery } from "./position-guard-pilot-recovery.js";
+import {
+  PositionGuardPilotInitializer,
+  type PositionGuardPilotInitializerClock,
+  type PositionGuardPilotInitializerRepository,
+} from "./position-guard-pilot-initializer.js";
 import { loadCheckedInPositionGuardPilotAbandonment } from "./position-guard-pilot-registry-loader.js";
 import { buildManualStrategyRunPreflight, buildStrategySchedulerStartupPreflight } from "./scheduler-preflight.js";
 import {
@@ -56,6 +61,7 @@ export interface AppServices {
   operatorState: OperatorStateStore;
   executionService: ExecutionService;
   candidateEvidenceService: CandidateExecutionEvidenceService | null;
+  candidatePilotInitializer: PositionGuardPilotInitializer | null;
   reconciliationService: ReconciliationService;
   portfolioSyncService: PortfolioSyncService;
   telegramRouter: TelegramCommandRouter;
@@ -75,6 +81,8 @@ export interface CreateAppOverrides {
   publicMarketDataReader?: PositionGuardPublicMarketDataReader;
   privateExchangeAdapter?: LiveExecutionAdapter;
   afterCandidatePilotAuthorityValidated?: (authority: PositionGuardPilotAbandonmentValidation) => void;
+  candidatePilotInitializerClock?: PositionGuardPilotInitializerClock;
+  candidatePilotInitializerRepository?: PositionGuardPilotInitializerRepository;
 }
 
 export function createApp(
@@ -103,6 +111,26 @@ export function createApp(
   });
   try {
   const { repositories, operatorState, accountExecutionLeases } = persistence;
+  const candidatePilotInitializer = candidatePolicySelection
+    ? new PositionGuardPilotInitializer({
+        identity: {
+          exchangeAccountId: "primary",
+          pilotId: candidatePolicySelection.pilotId,
+          market: candidatePolicySelection.market,
+          policyId: candidatePolicySelection.policyId,
+          policyVersion: candidatePolicySelection.policyVersion,
+        },
+        repository: overrides.candidatePilotInitializerRepository ?? {
+          initializeDeploymentWithInitialState:
+            persistence.candidatePilots.initializeDeploymentWithInitialState.bind(
+              persistence.candidatePilots,
+            ),
+        },
+        clock: overrides.candidatePilotInitializerClock ?? {
+          now: () => new Date().toISOString(),
+        },
+      })
+    : null;
 
   const strategy = new DeterministicStubStrategy();
   const liveExchangeClient = new UpbitPrivateClient({
@@ -388,6 +416,7 @@ export function createApp(
     operatorState,
     executionService,
     candidateEvidenceService,
+    candidatePilotInitializer,
     reconciliationService,
     portfolioSyncService,
     telegramRouter,

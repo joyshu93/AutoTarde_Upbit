@@ -21,6 +21,7 @@ test("createApp keeps dry-run adapter as the default live send path", async () =
   assert.equal(app.liveSendPath, "DRY_RUN_ADAPTER");
   assert.equal(app.strategyScheduler.getStatus().liveSendPath, "DRY_RUN_ADAPTER");
   assert.equal(app.telegramCommandMenuSetup.isConfigured(), false);
+  assert.equal(app.candidatePilotInitializer, null);
 
   app.persistence.close();
   await cleanupTempDatabase(databasePath);
@@ -29,6 +30,7 @@ test("createApp keeps dry-run adapter as the default live send path", async () =
 test("createApp baseline never invokes candidate authority or constructs candidate services", async () => {
   const databasePath = await createTempDatabasePath("baseline-no-candidate-graph");
   let observerCalls = 0;
+  let initializationRepositoryCalls = 0;
   let app: ReturnType<typeof createApp> | null = null;
 
   try {
@@ -39,13 +41,61 @@ test("createApp baseline never invokes candidate authority or constructs candida
           observerCalls += 1;
           throw new Error("baseline must not observe candidate authority");
         },
+        candidatePilotInitializerRepository: {
+          async initializeDeploymentWithInitialState() {
+            initializationRepositoryCalls += 1;
+            throw new Error("baseline must not initialize a candidate deployment");
+          },
+        },
       },
     );
 
     assert.equal(observerCalls, 0);
     assert.equal(app.candidateEvidenceService, null);
+    assert.equal(app.candidatePilotInitializer, null);
+    assert.equal(initializationRepositoryCalls, 0);
   } finally {
     (app as ReturnType<typeof createApp> | null)?.persistence.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("createApp exposes but does not invoke the candidate initializer", async () => {
+  const databasePath = await createTempDatabasePath("candidate-initializer-exposure");
+  let clockCalls = 0;
+  let initializationRepositoryCalls = 0;
+  let app: ReturnType<typeof createApp> | null = null;
+
+  try {
+    app = createApp(
+      createConfig({
+        databasePath,
+        executionMode: "LIVE",
+        positionGuardPolicySelection: candidatePolicySelection(),
+      }),
+      {
+        privateExchangeAdapter: createLiveExecutionAdapterFake(),
+        publicMarketDataReader: createDryRunOperatorMarketDataReader(),
+        candidatePilotInitializerClock: {
+          now() {
+            clockCalls += 1;
+            return "2026-08-24T00:00:00.000Z";
+          },
+        },
+        candidatePilotInitializerRepository: {
+          async initializeDeploymentWithInitialState() {
+            initializationRepositoryCalls += 1;
+            throw new Error("createApp must expose without initialization");
+          },
+        },
+      },
+    );
+
+    assert.notEqual(app.candidatePilotInitializer, null);
+    assert.equal(clockCalls, 0);
+    assert.equal(initializationRepositoryCalls, 0);
+  } finally {
+    app?.persistence.close();
     await cleanupTempDatabase(databasePath);
   }
 });

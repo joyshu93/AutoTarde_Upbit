@@ -1,0 +1,557 @@
+import { createHash } from "node:crypto";
+
+import type {
+  PositionGuardPilotAuditEventRecord,
+  PositionGuardPilotDeploymentRecord,
+} from "../domain/pilot-types.js";
+import {
+  candidateEvidenceMaterial,
+  parseCandidatePilotTimestamp,
+  toPositionGuardCandidateRoutingState,
+  validateCandidatePilotDeployment,
+  type CandidateEvidenceRecord,
+  type CandidatePilotDeploymentInitializationResult,
+  type CandidatePilotRecoveryIdentity,
+  type CandidatePilotRepository,
+  type CreateCandidatePilotDeploymentInput,
+} from "../modules/db/pilot-interfaces.js";
+import {
+  createExactEmptyCandidateState,
+  projectExactCandidateState,
+  type ExactCandidateState,
+} from "../modules/execution/candidate-evidence-decimals.js";
+import {
+  createEmptyPositionGuardCandidateState,
+  type PositionGuardCandidateExecutionEvidence,
+} from "../modules/strategy/position-guard-candidate-state.js";
+
+export type PositionGuardPilotInitializerIdentity = CandidatePilotRecoveryIdentity;
+
+export type PositionGuardPilotInitializerRepository = Pick<
+  CandidatePilotRepository,
+  "initializeDeploymentWithInitialState"
+>;
+
+export interface PositionGuardPilotInitializerClock {
+  now(): string;
+}
+
+export type PositionGuardPilotInitializationResult = Readonly<{
+  outcome: CandidatePilotDeploymentInitializationResult["outcome"];
+  deploymentId: string;
+  identity: Readonly<PositionGuardPilotInitializerIdentity>;
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>;
+  exactState: Readonly<ExactCandidateState>;
+  evidenceRecords: readonly Readonly<CandidateEvidenceRecord>[];
+  auditEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[];
+}>;
+
+type PositionGuardPilotInitializerDependencies = Readonly<{
+  identity: PositionGuardPilotInitializerIdentity;
+  repository: PositionGuardPilotInitializerRepository;
+  clock: PositionGuardPilotInitializerClock;
+}>;
+
+const IDENTITY_KEYS = [
+  "exchangeAccountId",
+  "pilotId",
+  "market",
+  "policyId",
+  "policyVersion",
+] as const;
+const RESULT_KEYS = [
+  "outcome",
+  "deployment",
+  "exactState",
+  "evidenceRecords",
+  "auditEvents",
+] as const;
+const EXACT_STATE_KEYS = [
+  "currentEpisodeAddCount",
+  "currentEpisodeCostBasisKrw",
+  "currentEpisodeInventoryQuantity",
+  "currentEpisodeRealizedPnlKrw",
+  "lastFullExitAt",
+  "lastFullExitRealizedPnlKrw",
+  "lastEntryPath",
+  "lastEvidenceAt",
+  "lastEvidenceId",
+  "stateVersion",
+] as const;
+const EVIDENCE_RECORD_KEYS = ["evidence", "materialHash", "materialVersion"] as const;
+const EVIDENCE_KEYS = [
+  "evidenceId",
+  "executedAt",
+  "action",
+  "entryPath",
+  "terminalStatus",
+  "executedQuantity",
+  "grossQuoteValueKrw",
+  "confirmedFeeKrw",
+  "remainingQuantity",
+] as const;
+const AUDIT_KEYS = [
+  "id",
+  "deploymentId",
+  "eventType",
+  "fromPhase",
+  "toPhase",
+  "stateVersion",
+  "payloadJson",
+  "createdAt",
+] as const;
+const AUDIT_EVENT_TYPES = [
+  "DEPLOYMENT_CREATED",
+  "STATE_ADVANCED",
+  "PHASE_TRANSITION",
+  "FAULT_PAUSED",
+  "ROLLBACK_STARTED",
+  "ROLLBACK_COMPLETED",
+] as const;
+const PILOT_PHASES = ["DISABLED", "PENDING_FLAT", "ACTIVE", "PAUSED_FAULT", "DRAINING"] as const;
+
+export class PositionGuardPilotInitializer {
+  readonly identity: Readonly<PositionGuardPilotInitializerIdentity>;
+  readonly deploymentId: string;
+
+  private readonly initializeDeploymentWithInitialState: (
+    input: CreateCandidatePilotDeploymentInput,
+  ) => Promise<CandidatePilotDeploymentInitializationResult>;
+  private readonly readClock: () => string;
+
+  constructor(dependencies: PositionGuardPilotInitializerDependencies) {
+    const dependencyRecord = exactOwnDataRecord(
+      dependencies,
+      "PositionGuard pilot initializer dependencies",
+      ["identity", "repository", "clock"] as const,
+    );
+    this.identity = snapshotIdentity(
+      dependencyRecord.identity as PositionGuardPilotInitializerIdentity,
+    );
+    this.deploymentId = derivePositionGuardPilotDeploymentId(this.identity);
+
+    const repository = exactOwnDataRecord(
+      dependencyRecord.repository,
+      "PositionGuard pilot initializer repository",
+      ["initializeDeploymentWithInitialState"] as const,
+    );
+    const initialize = repository.initializeDeploymentWithInitialState;
+    if (typeof initialize !== "function") {
+      throw new Error("PositionGuard pilot initializer repository method is required.");
+    }
+    this.initializeDeploymentWithInitialState = initialize.bind(dependencyRecord.repository);
+
+    const clock = exactOwnDataRecord(
+      dependencyRecord.clock,
+      "PositionGuard pilot initializer clock",
+      ["now"] as const,
+    );
+    const now = clock.now;
+    if (typeof now !== "function") {
+      throw new Error("PositionGuard pilot initializer clock now method is required.");
+    }
+    this.readClock = now.bind(dependencyRecord.clock);
+    Object.freeze(this);
+  }
+
+  async initialize(): Promise<PositionGuardPilotInitializationResult> {
+    const now = this.readClock();
+    const nowEpochNs = strictTimestamp(now, "initializer clock");
+    if (nowEpochNs < 0n) {
+      throw new Error("PositionGuard pilot initializer clock cannot be before the Unix epoch.");
+    }
+    const initialization = await this.initializeDeploymentWithInitialState({
+      deployment: {
+        id: this.deploymentId,
+        ...this.identity,
+        phase: "PENDING_FLAT",
+        activationAt: null,
+        activationEpochNs: null,
+        createdAt: now,
+        updatedAt: now,
+      },
+      initialState: createEmptyPositionGuardCandidateState(),
+    });
+    return validateAndSnapshotAuthority({
+      initialization,
+      identity: this.identity,
+      deploymentId: this.deploymentId,
+      nowEpochNs,
+    });
+  }
+}
+
+export function derivePositionGuardPilotDeploymentId(
+  identity: PositionGuardPilotInitializerIdentity,
+): string {
+  const snapshot = snapshotIdentity(identity);
+  const canonicalIdentity = JSON.stringify({
+    exchangeAccountId: snapshot.exchangeAccountId,
+    pilotId: snapshot.pilotId,
+    market: snapshot.market,
+    policyId: snapshot.policyId,
+    policyVersion: snapshot.policyVersion,
+  });
+  return `position_guard_pilot_${createHash("sha256")
+    .update(canonicalIdentity, "utf8")
+    .digest("hex")}`;
+}
+
+function validateAndSnapshotAuthority(input: Readonly<{
+  initialization: CandidatePilotDeploymentInitializationResult;
+  identity: Readonly<PositionGuardPilotInitializerIdentity>;
+  deploymentId: string;
+  nowEpochNs: bigint;
+}>): PositionGuardPilotInitializationResult {
+  const result = exactOwnDataRecord(
+    input.initialization,
+    "PositionGuard pilot initialization result",
+    RESULT_KEYS,
+  );
+  if (result.outcome !== "CREATED" && result.outcome !== "EXISTING") {
+    throw new Error("PositionGuard pilot initialization outcome is unsupported.");
+  }
+
+  const deployment = snapshotDeployment(
+    result.deployment as PositionGuardPilotDeploymentRecord,
+    input,
+  );
+  const evidenceRecords = snapshotEvidenceRecords(
+    result.evidenceRecords,
+    deployment,
+    input.nowEpochNs,
+  );
+  const exactState = snapshotExactState(result.exactState as ExactCandidateState);
+  assertExactStateMatchesEvidence(exactState, evidenceRecords);
+  const auditEvents = snapshotAuditEvents(
+    result.auditEvents,
+    deployment,
+    exactState,
+    input.nowEpochNs,
+  );
+  assertCanonicalCreationAudit(deployment, auditEvents);
+
+  if (result.outcome === "CREATED" && deployment.phase !== "PENDING_FLAT") {
+    throw new Error("A newly created PositionGuard pilot deployment must be PENDING_FLAT.");
+  }
+  switch (deployment.phase) {
+    case "PENDING_FLAT":
+      assertPristinePendingAuthority(deployment, exactState, evidenceRecords, auditEvents);
+      break;
+    case "ACTIVE":
+    case "PAUSED_FAULT":
+      break;
+    case "DISABLED":
+      throw new Error("Selected PositionGuard candidate conflicts with a DISABLED deployment.");
+    case "DRAINING":
+      throw new Error("PositionGuard candidate DRAINING recovery is deferred and blocks initialization.");
+    default:
+      throw new Error("PositionGuard pilot initialization phase is unsupported.");
+  }
+
+  return Object.freeze({
+    outcome: result.outcome,
+    deploymentId: input.deploymentId,
+    identity: input.identity,
+    deployment,
+    exactState,
+    evidenceRecords,
+    auditEvents,
+  });
+}
+
+function snapshotIdentity(
+  value: PositionGuardPilotInitializerIdentity,
+): Readonly<PositionGuardPilotInitializerIdentity> {
+  const identity = exactOwnDataRecord(value, "PositionGuard pilot initializer identity", IDENTITY_KEYS);
+  if (typeof identity.exchangeAccountId !== "string" || identity.exchangeAccountId.trim() === "") {
+    throw new Error("PositionGuard pilot initializer exchange account identity is required.");
+  }
+  if (
+    identity.pilotId !== "BTC_COMBINED_CONSERVATIVE_PILOT_V1" ||
+    identity.market !== "KRW-BTC" ||
+    identity.policyId !== "COMBINED_CONSERVATIVE" ||
+    identity.policyVersion !== "PCS-2026-001.DEPLOYMENT_READINESS_V1"
+  ) {
+    throw new Error("PositionGuard pilot initializer requires the exact approved BTC candidate identity.");
+  }
+  return Object.freeze({
+    exchangeAccountId: identity.exchangeAccountId,
+    pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1",
+    market: "KRW-BTC",
+    policyId: "COMBINED_CONSERVATIVE",
+    policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+  });
+}
+
+function snapshotDeployment(
+  value: PositionGuardPilotDeploymentRecord,
+  authority: Readonly<{
+    identity: Readonly<PositionGuardPilotInitializerIdentity>;
+    deploymentId: string;
+    nowEpochNs: bigint;
+  }>,
+): Readonly<PositionGuardPilotDeploymentRecord> {
+  const validated = validateCandidatePilotDeployment(value);
+  const deployment = Object.freeze({ ...validated });
+  if (deployment.id !== authority.deploymentId) {
+    throw new Error("PositionGuard pilot persisted deployment id does not match deterministic authority.");
+  }
+  for (const key of IDENTITY_KEYS) {
+    if (deployment[key] !== authority.identity[key]) {
+      throw new Error(`PositionGuard pilot persisted identity mismatch at ${key}.`);
+    }
+  }
+  const createdAt = strictTimestamp(deployment.createdAt, "persisted deployment createdAt");
+  const updatedAt = strictTimestamp(deployment.updatedAt, "persisted deployment updatedAt");
+  assertNotFuture(createdAt, authority.nowEpochNs, "persisted deployment createdAt");
+  assertNotFuture(updatedAt, authority.nowEpochNs, "persisted deployment updatedAt");
+  if (deployment.activationAt !== null) {
+    const activationAt = strictTimestamp(deployment.activationAt, "persisted deployment activationAt");
+    if (activationAt < createdAt || activationAt > updatedAt) {
+      throw new Error("PositionGuard pilot activation timestamp is outside deployment chronology.");
+    }
+    assertNotFuture(activationAt, authority.nowEpochNs, "persisted deployment activationAt");
+  }
+  return deployment;
+}
+
+function snapshotExactState(value: ExactCandidateState): Readonly<ExactCandidateState> {
+  const state = exactOwnDataRecord(value, "PositionGuard pilot exact state", EXACT_STATE_KEYS);
+  const snapshot: ExactCandidateState = {
+    currentEpisodeAddCount: state.currentEpisodeAddCount as number,
+    currentEpisodeCostBasisKrw: state.currentEpisodeCostBasisKrw as string,
+    currentEpisodeInventoryQuantity: state.currentEpisodeInventoryQuantity as string,
+    currentEpisodeRealizedPnlKrw: state.currentEpisodeRealizedPnlKrw as string,
+    lastFullExitAt: state.lastFullExitAt as string | null,
+    lastFullExitRealizedPnlKrw: state.lastFullExitRealizedPnlKrw as string | null,
+    lastEntryPath: state.lastEntryPath as ExactCandidateState["lastEntryPath"],
+    lastEvidenceAt: state.lastEvidenceAt as string | null,
+    lastEvidenceId: state.lastEvidenceId as string | null,
+    stateVersion: state.stateVersion as number,
+  };
+  toPositionGuardCandidateRoutingState(snapshot);
+  return Object.freeze(snapshot);
+}
+
+function snapshotEvidenceRecords(
+  value: unknown,
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  nowEpochNs: bigint,
+): readonly Readonly<CandidateEvidenceRecord>[] {
+  if (!Array.isArray(value)) {
+    throw new Error("PositionGuard pilot evidence authority must be an array.");
+  }
+  const ids = new Set<string>();
+  const activationEpochNs = deployment.activationAt === null
+    ? null
+    : strictTimestamp(deployment.activationAt, "persisted deployment activationAt");
+  const records = value.map((item, index) => {
+    const record = exactOwnDataRecord(item, `PositionGuard pilot evidence record ${index}`, EVIDENCE_RECORD_KEYS);
+    const evidenceRecord = exactOwnDataRecord(
+      record.evidence,
+      `PositionGuard pilot evidence ${index}`,
+      EVIDENCE_KEYS,
+    );
+    const evidence: PositionGuardCandidateExecutionEvidence = {
+      evidenceId: evidenceRecord.evidenceId as string,
+      executedAt: evidenceRecord.executedAt as string,
+      action: evidenceRecord.action as PositionGuardCandidateExecutionEvidence["action"],
+      entryPath: evidenceRecord.entryPath as PositionGuardCandidateExecutionEvidence["entryPath"],
+      terminalStatus: evidenceRecord.terminalStatus as PositionGuardCandidateExecutionEvidence["terminalStatus"],
+      executedQuantity: evidenceRecord.executedQuantity as PositionGuardCandidateExecutionEvidence["executedQuantity"],
+      grossQuoteValueKrw: evidenceRecord.grossQuoteValueKrw as PositionGuardCandidateExecutionEvidence["grossQuoteValueKrw"],
+      confirmedFeeKrw: evidenceRecord.confirmedFeeKrw as PositionGuardCandidateExecutionEvidence["confirmedFeeKrw"],
+      remainingQuantity: evidenceRecord.remainingQuantity as PositionGuardCandidateExecutionEvidence["remainingQuantity"],
+    };
+    const material = candidateEvidenceMaterial(deployment.id, evidence);
+    if (record.materialVersion !== "EXACT_V2" || record.materialHash !== material.hash) {
+      throw new Error(`PositionGuard pilot evidence ${material.evidence.evidenceId} material is invalid.`);
+    }
+    if (ids.has(material.evidence.evidenceId)) {
+      throw new Error(`Duplicate PositionGuard pilot evidence ${material.evidence.evidenceId}.`);
+    }
+    ids.add(material.evidence.evidenceId);
+    const evidenceAt = strictTimestamp(material.evidence.executedAt, "persisted evidence executedAt");
+    assertNotFuture(evidenceAt, nowEpochNs, "persisted evidence executedAt");
+    if (activationEpochNs === null || evidenceAt < activationEpochNs) {
+      throw new Error("PositionGuard pilot execution evidence requires prior activation authority.");
+    }
+    return Object.freeze({
+      evidence: Object.freeze({ ...material.evidence }),
+      materialHash: material.hash,
+      materialVersion: material.materialVersion,
+    });
+  });
+  return Object.freeze(records);
+}
+
+function snapshotAuditEvents(
+  value: unknown,
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  exactState: Readonly<ExactCandidateState>,
+  nowEpochNs: bigint,
+): readonly Readonly<PositionGuardPilotAuditEventRecord>[] {
+  if (!Array.isArray(value)) {
+    throw new Error("PositionGuard pilot audit authority must be an array.");
+  }
+  const createdAt = strictTimestamp(deployment.createdAt, "persisted deployment createdAt");
+  const ids = new Set<string>();
+  const events = value.map((item, index) => {
+    const record = exactOwnDataRecord(item, `PositionGuard pilot audit event ${index}`, AUDIT_KEYS);
+    if (typeof record.id !== "string" || record.id.trim() === "" || ids.has(record.id)) {
+      throw new Error("PositionGuard pilot audit event id is invalid or duplicated.");
+    }
+    ids.add(record.id);
+    if (record.deploymentId !== deployment.id) {
+      throw new Error("PositionGuard pilot audit event deployment identity mismatch.");
+    }
+    if (!AUDIT_EVENT_TYPES.includes(record.eventType as PositionGuardPilotAuditEventRecord["eventType"])) {
+      throw new Error("PositionGuard pilot audit event type is unsupported.");
+    }
+    if (record.fromPhase !== null && !PILOT_PHASES.includes(record.fromPhase as typeof PILOT_PHASES[number])) {
+      throw new Error("PositionGuard pilot audit fromPhase is unsupported.");
+    }
+    if (record.toPhase !== null && !PILOT_PHASES.includes(record.toPhase as typeof PILOT_PHASES[number])) {
+      throw new Error("PositionGuard pilot audit toPhase is unsupported.");
+    }
+    if (!Number.isSafeInteger(record.stateVersion) || (record.stateVersion as number) < 0 ||
+      (record.stateVersion as number) > exactState.stateVersion) {
+      throw new Error("PositionGuard pilot audit stateVersion is invalid.");
+    }
+    if (typeof record.payloadJson !== "string") {
+      throw new Error("PositionGuard pilot audit payloadJson must be a string.");
+    }
+    try {
+      JSON.parse(record.payloadJson);
+    } catch {
+      throw new Error("PositionGuard pilot audit payloadJson must be valid JSON.");
+    }
+    const eventAt = strictTimestamp(record.createdAt as string, "persisted audit createdAt");
+    if (eventAt < createdAt) {
+      throw new Error("PositionGuard pilot audit event precedes deployment creation.");
+    }
+    assertNotFuture(eventAt, nowEpochNs, "persisted audit createdAt");
+    return Object.freeze({
+      id: record.id,
+      deploymentId: deployment.id,
+      eventType: record.eventType,
+      fromPhase: record.fromPhase,
+      toPhase: record.toPhase,
+      stateVersion: record.stateVersion,
+      payloadJson: record.payloadJson,
+      createdAt: record.createdAt,
+    } as PositionGuardPilotAuditEventRecord);
+  });
+  return Object.freeze(events);
+}
+
+function assertExactStateMatchesEvidence(
+  exactState: Readonly<ExactCandidateState>,
+  evidenceRecords: readonly Readonly<CandidateEvidenceRecord>[],
+): void {
+  const projected = projectExactCandidateState(evidenceRecords.map((record) => record.evidence));
+  if (!recordsEqual(exactState, projected, EXACT_STATE_KEYS)) {
+    throw new Error("PositionGuard pilot exact state does not match persisted evidence material.");
+  }
+}
+
+function assertCanonicalCreationAudit(
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  auditEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+): void {
+  const creationEvents = auditEvents.filter((event) => event.eventType === "DEPLOYMENT_CREATED");
+  const expected = {
+    id: `${deployment.id}:created`,
+    deploymentId: deployment.id,
+    eventType: "DEPLOYMENT_CREATED",
+    fromPhase: null,
+    toPhase: "PENDING_FLAT",
+    stateVersion: 0,
+    payloadJson: JSON.stringify({
+      pilotId: deployment.pilotId,
+      market: deployment.market,
+      policyId: deployment.policyId,
+      policyVersion: deployment.policyVersion,
+    }),
+    createdAt: deployment.createdAt,
+  } as const;
+  if (creationEvents.length !== 1 || !recordsEqual(creationEvents[0]!, expected, AUDIT_KEYS)) {
+    throw new Error("PositionGuard pilot canonical DEPLOYMENT_CREATED audit authority is invalid.");
+  }
+}
+
+function assertPristinePendingAuthority(
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  exactState: Readonly<ExactCandidateState>,
+  evidenceRecords: readonly Readonly<CandidateEvidenceRecord>[],
+  auditEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+): void {
+  if (deployment.activationAt !== null || deployment.activationEpochNs !== null) {
+    throw new Error("PENDING_FLAT PositionGuard pilot must not contain activation authority.");
+  }
+  if (deployment.updatedAt !== deployment.createdAt) {
+    throw new Error("PENDING_FLAT PositionGuard pilot must preserve its pristine creation timestamp.");
+  }
+  if (!recordsEqual(exactState, createExactEmptyCandidateState(), EXACT_STATE_KEYS)) {
+    throw new Error("PENDING_FLAT PositionGuard pilot requires pristine exact state.");
+  }
+  if (evidenceRecords.length !== 0) {
+    throw new Error("PENDING_FLAT PositionGuard pilot must not contain execution evidence.");
+  }
+  if (auditEvents.length !== 1) {
+    throw new Error("PENDING_FLAT PositionGuard pilot requires exactly one creation audit event.");
+  }
+}
+
+function exactOwnDataRecord<K extends readonly string[]>(
+  value: unknown,
+  label: string,
+  expectedKeys: K,
+): Record<K[number], unknown> {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    throw new Error(`${label} must be an exact plain own-data object.`);
+  }
+  const actualKeys = Reflect.ownKeys(value);
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    actualKeys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))
+  ) {
+    throw new Error(`${label} must contain exactly the approved own data properties.`);
+  }
+  const snapshot = {} as Record<K[number], unknown>;
+  for (const key of expectedKeys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+      throw new Error(`${label} must contain enumerable own data properties only.`);
+    }
+    snapshot[key as K[number]] = descriptor.value;
+  }
+  return snapshot;
+}
+
+function recordsEqual<K extends readonly string[]>(
+  left: Readonly<Record<string, unknown>>,
+  right: Readonly<Record<string, unknown>>,
+  keys: K,
+): boolean {
+  return keys.every((key) => left[key] === right[key]);
+}
+
+function strictTimestamp(value: unknown, label: string): bigint {
+  if (typeof value !== "string") {
+    throw new Error(`${label} must be a strict ISO-8601 timestamp string.`);
+  }
+  return parseCandidatePilotTimestamp(value, label);
+}
+
+function assertNotFuture(value: bigint, now: bigint, label: string): void {
+  if (value > now) {
+    throw new Error(`${label} cannot be in the future.`);
+  }
+}
