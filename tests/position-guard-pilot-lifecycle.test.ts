@@ -41,7 +41,7 @@ const PILOT_IDENTITY = {
   pilotId: "BTC_COMBINED_CONSERVATIVE_PILOT_V1" as const,
   market: "KRW-BTC" as const,
   policyId: "COMBINED_CONSERVATIVE" as const,
-  policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1",
+  policyVersion: "PCS-2026-001.DEPLOYMENT_READINESS_V1" as const,
 };
 const DEPLOYMENT_ID = derivePositionGuardPilotDeploymentId(PILOT_IDENTITY);
 const CREATED_AT = "2026-08-21T00:00:00.000Z";
