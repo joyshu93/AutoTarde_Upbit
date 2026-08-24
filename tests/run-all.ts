@@ -26,6 +26,8 @@ await import("./candidate-btc-run-preparation.test.js");
 await import("./history-recovery-validation.test.js");
 await import("./startup-recovery.test.js");
 await import("./runtime-lifecycle.test.js");
+await import("./runtime-startup-gate.test.js");
+await import("./index-startup.test.js");
 await import("./sync-controller.test.js");
 await import("./scheduler-preflight.test.js");
 await import("./strategy-run-controller.test.js");

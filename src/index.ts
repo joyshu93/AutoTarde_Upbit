@@ -1,10 +1,11 @@
 import { fileURLToPath } from "node:url";
 
-import { createApp } from "./app/create-app.js";
+import { createApp, type AppServices } from "./app/create-app.js";
 import {
   hasBackgroundRuntime,
+  createRuntimeShutdown,
   installRuntimeSignalHandlers,
-  stopAppRuntime,
+  runRuntimeStartupGate,
 } from "./app/runtime-lifecycle.js";
 import { buildStrategySchedulerStartupPreflight } from "./app/scheduler-preflight.js";
 import { applyStartupRecoveryPolicy, runStartupRecovery } from "./app/startup-recovery.js";
@@ -16,6 +17,15 @@ export interface TelegramRuntimeStartupResult {
   readonly strategySchedulerStartupBlockNotified: boolean;
   readonly telegramInboundPollingStatus: { readonly running: boolean };
   readonly telegramCommandMenuSetup: TelegramCommandMenuSetupResult;
+}
+
+export interface AppStartupOperations {
+  readonly runStartupRecovery?: typeof runStartupRecovery;
+  readonly applyStartupRecoveryPolicy?: typeof applyStartupRecoveryPolicy;
+  readonly buildStrategySchedulerStartupPreflight?: typeof buildStrategySchedulerStartupPreflight;
+  readonly installRuntimeSignalHandlers?: typeof installRuntimeSignalHandlers;
+  readonly startTelegramRuntime?: typeof startTelegramRuntime;
+  readonly writeBanner?: (banner: unknown) => void;
 }
 
 export async function startTelegramRuntime(input: {
@@ -51,14 +61,33 @@ export async function startTelegramRuntime(input: {
   };
 }
 
-async function main(): Promise<void> {
-  const app = createApp();
-  const startupRecovery = await runStartupRecovery({
+export async function runAppStartup(
+  app: AppServices,
+  operations: AppStartupOperations = {},
+): Promise<void> {
+  const runStartupRecoveryOperation = operations.runStartupRecovery ?? runStartupRecovery;
+  const applyStartupRecoveryPolicyOperation =
+    operations.applyStartupRecoveryPolicy ?? applyStartupRecoveryPolicy;
+  const buildStrategySchedulerStartupPreflightOperation =
+    operations.buildStrategySchedulerStartupPreflight ?? buildStrategySchedulerStartupPreflight;
+  const installRuntimeSignalHandlersOperation =
+    operations.installRuntimeSignalHandlers ?? installRuntimeSignalHandlers;
+  const startTelegramRuntimeOperation = operations.startTelegramRuntime ?? startTelegramRuntime;
+  const writeBanner = operations.writeBanner ?? ((banner: unknown) => {
+    console.log(JSON.stringify(banner, null, 2));
+  });
+  const runtimeShutdown = createRuntimeShutdown(app);
+
+  await runRuntimeStartupGate({
+    initializer: app.candidatePilotInitializer,
+    shutdown: runtimeShutdown,
+    continueStartup: async () => {
+  const startupRecovery = await runStartupRecoveryOperation({
     exchangeAccountId: "primary",
     enabled: app.exchangeBackedReadEnabled,
     portfolioSyncService: app.portfolioSyncService,
   });
-  const startupRecoveryPolicy = await applyStartupRecoveryPolicy({
+  const startupRecoveryPolicy = await applyStartupRecoveryPolicyOperation({
     operatorState: app.operatorState,
     recovery: startupRecovery,
   });
@@ -103,7 +132,7 @@ async function main(): Promise<void> {
   }
 
   const state = await app.operatorState.getState();
-  const strategySchedulerStartupPreflight = await buildStrategySchedulerStartupPreflight({
+  const strategySchedulerStartupPreflight = await buildStrategySchedulerStartupPreflightOperation({
     config: app.config,
     exchangeAccountId: "primary",
     executionState: state,
@@ -112,10 +141,13 @@ async function main(): Promise<void> {
     liveSendPath: app.liveSendPath,
   });
   app.strategyScheduler.setStartupPreflight(strategySchedulerStartupPreflight);
-  const telegramRuntime = await startTelegramRuntime({
+  const telegramRuntime = await startTelegramRuntimeOperation({
     strategyScheduler: app.strategyScheduler,
     telegramInboundPolling: app.telegramInboundPolling,
-    installRuntimeSignalHandlers: () => installRuntimeSignalHandlers({ app }),
+    installRuntimeSignalHandlers: () => installRuntimeSignalHandlersOperation({
+      app,
+      shutdown: runtimeShutdown,
+    }),
     telegramCommandMenuSetup: app.telegramCommandMenuSetup,
   });
   const {
@@ -128,7 +160,7 @@ async function main(): Promise<void> {
     strategyScheduler: strategySchedulerStatus,
     telegramInboundPolling: telegramInboundPollingStatus,
   });
-  const runtimeShutdown = runtimeHasBackgroundWork
+  const runtimeShutdownStatus = runtimeHasBackgroundWork
     ? "SIGNAL_HANDLERS_INSTALLED"
     : "NO_BACKGROUND_RUNTIME";
   const seedMismatches = detectExecutionStateSeedMismatches(state, {
@@ -164,7 +196,7 @@ async function main(): Promise<void> {
     telegramDeliveryLeaseMs: app.config.telegramDeliveryLeaseMs,
     notificationDeliverySummary,
     runtimeHasBackgroundWork,
-    runtimeShutdown,
+    runtimeShutdown: runtimeShutdownStatus,
     deprecatedIgnoredEnvVars: app.config.deprecatedIgnoredEnvVars,
     telegramInboundPollingEnabled: app.config.telegramInboundPollingEnabled,
     telegramInboundPollingConfigured: app.telegramInboundPolling.isConfigured(),
@@ -176,11 +208,18 @@ async function main(): Promise<void> {
     supportedCommands: app.telegramRouter.getSupportedCommands(),
   };
 
-  console.log(JSON.stringify(banner, null, 2));
+  writeBanner(banner);
 
   if (!runtimeHasBackgroundWork) {
-    stopAppRuntime(app);
+    runtimeShutdown();
   }
+    },
+  });
+}
+
+async function main(): Promise<void> {
+  const app = createApp();
+  await runAppStartup(app);
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

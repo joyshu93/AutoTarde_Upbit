@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 
 import {
+  createRuntimeShutdown,
   hasBackgroundRuntime,
   installRuntimeSignalHandlers,
   stopAppRuntime,
@@ -115,6 +116,47 @@ test("runtime lifecycle signal handler is idempotent and exits by shutdown statu
   assert.deepEqual(exits, [0]);
   assert.equal(writes.length, 1);
   assert.equal(second.status, "STOPPED");
+});
+
+test("runtime lifecycle signal handler reuses an external shutdown owner", () => {
+  const calls: string[] = [];
+  const shutdown = createRuntimeShutdown({
+    telegramInboundPolling: {
+      stop() {
+        calls.push("telegram");
+        return createTelegramStatus(false);
+      },
+    },
+    strategyScheduler: {
+      stop() {
+        calls.push("scheduler");
+        return createSchedulerStatus(false);
+      },
+    },
+    persistence: {
+      close() {
+        calls.push("persistence");
+      },
+    },
+  });
+  const listeners = new Map<"SIGINT" | "SIGTERM", () => void>();
+  const handler = installRuntimeSignalHandlers({
+    shutdown,
+    signalTarget: {
+      on(signal, listener) {
+        listeners.set(signal, listener);
+      },
+      exit() {
+        return undefined as never;
+      },
+    },
+    writeLine() {},
+  });
+
+  handler.shutdown("manual");
+  listeners.get("SIGTERM")?.();
+
+  assert.deepEqual(calls, ["telegram", "scheduler", "persistence"]);
 });
 
 function createTelegramStatus(running: boolean) {
