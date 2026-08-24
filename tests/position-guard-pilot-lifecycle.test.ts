@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 import type { PositionGuardPolicySelection } from "../src/domain/pilot-types.js";
-import type { ExecutionStateRecord } from "../src/domain/types.js";
+import type { ExchangeBalance, ExecutionStateRecord } from "../src/domain/types.js";
 import {
   derivePositionGuardPilotDeploymentId,
   PositionGuardPilotInitializer,
@@ -19,11 +19,16 @@ import { CandidateExecutionEvidenceService } from
   "../src/modules/execution/candidate-evidence-service.js";
 import { ExecutionService } from "../src/modules/execution/execution-service.js";
 import type { CandidateExecutionAuthority } from "../src/modules/execution/interfaces.js";
-import {
-  DryRunExchangeAdapter,
-  type UpbitOrderRequest,
+import type {
+  CancelOrderResult,
+  ExchangeOrderSnapshot,
+  LiveExecutionAdapter,
+  OrderValidationResult,
+  UpbitOrderChance,
+  UpbitOrderRequest,
 } from "../src/modules/exchange/interfaces.js";
 import { ExchangeOrderSubmissionError } from "../src/modules/exchange/errors.js";
+import { ReconciliationService } from "../src/modules/reconciliation/reconciliation-service.js";
 import { createEmptyPositionGuardCandidateState } from
   "../src/modules/strategy/position-guard-candidate-state.js";
 import {
@@ -167,7 +172,7 @@ test("pending-flat suppresses new BTC risk until fake exchange-backed flat recov
 });
 
 test("fake validation and one send normalize cancel-with-fill and persist evidence exactly once across restart", async () => {
-  const operatorState = new InMemoryOperatorStateStore(executionState());
+  const operatorState = new InMemoryOperatorStateStore(executionState("LIVE"));
   const candidatePilots = new InMemoryCandidatePilotRepository(operatorState);
   const repositories = new InMemoryExecutionRepository(operatorState, candidatePilots);
   await candidatePilots.createDeploymentWithInitialState({
@@ -228,7 +233,7 @@ test("fake validation and one send normalize cancel-with-fill and persist eviden
     positionsJson: "[]",
   });
 
-  const adapter = new PartialCancelWithFillAdapter();
+  const adapter = new ImmediateCancelWithFillLiveAdapter();
   const executionService = new ExecutionService({
     riskLimits: {
       maxAllocationByAsset: { BTC: 0.6, ETH: 0.6 },
@@ -245,34 +250,67 @@ test("fake validation and one send normalize cancel-with-fill and persist eviden
     candidatePilots,
     now: () => "2026-08-21T00:00:20.000Z",
   });
-  const result = await executionService.submitOrderFromDecision({
+  const input = {
     exchangeAccountId: ACCOUNT_ID,
     strategyDecisionId: "lifecycle-decision",
     referencePriceCapturedAt: "2026-08-21T00:00:10.000Z",
     decision: {
       strategyKey: "position_guard.paper_core.v1",
-      market: "KRW-BTC",
-      action: "ENTER",
+      market: "KRW-BTC" as const,
+      action: "ENTER" as const,
       reasonCodes: ["CANDIDATE_ALLOWED"],
       referencePrice: 100_000_000,
       requestedNotionalKrw: 6_000,
       requestedQuantity: null,
       metadata: {},
     },
-    side: "bid",
-    ordType: "price",
+    side: "bid" as const,
+    ordType: "price" as const,
     price: "6000",
     volume: null,
     candidateAuthority: candidateAuthority(activationAt),
-  });
+  };
+  const result = await executionService.submitOrderFromDecision(input);
 
   assert.equal(result.accepted, true);
+  assert.equal(result.outcome, "SUBMITTED");
   assert.equal(result.order.status, "FILLED");
   assert.deepEqual(
     [adapter.orderChanceCalls, adapter.orderTestCalls, adapter.createOrderCalls],
     [1, 1, 1],
   );
   assert.equal((await repositories.listFills(result.order.id)).length, 2);
+
+  const stateBeforeExecutionRestart = await candidatePilots.getExactState(DEPLOYMENT_ID);
+  const evidenceBeforeExecutionRestart = await candidatePilots.listEvidenceAfter(DEPLOYMENT_ID, null);
+  const auditBeforeExecutionRestart = await candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  const restartedExecutionService = new ExecutionService({
+    riskLimits: {
+      maxAllocationByAsset: { BTC: 0.6, ETH: 0.6 },
+      totalExposureCap: 0.75,
+      stalePriceThresholdMs: 30_000,
+      minimumOrderValueKrw: 5_000,
+    },
+    executionAdapter: adapter,
+    validationAdapter: adapter,
+    repositories,
+    accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
+    accountExecutionLeaseMs: 30_000,
+    operatorState,
+    candidatePilots,
+    now: () => "2026-08-21T00:00:21.000Z",
+  });
+  const restartDuplicate = await restartedExecutionService.submitOrderFromDecision(input);
+
+  assert.equal(restartDuplicate.outcome, "DUPLICATE");
+  assert.equal(restartDuplicate.order?.id, result.order.id);
+  assert.equal(adapter.createOrderCalls, 1);
+  assert.deepEqual(await candidatePilots.getExactState(DEPLOYMENT_ID), stateBeforeExecutionRestart);
+  assert.deepEqual(
+    await candidatePilots.listEvidenceAfter(DEPLOYMENT_ID, null),
+    evidenceBeforeExecutionRestart,
+  );
+  assert.deepEqual(await candidatePilots.listAuditEvents(DEPLOYMENT_ID), auditBeforeExecutionRestart);
 
   const evidenceService = new CandidateExecutionEvidenceService({
     exchangeAccountId: ACCOUNT_ID,
@@ -287,6 +325,10 @@ test("fake validation and one send normalize cancel-with-fill and persist eviden
     },
   });
   const firstProjection = await evidenceService.processTerminalOrder(result.order.id);
+  const stateAfterFirstProjection = await candidatePilots.getExactState(DEPLOYMENT_ID);
+  const evidenceAfterFirstProjection = await candidatePilots.listEvidenceAfter(DEPLOYMENT_ID, null);
+  const evidenceRecordsAfterFirstProjection = await candidatePilots.listEvidenceRecords(DEPLOYMENT_ID);
+  const auditAfterFirstProjection = await candidatePilots.listAuditEvents(DEPLOYMENT_ID);
   const restartedEvidenceService = new CandidateExecutionEvidenceService({
     exchangeAccountId: ACCOUNT_ID,
     repositories,
@@ -305,6 +347,12 @@ test("fake validation and one send normalize cancel-with-fill and persist eviden
 
   assert.equal(firstProjection.outcome, "ADVANCED", firstProjection.detail);
   assert.equal(duplicateProjection.outcome, "DUPLICATE");
+  assert.deepEqual(await candidatePilots.getExactState(DEPLOYMENT_ID), stateAfterFirstProjection);
+  assert.deepEqual(
+    await candidatePilots.listEvidenceAfter(DEPLOYMENT_ID, null),
+    evidenceAfterFirstProjection,
+  );
+  assert.deepEqual(await candidatePilots.listAuditEvents(DEPLOYMENT_ID), auditAfterFirstProjection);
   assert.equal(evidence.length, 1);
   assert.equal(evidence[0]?.executedQuantity, "0.00006");
   assert.equal(evidence[0]?.grossQuoteValueKrw, "6000");
@@ -326,15 +374,155 @@ test("fake validation and one send normalize cancel-with-fill and persist eviden
     },
     clock: { now: () => "2026-08-21T00:00:30.000Z" },
   });
+  const auditBeforeInitializer = await candidatePilots.listAuditEvents(DEPLOYMENT_ID);
   const reconstructed = await initializer.initialize();
   assert.equal(reconstructed.deployment.phase, "ACTIVE");
-  assert.equal(reconstructed.exactState.stateVersion, 1);
-  assert.equal(reconstructed.evidenceRecords.length, 1);
-  assert.equal(reconstructed.exactState.currentEpisodeInventoryQuantity, "0.00006");
+  assert.deepEqual(reconstructed.exactState, stateAfterFirstProjection);
+  assert.deepEqual(reconstructed.evidenceRecords, evidenceRecordsAfterFirstProjection);
+  assert.deepEqual(await candidatePilots.listAuditEvents(DEPLOYMENT_ID), auditBeforeInitializer);
+});
+
+test("staged partial fills reconcile once before terminal cancel-with-fill advances candidate state", async () => {
+  const operatorState = new InMemoryOperatorStateStore(executionState("LIVE"));
+  const candidatePilots = new InMemoryCandidatePilotRepository(operatorState);
+  const repositories = new InMemoryExecutionRepository(operatorState, candidatePilots);
+  await candidatePilots.createDeploymentWithInitialState({
+    deployment: {
+      id: DEPLOYMENT_ID,
+      exchangeAccountId: ACCOUNT_ID,
+      pilotId: PILOT_IDENTITY.pilotId,
+      market: PILOT_IDENTITY.market,
+      policyId: PILOT_IDENTITY.policyId,
+      policyVersion: PILOT_IDENTITY.policyVersion,
+      phase: "PENDING_FLAT",
+      activationAt: null,
+      activationEpochNs: null,
+      createdAt: CREATED_AT,
+      updatedAt: CREATED_AT,
+    },
+    initialState: createEmptyPositionGuardCandidateState(),
+  });
+  const activationAt = "2026-08-21T00:00:05.000Z";
+  assert.notEqual(await candidatePilots.activateDeployment({
+    deploymentId: DEPLOYMENT_ID,
+    expectedPhase: "PENDING_FLAT",
+    expectedUpdatedAt: CREATED_AT,
+    activationAt,
+    activationEpochNs: BigInt(Date.parse(activationAt)) * 1_000_000n,
+  }), null);
+  await repositories.saveStrategyDecision({
+    id: "staged-lifecycle-decision",
+    exchangeAccountId: ACCOUNT_ID,
+    strategyKey: "position_guard.paper_core.v1",
+    market: "KRW-BTC",
+    action: "ENTER",
+    status: "READY",
+    decisionBasisJson: JSON.stringify({
+      strategyDecision: { market: "KRW-BTC", action: "ENTER" },
+      engineDecision: { entryPath: "PULLBACK" },
+    }),
+    intendedNotionalKrw: "6000",
+    intendedQuantity: null,
+    referencePrice: "100000000",
+    createdAt: "2026-08-21T00:00:09.000Z",
+  });
+  await repositories.saveBalanceSnapshot({
+    id: "staged-execution-balance",
+    exchangeAccountId: ACCOUNT_ID,
+    capturedAt: "2026-08-21T00:00:08.000Z",
+    source: "EXCHANGE_POLL",
+    totalKrwValue: "100000",
+    balancesJson: "[]",
+  });
+  await repositories.savePositionSnapshot({
+    id: "staged-execution-position",
+    exchangeAccountId: ACCOUNT_ID,
+    capturedAt: "2026-08-21T00:00:08.000Z",
+    source: "EXCHANGE_POLL",
+    positionsJson: "[]",
+  });
+
+  const adapter = new StagedPartialFillLiveAdapter();
+  const executionService = executionServiceFor({
+    adapter,
+    repositories,
+    operatorState,
+    candidatePilots,
+    now: "2026-08-21T00:00:20.000Z",
+  });
+  const input = candidateEnterInput("staged-lifecycle-decision", activationAt);
+  const submitted = await executionService.submitOrderFromDecision(input);
+  assert.equal(submitted.outcome, "SUBMITTED");
+  assert.equal(submitted.order?.status, "OPEN");
+  assert.equal(adapter.createOrderCalls, 1);
+  assert.equal((await repositories.listFills(submitted.order!.id)).length, 0);
+
+  const evidenceService = new CandidateExecutionEvidenceService({
+    exchangeAccountId: ACCOUNT_ID,
+    repositories,
+    pilotRepository: candidatePilots,
+    operatorState,
+    clock: {
+      now: () => ({
+        occurredAt: "2026-08-21T00:00:30.000Z",
+        occurredAtEpochMs: Date.parse("2026-08-21T00:00:30.000Z"),
+      }),
+    },
+  });
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: adapter,
+    candidateEvidenceService: evidenceService,
+  });
+  const runReconciliation = (sequence: number) => reconciliation.run(ACCOUNT_ID, {
+    source: "SCHEDULER_PREFLIGHT",
+    runIdentity: {
+      id: `staged-reconciliation-${sequence}`,
+      startedAt: `2026-08-21T00:00:${String(20 + sequence).padStart(2, "0")}.000Z`,
+    },
+  });
+
+  await runReconciliation(1);
+  assert.equal((await repositories.findOrderById(ACCOUNT_ID, submitted.order!.id))?.status, "PARTIALLY_FILLED");
+  assert.equal((await repositories.listFills(submitted.order!.id)).length, 1);
+  const stateAfterFirstPartial = await candidatePilots.getExactState(DEPLOYMENT_ID);
+  const evidenceAfterFirstPartial = await candidatePilots.listEvidenceAfter(DEPLOYMENT_ID, null);
+  const auditAfterFirstPartial = await candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+
+  await runReconciliation(2);
+  assert.equal((await repositories.listFills(submitted.order!.id)).length, 1);
+  assert.deepEqual(await candidatePilots.getExactState(DEPLOYMENT_ID), stateAfterFirstPartial);
+  assert.deepEqual(await candidatePilots.listEvidenceAfter(DEPLOYMENT_ID, null), evidenceAfterFirstPartial);
+  assert.deepEqual(await candidatePilots.listAuditEvents(DEPLOYMENT_ID), auditAfterFirstPartial);
+
+  await runReconciliation(3);
+  assert.equal((await repositories.findOrderById(ACCOUNT_ID, submitted.order!.id))?.status, "PARTIALLY_FILLED");
+  assert.equal((await repositories.listFills(submitted.order!.id)).length, 2);
+  assert.deepEqual(await candidatePilots.getExactState(DEPLOYMENT_ID), stateAfterFirstPartial);
+  assert.deepEqual(await candidatePilots.listEvidenceAfter(DEPLOYMENT_ID, null), evidenceAfterFirstPartial);
+
+  await runReconciliation(4);
+  assert.equal((await repositories.findOrderById(ACCOUNT_ID, submitted.order!.id))?.status, "FILLED");
+  assert.equal((await repositories.listFills(submitted.order!.id)).length, 2);
+  const terminalEvidence = await candidatePilots.listEvidenceAfter(DEPLOYMENT_ID, null);
+  const terminalState = await candidatePilots.getExactState(DEPLOYMENT_ID);
+  assert.equal(terminalEvidence.length, 1);
+  assert.equal(terminalEvidence[0]?.executedQuantity, "0.00006");
+  assert.equal(terminalState?.stateVersion, 1);
+  assert.equal(terminalState?.currentEpisodeInventoryQuantity, "0.00006");
+
+  const getOrderCallsBeforeTerminalReplay = adapter.getOrderCalls;
+  const terminalAudit = await candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  await runReconciliation(5);
+  assert.equal(adapter.getOrderCalls, getOrderCallsBeforeTerminalReplay);
+  assert.deepEqual(await candidatePilots.getExactState(DEPLOYMENT_ID), terminalState);
+  assert.deepEqual(await candidatePilots.listEvidenceAfter(DEPLOYMENT_ID, null), terminalEvidence);
+  assert.deepEqual(await candidatePilots.listAuditEvents(DEPLOYMENT_ID), terminalAudit);
 });
 
 test("uncertain fake send pauses globally and reconstructs a faulted pilot without retry or auto-resume", async () => {
-  const operatorState = new InMemoryOperatorStateStore(executionState());
+  const operatorState = new InMemoryOperatorStateStore(executionState("LIVE"));
   const candidatePilots = new InMemoryCandidatePilotRepository(operatorState);
   const repositories = new InMemoryExecutionRepository(operatorState, candidatePilots);
   await candidatePilots.createDeploymentWithInitialState({
@@ -462,14 +650,40 @@ test("uncertain fake send pauses globally and reconstructs a faulted pilot witho
     candidateAuthority: candidateAuthority(activationAt),
   };
   const uncertain = await executionService.submitOrderFromDecision(input);
-  const duplicateAttempt = await executionService.submitOrderFromDecision(input);
 
   assert.equal(uncertain.outcome, "RECONCILIATION_REQUIRED");
   assert.equal(uncertain.order?.status, "RECONCILIATION_REQUIRED");
   assert.equal(adapter.createOrderCalls, 1);
-  assert.notEqual(duplicateAttempt.outcome, "SUBMITTED");
   assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
   assert.equal((await candidatePilots.getDeployment(DEPLOYMENT_ID))?.phase, "ACTIVE");
+
+  const stateBeforeRestart = await candidatePilots.getExactState(DEPLOYMENT_ID);
+  const evidenceBeforeRestart = await candidatePilots.listEvidenceAfter(DEPLOYMENT_ID, null);
+  const auditBeforeRestart = await candidatePilots.listAuditEvents(DEPLOYMENT_ID);
+  const restartedExecutionService = new ExecutionService({
+    riskLimits: {
+      maxAllocationByAsset: { BTC: 0.6, ETH: 0.6 },
+      totalExposureCap: 0.75,
+      stalePriceThresholdMs: 30_000,
+      minimumOrderValueKrw: 5_000,
+    },
+    executionAdapter: adapter,
+    validationAdapter: adapter,
+    repositories,
+    accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
+    accountExecutionLeaseMs: 30_000,
+    operatorState,
+    candidatePilots,
+    now: () => "2026-08-21T00:00:21.000Z",
+  });
+  const duplicateAttempt = await restartedExecutionService.submitOrderFromDecision(input);
+
+  assert.equal(duplicateAttempt.outcome, "DUPLICATE");
+  assert.equal(duplicateAttempt.order?.id, uncertain.order?.id);
+  assert.equal(adapter.createOrderCalls, 1);
+  assert.deepEqual(await candidatePilots.getExactState(DEPLOYMENT_ID), stateBeforeRestart);
+  assert.deepEqual(await candidatePilots.listEvidenceAfter(DEPLOYMENT_ID, null), evidenceBeforeRestart);
+  assert.deepEqual(await candidatePilots.listAuditEvents(DEPLOYMENT_ID), auditBeforeRestart);
 
   const recovery = new PositionGuardPilotRecovery({
     exchangeAccountId: ACCOUNT_ID,
@@ -514,13 +728,64 @@ test("uncertain fake send pauses globally and reconstructs a faulted pilot witho
     },
     clock: { now: () => "2026-08-21T00:00:50.000Z" },
   });
+  const stateBeforeInitializer = await candidatePilots.getExactState(DEPLOYMENT_ID);
+  const evidenceBeforeInitializer = await candidatePilots.listEvidenceRecords(DEPLOYMENT_ID);
+  const auditBeforeInitializer = await candidatePilots.listAuditEvents(DEPLOYMENT_ID);
   const reconstructed = await initializer.initialize();
   assert.equal(reconstructed.deployment.phase, "PAUSED_FAULT");
   assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
   assert.equal(adapter.createOrderCalls, 1);
+  assert.deepEqual(reconstructed.exactState, stateBeforeInitializer);
+  assert.deepEqual(reconstructed.evidenceRecords, evidenceBeforeInitializer);
+  assert.deepEqual(await candidatePilots.listAuditEvents(DEPLOYMENT_ID), auditBeforeInitializer);
 });
 
-class PartialCancelWithFillAdapter extends DryRunExchangeAdapter {
+class NonNetworkLiveAdapter implements LiveExecutionAdapter {
+  readonly sendPath = "LIVE_ADAPTER" as const;
+
+  async getBalances(): Promise<ExchangeBalance[]> {
+    return [];
+  }
+
+  async getOrderChance(market: "KRW-BTC" | "KRW-ETH"): Promise<UpbitOrderChance> {
+    return {
+      marketId: market,
+      askTypes: ["limit", "market"],
+      bidTypes: ["limit", "price"],
+      maxTotal: null,
+      bidMinTotal: 5_000,
+      askMinTotal: 5_000,
+      bidFee: "0.0005",
+      askFee: "0.0005",
+    };
+  }
+
+  async testOrder(_request: UpbitOrderRequest): Promise<OrderValidationResult> {
+    return { accepted: true, marketOnline: true, reason: null, preview: null };
+  }
+
+  async createOrder(_request: UpbitOrderRequest): Promise<ExchangeOrderSnapshot> {
+    throw new Error("Non-network LIVE fake must define createOrder explicitly.");
+  }
+
+  async cancelOrder(_query: { uuid?: string; identifier?: string }): Promise<CancelOrderResult> {
+    return { accepted: false, canceledOrder: null, reason: "Not used by lifecycle fake." };
+  }
+
+  async getOrder(_query: { uuid?: string; identifier?: string }): Promise<ExchangeOrderSnapshot | null> {
+    return null;
+  }
+
+  async listOpenOrders(): Promise<ExchangeOrderSnapshot[]> {
+    return [];
+  }
+
+  async listClosedOrders(): Promise<ExchangeOrderSnapshot[]> {
+    return [];
+  }
+}
+
+class ImmediateCancelWithFillLiveAdapter extends NonNetworkLiveAdapter {
   orderChanceCalls = 0;
   orderTestCalls = 0;
   createOrderCalls = 0;
@@ -535,49 +800,60 @@ class PartialCancelWithFillAdapter extends DryRunExchangeAdapter {
     return super.testOrder(request);
   }
 
-  override async createOrder(request: UpbitOrderRequest) {
+  override async createOrder(request: UpbitOrderRequest): Promise<ExchangeOrderSnapshot> {
     this.createOrderCalls += 1;
-    return {
-      uuid: "fake-partial-cancel-order",
-      identifier: request.identifier,
-      market: request.market,
-      side: request.side,
-      ordType: request.ordType,
-      state: "cancel",
-      price: request.price,
-      volume: request.volume,
-      remainingVolume: "0",
-      executedVolume: "0.00006",
-      paidFee: "3",
-      createdAt: "2026-08-21T00:00:12.000Z",
-      fills: [
-        {
-          tradeUuid: "fake-partial-fill-1",
-          side: request.side,
-          price: "100000000",
-          volume: "0.00002",
-          funds: "2000",
-          fee: "1",
-          createdAt: "2026-08-21T00:00:21.000Z",
-          raw: { fake: true, part: 1 },
-        },
-        {
-          tradeUuid: "fake-partial-fill-2",
-          side: request.side,
-          price: "100000000",
-          volume: "0.00004",
-          funds: "4000",
-          fee: "2",
-          createdAt: "2026-08-21T00:00:22.000Z",
-          raw: { fake: true, part: 2 },
-        },
-      ],
-      raw: { fake: true, terminal: "cancel-with-fill" },
-    };
+    return terminalCancelWithFillSnapshot(request);
   }
 }
 
-class UncertainSubmissionAdapter extends DryRunExchangeAdapter {
+class StagedPartialFillLiveAdapter extends NonNetworkLiveAdapter {
+  createOrderCalls = 0;
+  getOrderCalls = 0;
+  private request: UpbitOrderRequest | null = null;
+  private readonly stageIndexes = [0, 0, 1, 2] as const;
+
+  override async createOrder(request: UpbitOrderRequest): Promise<ExchangeOrderSnapshot> {
+    this.createOrderCalls += 1;
+    this.request = { ...request };
+    return exchangeOrderSnapshot(request, {
+      state: "wait",
+      executedVolume: "0",
+      remainingVolume: "0.00006",
+      fills: [],
+      raw: { fake: true, stage: "OPEN" },
+    });
+  }
+
+  override async getOrder(): Promise<ExchangeOrderSnapshot | null> {
+    if (!this.request) throw new Error("Staged fake requires createOrder before getOrder.");
+    const stageIndex = this.stageIndexes[this.getOrderCalls];
+    if (stageIndex === undefined) throw new Error("Unexpected extra staged exchange lookup.");
+    this.getOrderCalls += 1;
+    const fillOne = exchangeFill("fake-staged-fill-1", "0.00002", "2000", "1", "2026-08-21T00:00:21.000Z");
+    const fillTwo = exchangeFill("fake-staged-fill-2", "0.00004", "4000", "2", "2026-08-21T00:00:23.000Z");
+    if (stageIndex === 0) {
+      return exchangeOrderSnapshot(this.request, {
+        state: "wait",
+        executedVolume: "0.00002",
+        remainingVolume: "0.00004",
+        fills: [fillOne],
+        raw: { fake: true, stage: "PARTIAL_ONE" },
+      });
+    }
+    if (stageIndex === 1) {
+      return exchangeOrderSnapshot(this.request, {
+        state: "wait",
+        executedVolume: "0.00006",
+        remainingVolume: "0",
+        fills: [fillOne, fillTwo],
+        raw: { fake: true, stage: "PARTIAL_TWO" },
+      });
+    }
+    return terminalCancelWithFillSnapshot(this.request, [fillOne, fillTwo]);
+  }
+}
+
+class UncertainSubmissionAdapter extends NonNetworkLiveAdapter {
   createOrderCalls = 0;
 
   override async createOrder(_request: UpbitOrderRequest): Promise<never> {
@@ -590,6 +866,116 @@ class UncertainSubmissionAdapter extends DryRunExchangeAdapter {
       responseReceived: false,
     });
   }
+}
+
+function exchangeFill(
+  tradeUuid: string,
+  volume: string,
+  funds: string,
+  fee: string,
+  createdAt: string,
+): ExchangeOrderSnapshot["fills"][number] {
+  return {
+    tradeUuid,
+    side: "bid",
+    price: "100000000",
+    volume,
+    funds,
+    fee,
+    createdAt,
+    raw: { fake: true, tradeUuid },
+  };
+}
+
+function exchangeOrderSnapshot(
+  request: UpbitOrderRequest,
+  input: Pick<ExchangeOrderSnapshot, "state" | "executedVolume" | "remainingVolume" | "fills" | "raw">,
+): ExchangeOrderSnapshot {
+  return {
+    uuid: "fake-partial-cancel-order",
+    identifier: request.identifier,
+    market: request.market,
+    side: request.side,
+    ordType: request.ordType,
+    state: input.state,
+    price: request.price,
+    volume: request.volume,
+    remainingVolume: input.remainingVolume,
+    executedVolume: input.executedVolume,
+    paidFee: input.fills.length === 0
+      ? "0"
+      : String(input.fills.reduce((total, fill) => total + Number(fill.fee ?? 0), 0)),
+    createdAt: "2026-08-21T00:00:12.000Z",
+    fills: input.fills,
+    raw: input.raw,
+  };
+}
+
+function terminalCancelWithFillSnapshot(
+  request: UpbitOrderRequest,
+  fills = [
+    exchangeFill("fake-partial-fill-1", "0.00002", "2000", "1", "2026-08-21T00:00:21.000Z"),
+    exchangeFill("fake-partial-fill-2", "0.00004", "4000", "2", "2026-08-21T00:00:22.000Z"),
+  ],
+): ExchangeOrderSnapshot {
+  return exchangeOrderSnapshot(request, {
+    state: "cancel",
+    executedVolume: "0.00006",
+    remainingVolume: "0",
+    fills,
+    raw: { fake: true, terminal: "cancel-with-fill" },
+  });
+}
+
+function executionServiceFor(input: {
+  adapter: LiveExecutionAdapter;
+  repositories: InMemoryExecutionRepository;
+  operatorState: InMemoryOperatorStateStore;
+  candidatePilots: InMemoryCandidatePilotRepository;
+  now: string;
+}): ExecutionService {
+  return new ExecutionService({
+    riskLimits: {
+      maxAllocationByAsset: { BTC: 0.6, ETH: 0.6 },
+      totalExposureCap: 0.75,
+      stalePriceThresholdMs: 30_000,
+      minimumOrderValueKrw: 5_000,
+    },
+    executionAdapter: input.adapter,
+    validationAdapter: input.adapter,
+    repositories: input.repositories,
+    accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
+    accountExecutionLeaseMs: 30_000,
+    operatorState: input.operatorState,
+    candidatePilots: input.candidatePilots,
+    now: () => input.now,
+  });
+}
+
+function candidateEnterInput(
+  strategyDecisionId: string,
+  activationAt: string,
+): Parameters<ExecutionService["submitOrderFromDecision"]>[0] {
+  return {
+    exchangeAccountId: ACCOUNT_ID,
+    strategyDecisionId,
+    referencePriceCapturedAt: "2026-08-21T00:00:10.000Z",
+    decision: {
+      strategyKey: "position_guard.paper_core.v1",
+      market: "KRW-BTC",
+      action: "ENTER",
+      reasonCodes: ["CANDIDATE_ALLOWED"],
+      referencePrice: 100_000_000,
+      requestedNotionalKrw: 6_000,
+      requestedQuantity: null,
+      metadata: {},
+    },
+    side: "bid",
+    ordType: "price",
+    price: "6000",
+    volume: null,
+    candidateAuthority: candidateAuthority(activationAt),
+  };
 }
 
 function candidateAuthority(activationAt: string): CandidateExecutionAuthority {
@@ -611,12 +997,12 @@ function candidateAuthority(activationAt: string): CandidateExecutionAuthority {
   };
 }
 
-function executionState(): ExecutionStateRecord {
+function executionState(mode: "DRY_RUN" | "LIVE" = "DRY_RUN"): ExecutionStateRecord {
   return {
     id: "lifecycle-execution-state",
     exchangeAccountId: ACCOUNT_ID,
-    executionMode: "DRY_RUN",
-    liveExecutionGate: "DISABLED",
+    executionMode: mode,
+    liveExecutionGate: mode === "LIVE" ? "ENABLED" : "DISABLED",
     systemStatus: "RUNNING",
     killSwitchActive: false,
     pauseReason: null,
