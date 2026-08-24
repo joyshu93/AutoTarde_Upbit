@@ -1010,7 +1010,7 @@ test("durable reporter queues notifications and kicks the delivery service witho
   assert.equal(notifications[0]?.deliveredAt, null);
 });
 
-test("durable reporter persists a deterministic pilot notification only once across retries", async () => {
+test("durable reporter persists a deterministic pilot notification once and re-kicks its pending retry", async () => {
   const repositories = new InMemoryExecutionRepository();
   const kickedExchangeAccounts: string[] = [];
   const reporter = new DurableTelegramReporter({
@@ -1042,7 +1042,128 @@ test("durable reporter persists a deterministic pilot notification only once acr
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0]?.id, notification.notificationId);
   assert.equal(notifications[0]?.notificationType, "POSITION_GUARD_PILOT_ROLLBACK_STARTED");
+  assert.deepEqual(kickedExchangeAccounts, ["primary", "primary"]);
+});
+
+test("durable reporter retry kicks an exact pre-existing pending notification without saving a duplicate", async () => {
+  const baseRepository = new InMemoryExecutionRepository();
+  const kickedExchangeAccounts: string[] = [];
+  let saveCalls = 0;
+  const input = {
+    notificationId: "operator_notification:position_guard_pilot_rollback_started:deployment-crash-gap:1",
+    exchangeAccountId: "primary",
+    notificationType: "POSITION_GUARD_PILOT_ROLLBACK_STARTED" as const,
+    severity: "WARN" as const,
+    title: "Candidate pilot rollback started",
+    message: "The candidate pilot entered DRAINING.",
+    payload: {
+      deploymentId: "deployment-crash-gap",
+      phase: "DRAINING",
+    },
+  };
+  const persisted = createNotification({
+    id: input.notificationId,
+    notificationType: input.notificationType,
+    severity: input.severity,
+    title: input.title,
+    message: input.message,
+    payloadJson: JSON.stringify(input.payload),
+    createdAt: "2026-08-21T00:01:00.000Z",
+  });
+  await baseRepository.saveOperatorNotification(persisted);
+  const reporter = new DurableTelegramReporter({
+    repositories: {
+      listOperatorNotifications: baseRepository.listOperatorNotifications.bind(baseRepository),
+      async saveOperatorNotification(record) {
+        saveCalls += 1;
+        await baseRepository.saveOperatorNotification(record);
+      },
+    },
+    deliveryService: {
+      kick(exchangeAccountId) {
+        kickedExchangeAccounts.push(exchangeAccountId);
+      },
+    },
+    now: () => persisted.createdAt,
+  });
+
+  await reporter.report(input);
+
+  assert.equal(saveCalls, 0);
+  assert.deepEqual(await baseRepository.listOperatorNotifications("primary"), [persisted]);
   assert.deepEqual(kickedExchangeAccounts, ["primary"]);
+});
+
+test("durable reporter retry does not re-kick exact sent or failed notifications", async () => {
+  const baseRepository = new InMemoryExecutionRepository();
+  const kickedExchangeAccounts: string[] = [];
+  let saveCalls = 0;
+  const createdAt = "2026-08-21T00:01:00.000Z";
+  const inputs = [
+    {
+      notificationId: "operator_notification:position_guard_pilot_activated:deployment-terminal:sent",
+      notificationType: "POSITION_GUARD_PILOT_ACTIVATED" as const,
+      severity: "INFO" as const,
+      title: "Candidate pilot activated",
+      message: "Candidate authority is ACTIVE.",
+      payload: { deploymentId: "deployment-terminal", phase: "ACTIVE" },
+      deliveryStatus: "SENT" as const,
+    },
+    {
+      notificationId: "operator_notification:position_guard_pilot_fault_paused:deployment-terminal:failed",
+      notificationType: "POSITION_GUARD_PILOT_FAULT_PAUSED" as const,
+      severity: "ERROR" as const,
+      title: "Candidate pilot fault paused",
+      message: "Candidate authority is PAUSED_FAULT.",
+      payload: { deploymentId: "deployment-terminal", phase: "PAUSED_FAULT" },
+      deliveryStatus: "FAILED" as const,
+    },
+  ];
+  for (const input of inputs) {
+    await baseRepository.saveOperatorNotification({
+      ...createNotification({
+        id: input.notificationId,
+        notificationType: input.notificationType,
+        severity: input.severity,
+        title: input.title,
+        message: input.message,
+        payloadJson: JSON.stringify(input.payload),
+        createdAt,
+      }),
+      deliveryStatus: input.deliveryStatus,
+    });
+  }
+  const reporter = new DurableTelegramReporter({
+    repositories: {
+      listOperatorNotifications: baseRepository.listOperatorNotifications.bind(baseRepository),
+      async saveOperatorNotification(record) {
+        saveCalls += 1;
+        await baseRepository.saveOperatorNotification(record);
+      },
+    },
+    deliveryService: {
+      kick(exchangeAccountId) {
+        kickedExchangeAccounts.push(exchangeAccountId);
+      },
+    },
+    now: () => createdAt,
+  });
+
+  for (const input of inputs) {
+    await reporter.report({
+      notificationId: input.notificationId,
+      exchangeAccountId: "primary",
+      notificationType: input.notificationType,
+      severity: input.severity,
+      title: input.title,
+      message: input.message,
+      payload: input.payload,
+    });
+  }
+
+  assert.equal(saveCalls, 0);
+  assert.equal((await baseRepository.listOperatorNotifications("primary")).length, 2);
+  assert.deepEqual(kickedExchangeAccounts, []);
 });
 
 test("durable reporter resolves a concurrent deterministic insert race by exact immutable readback", async () => {

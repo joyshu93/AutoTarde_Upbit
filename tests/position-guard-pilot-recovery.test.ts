@@ -1698,7 +1698,7 @@ test("candidate activation and recovery fault notifications are durable and idem
   );
 });
 
-test("candidate notification persistence stays idempotent and requests configured delivery once", async () => {
+test("candidate notification persistence stays idempotent and re-kicks each pending retry", async () => {
   const fixture = await createFixture();
   const kickedAccounts: string[] = [];
   const recovery = new PositionGuardPilotRecovery({
@@ -1718,7 +1718,7 @@ test("candidate notification persistence stays idempotent and requests configure
   const notifications = await fixture.repositories.listOperatorNotifications(ACCOUNT_ID);
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0]?.createdAt, NOW);
-  assert.deepEqual(kickedAccounts, [ACCOUNT_ID]);
+  assert.deepEqual(kickedAccounts, [ACCOUNT_ID, ACCOUNT_ID]);
 });
 
 interface FixtureOptions {
