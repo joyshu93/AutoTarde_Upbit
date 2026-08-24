@@ -1,13 +1,66 @@
 import assert from "node:assert/strict";
 
+import type { AppServices } from "../src/app/create-app.js";
 import type { AppConfig } from "../src/app/env.js";
 import type { ExecutionStateRecord, ReconciliationRunRecord } from "../src/domain/types.js";
 import {
   buildLiveReadinessNextActions,
   buildLiveReadinessSmokeChecks,
+  runLiveReadinessSmoke,
   summarizeLiveReadinessSmokeStatus,
 } from "../src/smoke/live-readiness.js";
 import { test } from "./harness.js";
+
+type CandidatePilotInitializer = { initialize(): Promise<unknown> } | null;
+
+test("live readiness smoke awaits candidate initialization before reading persisted state", async () => {
+  const events: string[] = [];
+
+  await runLiveReadinessSmoke(() => createSmokeApp(events, {
+    async initialize() {
+      events.push("initializer:start");
+      await Promise.resolve();
+      events.push("initializer:complete");
+    },
+  }));
+
+  assert.equal(events.indexOf("initializer:complete") < events.indexOf("operator_state"), true);
+  assert.equal(events.indexOf("initializer:complete") < events.indexOf("active_orders"), true);
+  assert.equal(events.filter((event) => event === "telegram:stop").length, 1);
+  assert.equal(events.filter((event) => event === "scheduler:stop").length, 1);
+  assert.equal(events.filter((event) => event === "persistence:close").length, 1);
+});
+
+test("live readiness smoke keeps a null candidate initializer as a no-op", async () => {
+  const events: string[] = [];
+
+  await runLiveReadinessSmoke(() => createSmokeApp(events, null));
+
+  assert.equal(events.includes("initializer:start"), false);
+  assert.equal(events.includes("operator_state"), true);
+});
+
+test("live readiness smoke preserves candidate initialization failure and cleans up before any read", async () => {
+  const events: string[] = [];
+  const originalError = new Error("candidate_initializer_failed");
+
+  await assert.rejects(
+    () => runLiveReadinessSmoke(() => createSmokeApp(events, {
+      async initialize() {
+        events.push("initializer:start");
+        throw originalError;
+      },
+    })),
+    (error) => error === originalError,
+  );
+
+  assert.deepEqual(events, [
+    "initializer:start",
+    "telegram:stop",
+    "scheduler:stop",
+    "persistence:close",
+  ]);
+});
 
 test("live readiness smoke checks block default dry-run wiring", () => {
   const checks = buildLiveReadinessSmokeChecks({
@@ -231,4 +284,69 @@ function createReconciliationRun(
     errorMessage: null,
     ...overrides,
   };
+}
+
+function createSmokeApp(
+  events: string[],
+  candidatePilotInitializer: CandidatePilotInitializer,
+): AppServices {
+  return {
+    candidatePilotInitializer: candidatePilotInitializer as AppServices["candidatePilotInitializer"],
+    config: createConfig({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+    }),
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    operatorState: {
+      async getState() {
+        events.push("operator_state");
+        return createExecutionState({
+          executionMode: "LIVE",
+          liveExecutionGate: "ENABLED",
+        });
+      },
+    } as never,
+    repositories: {
+      async listActiveOrders() {
+        events.push("active_orders");
+        return [];
+      },
+      async getLatestBalanceSnapshot() {
+        events.push("balance_snapshot");
+        return null;
+      },
+      async getLatestPositionSnapshot() {
+        events.push("position_snapshot");
+        return null;
+      },
+      async listReconciliationRuns() {
+        events.push("reconciliation_runs");
+        return [];
+      },
+    } as never,
+    telegramInboundPolling: {
+      isConfigured() {
+        return false;
+      },
+      stop() {
+        events.push("telegram:stop");
+      },
+    } as never,
+    strategyScheduler: {
+      stop() {
+        events.push("scheduler:stop");
+      },
+    } as never,
+    notificationDelivery: {
+      isConfigured() {
+        return false;
+      },
+    } as never,
+    persistence: {
+      close() {
+        events.push("persistence:close");
+      },
+    } as never,
+  } as unknown as AppServices;
 }

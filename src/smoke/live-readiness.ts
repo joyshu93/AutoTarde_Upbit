@@ -85,10 +85,13 @@ export interface LiveReadinessSmokeResult {
   readonly checks: LiveReadinessSmokeCheck[];
 }
 
-export async function runLiveReadinessSmoke(): Promise<LiveReadinessSmokeResult> {
-  const app = createApp();
+export async function runLiveReadinessSmoke(
+  createApplication: () => AppServices = createApp,
+): Promise<LiveReadinessSmokeResult> {
+  const app = createApplication();
 
   try {
+    await app.candidatePilotInitializer?.initialize();
     const [executionState, activeOrders, latestBalanceSnapshot, latestPositionSnapshot, reconciliationRuns] =
       await Promise.all([
         app.operatorState.getState(),

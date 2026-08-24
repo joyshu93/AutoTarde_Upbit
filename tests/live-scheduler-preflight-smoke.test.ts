@@ -1,14 +1,67 @@
 import assert from "node:assert/strict";
 
+import type { AppServices } from "../src/app/create-app.js";
 import type { AppConfig } from "../src/app/env.js";
-import type { StrategySchedulerStartupPreflight } from "../src/domain/types.js";
+import type { ExecutionStateRecord, StrategySchedulerStartupPreflight } from "../src/domain/types.js";
 import {
   buildLiveSchedulerPreflightNextActions,
   buildLiveSchedulerPreflightSmokeChecks,
   createSchedulerPreflightConfig,
+  runLiveSchedulerPreflightSmoke,
   summarizeLiveSchedulerPreflightSmokeStatus,
 } from "../src/smoke/live-scheduler-preflight.js";
 import { test } from "./harness.js";
+
+type CandidatePilotInitializer = { initialize(): Promise<unknown> } | null;
+
+test("live scheduler preflight smoke awaits candidate initialization before state and preflight reads", async () => {
+  const events: string[] = [];
+
+  await runLiveSchedulerPreflightSmoke(() => createSmokeApp(events, {
+    async initialize() {
+      events.push("initializer:start");
+      await Promise.resolve();
+      events.push("initializer:complete");
+    },
+  }));
+
+  assert.equal(events.indexOf("initializer:complete") < events.indexOf("operator_state"), true);
+  assert.equal(events.indexOf("initializer:complete") < events.indexOf("active_orders"), true);
+  assert.equal(events.filter((event) => event === "telegram:stop").length, 1);
+  assert.equal(events.filter((event) => event === "scheduler:stop").length, 1);
+  assert.equal(events.filter((event) => event === "persistence:close").length, 1);
+});
+
+test("live scheduler preflight smoke keeps a null candidate initializer as a no-op", async () => {
+  const events: string[] = [];
+
+  await runLiveSchedulerPreflightSmoke(() => createSmokeApp(events, null));
+
+  assert.equal(events.includes("initializer:start"), false);
+  assert.equal(events.includes("operator_state"), true);
+});
+
+test("live scheduler preflight smoke preserves candidate initialization failure and cleans up before preflight", async () => {
+  const events: string[] = [];
+  const originalError = new Error("candidate_initializer_failed");
+
+  await assert.rejects(
+    () => runLiveSchedulerPreflightSmoke(() => createSmokeApp(events, {
+      async initialize() {
+        events.push("initializer:start");
+        throw originalError;
+      },
+    })),
+    (error) => error === originalError,
+  );
+
+  assert.deepEqual(events, [
+    "initializer:start",
+    "telegram:stop",
+    "scheduler:stop",
+    "persistence:close",
+  ]);
+});
 
 test("live scheduler preflight smoke blocks non-live invocation", () => {
   const checks = buildLiveSchedulerPreflightSmokeChecks({
@@ -184,5 +237,74 @@ function createPreflight(
     detail: "Live scheduler startup preflight passed.",
     checks: [],
     ...overrides,
+  };
+}
+
+function createSmokeApp(
+  events: string[],
+  candidatePilotInitializer: CandidatePilotInitializer,
+): AppServices {
+  return {
+    candidatePilotInitializer: candidatePilotInitializer as AppServices["candidatePilotInitializer"],
+    config: createConfig({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+    }),
+    exchangeBackedReadEnabled: true,
+    liveSendPath: "LIVE_ADAPTER",
+    operatorState: {
+      async getState() {
+        events.push("operator_state");
+        return createExecutionState();
+      },
+    } as never,
+    repositories: {
+      async listActiveOrders() {
+        events.push("active_orders");
+        return [];
+      },
+      async getLatestBalanceSnapshot() {
+        events.push("balance_snapshot");
+        return null;
+      },
+      async getLatestPositionSnapshot() {
+        events.push("position_snapshot");
+        return null;
+      },
+      async listReconciliationRuns() {
+        events.push("reconciliation_runs");
+        return [];
+      },
+    } as never,
+    telegramInboundPolling: {
+      stop() {
+        events.push("telegram:stop");
+      },
+    } as never,
+    strategyScheduler: {
+      stop() {
+        events.push("scheduler:stop");
+      },
+    } as never,
+    persistence: {
+      close() {
+        events.push("persistence:close");
+      },
+    } as never,
+  } as unknown as AppServices;
+}
+
+function createExecutionState(): ExecutionStateRecord {
+  return {
+    id: "execution_state_primary",
+    exchangeAccountId: "primary",
+    executionMode: "LIVE",
+    liveExecutionGate: "ENABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-05-14T00:00:00.000Z",
   };
 }

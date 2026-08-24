@@ -61,10 +61,13 @@ export interface LiveSchedulerPreflightSmokeResult {
   readonly checks: LiveSchedulerPreflightSmokeCheck[];
 }
 
-export async function runLiveSchedulerPreflightSmoke(): Promise<LiveSchedulerPreflightSmokeResult> {
-  const app = createApp();
+export async function runLiveSchedulerPreflightSmoke(
+  createApplication: () => AppServices = createApp,
+): Promise<LiveSchedulerPreflightSmokeResult> {
+  const app = createApplication();
 
   try {
+    await app.candidatePilotInitializer?.initialize();
     return await buildLiveSchedulerPreflightSmokeResult(app);
   } finally {
     app.telegramInboundPolling.stop();
