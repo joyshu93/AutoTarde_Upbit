@@ -292,6 +292,71 @@ test("BTC pilot readiness AST allowlist rejects unsafe executable mutations", ()
   }
 });
 
+test("BTC pilot readiness AST shape rejects a top-level conditional exit override", () => {
+  const original = readPilotReadinessScript();
+  const mutation = `${original}\nif (-not $env:FAKE_NPM_EXIT_CODE) { $inspectionExitCode = 0 }\n`;
+
+  assertPilotReadinessMutationRejected("top-level-conditional-exit-override", mutation, original);
+});
+
+test("BTC pilot readiness AST shape rejects an exit override inside the native-call try block", () => {
+  const original = readPilotReadinessScript();
+  const mutation = original.replace(
+    "  $inspectionExitCode = $LASTEXITCODE\n",
+    "  $inspectionExitCode = $LASTEXITCODE\n  if (-not $env:FAKE_NPM_EXIT_CODE) { $inspectionExitCode = 0 }\n",
+  );
+
+  assertPilotReadinessMutationRejected("try-block-exit-override", mutation, original);
+});
+
+test("BTC pilot readiness AST shape rejects a function-definition command shadow", () => {
+  const original = readPilotReadinessScript();
+  const mutation = original.replace(
+    "$inspectionExitCode = 1\n",
+    "function npm.cmd { $global:LASTEXITCODE = 0 }\n$inspectionExitCode = 1\n",
+  );
+
+  assertPilotReadinessMutationRejected("function-command-shadow", mutation, original);
+});
+
+test("BTC pilot readiness AST shape ignores comments without relaxing executable structure", () => {
+  const original = readPilotReadinessScript();
+  const mutation = original.replace(
+    "try {\n  npm.cmd",
+    "try {\n  # Review comments may change without changing executable behavior.\n  npm.cmd",
+  );
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "autotrade-pilot-ast-comments-"));
+  const scriptPath = join(temporaryRoot, "comment-only-change.ps1");
+
+  try {
+    assert.notEqual(mutation, original, "comment-only mutation must change the fixture");
+    writeFileSync(scriptPath, mutation, "utf8");
+    assert.doesNotThrow(() => assertPilotReadinessAstSafe(scriptPath));
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+function assertPilotReadinessMutationRejected(
+  name: string,
+  mutation: string,
+  original: string,
+): void {
+  assert.notEqual(mutation, original, `${name} mutation must change the fixture`);
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "autotrade-pilot-ast-shape-"));
+  const scriptPath = join(temporaryRoot, `${name}.ps1`);
+
+  try {
+    writeFileSync(scriptPath, mutation, "utf8");
+    assert.throws(
+      () => assertPilotReadinessAstSafe(scriptPath),
+      `${name} must be rejected by the complete AST shape check`,
+    );
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+}
+
 function assertPilotReadinessAstSafe(scriptPath: string): void {
   const ast = inspectPowerShellAst(scriptPath);
   const commands = ast.commands.map((command) => ({
@@ -354,6 +419,132 @@ function assertPilotReadinessAstSafe(scriptPath: string): void {
       },
     ],
   );
+  assert.deepEqual(
+    {
+      paramAttributes: ast.paramAttributes,
+      paramBlock: ast.paramBlock,
+      topLevelStatements: ast.topLevelStatements,
+    },
+    expectedPilotReadinessAstShape,
+  );
+  assert.deepEqual(ast.executableTokens, [
+    ...expectedPilotReadinessAstShape.paramAttributes.flatMap((attribute) => attribute.tokens),
+    ...expectedPilotReadinessAstShape.paramBlock.tokens,
+    ...expectedPilotReadinessAstShape.topLevelStatements.flatMap((statement) => statement.tokens),
+  ]);
+}
+
+const expectedPilotReadinessAstShape = {
+  paramAttributes: [
+    astFingerprint("AttributeAst", "[", "CmdletBinding", "(", ")", "]"),
+  ],
+  paramBlock: astFingerprint(
+    "ParamBlockAst",
+    "param",
+    "(",
+    "[", "Parameter", "(", "Mandatory", "=", "$true", ")", "]",
+    "[", "ValidateNotNullOrEmpty", "(", ")", "]",
+    "[", "string", "]", "$DatabasePath", ",",
+    "[", "Parameter", "(", "Mandatory", "=", "$true", ")", "]",
+    "[", "ValidateNotNullOrEmpty", "(", ")", "]",
+    "[", "string", "]", "$ExchangeAccountId", ",",
+    "[", "Parameter", "(", "Mandatory", "=", "$true", ")", "]",
+    "[", "ValidateNotNullOrEmpty", "(", ")", "]",
+    "[", "string", "]", "$DeploymentId", ",",
+    "[", "Parameter", "(", "Mandatory", "=", "$true", ")", "]",
+    "[", "ValidateRange", "(", "1", ",", "[", "long", "]", "::", "MaxValue", ")", "]",
+    "[", "long", "]", "$FreshnessThresholdMs", ",",
+    "[", "ValidateSet", "(", '"TEXT"', ",", '"JSON"', ")", "]",
+    "[", "string", "]", "$Format", "=", '"TEXT"',
+    ")",
+  ),
+  topLevelStatements: [
+    astFingerprint("AssignmentStatementAst", "$ErrorActionPreference", "=", '"Stop"'),
+    astFingerprint(
+      "IfStatementAst",
+      "if", "(", "-not", "(", "Test-Path", "-LiteralPath", "$DatabasePath", "-PathType", "Leaf", ")", ")", "{",
+      "throw", '"BTC pilot readiness requires an explicit existing SQLite database file: $DatabasePath"',
+      "}",
+    ),
+    astFingerprint(
+      "AssignmentStatementAst",
+      "$DatabasePath", "=", "(", "Resolve-Path", "-LiteralPath", "$DatabasePath", ")", ".", "ProviderPath",
+    ),
+    astFingerprint(
+      "AssignmentStatementAst",
+      "$RepositoryRoot", "=", "(", "[", "System.IO.DirectoryInfo", "]", "$PSScriptRoot", ")", ".", "Parent", ".", "FullName",
+    ),
+    astFingerprint(
+      "AssignmentStatementAst",
+      "$checkedAt", "=", "[", "DateTimeOffset", "]", "::", "UtcNow", ".", "ToString", "(", '"o"', ")",
+    ),
+    astFingerprint("AssignmentStatementAst", "$PilotId", "=", '"BTC_COMBINED_CONSERVATIVE_PILOT_V1"'),
+    astFingerprint("AssignmentStatementAst", "$PilotMarket", "=", '"KRW-BTC"'),
+    astFingerprint("AssignmentStatementAst", "$PilotPolicy", "=", '"COMBINED_CONSERVATIVE"'),
+    astFingerprint(
+      "AssignmentStatementAst",
+      "$PilotPolicyVersion", "=", '"PCS-2026-001.DEPLOYMENT_READINESS_V1"',
+    ),
+    astFingerprint("AssignmentStatementAst", "$env:APP_EXECUTION_MODE", "=", '"DRY_RUN"'),
+    astFingerprint("AssignmentStatementAst", "$env:ENABLE_LIVE_ORDERS", "=", '"false"'),
+    astFingerprint(
+      "PipelineAst",
+      "Remove-Item", "Env:\\POSITION_GUARD_PILOT_ID", "-ErrorAction", "SilentlyContinue",
+    ),
+    astFingerprint(
+      "PipelineAst",
+      "Remove-Item", "Env:\\POSITION_GUARD_PILOT_CONFIRMATION", "-ErrorAction", "SilentlyContinue",
+    ),
+    astFingerprint(
+      "AssignmentStatementAst",
+      "$env:ENABLE_TELEGRAM_INBOUND_POLLING", "=", '"false"',
+    ),
+    astFingerprint("AssignmentStatementAst", "$env:ENABLE_TELEGRAM_DELIVERY", "=", '"false"'),
+    astFingerprint("AssignmentStatementAst", "$env:STRATEGY_SCHEDULER_ENABLED", "=", '"false"'),
+    astFingerprint(
+      "AssignmentStatementAst",
+      "$env:STRATEGY_SCHEDULER_RUN_ON_START", "=", '"false"',
+    ),
+    astFingerprint(
+      "PipelineAst",
+      "Write-Host", '"Inspecting persisted BTC pilot readiness with BASELINE policy selection and without activation."',
+    ),
+    astFingerprint(
+      "PipelineAst",
+      "Write-Host", '"pilot=$PilotId market=$PilotMarket policy=$PilotPolicy version=$PilotPolicyVersion"',
+    ),
+    astFingerprint(
+      "PipelineAst",
+      "Write-Host", '"database=$DatabasePath deployment=$DeploymentId account=$ExchangeAccountId"',
+    ),
+    astFingerprint("AssignmentStatementAst", "$inspectionExitCode", "=", "1"),
+    astFingerprint("PipelineAst", "Push-Location", "-LiteralPath", "$RepositoryRoot"),
+    astFingerprint(
+      "TryStatementAst",
+      "try", "{",
+      "npm.cmd", "run", "inspect:btc-pilot:readiness", "--",
+      "--database-path", '"$DatabasePath"',
+      "--format", "$Format",
+      "--exchange-account-id", "$ExchangeAccountId",
+      "--deployment-id", "$DeploymentId",
+      "--checked-at", "$checkedAt",
+      "--freshness-threshold-ms", "$FreshnessThresholdMs",
+      "$inspectionExitCode", "=", "$LASTEXITCODE",
+      "}", "finally", "{", "Pop-Location", "}",
+    ),
+    astFingerprint(
+      "IfStatementAst",
+      "if", "(", "$inspectionExitCode", "-ne", "0", ")", "{", "exit", "$inspectionExitCode", "}",
+    ),
+  ],
+} satisfies {
+  paramAttributes: PowerShellAstNodeFingerprint[];
+  paramBlock: PowerShellAstNodeFingerprint;
+  topLevelStatements: PowerShellAstNodeFingerprint[];
+};
+
+function astFingerprint(type: string, ...tokens: string[]): PowerShellAstNodeFingerprint {
+  return { type, tokens };
 }
 
 test("BTC pilot readiness example runs its single npm command from the repository root", () => {
@@ -418,8 +609,17 @@ function readPilotReadinessScript(): string {
 
 type PowerShellAstInspection = {
   commands: Array<{ name: string | null; text: string }>;
+  executableTokens: string[];
   finallyCommands: Array<string | null>;
   memberInvocations: Array<{ member: string | null; text: string }>;
+  paramAttributes: PowerShellAstNodeFingerprint[];
+  paramBlock: PowerShellAstNodeFingerprint | null;
+  topLevelStatements: PowerShellAstNodeFingerprint[];
+};
+
+type PowerShellAstNodeFingerprint = {
+  type: string;
+  tokens: string[];
 };
 
 function inspectPowerShellAst(scriptPath: string): PowerShellAstInspection {
@@ -446,7 +646,30 @@ $finallyCommands = @($ast.FindAll({ param($node) $node -is [System.Management.Au
     }
   }
 })
-[pscustomobject]@{ commands = $commands; finallyCommands = $finallyCommands; memberInvocations = $members } | ConvertTo-Json -Depth 5 -Compress
+function Get-ExecutableNodeFingerprint($node) {
+  if ($null -eq $node) { return $null }
+  $nodeTokens = @($tokens | Where-Object {
+    $_.Extent.StartOffset -ge $node.Extent.StartOffset -and
+    $_.Extent.EndOffset -le $node.Extent.EndOffset -and
+    $_.Kind.ToString() -notin @("Comment", "NewLine", "LineContinuation", "EndOfInput")
+  } | ForEach-Object { $_.Text })
+  return [pscustomobject]@{ type = $node.GetType().Name; tokens = $nodeTokens }
+}
+$paramAttributes = @($ast.ParamBlock.Attributes | ForEach-Object { Get-ExecutableNodeFingerprint $_ })
+$paramBlock = Get-ExecutableNodeFingerprint $ast.ParamBlock
+$topLevelStatements = @($ast.EndBlock.Statements | ForEach-Object { Get-ExecutableNodeFingerprint $_ })
+$executableTokens = @($tokens | Where-Object {
+  $_.Kind.ToString() -notin @("Comment", "NewLine", "LineContinuation", "EndOfInput")
+} | ForEach-Object { $_.Text })
+[pscustomobject]@{
+  commands = $commands
+  executableTokens = $executableTokens
+  finallyCommands = $finallyCommands
+  memberInvocations = $members
+  paramAttributes = $paramAttributes
+  paramBlock = $paramBlock
+  topLevelStatements = $topLevelStatements
+} | ConvertTo-Json -Depth 8 -Compress
 `;
   const result = spawnSync(
     "powershell.exe",
