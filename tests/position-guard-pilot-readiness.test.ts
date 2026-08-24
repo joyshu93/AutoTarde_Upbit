@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync, statSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -150,6 +150,7 @@ test("pending-flat candidate is visible but not ready for candidate execution", 
     assert.equal(report.deployment?.phase, "PENDING_FLAT");
     assert.equal(check(report, "pilot_phase").status, "WARN");
     assert.equal(check(report, "state_replay").status, "PASS");
+    assert.equal(check(report, "audit_chain").status, "PASS");
     assert.match(report.nextActions.join("\n"), /flat-start|PENDING_FLAT/u);
   });
 });
@@ -165,6 +166,7 @@ test("clean active candidate produces PASS with stable JSON and text provenance"
     assert.equal(report.stateProvenance?.replayEqual, true);
     assert.equal(report.stateProvenance?.stateVersion, 0);
     assert.equal(report.evidenceProvenance?.count, 0);
+    assert.equal(check(report, "audit_chain").status, "PASS");
     assert.equal(report.orderState.activeCount, 0);
     assert.equal(report.orderState.uncertainCount, 0);
     assert.equal(report.leaseState.classification, "ABSENT");
@@ -191,7 +193,288 @@ test("paused-fault phase is blocked with an explicit next action", async () => {
     const report = inspectPositionGuardPilotReadiness(options(databasePath));
     assert.equal(report.status, "BLOCK");
     assert.equal(check(report, "pilot_phase").status, "BLOCK");
+    assert.equal(check(report, "audit_chain").status, "PASS");
     assert.match(report.nextActions.join("\n"), /PAUSED_FAULT/u);
+  });
+});
+
+test("missing or unsupported candidate audit authority fails closed", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE", { audit: false });
+    seedHealth(db);
+
+    const missing = inspectPositionGuardPilotReadiness(options(databasePath));
+    assert.equal(missing.status, "BLOCK");
+    assert.equal(check(missing, "state_replay").status, "PASS");
+    assert.equal(check(missing, "audit_chain").status, "BLOCK");
+    assert.match(check(missing, "audit_chain").detail, /DEPLOYMENT_CREATED|audit/u);
+  });
+
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE");
+    seedHealth(db);
+    seedAudit(db, {
+      id: `${IDENTITY.deploymentId}:unexpected-state`,
+      eventType: "STATE_ADVANCED",
+      fromPhase: "ACTIVE",
+      toPhase: "ACTIVE",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({
+        evidenceId: "missing-evidence",
+        materialHash: "0".repeat(64),
+        materialVersion: "EXACT_V2",
+        fromStateVersion: 0,
+        toStateVersion: 1,
+      }),
+      createdAt: "2026-08-24T00:10:00.000Z",
+    });
+
+    const malformed = inspectPositionGuardPilotReadiness(options(databasePath));
+    assert.equal(malformed.status, "BLOCK");
+    assert.equal(check(malformed, "state_replay").status, "PASS");
+    assert.equal(check(malformed, "audit_chain").status, "BLOCK");
+    assert.match(check(malformed, "audit_chain").detail, /STATE_ADVANCED|audit/u);
+  });
+});
+
+test("pilot audit authority is rejected when append-only triggers are missing", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE");
+    seedHealth(db);
+    db.exec("DROP TRIGGER strategy_pilot_audit_events_no_update");
+    db.exec("DROP TRIGGER strategy_pilot_audit_events_no_delete");
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+    assert.equal(report.status, "BLOCK");
+    assert.equal(check(report, "required_schema").status, "BLOCK");
+    assert.equal(check(report, "audit_chain").status, "BLOCK");
+    assert.match(check(report, "required_schema").detail, /append-only|trigger|immutable/u);
+  });
+});
+
+test("canonical audit event identity is required even when payload and timestamps match", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE", { audit: false });
+    seedHealth(db);
+    const activationAt = "2026-08-23T23:59:30.000Z";
+    const activationEpochNs = BigInt(epochMs(activationAt)) * 1_000_000n;
+    seedAudit(db, {
+      id: `${IDENTITY.deploymentId}:wrong-created-identity`,
+      eventType: "DEPLOYMENT_CREATED",
+      fromPhase: null,
+      toPhase: "PENDING_FLAT",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({
+        pilotId: IDENTITY.pilotId,
+        market: IDENTITY.market,
+        policyId: IDENTITY.policyId,
+        policyVersion: IDENTITY.policyVersion,
+      }),
+      createdAt: "2026-08-23T23:59:00.000Z",
+    });
+    seedAudit(db, {
+      id: `${IDENTITY.deploymentId}:activation:${activationEpochNs.toString()}`,
+      eventType: "PHASE_TRANSITION",
+      fromPhase: "PENDING_FLAT",
+      toPhase: "ACTIVE",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({ activationAt, activationEpochNs: activationEpochNs.toString() }),
+      createdAt: activationAt,
+    });
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+    assert.equal(check(report, "state_replay").status, "PASS");
+    assert.equal(check(report, "audit_chain").status, "BLOCK");
+    assert.match(check(report, "audit_chain").detail, /DEPLOYMENT_CREATED|identity/u);
+  });
+});
+
+test("STATE_ADVANCED audit must link the exact evidence, state version, and chronology", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE", { audit: "LIFECYCLE_ONLY" });
+    seedHealth(db);
+    const evidence = {
+      evidenceId: "evidence-enter",
+      executedAt: "2026-08-24T00:10:00.000Z",
+      action: "ENTER" as const,
+      entryPath: "PULLBACK" as const,
+      terminalStatus: "FILLED" as const,
+      executedQuantity: "0.001",
+      grossQuoteValueKrw: "100000",
+      confirmedFeeKrw: "50",
+      remainingQuantity: "0.001",
+    };
+    const material = candidateEvidenceMaterial(IDENTITY.deploymentId, evidence);
+    db.prepare(`
+      INSERT INTO strategy_candidate_execution_evidence (
+        deployment_id, id, executed_at, executed_at_epoch_ns, action, entry_path,
+        terminal_status, executed_quantity, gross_quote_value_krw, confirmed_fee_krw,
+        remaining_quantity, material_hash, created_at, material_version,
+        executed_quantity_exact, gross_quote_value_krw_exact, confirmed_fee_krw_exact,
+        remaining_quantity_exact
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'EXACT_V2', ?, ?, ?, ?)
+    `).run(
+      IDENTITY.deploymentId, evidence.evidenceId, evidence.executedAt,
+      material.epochNanoseconds, evidence.action, evidence.entryPath, evidence.terminalStatus,
+      0.001, 100000, 50, 0.001, material.hash, evidence.executedAt,
+      evidence.executedQuantity, evidence.grossQuoteValueKrw, evidence.confirmedFeeKrw,
+      evidence.remainingQuantity,
+    );
+    db.prepare(`
+      UPDATE strategy_candidate_states
+      SET current_episode_cost_basis_krw = 100050,
+          current_episode_inventory_quantity = 0.001,
+          last_entry_path = 'PULLBACK', last_evidence_at = ?, last_evidence_id = ?,
+          state_version = 1, updated_at = ?,
+          current_episode_cost_basis_krw_exact = '100050',
+          current_episode_inventory_quantity_exact = '0.001'
+      WHERE deployment_id = ?
+    `).run(evidence.executedAt, evidence.evidenceId, evidence.executedAt, IDENTITY.deploymentId);
+    seedAudit(db, {
+      id: `${IDENTITY.deploymentId}:evidence:${evidence.evidenceId}`,
+      eventType: "STATE_ADVANCED",
+      fromPhase: "ACTIVE",
+      toPhase: "ACTIVE",
+      stateVersion: 1,
+      payloadJson: JSON.stringify({
+        evidenceId: evidence.evidenceId,
+        materialHash: material.hash,
+        materialVersion: material.materialVersion,
+        fromStateVersion: 0,
+        toStateVersion: 2,
+      }),
+      createdAt: evidence.executedAt,
+    });
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+    assert.equal(check(report, "state_replay").status, "PASS");
+    assert.equal(check(report, "audit_chain").status, "BLOCK");
+    assert.match(check(report, "audit_chain").detail, /STATE_ADVANCED|state version|audit/u);
+  });
+});
+
+test("draining and disabled rollback phases require canonical audit authority", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "DRAINING");
+    seedHealth(db);
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+    assert.equal(check(report, "pilot_phase").status, "BLOCK");
+    assert.equal(check(report, "audit_chain").status, "PASS");
+  });
+
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "DISABLED");
+    seedHealth(db);
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+    assert.equal(check(report, "pilot_phase").status, "WARN");
+    assert.equal(check(report, "audit_chain").status, "PASS");
+  });
+});
+
+test("rollback completion cannot precede later exact state authority", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "DISABLED", { audit: false });
+    seedHealth(db);
+    const activationAt = "2026-08-23T23:59:30.000Z";
+    const completionAt = "2026-08-23T23:59:40.000Z";
+    const activationEpochNs = BigInt(epochMs(activationAt)) * 1_000_000n;
+    db.prepare(`
+      UPDATE strategy_pilot_deployments
+      SET activation_at = ?, activation_epoch_ns = ?, updated_at = ?
+      WHERE id = ?
+    `).run(activationAt, activationEpochNs, completionAt, IDENTITY.deploymentId);
+    seedAudit(db, {
+      id: `${IDENTITY.deploymentId}:created`,
+      eventType: "DEPLOYMENT_CREATED",
+      fromPhase: null,
+      toPhase: "PENDING_FLAT",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({
+        pilotId: IDENTITY.pilotId,
+        market: IDENTITY.market,
+        policyId: IDENTITY.policyId,
+        policyVersion: IDENTITY.policyVersion,
+      }),
+      createdAt: "2026-08-23T23:59:00.000Z",
+    });
+    seedAudit(db, {
+      id: `${IDENTITY.deploymentId}:activation:${activationEpochNs.toString()}`,
+      eventType: "PHASE_TRANSITION",
+      fromPhase: "PENDING_FLAT",
+      toPhase: "ACTIVE",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({ activationAt, activationEpochNs: activationEpochNs.toString() }),
+      createdAt: activationAt,
+    });
+    seedAudit(db, {
+      id: `${IDENTITY.deploymentId}:rollback_completed:${String(BigInt(epochMs(completionAt)) * 1_000_000n)}`,
+      eventType: "ROLLBACK_COMPLETED",
+      fromPhase: "ACTIVE",
+      toPhase: "DISABLED",
+      stateVersion: 2,
+      payloadJson: JSON.stringify({ transitionAt: completionAt }),
+      createdAt: completionAt,
+    });
+    const enter = seedExactEvidence(db, {
+      evidenceId: "late-enter",
+      executedAt: "2026-08-24T00:00:00.000Z",
+      action: "ENTER",
+      entryPath: "PULLBACK",
+      terminalStatus: "FILLED",
+      executedQuantity: "0.001",
+      grossQuoteValueKrw: "100000",
+      confirmedFeeKrw: "50",
+      remainingQuantity: "0.001",
+    });
+    const exit = seedExactEvidence(db, {
+      evidenceId: "late-exit",
+      executedAt: "2026-08-24T00:01:00.000Z",
+      action: "EXIT",
+      entryPath: "NONE",
+      terminalStatus: "FILLED",
+      executedQuantity: "0.001",
+      grossQuoteValueKrw: "101000",
+      confirmedFeeKrw: "50",
+      remainingQuantity: "0",
+    });
+    for (const [index, record] of [enter, exit].entries()) {
+      seedAudit(db, {
+        id: `${IDENTITY.deploymentId}:evidence:${record.evidence.evidenceId}`,
+        eventType: "STATE_ADVANCED",
+        fromPhase: "ACTIVE",
+        toPhase: "ACTIVE",
+        stateVersion: index + 1,
+        payloadJson: JSON.stringify({
+          evidenceId: record.evidence.evidenceId,
+          materialHash: record.materialHash,
+          materialVersion: record.materialVersion,
+          fromStateVersion: index,
+          toStateVersion: index + 1,
+        }),
+        createdAt: record.evidence.executedAt,
+      });
+    }
+    db.prepare(`
+      UPDATE strategy_candidate_states
+      SET current_episode_add_count = 0, current_episode_cost_basis_krw = 0,
+          current_episode_inventory_quantity = 0, current_episode_realized_pnl_krw = 0,
+          last_full_exit_at = ?, last_full_exit_realized_pnl_krw = 900,
+          last_entry_path = 'PULLBACK', last_evidence_at = ?, last_evidence_id = ?,
+          state_version = 2, updated_at = ?,
+          current_episode_cost_basis_krw_exact = '0',
+          current_episode_inventory_quantity_exact = '0',
+          current_episode_realized_pnl_krw_exact = '0',
+          last_full_exit_realized_pnl_krw_exact = '900'
+      WHERE deployment_id = ?
+    `).run(
+      exit.evidence.executedAt, exit.evidence.executedAt, exit.evidence.evidenceId,
+      exit.evidence.executedAt, IDENTITY.deploymentId,
+    );
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+    assert.equal(check(report, "state_replay").status, "PASS");
+    assert.equal(check(report, "audit_chain").status, "BLOCK");
+    assert.match(check(report, "audit_chain").detail, /ROLLBACK_COMPLETED|chronology|state authority/u);
   });
 });
 
@@ -333,6 +616,74 @@ test("missing or malformed persisted health fails closed without inference", asy
   });
 });
 
+test("malformed health timestamps cannot hide behind a lexically later valid row", async () => {
+  await withMigratedFixture(async ({ databasePath, db }) => {
+    seedDeployment(db, "ACTIVE");
+    seedHealth(db);
+    db.prepare(`
+      INSERT INTO balance_snapshots (
+        id, exchange_account_id, captured_at, source, total_krw_value, balances_json
+      ) VALUES ('balance-hidden-bad', 'primary', '0000-invalid', 'RECONCILIATION', '100000', '[]')
+    `).run();
+    db.prepare(`
+      INSERT INTO position_snapshots (id, exchange_account_id, captured_at, source, positions_json)
+      VALUES ('position-hidden-bad', 'primary', '0000-invalid', 'RECONCILIATION', '[]')
+    `).run();
+    db.prepare(`
+      INSERT INTO reconciliation_runs (
+        id, exchange_account_id, status, started_at, completed_at, summary_json, error_message
+      ) VALUES ('reconciliation-hidden-bad', 'primary', 'SUCCESS', '0000-invalid',
+        '0000-invalid', ?, NULL)
+    `).run(JSON.stringify({
+      source: "SCHEDULER_PREFLIGHT",
+      status: "SUCCESS",
+      issues: [],
+      candidateCount: 0,
+      processedCount: 0,
+      deferredCount: 0,
+      maxOrderLookupsPerRun: 10,
+    }));
+
+    const report = inspectPositionGuardPilotReadiness(options(databasePath));
+    assert.equal(check(report, "balance_snapshot").status, "BLOCK");
+    assert.equal(check(report, "position_snapshot").status, "BLOCK");
+    assert.equal(check(report, "latest_reconciliation").status, "BLOCK");
+    assert.equal(report.health.balance, null);
+    assert.equal(report.health.position, null);
+    assert.equal(report.health.reconciliation, null);
+  });
+});
+
+test("database paths through an existing symlink or junction ancestor are rejected", async () => {
+  await withDirectory("ancestor-link", async (directory) => {
+    const realDirectory = join(directory, "real");
+    const aliasDirectory = join(directory, "alias");
+    await mkdir(realDirectory);
+    const databasePath = join(realDirectory, "fixture.sqlite");
+    const handle = openSqliteDatabase(databasePath);
+    try {
+      seedAccount(handle.db);
+      handle.db.exec("PRAGMA journal_mode = DELETE");
+      seedDeployment(handle.db, "ACTIVE");
+      seedHealth(handle.db);
+    } finally {
+      handle.close();
+    }
+    try {
+      await symlink(realDirectory, aliasDirectory, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EPERM" || code === "EACCES" || code === "ENOTSUP") return;
+      throw error;
+    }
+
+    const report = inspectPositionGuardPilotReadiness(options(join(aliasDirectory, "fixture.sqlite")));
+    assert.equal(report.status, "BLOCK");
+    assert.equal(check(report, "database_file").status, "BLOCK");
+    assert.match(check(report, "database_file").detail, /ancestor|reparse|symlink|junction/u);
+  });
+});
+
 test("non-canonical exact candidate numerics fail closed", async () => {
   await withMigratedFixture(async ({ databasePath, db }) => {
     seedDeployment(db, "ACTIVE");
@@ -405,7 +756,7 @@ test("inspection source has a strict dependency boundary and import-only CLI gua
     assert.doesNotMatch(source, new RegExp(`from [^\\n]*${escapeRegExp(forbidden)}`, "iu"));
   }
   assert.match(source, /new DatabaseSync\(databasePath, \{ readOnly: true \}\)/u);
-  assert.doesNotMatch(source, /immutable/u);
+  assert.doesNotMatch(source, /(?:[?&]|\b)immutable\s*=\s*(?:1|true)/iu);
   assert.doesNotMatch(source, /readFileSync/u);
   assert.doesNotMatch(source, /WAL-index|readNativeUInt32|readFilePrefix/u);
   assert.doesNotMatch(source, /inspectPositionGuardPilotReadiness\([^)]*process\.env/u);
@@ -514,10 +865,18 @@ function seedAccount(db: DatabaseSync): void {
 
 function seedDeployment(
   db: DatabaseSync,
-  phase: "PENDING_FLAT" | "ACTIVE" | "PAUSED_FAULT",
+  phase: "DISABLED" | "PENDING_FLAT" | "ACTIVE" | "PAUSED_FAULT" | "DRAINING",
+  options: Readonly<{ audit?: boolean | "LIFECYCLE_ONLY" }> = {},
 ): void {
-  const activationAt = phase === "ACTIVE" ? "2026-08-24T00:00:00.000Z" : null;
+  const activationAt = phase === "ACTIVE" || phase === "DRAINING"
+    ? "2026-08-23T23:59:30.000Z"
+    : null;
   const activationEpochNs = activationAt === null ? null : String(BigInt(epochMs(activationAt)) * 1_000_000n);
+  const updatedAt = phase === "PENDING_FLAT"
+    ? "2026-08-23T23:59:00.000Z"
+    : phase === "ACTIVE"
+      ? activationAt!
+      : "2026-08-24T00:00:00.000Z";
   db.prepare(`
     INSERT INTO strategy_pilot_deployments (
       id, exchange_account_id, pilot_id, market, policy_id, policy_version, phase,
@@ -526,7 +885,7 @@ function seedDeployment(
   `).run(
     IDENTITY.deploymentId, IDENTITY.exchangeAccountId, IDENTITY.pilotId, IDENTITY.market,
     IDENTITY.policyId, IDENTITY.policyVersion, phase, "2026-08-23T23:59:00.000Z",
-    "2026-08-24T00:00:00.000Z", activationAt, activationEpochNs,
+    updatedAt, activationAt, activationEpochNs,
   );
   db.prepare(`
     INSERT INTO strategy_candidate_states (
@@ -538,6 +897,126 @@ function seedDeployment(
       current_episode_realized_pnl_krw_exact, last_full_exit_realized_pnl_krw_exact
     ) VALUES (?, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, 0, ?, 'EXACT_V2', '0', '0', '0', NULL)
   `).run(IDENTITY.deploymentId, "2026-08-24T00:00:00.000Z");
+  if (options.audit === false) return;
+  seedAudit(db, {
+    id: `${IDENTITY.deploymentId}:created`,
+    eventType: "DEPLOYMENT_CREATED",
+    fromPhase: null,
+    toPhase: "PENDING_FLAT",
+    stateVersion: 0,
+    payloadJson: JSON.stringify({
+      pilotId: IDENTITY.pilotId,
+      market: IDENTITY.market,
+      policyId: IDENTITY.policyId,
+      policyVersion: IDENTITY.policyVersion,
+    }),
+    createdAt: "2026-08-23T23:59:00.000Z",
+  });
+  if (activationAt !== null) {
+    seedAudit(db, {
+      id: `${IDENTITY.deploymentId}:activation:${activationEpochNs}`,
+      eventType: "PHASE_TRANSITION",
+      fromPhase: "PENDING_FLAT",
+      toPhase: "ACTIVE",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({ activationAt, activationEpochNs }),
+      createdAt: activationAt,
+    });
+  }
+  if (options.audit === "LIFECYCLE_ONLY") return;
+  if (phase === "DRAINING") {
+    seedAudit(db, {
+      id: `${IDENTITY.deploymentId}:rollback_started:${String(BigInt(epochMs(updatedAt)) * 1_000_000n)}`,
+      eventType: "ROLLBACK_STARTED",
+      fromPhase: "ACTIVE",
+      toPhase: "DRAINING",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({ transitionAt: updatedAt }),
+      createdAt: updatedAt,
+    });
+  }
+  if (phase === "DISABLED") {
+    seedAudit(db, {
+      id: `${IDENTITY.deploymentId}:rollback_completed:${String(BigInt(epochMs(updatedAt)) * 1_000_000n)}`,
+      eventType: "ROLLBACK_COMPLETED",
+      fromPhase: "PENDING_FLAT",
+      toPhase: "DISABLED",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({ transitionAt: updatedAt }),
+      createdAt: updatedAt,
+    });
+  }
+  if (phase === "PAUSED_FAULT") {
+    seedAudit(db, {
+      id: `${IDENTITY.deploymentId}:fault`,
+      eventType: "FAULT_PAUSED",
+      fromPhase: "PENDING_FLAT",
+      toPhase: "PAUSED_FAULT",
+      stateVersion: 0,
+      payloadJson: JSON.stringify({ reasonCode: "REPLAY_MISMATCH", provenanceJson: "{}" }),
+      createdAt: updatedAt,
+    });
+  }
+}
+
+function seedAudit(db: DatabaseSync, event: Readonly<{
+  id: string;
+  eventType: "DEPLOYMENT_CREATED" | "STATE_ADVANCED" | "PHASE_TRANSITION" |
+    "FAULT_PAUSED" | "ROLLBACK_STARTED" | "ROLLBACK_COMPLETED";
+  fromPhase: "DISABLED" | "PENDING_FLAT" | "ACTIVE" | "PAUSED_FAULT" | "DRAINING" | null;
+  toPhase: "DISABLED" | "PENDING_FLAT" | "ACTIVE" | "PAUSED_FAULT" | "DRAINING" | null;
+  stateVersion: number;
+  payloadJson: string;
+  createdAt: string;
+}>): void {
+  db.prepare(`
+    INSERT INTO strategy_pilot_audit_events (
+      id, deployment_id, event_type, from_phase, to_phase, state_version,
+      payload_json, created_at, created_at_epoch_ns
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    event.id, IDENTITY.deploymentId, event.eventType, event.fromPhase, event.toPhase,
+    event.stateVersion, event.payloadJson, event.createdAt,
+    BigInt(epochMs(event.createdAt)) * 1_000_000n,
+  );
+}
+
+function seedExactEvidence(
+  db: DatabaseSync,
+  evidence: Readonly<{
+    evidenceId: string;
+    executedAt: string;
+    action: "ENTER" | "ADD" | "REDUCE" | "EXIT";
+    entryPath: "PULLBACK" | "RECLAIM" | "BREAKOUT_HOLD" | "NONE";
+    terminalStatus: "FILLED" | "CANCELED";
+    executedQuantity: string;
+    grossQuoteValueKrw: string;
+    confirmedFeeKrw: string;
+    remainingQuantity: string;
+  }>,
+) {
+  const material = candidateEvidenceMaterial(IDENTITY.deploymentId, evidence);
+  db.prepare(`
+    INSERT INTO strategy_candidate_execution_evidence (
+      deployment_id, id, executed_at, executed_at_epoch_ns, action, entry_path,
+      terminal_status, executed_quantity, gross_quote_value_krw, confirmed_fee_krw,
+      remaining_quantity, material_hash, created_at, material_version,
+      executed_quantity_exact, gross_quote_value_krw_exact, confirmed_fee_krw_exact,
+      remaining_quantity_exact
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'EXACT_V2', ?, ?, ?, ?)
+  `).run(
+    IDENTITY.deploymentId, evidence.evidenceId, evidence.executedAt, material.epochNanoseconds,
+    evidence.action, evidence.entryPath, evidence.terminalStatus,
+    Number(evidence.executedQuantity), Number(evidence.grossQuoteValueKrw),
+    Number(evidence.confirmedFeeKrw), Number(evidence.remainingQuantity), material.hash,
+    evidence.executedAt, evidence.executedQuantity, evidence.grossQuoteValueKrw,
+    evidence.confirmedFeeKrw, evidence.remainingQuantity,
+  );
+  return Object.freeze({
+    evidence: material.evidence,
+    materialHash: material.hash,
+    materialVersion: material.materialVersion,
+  });
 }
 
 function seedHealth(db: DatabaseSync): void {

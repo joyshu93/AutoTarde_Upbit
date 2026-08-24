@@ -5,6 +5,9 @@ import { DatabaseSync } from "node:sqlite";
 
 import type {
   PositionGuardPilotAbandonmentValidation,
+  PositionGuardPilotAuditEventRecord,
+  PositionGuardPilotDeploymentRecord,
+  PositionGuardPilotPhase,
   PositionGuardPolicySelection,
 } from "../domain/pilot-types.js";
 import {
@@ -167,6 +170,18 @@ type ExactDecimal = Readonly<{
   scale: number;
 }>;
 
+type ValidatedEvidenceRecord = Readonly<{
+  evidence: Readonly<PositionGuardCandidateExecutionEvidence>;
+  materialHash: string;
+  materialVersion: string;
+  hashValid: boolean;
+}>;
+
+type ReplayAuthority = Readonly<{
+  state: Readonly<ExactCandidateState>;
+  evidence: readonly ValidatedEvidenceRecord[];
+}>;
+
 type MutableInspection = {
   deployment: PositionGuardPilotReadinessReport["deployment"];
   stateProvenance: PositionGuardPilotReadinessReport["stateProvenance"];
@@ -195,7 +210,10 @@ const REQUIRED_SCHEMA: Readonly<Record<string, readonly string[]>> = Object.free
     "current_episode_cost_basis_krw_exact", "current_episode_inventory_quantity_exact",
     "current_episode_realized_pnl_krw_exact", "last_full_exit_realized_pnl_krw_exact",
   ],
-  strategy_pilot_audit_events: ["id", "deployment_id", "event_type", "payload_json", "created_at"],
+  strategy_pilot_audit_events: [
+    "id", "deployment_id", "event_type", "from_phase", "to_phase", "state_version",
+    "payload_json", "created_at", "created_at_epoch_ns",
+  ],
   account_execution_leases: [
     "exchange_account_id", "owner_token", "purpose", "acquired_at_epoch_ms", "expires_at_epoch_ms",
   ],
@@ -237,6 +255,22 @@ const EXPECTED_AUTHORITY = Object.freeze({
   experimentId: "PCS-2026-001",
   eventAt: "2026-08-21T03:08:24.756Z",
 });
+const PILOT_PHASES = Object.freeze([
+  "DISABLED", "PENDING_FLAT", "ACTIVE", "PAUSED_FAULT", "DRAINING",
+] as const);
+const AUDIT_EVENT_TYPES = Object.freeze([
+  "DEPLOYMENT_CREATED", "STATE_ADVANCED", "PHASE_TRANSITION", "FAULT_PAUSED",
+  "ROLLBACK_STARTED", "ROLLBACK_COMPLETED",
+] as const);
+const RECOVERY_FAULT_REASONS = new Set([
+  "SNAPSHOT_PROVENANCE_INVALID", "STALE_SNAPSHOT", "IDENTITY_MISMATCH", "REPLAY_MISMATCH",
+  "INVENTORY_MISMATCH", "BLOCKING_RECONCILIATION", "ACTIVE_ORDER", "UNCERTAIN_ORDER",
+  "ACTIVATION_CAS_CONFLICT",
+]);
+const REQUIRED_AUDIT_IMMUTABILITY_TRIGGERS = Object.freeze({
+  strategy_pilot_audit_events_no_update: /BEFORE\s+UPDATE\s+ON\s+strategy_pilot_audit_events[\s\S]*RAISE\s*\(\s*ABORT\s*,\s*'strategy pilot audit events are append-only'\s*\)/iu,
+  strategy_pilot_audit_events_no_delete: /BEFORE\s+DELETE\s+ON\s+strategy_pilot_audit_events[\s\S]*RAISE\s*\(\s*ABORT\s*,\s*'strategy pilot audit events are append-only'\s*\)/iu,
+});
 
 export function inspectPositionGuardPilotReadiness(
   rawOptions: PositionGuardPilotReadinessOptions,
@@ -263,12 +297,12 @@ export function inspectPositionGuardPilotReadiness(
     addUnavailableChecks(mutable, "database file is unavailable");
     return buildReport(options, databasePath, selection, authority, mutable);
   }
-  const stats = lstatSync(databasePath);
-  if (!stats.isFile() || stats.isSymbolicLink()) {
+  const databasePathFailure = validateRegularNonReparseDatabasePath(databasePath);
+  if (databasePathFailure !== null) {
     mutable.checks.unshift({
       name: "database_file",
       status: "BLOCK",
-      detail: "The explicitly selected database path must identify an existing regular non-symlink file.",
+      detail: databasePathFailure,
     });
     addUnavailableChecks(mutable, "database path is not a regular file");
     return buildReport(options, databasePath, selection, authority, mutable);
@@ -298,7 +332,7 @@ export function inspectPositionGuardPilotReadiness(
     mutable.checks.push({
       name: "required_schema",
       status: "PASS",
-      detail: "Required migrated pilot, order, snapshot, reconciliation, and lease schema is present.",
+      detail: "Required migrated pilot, order, snapshot, reconciliation, lease schema, and immutable audit triggers are present.",
     });
 
     inspectDeploymentAndReplay(db, options, mutable);
@@ -323,6 +357,27 @@ export function inspectPositionGuardPilotReadiness(
       : "Read-only inspection performed no migration, write, runtime, exchange, Telegram, sync, scheduler, execution, or order action.",
   });
   return buildReport(options, databasePath, selection, authority, mutable);
+}
+
+function validateRegularNonReparseDatabasePath(databasePath: string): string | null {
+  let component = databasePath;
+  let final = true;
+  while (true) {
+    const stats = lstatSync(component);
+    if (stats.isSymbolicLink()) {
+      return final
+        ? "The explicitly selected database path must identify an existing regular non-symlink file."
+        : "The explicitly selected database path has a symlink, junction, or reparse-point ancestor and is rejected.";
+    }
+    if (final && !stats.isFile()) {
+      return "The explicitly selected database path must identify an existing regular non-symlink file.";
+    }
+    const parent = resolve(component, "..");
+    if (parent === component) break;
+    component = parent;
+    final = false;
+  }
+  return null;
 }
 
 export function formatPositionGuardPilotReadiness(
@@ -557,9 +612,19 @@ function validateRequiredSchema(db: DatabaseSync): string | null {
   }
   const migration = db.prepare("SELECT filename FROM _schema_migrations WHERE filename = ?")
     .get("0017_add_btc_candidate_live_pilot.sql") as { filename?: unknown } | undefined;
-  return migration?.filename === "0017_add_btc_candidate_live_pilot.sql"
-    ? null
-    : "Migration 0017_add_btc_candidate_live_pilot.sql is not recorded as applied.";
+  if (migration?.filename !== "0017_add_btc_candidate_live_pilot.sql") {
+    return "Migration 0017_add_btc_candidate_live_pilot.sql is not recorded as applied.";
+  }
+  for (const [name, expectedSql] of Object.entries(REQUIRED_AUDIT_IMMUTABILITY_TRIGGERS)) {
+    const trigger = db.prepare(`
+      SELECT tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ?
+    `).get(name) as { tbl_name?: unknown; sql?: unknown } | undefined;
+    if (trigger?.tbl_name !== "strategy_pilot_audit_events" ||
+      typeof trigger.sql !== "string" || !expectedSql.test(trigger.sql)) {
+      return `Required immutable append-only audit trigger ${name} is missing or malformed.`;
+    }
+  }
+  return null;
 }
 
 function inspectSqliteSnapshotReadSafety(
@@ -671,7 +736,16 @@ function inspectDeploymentAndReplay(
   const phaseCheck = classifyPhase(deployment.phase, options.selection.kind);
   mutable.checks.push(phaseCheck);
   try {
-    inspectReplay(db, deployment.id, mutable);
+    const replay = inspectReplay(db, deployment.id, mutable);
+    if (replay === null) {
+      mutable.checks.push({
+        name: "audit_chain",
+        status: "BLOCK",
+        detail: "Pilot audit authority cannot be verified because exact state is unavailable.",
+      });
+    } else {
+      inspectAuditChain(db, deployment, replay, options.checkedAt, mutable);
+    }
   } catch (error) {
     if (!mutable.checks.some((item) => item.name === "state_replay")) {
       mutable.checks.push({
@@ -680,10 +754,17 @@ function inspectDeploymentAndReplay(
         detail: `Candidate state/evidence replay is invalid: ${formatError(error)}`,
       });
     }
+    if (!mutable.checks.some((item) => item.name === "audit_chain")) {
+      mutable.checks.push({
+        name: "audit_chain",
+        status: "BLOCK",
+        detail: `Pilot audit authority is invalid: ${formatError(error)}`,
+      });
+    }
   }
 }
 
-function inspectReplay(db: DatabaseSync, deploymentId: string, mutable: MutableInspection): void {
+function inspectReplay(db: DatabaseSync, deploymentId: string, mutable: MutableInspection): ReplayAuthority | null {
   const stateRow = db.prepare(`
     SELECT deployment_id, current_episode_add_count, last_full_exit_at,
       last_full_exit_realized_pnl_krw_exact, last_entry_path, last_evidence_at,
@@ -694,7 +775,7 @@ function inspectReplay(db: DatabaseSync, deploymentId: string, mutable: MutableI
   `).get(deploymentId) as StateRow | undefined;
   if (stateRow === undefined) {
     mutable.checks.push({ name: "state_replay", status: "BLOCK", detail: "Persisted exact candidate state is missing." });
-    return;
+    return null;
   }
   const persisted = exactStateFromRow(stateRow);
   const evidenceStatement = db.prepare(`
@@ -734,6 +815,401 @@ function inspectReplay(db: DatabaseSync, deploymentId: string, mutable: MutableI
       ? `Exact persisted state equals replay of ${evidence.length} validated evidence record(s).`
       : "Exact persisted candidate state, evidence material, or deterministic replay does not match.",
   });
+  return Object.freeze({ state: persisted, evidence: Object.freeze(evidence) });
+}
+
+function inspectAuditChain(
+  db: DatabaseSync,
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  replay: ReplayAuthority,
+  checkedAt: string,
+  mutable: MutableInspection,
+): void {
+  try {
+    const statement = db.prepare(`
+      SELECT id, deployment_id, event_type, from_phase, to_phase, state_version,
+        payload_json, created_at, created_at_epoch_ns
+      FROM strategy_pilot_audit_events
+      WHERE deployment_id = ?
+      ORDER BY created_at_epoch_ns ASC, id ASC
+    `);
+    statement.setReadBigInts(true);
+    const rows = statement.all(deployment.id) as AuditRow[];
+    const events = validateAuditRows(rows, deployment, replay.state, checkedAt);
+    assertCanonicalAuditLifecycle(deployment, replay, events);
+    mutable.checks.push({
+      name: "audit_chain",
+      status: "PASS",
+      detail: `Immutable pilot audit authority proves the ${deployment.phase} lifecycle and ${replay.evidence.length} exact state advance(s).`,
+    });
+  } catch (error) {
+    mutable.checks.push({
+      name: "audit_chain",
+      status: "BLOCK",
+      detail: `Immutable pilot audit authority is invalid: ${formatError(error)}`,
+    });
+  }
+}
+
+function validateAuditRows(
+  rows: readonly AuditRow[],
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  state: Readonly<ExactCandidateState>,
+  checkedAt: string,
+): readonly Readonly<PositionGuardPilotAuditEventRecord>[] {
+  const deploymentCreatedAt = parseCandidatePilotTimestamp(deployment.createdAt, "deployment createdAt");
+  const checkedAtEpoch = parseCandidatePilotTimestamp(checkedAt, "readiness checkedAt");
+  const ids = new Set<string>();
+  let previousEpoch: bigint | null = null;
+  let previousId: string | null = null;
+  const events = rows.map((row, index) => {
+    const id = requireString(row.id, `audit event ${index} id`);
+    if (ids.has(id)) throw new Error(`audit event id ${id} is duplicated`);
+    ids.add(id);
+    if (requireString(row.deployment_id, `audit event ${index} deployment`) !== deployment.id) {
+      throw new Error(`audit event ${id} deployment identity is inconsistent`);
+    }
+    const eventType = requireString(row.event_type, `audit event ${id} type`);
+    if (!(AUDIT_EVENT_TYPES as readonly string[]).includes(eventType)) {
+      throw new Error(`audit event ${id} type is unsupported`);
+    }
+    const fromPhase = nullablePilotPhase(row.from_phase, `audit event ${id} fromPhase`);
+    const toPhase = nullablePilotPhase(row.to_phase, `audit event ${id} toPhase`);
+    const stateVersion = requireSafeNonNegativeInteger(row.state_version, `audit event ${id} stateVersion`);
+    if (stateVersion > state.stateVersion) throw new Error(`audit event ${id} state version exceeds exact state`);
+    const payloadJson = requireString(row.payload_json, `audit event ${id} payloadJson`);
+    parsePlainJsonObject(payloadJson, `audit event ${id} payload`);
+    const createdAt = requireString(row.created_at, `audit event ${id} createdAt`);
+    const createdAtEpoch = parseCandidatePilotTimestamp(createdAt, `audit event ${id} createdAt`);
+    const persistedEpoch = typeof row.created_at_epoch_ns === "bigint"
+      ? row.created_at_epoch_ns
+      : BigInt(requireString(row.created_at_epoch_ns, `audit event ${id} persisted epoch`));
+    if (persistedEpoch !== createdAtEpoch) throw new Error(`audit event ${id} timestamp and epoch are inconsistent`);
+    if (createdAtEpoch < deploymentCreatedAt || createdAtEpoch > checkedAtEpoch) {
+      throw new Error(`audit event ${id} chronology is outside deployment and inspection bounds`);
+    }
+    if (
+      previousEpoch !== null &&
+      (createdAtEpoch < previousEpoch || (createdAtEpoch === previousEpoch && id <= previousId!))
+    ) {
+      throw new Error(`audit event ${id} chronology is not strictly ordered`);
+    }
+    previousEpoch = createdAtEpoch;
+    previousId = id;
+    return Object.freeze({
+      id,
+      deploymentId: deployment.id,
+      eventType: eventType as PositionGuardPilotAuditEventRecord["eventType"],
+      fromPhase,
+      toPhase,
+      stateVersion,
+      payloadJson,
+      createdAt,
+    });
+  });
+  return Object.freeze(events);
+}
+
+function assertCanonicalAuditLifecycle(
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  replay: ReplayAuthority,
+  events: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+): void {
+  assertCanonicalCreationEvent(deployment, events);
+  const activationEvents = events.filter((event) => event.eventType === "PHASE_TRANSITION");
+  const stateEvents = events.filter((event) => event.eventType === "STATE_ADVANCED");
+  const rollbackEvents = events.filter((event) => event.eventType === "ROLLBACK_STARTED");
+  const completionEvents = events.filter((event) => event.eventType === "ROLLBACK_COMPLETED");
+  const faultEvents = events.filter((event) => event.eventType === "FAULT_PAUSED");
+
+  const requiresActivation = deployment.activationAt !== null || deployment.activationEpochNs !== null;
+  if ((deployment.activationAt === null) !== (deployment.activationEpochNs === null)) {
+    throw new Error("deployment activation timestamp and epoch must be persisted together");
+  }
+  if (requiresActivation) {
+    assertCanonicalActivationEvent(deployment, activationEvents);
+  } else if (activationEvents.length !== 0 || replay.evidence.length !== 0) {
+    throw new Error("audit authority contains activation or evidence without deployment activation");
+  }
+
+  const rollback = rollbackEvents.length === 1 ? rollbackEvents[0]! : null;
+  if (rollbackEvents.length > 1) throw new Error("audit authority contains multiple rollback-start events");
+  const rollbackBoundary = rollback === null
+    ? null
+    : assertCanonicalRollbackStart(deployment, replay, events, rollback);
+  assertCanonicalStateEvents(deployment, replay, events, stateEvents, rollbackBoundary);
+
+  switch (deployment.phase) {
+    case "PENDING_FLAT":
+      if (requiresActivation || replay.evidence.length !== 0 || replay.state.stateVersion !== 0 ||
+        deployment.updatedAt !== deployment.createdAt || rollback !== null ||
+        faultEvents.length !== 0 || completionEvents.length !== 0) {
+        throw new Error("PENDING_FLAT audit authority is not pristine");
+      }
+      break;
+    case "ACTIVE":
+      if (!requiresActivation || deployment.updatedAt !== deployment.activationAt || rollback !== null ||
+        faultEvents.length !== 0 || completionEvents.length !== 0) {
+        throw new Error("ACTIVE audit authority is inconsistent with canonical activation");
+      }
+      break;
+    case "DRAINING":
+      if (!requiresActivation || rollback === null || deployment.updatedAt !== rollback.createdAt ||
+        faultEvents.length !== 0 || completionEvents.length !== 0) {
+        throw new Error("DRAINING audit authority requires one current rollback-start transition");
+      }
+      break;
+    case "PAUSED_FAULT":
+      if (completionEvents.length !== 0) throw new Error("PAUSED_FAULT audit authority cannot be rollback-completed");
+      assertCanonicalFaultEvent(deployment, replay, events, faultEvents, rollback);
+      break;
+    case "DISABLED":
+      if (faultEvents.length !== 0) throw new Error("DISABLED audit authority cannot retain fault-pause authority");
+      assertCanonicalRollbackCompletion(deployment, replay.state, events, completionEvents, rollback);
+      break;
+    default:
+      throw new Error("pilot phase is unsupported");
+  }
+
+  const expectedCount = 1 + activationEvents.length + stateEvents.length + rollbackEvents.length +
+    completionEvents.length + faultEvents.length;
+  if (events.length !== expectedCount) throw new Error("audit authority contains unsupported lifecycle events");
+}
+
+function assertCanonicalCreationEvent(
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  events: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+): void {
+  const creations = events.filter((event) => event.eventType === "DEPLOYMENT_CREATED");
+  const expectedPayload = JSON.stringify({
+    pilotId: deployment.pilotId,
+    market: deployment.market,
+    policyId: deployment.policyId,
+    policyVersion: deployment.policyVersion,
+  });
+  const event = creations[0];
+  if (creations.length !== 1 || event === undefined ||
+    event.id !== `${deployment.id}:created` || event.deploymentId !== deployment.id ||
+    event.fromPhase !== null || event.toPhase !== "PENDING_FLAT" || event.stateVersion !== 0 ||
+    event.payloadJson !== expectedPayload || event.createdAt !== deployment.createdAt) {
+    throw new Error("canonical DEPLOYMENT_CREATED audit authority is missing or malformed");
+  }
+}
+
+function assertCanonicalActivationEvent(
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  events: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+): void {
+  if (deployment.activationAt === null || deployment.activationEpochNs === null) {
+    throw new Error("activation audit has no deployment activation authority");
+  }
+  const event = events[0];
+  const expectedPayload = JSON.stringify({
+    activationAt: deployment.activationAt,
+    activationEpochNs: deployment.activationEpochNs.toString(),
+  });
+  if (events.length !== 1 || event === undefined ||
+    event.id !== `${deployment.id}:activation:${deployment.activationEpochNs.toString()}` ||
+    event.fromPhase !== "PENDING_FLAT" || event.toPhase !== "ACTIVE" ||
+    event.stateVersion !== 0 || event.payloadJson !== expectedPayload ||
+    event.createdAt !== deployment.activationAt ||
+    parseCandidatePilotTimestamp(deployment.activationAt, "deployment activationAt") !== deployment.activationEpochNs) {
+    throw new Error("canonical activation PHASE_TRANSITION audit authority is missing or malformed");
+  }
+}
+
+function assertCanonicalStateEvents(
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  replay: ReplayAuthority,
+  allEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+  stateEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+  rollbackBoundary: number | null,
+): void {
+  if (stateEvents.length !== replay.evidence.length || replay.state.stateVersion !== replay.evidence.length) {
+    throw new Error("STATE_ADVANCED audit count does not match exact evidence and state version");
+  }
+  const activationAt = deployment.activationAt === null
+    ? null
+    : parseCandidatePilotTimestamp(deployment.activationAt, "deployment activationAt");
+  for (let index = 0; index < replay.evidence.length; index += 1) {
+    const record = replay.evidence[index]!;
+    const event = stateEvents[index];
+    const phase = rollbackBoundary !== null && index >= rollbackBoundary ? "DRAINING" : "ACTIVE";
+    const expectedVersion = index + 1;
+    if (phase === "DRAINING" && record.evidence.action !== "REDUCE" && record.evidence.action !== "EXIT") {
+      throw new Error("DRAINING STATE_ADVANCED evidence must be REDUCE or EXIT");
+    }
+    const expectedPayload = JSON.stringify({
+      evidenceId: record.evidence.evidenceId,
+      materialHash: record.materialHash,
+      materialVersion: record.materialVersion,
+      fromStateVersion: index,
+      toStateVersion: expectedVersion,
+    });
+    if (event === undefined || event.id !== `${deployment.id}:evidence:${record.evidence.evidenceId}` ||
+      event.fromPhase !== phase || event.toPhase !== phase || event.stateVersion !== expectedVersion ||
+      event.payloadJson !== expectedPayload || event.createdAt !== record.evidence.executedAt) {
+      throw new Error("STATE_ADVANCED audit does not link exact evidence, material, state version, and phase");
+    }
+    const evidenceAt = parseCandidatePilotTimestamp(record.evidence.executedAt, "candidate evidence executedAt");
+    if (activationAt === null || evidenceAt <= activationAt) {
+      throw new Error("STATE_ADVANCED audit does not follow activation chronology");
+    }
+    if (index > 0 && allEvents.indexOf(stateEvents[index - 1]!) >= allEvents.indexOf(event)) {
+      throw new Error("STATE_ADVANCED audit chronology is inconsistent");
+    }
+  }
+}
+
+function assertCanonicalRollbackStart(
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  replay: ReplayAuthority,
+  events: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+  rollback: Readonly<PositionGuardPilotAuditEventRecord>,
+): number {
+  if (deployment.activationAt === null || deployment.activationEpochNs === null) {
+    throw new Error("ROLLBACK_STARTED requires activation authority");
+  }
+  const rollbackAt = parseCandidatePilotTimestamp(rollback.createdAt, "rollback startedAt");
+  const precedingStateCount = events.slice(0, events.indexOf(rollback))
+    .filter((event) => event.eventType === "STATE_ADVANCED").length;
+  if (rollback.id !== `${deployment.id}:rollback_started:${rollbackAt.toString()}` ||
+    rollback.fromPhase !== "ACTIVE" || rollback.toPhase !== "DRAINING" ||
+    rollback.stateVersion !== precedingStateCount ||
+    rollback.payloadJson !== JSON.stringify({ transitionAt: rollback.createdAt })) {
+    throw new Error("canonical ROLLBACK_STARTED audit authority is malformed");
+  }
+  const activationAt = parseCandidatePilotTimestamp(deployment.activationAt, "deployment activationAt");
+  const activationEvent = events.find((event) => event.eventType === "PHASE_TRANSITION");
+  if (rollbackAt < activationAt || activationEvent === undefined ||
+    events.indexOf(activationEvent) >= events.indexOf(rollback)) {
+    throw new Error("ROLLBACK_STARTED precedes canonical activation authority");
+  }
+  for (let index = 0; index < replay.evidence.length; index += 1) {
+    const evidenceAt = parseCandidatePilotTimestamp(replay.evidence[index]!.evidence.executedAt, "candidate evidence executedAt");
+    if ((index < precedingStateCount && evidenceAt > rollbackAt) ||
+      (index >= precedingStateCount && evidenceAt < rollbackAt)) {
+      throw new Error("ROLLBACK_STARTED boundary is inconsistent with exact evidence chronology");
+    }
+  }
+  return precedingStateCount;
+}
+
+function assertCanonicalFaultEvent(
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  replay: ReplayAuthority,
+  allEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+  faultEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+  rollback: Readonly<PositionGuardPilotAuditEventRecord> | null,
+): void {
+  const fault = faultEvents[0];
+  const expectedFrom: PositionGuardPilotPhase = rollback !== null
+    ? "DRAINING"
+    : deployment.activationAt === null ? "PENDING_FLAT" : "ACTIVE";
+  if (faultEvents.length !== 1 || fault === undefined || fault.fromPhase !== expectedFrom ||
+    fault.toPhase !== "PAUSED_FAULT" || fault.stateVersion !== replay.state.stateVersion ||
+    fault.createdAt !== deployment.updatedAt) {
+    throw new Error("canonical FAULT_PAUSED audit authority is missing or malformed");
+  }
+  const payload = parseExactJsonKeys(fault.payloadJson, ["reasonCode", "provenanceJson"], "fault audit payload");
+  if (typeof payload.reasonCode !== "string" || !RECOVERY_FAULT_REASONS.has(payload.reasonCode) ||
+    typeof payload.provenanceJson !== "string") {
+    throw new Error("FAULT_PAUSED reason or provenance is invalid");
+  }
+  parsePlainJsonObject(payload.provenanceJson, "fault provenance");
+  if (fault.payloadJson !== JSON.stringify({
+    reasonCode: payload.reasonCode,
+    provenanceJson: payload.provenanceJson,
+  })) throw new Error("FAULT_PAUSED payload is not canonical JSON");
+  const faultAt = parseCandidatePilotTimestamp(fault.createdAt, "fault audit createdAt");
+  const latestEvidence = replay.evidence.at(-1);
+  if (latestEvidence !== undefined) {
+    const evidenceAt = parseCandidatePilotTimestamp(latestEvidence.evidence.executedAt, "candidate evidence executedAt");
+    if (rollback === null ? faultAt < evidenceAt : faultAt <= evidenceAt) {
+      throw new Error("FAULT_PAUSED chronology does not follow exact evidence");
+    }
+  }
+  if (rollback !== null && allEvents.indexOf(rollback) >= allEvents.indexOf(fault)) {
+    throw new Error("FAULT_PAUSED does not follow ROLLBACK_STARTED");
+  }
+  const lastStateEvent = allEvents.filter((event) => event.eventType === "STATE_ADVANCED").at(-1);
+  if (lastStateEvent !== undefined && allEvents.indexOf(lastStateEvent) >= allEvents.indexOf(fault)) {
+    throw new Error("FAULT_PAUSED precedes exact state authority chronology");
+  }
+  const activationEvent = allEvents.find((event) => event.eventType === "PHASE_TRANSITION");
+  if (rollback === null && activationEvent !== undefined &&
+    allEvents.indexOf(activationEvent) >= allEvents.indexOf(fault)) {
+    throw new Error("FAULT_PAUSED does not follow activation authority");
+  }
+}
+
+function assertCanonicalRollbackCompletion(
+  deployment: Readonly<PositionGuardPilotDeploymentRecord>,
+  state: Readonly<ExactCandidateState>,
+  allEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+  completionEvents: readonly Readonly<PositionGuardPilotAuditEventRecord>[],
+  rollback: Readonly<PositionGuardPilotAuditEventRecord> | null,
+): void {
+  const completion = completionEvents[0];
+  if (completionEvents.length !== 1 || completion === undefined ||
+    (completion.fromPhase !== "PENDING_FLAT" && completion.fromPhase !== "ACTIVE" && completion.fromPhase !== "DRAINING") ||
+    completion.toPhase !== "DISABLED" || completion.stateVersion !== state.stateVersion ||
+    completion.createdAt !== deployment.updatedAt) {
+    throw new Error("canonical ROLLBACK_COMPLETED audit authority is missing or malformed");
+  }
+  const completedAt = parseCandidatePilotTimestamp(completion.createdAt, "rollback completedAt");
+  if (completion.id !== `${deployment.id}:rollback_completed:${completedAt.toString()}` ||
+    completion.payloadJson !== JSON.stringify({ transitionAt: completion.createdAt })) {
+    throw new Error("canonical ROLLBACK_COMPLETED identity or payload is malformed");
+  }
+  if (!isExactRollbackFlat(state)) throw new Error("ROLLBACK_COMPLETED requires exact-flat state");
+  if ((completion.fromPhase === "DRAINING") !== (rollback !== null)) {
+    throw new Error("ROLLBACK_COMPLETED phase does not match rollback-start authority");
+  }
+  if (completion.fromPhase === "ACTIVE" && deployment.activationAt === null) {
+    throw new Error("ACTIVE ROLLBACK_COMPLETED requires activation authority");
+  }
+  if (completion.fromPhase === "PENDING_FLAT" && (deployment.activationAt !== null || rollback !== null)) {
+    throw new Error("PENDING_FLAT ROLLBACK_COMPLETED cannot contain activation or rollback-start authority");
+  }
+  if (rollback !== null && allEvents.indexOf(rollback) >= allEvents.indexOf(completion)) {
+    throw new Error("ROLLBACK_COMPLETED does not follow ROLLBACK_STARTED");
+  }
+  const lastStateEvent = allEvents.filter((event) => event.eventType === "STATE_ADVANCED").at(-1);
+  if (lastStateEvent !== undefined && allEvents.indexOf(lastStateEvent) >= allEvents.indexOf(completion)) {
+    throw new Error("ROLLBACK_COMPLETED precedes exact state authority chronology");
+  }
+}
+
+function isExactRollbackFlat(state: Readonly<ExactCandidateState>): boolean {
+  return state.currentEpisodeAddCount === 0 && state.currentEpisodeCostBasisKrw === "0" &&
+    state.currentEpisodeInventoryQuantity === "0" && state.currentEpisodeRealizedPnlKrw === "0";
+}
+
+function nullablePilotPhase(value: unknown, label: string): PositionGuardPilotPhase | null {
+  if (value === null) return null;
+  const phase = requireString(value, label);
+  if (!(PILOT_PHASES as readonly string[]).includes(phase)) throw new Error(`${label} is unsupported`);
+  return phase as PositionGuardPilotPhase;
+}
+
+function parsePlainJsonObject(value: string, label: string): Record<string, unknown> {
+  const parsed = parseJson(value, label);
+  if (!isPlainRecord(parsed)) throw new Error(`${label} must contain an object`);
+  return parsed;
+}
+
+function parseExactJsonKeys(
+  value: string,
+  expectedKeys: readonly string[],
+  label: string,
+): Record<string, unknown> {
+  const parsed = parsePlainJsonObject(value, label);
+  const actual = Object.keys(parsed);
+  if (actual.length !== expectedKeys.length || actual.some((key, index) => key !== expectedKeys[index])) {
+    throw new Error(`${label} keys are not canonical`);
+  }
+  return parsed;
 }
 
 function inspectOrders(
@@ -783,56 +1259,127 @@ function inspectHealth(
   options: PositionGuardPilotReadinessOptions,
   mutable: MutableInspection,
 ): void {
-  const balanceRow = db.prepare(`
+  const balanceRows = db.prepare(`
     SELECT id, captured_at, source, total_krw_value, balances_json
     FROM balance_snapshots WHERE exchange_account_id = ?
-    ORDER BY captured_at DESC, id DESC LIMIT 1
-  `).get(options.identity.exchangeAccountId) as BalanceRow | undefined;
+  `).all(options.identity.exchangeAccountId) as BalanceRow[];
+  const balanceSelection = selectLatestTimestampedRow(
+    balanceRows,
+    (row) => row.id,
+    (row) => row.captured_at,
+    "balance snapshot",
+  );
   const balance = classifySnapshot(
-    balanceRow === undefined ? null : {
-      id: balanceRow.id,
-      capturedAt: balanceRow.captured_at,
-      source: balanceRow.source,
-      payloadJson: balanceRow.balances_json,
-      numericValue: balanceRow.total_krw_value,
-    },
+    balanceSelection.error === null && balanceSelection.row !== null
+      ? {
+          id: balanceSelection.row.id,
+          capturedAt: balanceSelection.row.captured_at,
+          source: balanceSelection.row.source,
+          payloadJson: balanceSelection.row.balances_json,
+          numericValue: balanceSelection.row.total_krw_value,
+        }
+      : null,
     options,
     "balance",
   );
-  mutable.health = { ...mutable.health, balance: balance.evidence };
-  mutable.checks.push({ name: "balance_snapshot", status: balance.status, detail: balance.detail });
+  const balanceResult = balanceSelection.error === null
+    ? balance
+    : { status: "BLOCK" as const, detail: balanceSelection.error, evidence: null };
+  mutable.health = { ...mutable.health, balance: balanceResult.evidence };
+  mutable.checks.push({ name: "balance_snapshot", status: balanceResult.status, detail: balanceResult.detail });
 
-  const positionRow = db.prepare(`
+  const positionRows = db.prepare(`
     SELECT id, captured_at, source, positions_json
     FROM position_snapshots WHERE exchange_account_id = ?
-    ORDER BY captured_at DESC, id DESC LIMIT 1
-  `).get(options.identity.exchangeAccountId) as PositionRow | undefined;
+  `).all(options.identity.exchangeAccountId) as PositionRow[];
+  const positionSelection = selectLatestTimestampedRow(
+    positionRows,
+    (row) => row.id,
+    (row) => row.captured_at,
+    "position snapshot",
+  );
   const position = classifySnapshot(
-    positionRow === undefined ? null : {
-      id: positionRow.id,
-      capturedAt: positionRow.captured_at,
-      source: positionRow.source,
-      payloadJson: positionRow.positions_json,
-      numericValue: null,
-    },
+    positionSelection.error === null && positionSelection.row !== null
+      ? {
+          id: positionSelection.row.id,
+          capturedAt: positionSelection.row.captured_at,
+          source: positionSelection.row.source,
+          payloadJson: positionSelection.row.positions_json,
+          numericValue: null,
+        }
+      : null,
     options,
     "position",
   );
-  mutable.health = { ...mutable.health, position: position.evidence };
-  mutable.checks.push({ name: "position_snapshot", status: position.status, detail: position.detail });
+  const positionResult = positionSelection.error === null
+    ? position
+    : { status: "BLOCK" as const, detail: positionSelection.error, evidence: null };
+  mutable.health = { ...mutable.health, position: positionResult.evidence };
+  mutable.checks.push({ name: "position_snapshot", status: positionResult.status, detail: positionResult.detail });
 
-  const reconciliationRow = db.prepare(`
+  const reconciliationRows = db.prepare(`
     SELECT id, status, started_at, completed_at, summary_json, error_message
     FROM reconciliation_runs WHERE exchange_account_id = ?
-    ORDER BY COALESCE(completed_at, started_at) DESC, id DESC LIMIT 1
-  `).get(options.identity.exchangeAccountId) as ReconciliationRow | undefined;
-  const reconciliation = classifyReconciliation(reconciliationRow ?? null, options);
+  `).all(options.identity.exchangeAccountId) as ReconciliationRow[];
+  const reconciliationSelection = selectLatestReconciliationRow(reconciliationRows);
+  const reconciliation = reconciliationSelection.error === null
+    ? classifyReconciliation(reconciliationSelection.row, options)
+    : { status: "BLOCK" as const, detail: reconciliationSelection.error, evidence: null };
   mutable.health = { ...mutable.health, reconciliation: reconciliation.evidence };
   mutable.checks.push({
     name: "latest_reconciliation",
     status: reconciliation.status,
     detail: reconciliation.detail,
   });
+}
+
+function selectLatestTimestampedRow<Row>(
+  rows: readonly Row[],
+  readId: (row: Row) => unknown,
+  readTimestamp: (row: Row) => unknown,
+  label: string,
+): Readonly<{ row: Row | null; error: string | null }> {
+  try {
+    let latest: { row: Row; id: string; epoch: bigint } | null = null;
+    for (const row of rows) {
+      const id = requireString(readId(row), `${label} id`);
+      const timestamp = requireString(readTimestamp(row), `${label} timestamp`);
+      const epoch = parseCandidatePilotTimestamp(timestamp, `${label} timestamp`);
+      if (latest === null || epoch > latest.epoch || (epoch === latest.epoch && id > latest.id)) {
+        latest = { row, id, epoch };
+      }
+    }
+    return { row: latest?.row ?? null, error: null };
+  } catch (error) {
+    return { row: null, error: `Persisted ${label} timestamp set is invalid: ${formatError(error)}` };
+  }
+}
+
+function selectLatestReconciliationRow(
+  rows: readonly ReconciliationRow[],
+): Readonly<{ row: ReconciliationRow | null; error: string | null }> {
+  try {
+    let latest: { row: ReconciliationRow; id: string; epoch: bigint } | null = null;
+    for (const row of rows) {
+      const id = requireString(row.id, "reconciliation id");
+      const startedAt = requireString(row.started_at, `reconciliation ${id} startedAt`);
+      const startedEpoch = parseCandidatePilotTimestamp(startedAt, `reconciliation ${id} startedAt`);
+      const completedAt = nullableString(row.completed_at, `reconciliation ${id} completedAt`);
+      const completedEpoch = completedAt === null
+        ? null
+        : parseCandidatePilotTimestamp(completedAt, `reconciliation ${id} completedAt`);
+      if (completedEpoch !== null && completedEpoch < startedEpoch) {
+        throw new Error(`reconciliation ${id} completion precedes start`);
+      }
+      const epoch = completedEpoch ?? startedEpoch;
+      if (latest === null || epoch > latest.epoch || (epoch === latest.epoch && id > latest.id)) {
+        latest = { row, id, epoch };
+      }
+    }
+    return { row: latest?.row ?? null, error: null };
+  } catch (error) {
+    return { row: null, error: `Persisted reconciliation timestamp set is invalid: ${formatError(error)}` };
+  }
 }
 
 function inspectLease(
@@ -1340,6 +1887,7 @@ function evidenceFromRow(
   deploymentId: string,
 ): Readonly<{
   evidence: Readonly<PositionGuardCandidateExecutionEvidence>;
+  materialHash: string;
   materialVersion: string;
   hashValid: boolean;
 }> {
@@ -1361,10 +1909,12 @@ function evidenceFromRow(
   if (persistedEpoch !== material.epochNanoseconds) throw new Error("Candidate evidence epoch does not match timestamp.");
   parseCandidatePilotTimestamp(requireString(row.created_at, "candidate evidence createdAt"), "candidate evidence createdAt");
   const materialVersion = requireString(row.material_version, "candidate evidence materialVersion");
+  const materialHash = requireString(row.material_hash, "candidate evidence materialHash");
   return Object.freeze({
     evidence: material.evidence,
+    materialHash,
     materialVersion,
-    hashValid: materialVersion === "EXACT_V2" && requireString(row.material_hash, "candidate evidence materialHash") === material.hash,
+    hashValid: materialVersion === "EXACT_V2" && materialHash === material.hash,
   });
 }
 
@@ -1413,7 +1963,7 @@ function createMutableInspection(): MutableInspection {
 function addUnavailableChecks(mutable: MutableInspection, reason: string): void {
   const existing = new Set(mutable.checks.map((item) => item.name));
   for (const name of [
-    "sqlite_snapshot", "required_schema", "pilot_deployment", "pilot_phase", "state_replay", "active_orders",
+    "sqlite_snapshot", "required_schema", "pilot_deployment", "pilot_phase", "state_replay", "audit_chain", "active_orders",
     "uncertain_orders", "balance_snapshot", "position_snapshot", "latest_reconciliation", "execution_lease",
   ]) {
     if (!existing.has(name)) mutable.checks.push({ name, status: "BLOCK", detail: `Not evaluated because ${reason}.` });
@@ -1588,6 +2138,11 @@ type EvidenceRow = Record<
   "terminal_status" | "material_hash" | "created_at" | "material_version" |
   "executed_quantity_exact" | "gross_quote_value_krw_exact" | "confirmed_fee_krw_exact" |
   "remaining_quantity_exact",
+  unknown
+>;
+type AuditRow = Record<
+  "id" | "deployment_id" | "event_type" | "from_phase" | "to_phase" | "state_version" |
+  "payload_json" | "created_at" | "created_at_epoch_ns",
   unknown
 >;
 type OrderRow = Record<"id" | "status" | "requested_at" | "created_at" | "updated_at", unknown>;
