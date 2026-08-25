@@ -669,7 +669,10 @@ function readLocalRuntimeScript(scriptName: (typeof localRuntimeScriptNames)[num
 }
 
 function readPilotReadinessScript(): string {
-  return readFileSync(join(scriptsDirectory, pilotReadinessScriptName), "utf8");
+  return readFileSync(join(scriptsDirectory, pilotReadinessScriptName), "utf8").replaceAll(
+    "\r\n",
+    "\n",
+  );
 }
 
 type PowerShellAstInspection = {
