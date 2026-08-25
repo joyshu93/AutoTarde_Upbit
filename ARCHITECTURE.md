@@ -9,6 +9,12 @@
 - no hidden defaults for execution behavior
 - exchange and strategy boundaries designed for later replacement
 
+## LIVE Database Identity Boundary
+
+`src/app/live-database-identity.ts` is a fail-closed composition-root guard, not trading logic. `DRY_RUN` remains creation-and-migration capable. Before a LIVE runtime is constructed, the guard requires an absolute existing regular non-reparse SQLite path, validates the canonical migration ledger read-only (including the explicitly retired historical `0013` record), verifies the primary Upbit KRW spot account row, and compares the persisted database instance UUID and domain-separated Upbit access-key fingerprint. It never creates, migrates, bootstraps, repairs, or auto-binds a LIVE database.
+
+`live-readonly-context` is the separate composition root for LIVE readiness and scheduler-preflight smoke commands. It opens `DatabaseSync(..., { readOnly: true })`, creates only read-capable repository facades, and never constructs `createApp`, candidate initialization, runtime workers, exchange clients, or Telegram transports. The explicit provisioning CLI is the only path that may apply migration `0023` and insert the singleton identity, and it requires an operator confirmation while LIVE is stopped.
+
 ## Module Map
 
 ### `domain`

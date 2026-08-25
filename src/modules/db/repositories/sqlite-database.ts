@@ -67,7 +67,7 @@ function ensureMigrationTable(db: DatabaseSync): void {
 }
 
 function applyMigrations(db: DatabaseSync, migrationsDir: string): void {
-  const filenames = listMigrationFilenames(migrationsDir);
+  const filenames = listCanonicalMigrationFilenames(migrationsDir);
 
   const appliedStatement = db.prepare("SELECT filename FROM _schema_migrations WHERE filename = ?");
   const insertStatement = db.prepare("INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)");
@@ -105,7 +105,9 @@ function applyMigrations(db: DatabaseSync, migrationsDir: string): void {
   }
 }
 
-function listMigrationFilenames(migrationsDir: string): string[] {
+export function listCanonicalMigrationFilenames(
+  migrationsDir = resolve(process.cwd(), "migrations"),
+): string[] {
   return readdirSync(migrationsDir)
     .filter((filename) => extname(filename) === ".sql")
     .sort((left, right) => left.localeCompare(right));
@@ -272,7 +274,7 @@ function canonicalMigrationDelta(
     shadow.exec("PRAGMA foreign_keys = ON;");
     let before: SchemaSnapshot | null = null;
     let after: SchemaSnapshot | null = null;
-    for (const candidate of listMigrationFilenames(migrationsDir)) {
+    for (const candidate of listCanonicalMigrationFilenames(migrationsDir)) {
       if (candidate === filename) before = readSchemaSnapshot(shadow);
       const candidateSql = readFileSync(join(migrationsDir, candidate), "utf8");
       const parsed = parseMigrationScript(candidateSql);

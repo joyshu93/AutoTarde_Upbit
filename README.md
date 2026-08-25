@@ -616,6 +616,12 @@ This smoke forces `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, disa
 
 ## Local LIVE Script
 
+LIVE startup now fails closed unless `DATABASE_PATH` is an explicit absolute path to an existing regular SQLite file and that database has a matching persisted identity. The identity binds one non-secret instance UUID, `exchange_account_id=primary`, and a domain-separated SHA-256 fingerprint of the configured Upbit access key. A wrong working directory, missing file, copied database, different account binding, key rotation, missing migration, or unknown migration blocks before runtime persistence, Telegram, scheduler, or exchange clients start.
+
+Existing databases are never bound automatically. Stop LIVE, back up `var/company-live.sqlite`, copy `scripts/provision-live-database-identity.example.ps1` to its ignored `.local.ps1` form, create a UUID with `[guid]::NewGuid().ToString()`, fill the existing absolute DB path and current Upbit access key, then run the script once. Keep the resulting UUID in every local LIVE startup/readiness script as `LIVE_DATABASE_INSTANCE_ID`; it is not a secret. Provisioning applies pending migrations and inserts the singleton binding, so it must never run while LIVE is active. Key rotation intentionally requires a separately reviewed rebind procedure; startup never rewrites a fingerprint.
+
+Both LIVE smoke commands open the verified database with `readOnly: true` and do not construct the runtime application, run migrations, bootstrap records, initialize the candidate pilot, or start operational workers. They may read persisted state only.
+
 For an explicit live validation run, copy `scripts/start-company-live.example.ps1` to `scripts/start-company-live.local.ps1`, fill in secrets, set:
 
 ```powershell

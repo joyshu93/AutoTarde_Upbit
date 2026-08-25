@@ -52,6 +52,14 @@ if ($TargetScriptText -notmatch "smoke:live:scheduler-preflight") {
   throw "Refusing to register $TaskName because start-company-live-scheduler.local.ps1 must run the live scheduler preflight smoke before startup."
 }
 
+if ($TargetScriptText -notmatch "LIVE_DATABASE_INSTANCE_ID") {
+  throw "Refusing to register $TaskName because the LIVE scheduler launcher must bind the provisioned database instance identity."
+}
+
+if ($TargetScriptText -notmatch "Resolve-Path -LiteralPath") {
+  throw "Refusing to register $TaskName because the LIVE scheduler launcher must resolve an existing absolute database path."
+}
+
 $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($null -ne $ExistingTask) {
   if (-not $ReplaceExistingTask) {

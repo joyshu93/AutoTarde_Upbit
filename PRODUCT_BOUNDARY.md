@@ -46,6 +46,7 @@ Live mode requires both:
 - explicit configuration enabling live order submission
 
 The application may wire the live Upbit adapter only when `APP_EXECUTION_MODE=LIVE`, `ENABLE_LIVE_ORDERS=true`, and Upbit credentials are configured. If any condition is missing, the runtime must fall back to the dry-run send path.
+Before any LIVE runtime is constructed, the selected SQLite database must be an explicit absolute existing regular non-reparse file with the canonical migration ledger and a persisted identity matching the configured instance UUID, primary Upbit KRW spot account, and current access-key fingerprint. Missing or mismatched identity fails closed without creating, migrating, bootstrapping, or auto-binding a database. LIVE readiness and scheduler-preflight smoke commands use a separate read-only SQLite composition root; identity provisioning is a separately confirmed offline operation and is never part of startup or readiness.
 The execution adapter itself carries the required live/dry discriminant; callers cannot supply a separate path label. A live adapter requires the persisted `LIVE`/`ENABLED` tuple both initially and immediately before its sole send. A dry adapter accepts any non-fully-live persisted tuple, but the exact initial mode-and-gate tuple must remain unchanged at the final check. Order mode, event source, simulated-fill behavior, and submission outcome follow that adapter discriminant.
 
 ## BTC Candidate Pilot Boundary

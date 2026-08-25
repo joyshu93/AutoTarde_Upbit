@@ -9,6 +9,7 @@ import {
 } from "../app/runtime-lifecycle.js";
 import type { ExecutionStateRecord, ReconciliationRunRecord } from "../domain/types.js";
 import { detectExecutionStateSeedMismatches } from "../modules/db/interfaces.js";
+import { openLiveReadOnlyContext } from "./live-readonly-context.js";
 
 type LiveReadinessSmokeStatus = "PASS" | "WARN" | "BLOCK";
 type NonMutationBoundary = Record<
@@ -20,7 +21,12 @@ type NonMutationBoundary = Record<
   | "exchangeProbe"
   | "notificationDelivery",
   false
->;
+> & Readonly<{
+  databaseWrites: false;
+  migrations: false;
+  bootstrap: false;
+  candidateInitialization: false;
+}>;
 
 const BLOCKING_RECONCILIATION_ISSUE_CODES = new Set([
   "BALANCE_DRIFT_DETECTED",
@@ -90,7 +96,90 @@ export interface LiveReadinessSmokeResult {
   readonly checks: LiveReadinessSmokeCheck[];
 }
 
-export async function runLiveReadinessSmoke(
+export async function runLiveReadinessSmoke(): Promise<LiveReadinessSmokeResult> {
+  return runReadOnlyLiveReadinessSmoke();
+}
+
+async function runReadOnlyLiveReadinessSmoke(): Promise<LiveReadinessSmokeResult> {
+  const context = openLiveReadOnlyContext();
+  try {
+    const [executionState, activeOrders, latestBalanceSnapshot, latestPositionSnapshot, reconciliationRuns] =
+      await Promise.all([
+        context.operatorState.getState(),
+        context.repositories.listActiveOrders("primary", undefined, 20),
+        context.repositories.getLatestBalanceSnapshot("primary"),
+        context.repositories.getLatestPositionSnapshot("primary"),
+        context.repositories.listReconciliationRuns("primary", 1),
+      ]);
+    const latestReconciliationRun = reconciliationRuns[0] ?? null;
+    const latestReconciliationIssueCodes = parseReconciliationIssueCodes(latestReconciliationRun?.summaryJson ?? null);
+    const latestReconciliationBlockingIssueCodes = latestReconciliationIssueCodes.filter((code) =>
+      BLOCKING_RECONCILIATION_ISSUE_CODES.has(code)
+    );
+    const seedMismatches = detectExecutionStateSeedMismatches(executionState, {
+      executionMode: context.config.executionMode,
+      liveExecutionGate: context.config.liveExecutionGate,
+      killSwitchActive: context.config.globalKillSwitch,
+    });
+    const checks = buildLiveReadinessSmokeChecks({
+      app: context,
+      executionState,
+      seedMismatches,
+      activeOrderCount: activeOrders.length,
+      latestBalanceSnapshotAt: latestBalanceSnapshot?.capturedAt ?? null,
+      latestPositionSnapshotAt: latestPositionSnapshot?.capturedAt ?? null,
+      latestReconciliationRun,
+      latestReconciliationIssueCodes,
+      latestReconciliationBlockingIssueCodes,
+    });
+    return {
+      service: context.config.serviceName,
+      status: summarizeLiveReadinessSmokeStatus(checks),
+      executionMode: context.config.executionMode,
+      liveExecutionGate: context.config.liveExecutionGate,
+      liveSendPath: context.liveSendPath,
+      databasePath: context.config.databasePath,
+      exchangeBackedReadEnabled: context.exchangeBackedReadEnabled,
+      schedulerEnabled: context.config.strategySchedulerEnabled,
+      schedulerRunOnStart: context.config.strategySchedulerRunOnStart,
+      telegramInboundPollingEnabled: context.config.telegramInboundPollingEnabled,
+      telegramInboundPollingConfigured: context.telegramInboundPollingConfigured,
+      telegramDeliveryEnabled: context.config.telegramDeliveryEnabled,
+      telegramDeliveryConfigured: context.telegramDeliveryConfigured,
+      telegramBotTokenConfigured: Boolean(context.config.telegramBotToken),
+      telegramOperatorChatIdConfigured: Boolean(context.config.telegramOperatorChatId),
+      systemStatus: executionState.systemStatus,
+      killSwitchActive: executionState.killSwitchActive,
+      degradedReason: executionState.degradedReason,
+      operatorStateUpdatedAt: executionState.updatedAt,
+      nonMutationBoundary: createNonMutationBoundary(),
+      orderTransmissionAttempted: false,
+      strategyRunAttempted: false,
+      syncAttempted: false,
+      schedulerStarted: false,
+      telegramPollingStarted: false,
+      exchangeProbeAttempted: false,
+      notificationDeliveryAttempted: false,
+      readOnlyDataSources: READ_ONLY_DATA_SOURCES,
+      activeOrderCount: activeOrders.length,
+      latestBalanceSnapshotAt: latestBalanceSnapshot?.capturedAt ?? null,
+      latestPositionSnapshotAt: latestPositionSnapshot?.capturedAt ?? null,
+      latestReconciliationStatus: latestReconciliationRun?.status ?? null,
+      latestReconciliationCompletedAt: latestReconciliationRun?.completedAt ?? null,
+      latestReconciliationIssueCodes,
+      latestReconciliationBlockingIssueCodes,
+      seedMismatches,
+      blockingCheckNames: getCheckNamesByStatus(checks, "BLOCK"),
+      warningCheckNames: getCheckNamesByStatus(checks, "WARN"),
+      nextActions: buildLiveReadinessNextActions(checks),
+      checks,
+    };
+  } finally {
+    context.close();
+  }
+}
+
+export async function runLiveReadinessSmokeWithApplicationForTest(
   createApplication: () => AppServices = createApp,
 ): Promise<LiveReadinessSmokeResult> {
   const app = createApplication();
@@ -352,6 +441,10 @@ function createNonMutationBoundary(): NonMutationBoundary {
     telegramPolling: false,
     exchangeProbe: false,
     notificationDelivery: false,
+    databaseWrites: false,
+    migrations: false,
+    bootstrap: false,
+    candidateInitialization: false,
   };
 }
 

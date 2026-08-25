@@ -8,6 +8,7 @@ await import("./env.test.js");
 await import("./position-guard-pilot-config.test.js");
 await import("./position-guard-pilot-authority.test.js");
 await import("./position-guard-pilot-readiness.test.js");
+await import("./live-database-identity.test.js");
 await import("./position-guard-pilot-initializer.test.js");
 await import("./position-guard-pilot-registry-loader.test.js");
 await import("./create-app.test.js");

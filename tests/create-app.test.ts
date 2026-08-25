@@ -4,9 +4,14 @@ import { access, mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import { createApp } from "../src/app/create-app.js";
+import {
+  createApp as createProductionApp,
+  type CreateAppOverrides,
+} from "../src/app/create-app.js";
 import type { AppConfig } from "../src/app/env.js";
+import { provisionLiveDatabaseIdentity } from "../src/app/live-database-identity.js";
 import { runAppStartup, startTelegramRuntime, type AppStartupOperations } from "../src/index.js";
+import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
 import {
   DryRunExchangeAdapter,
   type LiveExecutionAdapter,
@@ -16,6 +21,48 @@ import type { PositionGuardPublicMarketDataReader } from
   "../src/modules/strategy/position-guard-snapshot.js";
 import { createDryRunOperatorMarketDataReader } from "../src/smoke/dryrun-operator.js";
 import { test } from "./harness.js";
+
+const TEST_LIVE_DATABASE_INSTANCE_ID = "11111111-1111-4111-8111-111111111111";
+const TEST_LIVE_ACCESS_KEY = "create-app-test-access-key";
+
+function createApp(config?: AppConfig, overrides: CreateAppOverrides = {}) {
+  if (!config || config.executionMode !== "LIVE") {
+    return createProductionApp(config, overrides);
+  }
+
+  const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
+  const accessKey = previousAccessKey?.trim() || TEST_LIVE_ACCESS_KEY;
+  process.env.UPBIT_ACCESS_KEY = accessKey;
+  const guardedConfig: AppConfig = {
+    ...config,
+    liveDatabaseInstanceId: config.liveDatabaseInstanceId ?? TEST_LIVE_DATABASE_INSTANCE_ID,
+  };
+
+  try {
+    const setup = createSqlitePersistence({
+      databasePath: guardedConfig.databasePath,
+      exchangeAccountId: "primary",
+      userId: "system_operator",
+      userTelegramId: "system_operator",
+      userDisplayName: "System Operator",
+      accessKeyRef: "TEST:UPBIT_ACCESS_KEY",
+      secretKeyRef: "TEST:UPBIT_SECRET_KEY",
+      executionMode: guardedConfig.executionMode,
+      liveExecutionGate: guardedConfig.liveExecutionGate,
+      killSwitchActive: guardedConfig.globalKillSwitch,
+    });
+    setup.close();
+    provisionLiveDatabaseIdentity({
+      databasePath: guardedConfig.databasePath,
+      databaseInstanceId: guardedConfig.liveDatabaseInstanceId!,
+      exchangeAccountId: "primary",
+      upbitAccessKey: accessKey,
+    });
+    return createProductionApp(guardedConfig, overrides);
+  } finally {
+    restoreOptionalEnv("UPBIT_ACCESS_KEY", previousAccessKey);
+  }
+}
 
 test("createApp keeps dry-run adapter as the default live send path", async () => {
   const databasePath = await createTempDatabasePath("dryrun");
@@ -403,7 +450,7 @@ test("createApp runs the candidate authority observer after checked-in validatio
   try {
     assert.throws(
       () => {
-        app = createApp(
+        app = createProductionApp(
         createConfig({
           databasePath,
           executionMode: "LIVE",
@@ -492,7 +539,7 @@ test("createApp rejects malformed candidate selections before SQLite persistence
     const databasePath = await createTempDatabasePath(`candidate-selection-${entry.label}`);
     try {
       assert.throws(
-        () => createApp(createConfig({
+        () => createProductionApp(createConfig({
           databasePath,
           executionMode: "LIVE",
           positionGuardPolicySelection: entry.selection as AppConfig["positionGuardPolicySelection"],
@@ -612,9 +659,6 @@ test("createApp wires candidate-only BTC preparation and recovery without changi
       {
         privateExchangeAdapter: privateAdapter.adapter,
         publicMarketDataReader: createDryRunOperatorMarketDataReader(),
-        afterCandidatePilotAuthorityValidated: () => {
-          assert.equal(existsSync(databasePath), false);
-        },
       },
     );
 

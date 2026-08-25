@@ -4,6 +4,8 @@
 
 Define one explicit lifecycle that works for both `DRY_RUN` and future `LIVE` execution.
 
+LIVE database identity validation occurs before the order lifecycle exists. A path, migration, instance, account, or credential mismatch must stop composition before persistence bootstrap, recovery, scheduler, Telegram, strategy, or order services are constructed; it must not create an order event or risk record in an untrusted database. Readiness and scheduler-preflight smoke commands inspect the verified DB read-only and cannot transition an order.
+
 The system must never treat “strategy said buy” as equivalent to “order exists.” Orders need explicit lifecycle records.
 
 A `DEFERRED_CONFIRMATION` strategy decision is persisted as `PENDING_CONFIRMATION` but does not create an order intent or `orders` row. A later matching `EXECUTED_AFTER_CONFIRMATION` decision must pass the full lifecycle independently.

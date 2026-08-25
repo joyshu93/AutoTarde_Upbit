@@ -1,6 +1,8 @@
 import { fileURLToPath } from "node:url";
 
 import { createApp, type AppServices } from "./app/create-app.js";
+import { loadAppConfig } from "./app/env.js";
+import { verifyLiveDatabaseIdentity } from "./app/live-database-identity.js";
 import {
   hasBackgroundRuntime,
   createRuntimeShutdown,
@@ -219,10 +221,22 @@ export async function runAppStartup(
 }
 
 export async function runMain(
-  createApplication: () => AppServices = createApp,
+  createApplication: () => AppServices = createVerifiedApplication,
 ): Promise<void> {
   const app = createApplication();
   await runAppStartup(app);
+}
+
+export function createVerifiedApplication(): AppServices {
+  const config = loadAppConfig();
+  verifyLiveDatabaseIdentity({
+    executionMode: config.executionMode,
+    databasePath: config.databasePath,
+    expectedDatabaseInstanceId: config.liveDatabaseInstanceId ?? null,
+    exchangeAccountId: "primary",
+    upbitAccessKey: process.env.UPBIT_ACCESS_KEY?.trim() || null,
+  });
+  return createApp(config);
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

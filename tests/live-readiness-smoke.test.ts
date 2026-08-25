@@ -6,7 +6,7 @@ import type { ExecutionStateRecord, ReconciliationRunRecord } from "../src/domai
 import {
   buildLiveReadinessNextActions,
   buildLiveReadinessSmokeChecks,
-  runLiveReadinessSmoke,
+  runLiveReadinessSmokeWithApplicationForTest,
   summarizeLiveReadinessSmokeStatus,
 } from "../src/smoke/live-readiness.js";
 import { test } from "./harness.js";
@@ -16,7 +16,7 @@ type CandidatePilotInitializer = { initialize(): Promise<unknown> } | null;
 test("live readiness smoke awaits candidate initialization before reading persisted state", async () => {
   const events: string[] = [];
 
-  await runLiveReadinessSmoke(() => createSmokeApp(events, {
+  await runLiveReadinessSmokeWithApplicationForTest(() => createSmokeApp(events, {
     async initialize() {
       events.push("initializer:start");
       await Promise.resolve();
@@ -39,7 +39,7 @@ test("live readiness smoke awaits candidate initialization before reading persis
 test("live readiness smoke keeps a null candidate initializer as a no-op", async () => {
   const events: string[] = [];
 
-  await runLiveReadinessSmoke(() => createSmokeApp(events, null));
+  await runLiveReadinessSmokeWithApplicationForTest(() => createSmokeApp(events, null));
 
   assert.equal(events.includes("initializer:start"), false);
   assert.equal(events.includes("operator_state"), true);
@@ -50,7 +50,7 @@ test("live readiness smoke preserves candidate initialization failure and cleans
   const originalError = new Error("candidate_initializer_failed");
 
   await assert.rejects(
-    () => runLiveReadinessSmoke(() => createSmokeApp(events, {
+    () => runLiveReadinessSmokeWithApplicationForTest(() => createSmokeApp(events, {
       async initialize() {
         events.push("initializer:start");
         throw originalError;
@@ -72,7 +72,7 @@ test("live readiness smoke preserves candidate initialization failure when every
   const originalError = new Error("candidate_initializer_failed");
 
   await assert.rejects(
-    () => runLiveReadinessSmoke(() => createSmokeApp(events, {
+    () => runLiveReadinessSmokeWithApplicationForTest(() => createSmokeApp(events, {
       async initialize() {
         events.push("initializer:start");
         throw originalError;
@@ -94,7 +94,7 @@ test("live readiness smoke preserves a continuation read failure when one cleanu
   const originalError = new Error("balance_snapshot_failed");
 
   await assert.rejects(
-    () => runLiveReadinessSmoke(() => createSmokeApp(events, {
+    () => runLiveReadinessSmokeWithApplicationForTest(() => createSmokeApp(events, {
       async initialize() {
         events.push("initializer:start");
         await Promise.resolve();
@@ -123,7 +123,7 @@ test("live readiness smoke preserves a continuation read failure when every clea
   const originalError = new Error("balance_snapshot_failed");
 
   await assert.rejects(
-    () => runLiveReadinessSmoke(() => createSmokeApp(events, {
+    () => runLiveReadinessSmokeWithApplicationForTest(() => createSmokeApp(events, {
       async initialize() {
         events.push("initializer:start");
         await Promise.resolve();
@@ -154,7 +154,7 @@ test("live readiness smoke rejects successful result when one cleanup step fails
   const events: string[] = [];
 
   await assert.rejects(
-    () => runLiveReadinessSmoke(() => createSmokeApp(events, null, ["telegram"])),
+    () => runLiveReadinessSmokeWithApplicationForTest(() => createSmokeApp(events, null, ["telegram"])),
     (error) => error instanceof Error &&
       error.message === "Live smoke cleanup failed: telegram_inbound_polling: telegram_cleanup_failed",
   );
@@ -168,7 +168,7 @@ test("live readiness smoke rejects successful result with every cleanup failure"
   const events: string[] = [];
 
   await assert.rejects(
-    () => runLiveReadinessSmoke(() => createSmokeApp(
+    () => runLiveReadinessSmokeWithApplicationForTest(() => createSmokeApp(
       events,
       null,
       ["telegram", "scheduler", "persistence"],

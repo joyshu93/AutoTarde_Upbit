@@ -9,6 +9,7 @@ import {
 } from "../app/runtime-lifecycle.js";
 import { buildStrategySchedulerStartupPreflight } from "../app/scheduler-preflight.js";
 import type { StrategySchedulerStartupPreflight } from "../domain/types.js";
+import { openLiveReadOnlyContext } from "./live-readonly-context.js";
 
 type LiveSchedulerPreflightSmokeStatus = "PASS" | "WARN" | "BLOCK";
 type NonMutationBoundary = Record<
@@ -20,7 +21,12 @@ type NonMutationBoundary = Record<
   | "exchangeProbe"
   | "notificationDelivery",
   false
->;
+> & Readonly<{
+  databaseWrites: false;
+  migrations: false;
+  bootstrap: false;
+  candidateInitialization: false;
+}>;
 
 const READ_ONLY_DATA_SOURCES = [
   "runtime_config",
@@ -66,7 +72,16 @@ export interface LiveSchedulerPreflightSmokeResult {
   readonly checks: LiveSchedulerPreflightSmokeCheck[];
 }
 
-export async function runLiveSchedulerPreflightSmoke(
+export async function runLiveSchedulerPreflightSmoke(): Promise<LiveSchedulerPreflightSmokeResult> {
+  const context = openLiveReadOnlyContext();
+  try {
+    return await buildLiveSchedulerPreflightSmokeResult(context);
+  } finally {
+    context.close();
+  }
+}
+
+export async function runLiveSchedulerPreflightSmokeWithApplicationForTest(
   createApplication: () => AppServices = createApp,
 ): Promise<LiveSchedulerPreflightSmokeResult> {
   const app = createApplication();
@@ -105,9 +120,6 @@ export async function buildLiveSchedulerPreflightSmokeResult(
     | "repositories"
     | "exchangeBackedReadEnabled"
     | "liveSendPath"
-    | "telegramInboundPolling"
-    | "strategyScheduler"
-    | "persistence"
   >,
 ): Promise<LiveSchedulerPreflightSmokeResult> {
   const executionState = await app.operatorState.getState();
@@ -258,6 +270,10 @@ function createNonMutationBoundary(): NonMutationBoundary {
     telegramPolling: false,
     exchangeProbe: false,
     notificationDelivery: false,
+    databaseWrites: false,
+    migrations: false,
+    bootstrap: false,
+    candidateInitialization: false,
   };
 }
 

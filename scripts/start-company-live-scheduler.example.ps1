@@ -18,7 +18,9 @@ if ($LiveSchedulerSecondConfirmation -ne "I_UNDERSTAND_AUTOMATIC_SCHEDULED_ORDER
 
 $env:APP_EXECUTION_MODE = "LIVE"
 $env:ENABLE_LIVE_ORDERS = "true"
-$env:DATABASE_PATH = "./var/company-live.sqlite"
+$RepositoryRoot = Resolve-Path (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "..")
+$env:DATABASE_PATH = (Resolve-Path -LiteralPath (Join-Path $RepositoryRoot "var/company-live.sqlite") -ErrorAction Stop).Path
+$env:LIVE_DATABASE_INSTANCE_ID = "REPLACE_WITH_PROVISIONED_DATABASE_INSTANCE_UUID"
 
 $env:UPBIT_ACCESS_KEY = "REPLACE_WITH_UPBIT_ACCESS_KEY"
 $env:UPBIT_SECRET_KEY = "REPLACE_WITH_UPBIT_SECRET_KEY"
@@ -36,6 +38,7 @@ $env:STRATEGY_SCHEDULER_ETH_INTERVAL_MS = "3600000"
 $requiredEnv = @(
   "UPBIT_ACCESS_KEY",
   "UPBIT_SECRET_KEY",
+  "LIVE_DATABASE_INSTANCE_ID",
   "TELEGRAM_BOT_TOKEN",
   "TELEGRAM_OPERATOR_CHAT_ID",
   "STRATEGY_SCHEDULER_BTC_INTERVAL_MS",

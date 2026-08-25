@@ -1,5 +1,11 @@
 # Risk Policy
 
+## LIVE Database Selection Guard
+
+LIVE must fail before runtime construction when `DATABASE_PATH` is relative, missing, not a regular file, passes through a symlink/junction, has a non-canonical migration ledger, lacks its singleton identity, or does not match the configured database UUID, primary account, or Upbit access-key fingerprint. The guard must not reveal credentials or fingerprints in errors. It must not create a replacement DB or silently bind/rebind an identity. `DRY_RUN` retains its existing local DB creation behavior.
+
+Identity provisioning is an offline database mutation: stop LIVE, make a backup, use the explicit confirmation command once, and preserve its UUID in ignored local scripts. Upbit key rotation must block LIVE until a separate reviewed rebind operation exists; operators must not work around it by deleting or editing the identity row.
+
 ## Non-Negotiable Safety Rules
 
 - default execution mode is `DRY_RUN`

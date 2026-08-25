@@ -56,6 +56,9 @@ import type {
   PositionGuardPilotAbandonmentValidation,
   PositionGuardPolicySelection,
 } from "../domain/pilot-types.js";
+import {
+  verifyLiveDatabaseIdentity,
+} from "./live-database-identity.js";
 
 export interface AppServices {
   config: AppConfig;
@@ -102,6 +105,13 @@ export function createApp(
     );
     overrides.afterCandidatePilotAuthorityValidated?.(authority);
   }
+  verifyLiveDatabaseIdentity({
+    executionMode: config.executionMode,
+    databasePath: config.databasePath,
+    expectedDatabaseInstanceId: config.liveDatabaseInstanceId ?? null,
+    exchangeAccountId: "primary",
+    upbitAccessKey: process.env.UPBIT_ACCESS_KEY?.trim() || null,
+  });
   const persistence = createSqlitePersistence({
     databasePath: config.databasePath,
     exchangeAccountId: "primary",

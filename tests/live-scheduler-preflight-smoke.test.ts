@@ -7,7 +7,7 @@ import {
   buildLiveSchedulerPreflightNextActions,
   buildLiveSchedulerPreflightSmokeChecks,
   createSchedulerPreflightConfig,
-  runLiveSchedulerPreflightSmoke,
+  runLiveSchedulerPreflightSmokeWithApplicationForTest,
   summarizeLiveSchedulerPreflightSmokeStatus,
 } from "../src/smoke/live-scheduler-preflight.js";
 import { test } from "./harness.js";
@@ -17,7 +17,7 @@ type CandidatePilotInitializer = { initialize(): Promise<unknown> } | null;
 test("live scheduler preflight smoke awaits candidate initialization before state and preflight reads", async () => {
   const events: string[] = [];
 
-  await runLiveSchedulerPreflightSmoke(() => createSmokeApp(events, {
+  await runLiveSchedulerPreflightSmokeWithApplicationForTest(() => createSmokeApp(events, {
     async initialize() {
       events.push("initializer:start");
       await Promise.resolve();
@@ -40,7 +40,7 @@ test("live scheduler preflight smoke awaits candidate initialization before stat
 test("live scheduler preflight smoke keeps a null candidate initializer as a no-op", async () => {
   const events: string[] = [];
 
-  await runLiveSchedulerPreflightSmoke(() => createSmokeApp(events, null));
+  await runLiveSchedulerPreflightSmokeWithApplicationForTest(() => createSmokeApp(events, null));
 
   assert.equal(events.includes("initializer:start"), false);
   assert.equal(events.includes("operator_state"), true);
@@ -51,7 +51,7 @@ test("live scheduler preflight smoke preserves candidate initialization failure 
   const originalError = new Error("candidate_initializer_failed");
 
   await assert.rejects(
-    () => runLiveSchedulerPreflightSmoke(() => createSmokeApp(events, {
+    () => runLiveSchedulerPreflightSmokeWithApplicationForTest(() => createSmokeApp(events, {
       async initialize() {
         events.push("initializer:start");
         throw originalError;
@@ -73,7 +73,7 @@ test("live scheduler preflight smoke preserves candidate initialization failure 
   const originalError = new Error("candidate_initializer_failed");
 
   await assert.rejects(
-    () => runLiveSchedulerPreflightSmoke(() => createSmokeApp(events, {
+    () => runLiveSchedulerPreflightSmokeWithApplicationForTest(() => createSmokeApp(events, {
       async initialize() {
         events.push("initializer:start");
         throw originalError;
@@ -95,7 +95,7 @@ test("live scheduler preflight smoke preserves a continuation read failure when 
   const originalError = new Error("operator_state_failed");
 
   await assert.rejects(
-    () => runLiveSchedulerPreflightSmoke(() => createSmokeApp(events, {
+    () => runLiveSchedulerPreflightSmokeWithApplicationForTest(() => createSmokeApp(events, {
       async initialize() {
         events.push("initializer:start");
         await Promise.resolve();
@@ -120,7 +120,7 @@ test("live scheduler preflight smoke preserves a continuation read failure when 
   const originalError = new Error("operator_state_failed");
 
   await assert.rejects(
-    () => runLiveSchedulerPreflightSmoke(() => createSmokeApp(events, {
+    () => runLiveSchedulerPreflightSmokeWithApplicationForTest(() => createSmokeApp(events, {
       async initialize() {
         events.push("initializer:start");
         await Promise.resolve();
@@ -147,7 +147,7 @@ test("live scheduler preflight smoke rejects successful result when one cleanup 
   const events: string[] = [];
 
   await assert.rejects(
-    () => runLiveSchedulerPreflightSmoke(() => createSmokeApp(events, null, ["telegram"])),
+    () => runLiveSchedulerPreflightSmokeWithApplicationForTest(() => createSmokeApp(events, null, ["telegram"])),
     (error) => error instanceof Error &&
       error.message === "Live smoke cleanup failed: telegram_inbound_polling: telegram_cleanup_failed",
   );
@@ -161,7 +161,7 @@ test("live scheduler preflight smoke rejects successful result with every cleanu
   const events: string[] = [];
 
   await assert.rejects(
-    () => runLiveSchedulerPreflightSmoke(() => createSmokeApp(
+    () => runLiveSchedulerPreflightSmokeWithApplicationForTest(() => createSmokeApp(
       events,
       null,
       ["telegram", "scheduler", "persistence"],
