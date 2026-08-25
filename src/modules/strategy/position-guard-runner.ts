@@ -31,6 +31,7 @@ import type {
   SubmitOrderFromDecisionInput,
   SubmitOrderFromDecisionResult,
 } from "../execution/interfaces.js";
+import { serializeUpbitOrderDecimal } from "../exchange/upbit/order-decimals.js";
 import { analyzePositionGuardMarketStructure } from "./market-structure.js";
 import {
   buildPositionGuardStrategyContext,
@@ -778,7 +779,7 @@ export function createStrategyDecisionRecord(input: {
     decisionBasisJson: JSON.stringify(decisionBasis),
     intendedNotionalKrw: input.strategyDecision.requestedNotionalKrw === null
       ? null
-      : String(input.strategyDecision.requestedNotionalKrw),
+      : formatUpbitMarketBuyQuote(input.strategyDecision.requestedNotionalKrw),
     intendedQuantity: input.strategyDecision.requestedQuantity === null
       ? null
       : String(input.strategyDecision.requestedQuantity),
@@ -812,7 +813,7 @@ export function toOrderSubmissionInput(input: {
         decision: input.decision,
         side: "bid",
         ordType: "price",
-        price: formatDecimal(input.decision.requestedNotionalKrw),
+        price: formatUpbitMarketBuyQuote(input.decision.requestedNotionalKrw),
         volume: null,
         ...(input.candidateAuthority === undefined ? {} : { candidateAuthority: input.candidateAuthority }),
       };
@@ -852,6 +853,10 @@ export function createDefaultPositionGuardRunnerConfig(
 
 function formatDecimal(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(12).replace(/0+$/u, "").replace(/\.$/u, "");
+}
+
+function formatUpbitMarketBuyQuote(value: number): string {
+  return serializeUpbitOrderDecimal(value, "Upbit market-buy quote");
 }
 
 function resolveReferencePriceCapturedAt(

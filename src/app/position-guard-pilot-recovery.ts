@@ -2183,8 +2183,13 @@ function isValidRecoveryObservationDetail(
       isValidRecoveryQueries(detail.attemptedQueries, expectedQueries);
   }
   if (outcome === "TRANSIENT_FAILURE") {
-    return hasExactOwnKeys(detail, ["attemptedQueries", "reason"]) &&
-      isValidRecoveryQueries(detail.attemptedQueries, expectedQueries) && isNonEmptyString(detail.reason);
+    const validQueries = isValidRecoveryQueries(detail.attemptedQueries, expectedQueries);
+    const hasLegacyReason = hasExactOwnKeys(detail, ["attemptedQueries", "reason"]) &&
+      isNonEmptyString(detail.reason);
+    const hasSnapshotBindingReasonCode =
+      hasExactOwnKeys(detail, ["attemptedQueries", "reasonCode"]) &&
+      detail.reasonCode === "EXCHANGE_SNAPSHOT_BINDING_MISMATCH";
+    return validQueries && (hasLegacyReason || hasSnapshotBindingReasonCode);
   }
   if (outcome === "FOUND") {
     return hasExactOwnKeys(detail, ["query", "attemptedQueries", "uuid"]) &&

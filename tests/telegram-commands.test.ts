@@ -2016,6 +2016,70 @@ test("telegram /order renders equivalent English lifecycle information", async (
   assert.match(response.text, /Full technical detail: \/order order-en detail/);
 });
 
+test("telegram /order summary labels stale terminal failure metadata as processing history", () => {
+  const cases: Array<{
+    locale: "ko-KR" | "en-US";
+    status: "FILLED" | "CANCELED";
+    expected: RegExp;
+    forbidden: RegExp;
+  }> = [
+    {
+      locale: "ko-KR",
+      status: "FILLED",
+      expected: /과거 처리 이력: 이전 주문 처리 오류 정보가 남아 있습니다\. 현재 상태는 체결 완료입니다\./,
+      forbidden: /실패:|RECONCILIATION_REQUIRED|Exchange order lookup failed/,
+    },
+    {
+      locale: "en-US",
+      status: "CANCELED",
+      expected: /Processing history: Earlier order-processing failure metadata remains\. Current status is Canceled\./,
+      forbidden: /Failure:|RECONCILIATION_REQUIRED|Exchange order lookup failed/,
+    },
+  ];
+
+  for (const testCase of cases) {
+    const order = createOrder({
+      id: `order-terminal-${testCase.status}`,
+      status: testCase.status,
+      failureCode: "RECONCILIATION_REQUIRED",
+      failureMessage: "Exchange order lookup failed.",
+    });
+
+    const message = formatOrderDetailSummaryMessage(
+      order,
+      [],
+      [],
+      order.id,
+      testCase.locale,
+    );
+
+    assert.match(message, testCase.expected);
+    assert.doesNotMatch(message, testCase.forbidden);
+  }
+});
+
+test("telegram /order summary keeps active failure metadata for unresolved statuses", () => {
+  const statuses: Array<"FAILED" | "REJECTED" | "RECONCILIATION_REQUIRED"> = [
+    "FAILED",
+    "REJECTED",
+    "RECONCILIATION_REQUIRED",
+  ];
+
+  for (const status of statuses) {
+    const order = createOrder({
+      id: `order-active-failure-${status}`,
+      status,
+      failureCode: "LOOKUP_FAILED",
+      failureMessage: "Exchange lookup timed out.",
+    });
+    const korean = formatOrderDetailSummaryMessage(order, [], [], order.id, "ko-KR");
+    const english = formatOrderDetailSummaryMessage(order, [], [], order.id, "en-US");
+
+    assert.match(korean, /실패: LOOKUP_FAILED · Exchange lookup timed out\./);
+    assert.match(english, /Failure: LOOKUP_FAILED · Exchange lookup timed out\./);
+  }
+});
+
 test("telegram /order shows only the newest three events and fills without inferring state", async () => {
   const repository = new InMemoryExecutionRepository();
   const order = createOrder({
@@ -2306,6 +2370,8 @@ test("telegram /order detail preserves the canonical technical output exactly", 
     id: "order-canonical",
     identifier: "order-canonical-identifier",
     status: "FILLED",
+    failureCode: "RECONCILIATION_REQUIRED",
+    failureMessage: "Exchange order lookup failed.",
   });
   const events: OrderEventRecord[] = [{
     id: "canonical-event",
@@ -2342,6 +2408,8 @@ test("telegram /order detail preserves the canonical technical output exactly", 
     response.text,
     formatOrderDetailMessage(order, events, fills, "order-canonical-identifier"),
   );
+  assert.match(response.text, /failure_code: RECONCILIATION_REQUIRED/);
+  assert.match(response.text, /failure_message: Exchange order lookup failed\./);
 });
 
 test("telegram order detail summary gives every persisted lifecycle state an honest meaning", () => {

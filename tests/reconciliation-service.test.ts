@@ -2240,6 +2240,68 @@ test("submission recovery uses a persisted UUID before identifier fallback and n
   assert.deepEqual(observations.map((observation) => observation.outcome), ["FOUND"]);
 });
 
+test("exact exchange recovery clears current failure projection while preserving historical events", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = pausedUncertainSubmissionState();
+  const order = uncertainSubmissionOrder({
+    id: "resolved-uncertain-order",
+    identifier: "resolved-uncertain-identifier",
+    upbitUuid: "resolved-uncertain-uuid",
+    failureCode: "EXCHANGE_SNAPSHOT_BINDING_MISMATCH",
+    failureMessage: "The prior exchange lookup could not bind an exact snapshot.",
+  });
+  await repositories.saveOrder(order);
+  await repositories.appendOrderEvent({
+    id: "resolved-uncertain-history",
+    orderId: order.id,
+    eventType: "RECONCILIATION_RECOVERY_REQUIRED",
+    eventSource: "RECONCILIATION",
+    payloadJson: JSON.stringify({ reason: order.failureMessage }),
+    createdAt: "2026-08-21T00:00:00.500Z",
+  });
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: {
+      async getOrder() {
+        return {
+          uuid: order.upbitUuid!,
+          identifier: order.identifier,
+          market: order.market,
+          side: order.side,
+          ordType: order.ordType,
+          state: "done" as const,
+          price: order.price,
+          volume: null,
+          remainingVolume: "0",
+          executedVolume: "0.1",
+          paidFee: "500",
+          createdAt: order.requestedAt,
+          fills: [],
+          raw: { state: "done" },
+        };
+      },
+    },
+    recoveryClock: {
+      now: () => ({ observedAt: "2026-08-21T00:00:01.000Z", observedAtEpochMs: 1_787_270_401_000 }),
+    },
+  });
+
+  const result = await reconciliation.recoverOrderByIdentifier(order);
+  const persistedOrder = await repositories.findOrderByReference("primary", order.id);
+  const events = await repositories.listOrderEvents(order.id);
+
+  assert.equal(result.outcome, "RECOVERED");
+  assert.equal(persistedOrder?.status, "FILLED");
+  assert.equal(persistedOrder?.failureCode, null);
+  assert.equal(persistedOrder?.failureMessage, null);
+  assert.equal(events.some((event) => event.id === "resolved-uncertain-history"), true);
+  assert.equal(
+    events.some((event) => event.eventType === "RECONCILIATION_STATUS_UPDATED"),
+    true,
+  );
+});
+
 test("submission recovery accepts canonical Upbit market-ask decimal normalization", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = pausedUncertainSubmissionState();
@@ -2284,6 +2346,108 @@ test("submission recovery accepts canonical Upbit market-ask decimal normalizati
 
   assert.equal(result.outcome, "RECOVERED");
   assert.equal((await repositories.findOrderByReference("primary", order.id))?.status, "FILLED");
+});
+
+test("submission recovery accepts canonical Upbit market-bid quote truncation", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = pausedUncertainSubmissionState();
+  const order = uncertainSubmissionOrder({
+    id: "market-bid-quote-normalization",
+    market: "KRW-ETH",
+    price: "9609.096100999999",
+    identifier: "market-bid-quote-normalization-identifier",
+    upbitUuid: "market-bid-quote-normalization-uuid",
+  });
+  await repositories.saveOrder(order);
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: {
+      async getOrder() {
+        return {
+          uuid: order.upbitUuid!,
+          identifier: order.identifier,
+          market: order.market,
+          side: "bid" as const,
+          ordType: "price" as const,
+          state: "done",
+          price: "9609.09610099",
+          volume: null,
+          remainingVolume: "0",
+          executedVolume: "0.0027956",
+          paidFee: "4.80454805",
+          createdAt: order.requestedAt,
+          fills: [],
+          raw: { state: "done" },
+        };
+      },
+    },
+    recoveryClock: {
+      now: () => ({ observedAt: "2026-08-25T05:22:05.431Z", observedAtEpochMs: 1_787_635_325_431 }),
+    },
+  });
+
+  const result = await reconciliation.recoverOrderByIdentifier(order);
+
+  assert.equal(result.outcome, "RECOVERED");
+  assert.equal((await repositories.findOrderByReference("primary", order.id))?.status, "FILLED");
+});
+
+test("submission recovery rejects a market-bid quote mismatch within Upbit precision", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = pausedUncertainSubmissionState();
+  const order = uncertainSubmissionOrder({
+    id: "market-bid-material-quote-mismatch",
+    market: "KRW-ETH",
+    price: "9609.096100999999",
+    identifier: "market-bid-material-quote-mismatch-identifier",
+    upbitUuid: "market-bid-material-quote-mismatch-uuid",
+  });
+  await repositories.saveOrder(order);
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: {
+      async getOrder() {
+        return {
+          uuid: order.upbitUuid!,
+          identifier: order.identifier,
+          market: order.market,
+          side: order.side,
+          ordType: order.ordType,
+          state: "done",
+          price: "9609.09610098",
+          volume: null,
+          remainingVolume: "0",
+          executedVolume: "0.0027956",
+          paidFee: "4.80454805",
+          createdAt: order.requestedAt,
+          fills: [],
+          raw: { state: "done" },
+        };
+      },
+    },
+    recoveryClock: {
+      now: () => ({ observedAt: "2026-08-25T05:22:05.431Z", observedAtEpochMs: 1_787_635_325_431 }),
+    },
+  });
+
+  const result = await reconciliation.recoverOrderByIdentifier(order);
+
+  assert.equal(result.outcome, "TRANSIENT_FAILURE");
+  assert.equal(
+    (await repositories.findOrderByReference("primary", order.id))?.status,
+    "RECONCILIATION_REQUIRED",
+  );
+  const observations = await repositories.listOrderSubmissionRecoveryObservations(order.id);
+  assert.equal(observations.length, 1);
+  assert.deepEqual(JSON.parse(observations[0]!.detailJson), {
+    attemptedQueries: [
+      { uuid: order.upbitUuid },
+      { identifier: order.identifier },
+    ],
+    reasonCode: "EXCHANGE_SNAPSHOT_BINDING_MISMATCH",
+  });
 });
 
 test("submission recovery rejects foreign or immutable-material-mismatched snapshots without importing fills", async () => {

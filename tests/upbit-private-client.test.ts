@@ -238,6 +238,30 @@ test("authenticated order lookup returns null for a confirmed Upbit not-found re
   assert.equal(order, null);
 });
 
+test("authenticated order lookup preserves Upbit-normalized market-buy quote evidence", async () => {
+  const client = createPrivateClient(async () => jsonResponse({
+    uuid: "a08764e9-6ebb-41e1-ba88-53829c5d01de",
+    side: "bid",
+    ord_type: "price",
+    price: "9609.09610099",
+    state: "done",
+    market: "KRW-ETH",
+    created_at: "2026-08-25T13:48:02+09:00",
+    remaining_volume: "0",
+    executed_volume: "0.0027956",
+    paid_fee: "4.80454805",
+    identifier: "KRW-ETH-bid-a3b6b67b6c2a",
+    trades: [],
+  }));
+
+  const order = await client.getOrder({ uuid: "a08764e9-6ebb-41e1-ba88-53829c5d01de" });
+
+  assert.equal(order?.price, "9609.09610099");
+  assert.equal(order?.volume, null);
+  assert.equal(order?.identifier, "KRW-ETH-bid-a3b6b67b6c2a");
+  assert.equal(order?.ordType, "price");
+});
+
 test("authenticated order lookup exposes only a typed transient discriminant for retryable exchange failures", async () => {
   const client = createPrivateClient(async () => upbitErrorResponse(429, "too_many_requests", "rate limited"));
 

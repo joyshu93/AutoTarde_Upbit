@@ -102,6 +102,71 @@ test("submission outcomes require an explicit discriminant", () => {
   assert.equal(result.outcome, "SIMULATED_FILLED");
 });
 
+test("execution service rejects a non-canonical market-buy quote before persistence", async () => {
+  const { service, repositories } = createExecutionService();
+
+  await assert.rejects(
+    () => service.submitOrderFromDecision({
+      exchangeAccountId: "primary",
+      strategyDecisionId: "decision-noncanonical-market-buy",
+      referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
+      decision: {
+        strategyKey: "deterministic.stub.v1",
+        market: "KRW-ETH",
+        action: "ENTER",
+        reasonCodes: ["NONCANONICAL_MARKET_BUY_TEST"],
+        referencePrice: 3_438_000,
+        requestedNotionalKrw: 9609.123456789,
+        requestedQuantity: null,
+        metadata: {},
+      },
+      side: "bid",
+      ordType: "price",
+      price: "9609.123456789",
+      volume: null,
+    }),
+    /canonical decision notional/,
+  );
+
+  assert.deepEqual(await repositories.listOrders("primary"), []);
+});
+
+test("execution service binds market-buy wire material exactly to the decision", async () => {
+  for (const material of [
+    { price: "20000", volume: null, requestedNotionalKrw: 10_000 },
+    { price: null, volume: null, requestedNotionalKrw: 10_000 },
+    { price: "10000", volume: "0.1", requestedNotionalKrw: 10_000 },
+    { price: "0", volume: null, requestedNotionalKrw: 0 },
+  ] as const) {
+    const { service, repositories } = createExecutionService();
+
+    await assert.rejects(
+      () => service.submitOrderFromDecision({
+        exchangeAccountId: "primary",
+        strategyDecisionId: "decision-market-buy-material",
+        referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
+        decision: {
+          strategyKey: "deterministic.stub.v1",
+          market: "KRW-ETH",
+          action: "ENTER",
+          reasonCodes: ["MARKET_BUY_MATERIAL_TEST"],
+          referencePrice: 3_438_000,
+          requestedNotionalKrw: material.requestedNotionalKrw,
+          requestedQuantity: null,
+          metadata: {},
+        },
+        side: "bid",
+        ordType: "price",
+        price: material.price,
+        volume: material.volume,
+      }),
+      /market-buy quote/i,
+    );
+
+    assert.deepEqual(await repositories.listOrders("primary"), []);
+  }
+});
+
 test("baseline final send requires its own exact persisted SUBMITTING intent", async () => {
   for (const mutation of ["MISSING", "TERMINAL", "IMMUTABLE"] as const) {
     const operatorState = new InMemoryOperatorStateStore({
@@ -919,7 +984,7 @@ test("execution service blocks price orders below the exchange min total before 
       action: "ENTER",
       reasonCodes: ["PRECHECK"],
       referencePrice: 100_000_000,
-      requestedNotionalKrw: null,
+      requestedNotionalKrw: 7_000,
       requestedQuantity: null,
       metadata: {},
     },

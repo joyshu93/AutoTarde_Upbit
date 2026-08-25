@@ -242,6 +242,73 @@ test("position guard runner maps buy and sell decisions to Upbit spot order requ
   });
 });
 
+test("position guard market buys preserve exact decimal intent up to eight places", () => {
+  const decision = {
+    strategyKey: "position_guard.paper_core.v1",
+    market: "KRW-ETH" as const,
+    action: "ADD" as const,
+    reasonCodes: ["add"],
+    referencePrice: 3_438_000,
+    requestedNotionalKrw: 9609.096101,
+    requestedQuantity: null,
+    metadata: {},
+  };
+
+  const input = toOrderSubmissionInput({
+    exchangeAccountId: "primary",
+    strategyDecisionId: "decision-market-bid-precision",
+    referencePriceCapturedAt: "2026-08-25T04:48:02.408Z",
+    decision,
+  });
+
+  assert.equal(input?.price, "9609.096101");
+});
+
+test("position guard market buys truncate only decimal intent beyond eight places", () => {
+  const decision = {
+    strategyKey: "position_guard.paper_core.v1",
+    market: "KRW-ETH" as const,
+    action: "ADD" as const,
+    reasonCodes: ["add"],
+    referencePrice: 3_438_000,
+    requestedNotionalKrw: 9609.123456789,
+    requestedQuantity: null,
+    metadata: {},
+  };
+
+  const input = toOrderSubmissionInput({
+    exchangeAccountId: "primary",
+    strategyDecisionId: "decision-market-bid-eight-decimals",
+    referencePriceCapturedAt: "2026-08-25T04:48:02.408Z",
+    decision,
+  });
+
+  assert.equal(input?.price, "9609.12345678");
+});
+
+test("position guard persists the same canonical market-buy quote it submits", () => {
+  const generatedAt = "2026-08-25T04:48:02.408Z";
+  const bundle = createBullishDecisionBundle("EXECUTED_AFTER_CONFIRMATION", generatedAt);
+  bundle.strategyDecision.requestedNotionalKrw = 9609.123456789;
+
+  const record = createStrategyDecisionRecord({
+    exchangeAccountId: "primary",
+    generatedAt,
+    strategyDecision: bundle.strategyDecision,
+    engineDecision: bundle.engineDecision,
+    context: bundle.context,
+  });
+  const submission = toOrderSubmissionInput({
+    exchangeAccountId: "primary",
+    strategyDecisionId: record.id,
+    referencePriceCapturedAt: generatedAt,
+    decision: bundle.strategyDecision,
+  });
+
+  assert.equal(record.intendedNotionalKrw, "9609.12345678");
+  assert.equal(submission?.price, record.intendedNotionalKrw);
+});
+
 test("position guard runner records inspectable decision basis", () => {
   const strategyDecision: StrategyDecision = {
     strategyKey: "position_guard.paper_core.v1",

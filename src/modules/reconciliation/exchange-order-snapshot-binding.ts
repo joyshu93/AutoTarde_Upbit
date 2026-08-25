@@ -7,6 +7,7 @@ import type {
   UpbitSelfMatchPrevention,
 } from "../../domain/types.js";
 import type { ExchangeFillSnapshot, ExchangeOrderSnapshot } from "../exchange/interfaces.js";
+import { canonicalizeUpbitOrderDecimal } from "../exchange/upbit/order-decimals.js";
 
 export interface ExchangeOrderLookupIdentity {
   uuid?: string;
@@ -70,8 +71,8 @@ function projectAndValidateSnapshot(input: {
     market !== input.order.market ||
     side !== input.order.side ||
     ordType !== input.order.ordType ||
-    !sameNullableDecimal(price, input.order.price, "order price") ||
-    !sameNullableDecimal(volume, input.order.volume, "order volume") ||
+    !sameOrderIntentDecimal(price, input.order.price, "order price", side, ordType, "price") ||
+    !sameOrderIntentDecimal(volume, input.order.volume, "order volume", side, ordType, "volume") ||
     timeInForce !== input.order.timeInForce ||
     smpType !== input.order.smpType
   ) {
@@ -207,6 +208,24 @@ function sameNullableDecimal(left: string | null, right: string | null, label: s
   if (left === null || right === null) return left === right;
   return normalizeNonNegativeDecimal(left, `exchange ${label}`) ===
     normalizeNonNegativeDecimal(right, `local ${label}`);
+}
+
+function sameOrderIntentDecimal(
+  left: string | null,
+  right: string | null,
+  label: string,
+  side: OrderSide,
+  ordType: OrderType,
+  field: "price" | "volume",
+): boolean {
+  if (left === null || right === null) return left === right;
+  const usesUpbitEightDecimalCanonicalization =
+    side === "bid" && ordType === "price" && field === "price";
+  if (!usesUpbitEightDecimalCanonicalization) {
+    return sameNullableDecimal(left, right, label);
+  }
+  return canonicalizeUpbitOrderDecimal(left, `exchange ${label}`) ===
+    canonicalizeUpbitOrderDecimal(right, `local ${label}`);
 }
 
 function decimal(value: unknown, label: string): string {

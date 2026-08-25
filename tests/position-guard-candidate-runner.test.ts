@@ -191,6 +191,8 @@ test("candidate allow preserves baseline entry and add sizing exactly", async ()
     assert.equal(result.engineDecision.targetNotionalKrw, baseline.targetNotionalKrw);
     assert.equal(result.strategyDecision.requestedNotionalKrw, 123_456.789012);
     assert.equal(harness.submitted[0]?.decision.requestedNotionalKrw, 123_456.789012);
+    assert.equal(harness.saved[0]?.intendedNotionalKrw, "123456.789012");
+    assert.equal(harness.submitted[0]?.price, harness.saved[0]?.intendedNotionalKrw);
   }
 });
 

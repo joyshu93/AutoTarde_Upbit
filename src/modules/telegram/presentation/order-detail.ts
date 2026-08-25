@@ -151,6 +151,12 @@ function buildFailureLines(order: OrderRecord, locale: TelegramLocale): string[]
   if (order.failureCode === null && order.failureMessage === null) {
     return [];
   }
+  if (order.status === "FILLED" || order.status === "CANCELED") {
+    const status = describeStatus(order.status, locale);
+    return [locale === "ko-KR"
+      ? `과거 처리 이력: 이전 주문 처리 오류 정보가 남아 있습니다. 현재 상태는 ${status}입니다.`
+      : `Processing history: Earlier order-processing failure metadata remains. Current status is ${status}.`];
+  }
   const code = order.failureCode ?? (locale === "ko-KR" ? "없음" : "none");
   const message = order.failureMessage ?? (locale === "ko-KR" ? "없음" : "none");
   return [locale === "ko-KR" ? `실패: ${code} · ${message}` : `Failure: ${code} · ${message}`];

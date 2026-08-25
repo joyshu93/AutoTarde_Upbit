@@ -57,6 +57,29 @@ test("candidate execution persists one atomic bound intent with exact successor 
   assert.equal(binding?.materialVersion, "BINDING_V2");
 });
 
+test("candidate execution persists and sends one canonical quote beyond eight decision decimals", async () => {
+  const candidateDecision = {
+    ...persistedDecision(),
+    intendedNotionalKrw: "9609.12345678",
+  };
+  const fixture = await createFixture({ persistedDecisionOverride: candidateDecision });
+  const input = candidateInput();
+  input.decision.requestedNotionalKrw = 9609.123456789;
+  input.price = "9609.12345678";
+
+  const result = await fixture.service.submitOrderFromDecision(input);
+
+  assert.equal(result.accepted, true);
+  assert.equal(fixture.adapter.createOrderCalls, 1);
+  assert.equal(fixture.adapter.lastCreateOrderRequest?.price, "9609.12345678");
+  assert.equal(fixture.adapter.lastCreateOrderRequest?.volume, null);
+  const [order] = await fixture.repositories.listOrders("primary");
+  const binding = await fixture.candidatePilots.getExecutionBindingForOrder(order!.id);
+  assert.equal(order?.price, "9609.12345678");
+  assert.equal(binding?.intendedNotionalKrw, "9609.12345678");
+  assert.equal(binding?.boundPrice, "9609.12345678");
+});
+
 test("candidate LIVE execution persists a LIVE binding and sends exactly once", async () => {
   const fixture = await createFixture({ live: true });
 
@@ -339,9 +362,11 @@ class RecordingExecutionRepository extends InMemoryExecutionRepository {
 
 class RecordingDryRunAdapter extends DryRunExchangeAdapter {
   createOrderCalls = 0;
+  lastCreateOrderRequest: UpbitOrderRequest | null = null;
 
   override async createOrder(request: UpbitOrderRequest) {
     this.createOrderCalls += 1;
+    this.lastCreateOrderRequest = request;
     return super.createOrder(request);
   }
 }
@@ -349,6 +374,7 @@ class RecordingDryRunAdapter extends DryRunExchangeAdapter {
 class RecordingLiveAdapter implements LiveExecutionAdapter {
   readonly sendPath = "LIVE_ADAPTER" as const;
   createOrderCalls = 0;
+  lastCreateOrderRequest: UpbitOrderRequest | null = null;
   private readonly delegate = new DryRunExchangeAdapter();
 
   getBalances(): ReturnType<DryRunExchangeAdapter["getBalances"]> {
@@ -365,6 +391,7 @@ class RecordingLiveAdapter implements LiveExecutionAdapter {
 
   async createOrder(request: UpbitOrderRequest) {
     this.createOrderCalls += 1;
+    this.lastCreateOrderRequest = request;
     return this.delegate.createOrder(request);
   }
 
@@ -389,6 +416,7 @@ async function createFixture(options: {
   includeCandidateDependency?: boolean;
   failCandidatePersistence?: boolean;
   saveDecision?: boolean;
+  persistedDecisionOverride?: StrategyDecisionRecord;
   live?: boolean;
   transformDuplicateBinding?: (binding: CandidateExecutionBindingRecord) => CandidateExecutionBindingRecord;
 } = {}) {
@@ -398,7 +426,12 @@ async function createFixture(options: {
   repositories.failCandidatePersistence = options.failCandidatePersistence ?? false;
   const adapter = options.live ? new RecordingLiveAdapter() : new RecordingDryRunAdapter();
   const leases = new InMemoryAccountExecutionLeaseStore();
-  await seedCandidate(candidatePilots, repositories, options.saveDecision ?? true);
+  await seedCandidate(
+    candidatePilots,
+    repositories,
+    options.saveDecision ?? true,
+    options.persistedDecisionOverride,
+  );
 
   const dependencies = {
     riskLimits: {
@@ -426,6 +459,7 @@ async function seedCandidate(
   candidatePilots: InMemoryCandidatePilotRepository,
   repositories: InMemoryExecutionRepository,
   saveDecision: boolean,
+  persistedDecisionOverride?: StrategyDecisionRecord,
 ): Promise<void> {
   await candidatePilots.createDeploymentWithInitialState({
     deployment: {
@@ -451,7 +485,7 @@ async function seedCandidate(
     activationEpochNs: BigInt(Date.parse(ACTIVATION_AT)) * 1_000_000n,
   });
   if (saveDecision) {
-    await repositories.saveStrategyDecision(persistedDecision());
+    await repositories.saveStrategyDecision(persistedDecisionOverride ?? persistedDecision());
   }
   await repositories.saveBalanceSnapshot({
     id: "balance-1",

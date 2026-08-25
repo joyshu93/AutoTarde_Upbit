@@ -21,6 +21,10 @@ import {
 } from "../db/repositories/candidate-bound-order-validation.js";
 import { ExchangeOrderSubmissionError } from "../exchange/errors.js";
 import type { ExchangeAdapter, ExecutionExchangeAdapter, UpbitOrderChance } from "../exchange/interfaces.js";
+import {
+  canonicalizeUpbitOrderDecimal,
+  serializeUpbitOrderDecimal,
+} from "../exchange/upbit/order-decimals.js";
 import { evaluateRiskGuards } from "../risk/guards.js";
 import type { OperatorNotificationReporter } from "../telegram/reporter.js";
 import { buildOrderIdentifier, buildOrderIdempotencyKey } from "./idempotency.js";
@@ -95,6 +99,7 @@ export class ExecutionService {
   ) {}
 
   async submitOrderFromDecision(input: SubmitOrderFromDecisionInput): Promise<SubmitOrderFromDecisionResult> {
+    assertCanonicalUpbitMarketBuyQuote(input);
     const attemptStartedAt = this.dependencies.now?.() ?? new Date().toISOString();
     const decision = input.decision;
     const market = input.market ?? decision.market;
@@ -879,7 +884,7 @@ export class ExecutionService {
       decision.action !== input.decision.action ||
       decision.status !== "READY" ||
       decision.referencePrice !== String(input.decision.referencePrice) ||
-      decision.intendedNotionalKrw !== nullableNumberString(input.decision.requestedNotionalKrw) ||
+      decision.intendedNotionalKrw !== nullableDecisionNotionalString(input.decision) ||
       decision.intendedQuantity !== nullableNumberString(input.decision.requestedQuantity)
     ) {
       throw new CandidateExecutionSafetyError(
@@ -1664,6 +1669,32 @@ function deriveRequestedNotionalKrw(
 
 function nullableNumberString(value: number | null): string | null {
   return value === null ? null : String(value);
+}
+
+function nullableDecisionNotionalString(decision: StrategyDecision): string | null {
+  if (decision.requestedNotionalKrw === null) return null;
+  return serializeUpbitOrderDecimal(decision.requestedNotionalKrw, "candidate market-buy quote");
+}
+
+function assertCanonicalUpbitMarketBuyQuote(input: SubmitOrderFromDecisionInput): void {
+  if (input.side !== "bid" || input.ordType !== "price") return;
+  if (
+    input.price === null ||
+    input.volume !== null ||
+    input.decision.requestedNotionalKrw === null ||
+    !Number.isFinite(input.decision.requestedNotionalKrw) ||
+    input.decision.requestedNotionalKrw <= 0
+  ) {
+    throw new Error("Market-buy quote must have a positive decision notional, price, and no volume.");
+  }
+  const canonical = canonicalizeUpbitOrderDecimal(input.price, "market-buy quote");
+  const expected = serializeUpbitOrderDecimal(
+    input.decision.requestedNotionalKrw,
+    "market-buy decision notional",
+  );
+  if (input.price !== canonical || input.price !== expected) {
+    throw new Error("Market-buy quote must exactly match the canonical decision notional.");
+  }
 }
 
 function matchesCandidateDuplicateOrder(

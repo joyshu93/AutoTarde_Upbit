@@ -1143,13 +1143,17 @@ export class ReconciliationService {
       upbitUuid: snapshot.uuid,
       status: nextStatus,
       exchangeResponseJson: JSON.stringify(snapshot.raw),
+      failureCode: null,
+      failureMessage: null,
       updatedAt: reconciledAt,
     };
 
     const orderChanged =
       nextOrder.status !== order.status ||
       nextOrder.upbitUuid !== order.upbitUuid ||
-      nextOrder.exchangeResponseJson !== order.exchangeResponseJson;
+      nextOrder.exchangeResponseJson !== order.exchangeResponseJson ||
+      nextOrder.failureCode !== order.failureCode ||
+      nextOrder.failureMessage !== order.failureMessage;
     const reconciliationEvent = orderChanged
       ? {
         id: createId("order_event"),

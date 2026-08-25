@@ -1318,6 +1318,91 @@ test("every observation query and returned UUID is bound to the persisted order"
   assert.equal(legitimateResult.status, "READY");
 });
 
+test("recovery accepts the exact snapshot-binding transient observation emitted by reconciliation", async () => {
+  const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+  const order = {
+    ...orderRecord({ id: "snapshot-binding-transient", status: "FILLED" }),
+    upbitUuid: "snapshot-binding-transient-uuid",
+  };
+  await fixture.repositories.saveOrder(order);
+  await fixture.repositories.saveOrderSubmissionRecoveryObservation({
+    ...recoveryObservation(order.id, "snapshot-binding-transient-observation", "2026-08-21T00:00:28.000Z"),
+    outcome: "TRANSIENT_FAILURE",
+    detailJson: JSON.stringify({
+      attemptedQueries: [
+        { uuid: order.upbitUuid },
+        { identifier: order.identifier },
+      ],
+      reasonCode: "EXCHANGE_SNAPSHOT_BINDING_MISMATCH",
+    }),
+  });
+
+  const result = await fixture.recovery.verifyAndPrepareBtcRun(fixture.receipt);
+
+  assert.equal(result.status, "READY");
+});
+
+test("snapshot-binding transient observations reject unknown shapes and unbound queries", async () => {
+  const scenarios: ReadonlyArray<Readonly<{
+    name: string;
+    detail(order: ReturnType<typeof orderRecord> & { upbitUuid: string }): unknown;
+  }>> = [
+    {
+      name: "unknown reason code",
+      detail: (order) => ({
+        attemptedQueries: [{ uuid: order.upbitUuid }],
+        reasonCode: "UNKNOWN_BINDING_FAILURE",
+      }),
+    },
+    {
+      name: "mixed reason keys",
+      detail: (order) => ({
+        attemptedQueries: [{ uuid: order.upbitUuid }],
+        reason: "temporary lookup failure",
+        reasonCode: "EXCHANGE_SNAPSHOT_BINDING_MISMATCH",
+      }),
+    },
+    {
+      name: "additional property",
+      detail: (order) => ({
+        attemptedQueries: [{ uuid: order.upbitUuid }],
+        reasonCode: "EXCHANGE_SNAPSHOT_BINDING_MISMATCH",
+        extra: true,
+      }),
+    },
+    {
+      name: "foreign query",
+      detail: () => ({
+        attemptedQueries: [{ uuid: "foreign-order-uuid" }],
+        reasonCode: "EXCHANGE_SNAPSHOT_BINDING_MISMATCH",
+      }),
+    },
+    {
+      name: "duplicate query",
+      detail: (order) => ({
+        attemptedQueries: [{ uuid: order.upbitUuid }, { uuid: order.upbitUuid }],
+        reasonCode: "EXCHANGE_SNAPSHOT_BINDING_MISMATCH",
+      }),
+    },
+  ];
+
+  for (const [index, scenario] of scenarios.entries()) {
+    const fixture = await createFixture({ balanceFree: "0.2", positionQuantity: "0.2" });
+    const order = {
+      ...orderRecord({ id: `invalid-snapshot-binding-transient-${index}`, status: "FILLED" }),
+      upbitUuid: `invalid-snapshot-binding-transient-uuid-${index}`,
+    };
+    await fixture.repositories.saveOrder(order);
+    await fixture.repositories.saveOrderSubmissionRecoveryObservation({
+      ...recoveryObservation(order.id, `invalid-snapshot-binding-observation-${index}`, "2026-08-21T00:00:28.000Z"),
+      outcome: "TRANSIENT_FAILURE",
+      detailJson: JSON.stringify(scenario.detail(order)),
+    });
+
+    await expectFault(fixture, "UNCERTAIN_ORDER", scenario.name);
+  }
+});
+
 test("balance, position, replay inventory, and malformed numeric mismatches fault closed", async () => {
   const scenarios = [
     { name: "balance-position", balanceFree: "0.2", positionQuantity: "0.1", evidenceQuantity: "0.1" },
