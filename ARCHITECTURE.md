@@ -9,6 +9,8 @@ Ownership begins before mutable application construction. The owner receives a m
 
 Migration `0024_add_runtime_ownership.sql` is an offline deployment operation, never a runtime startup action: stop the runtime explicitly, back up the database and sidecars, migrate through the approved procedure, verify read-only readiness, then start one owner and separately exercise duplicate-start rejection.
 
+DRY_RUN readiness and completion smokes make no trading or business-state mutation while acquiring and releasing process plus persisted runtime-control ownership evidence; each contends with an existing owner. Their runtime-control writes are ownership acquisition, heartbeat, takeover/loss evidence, and exact-generation release rather than trading or business state. Only a provably read-only report, inspection, or smoke that does not construct a mutable runtime composition is ownership-free.
+
 ## Core Principles
 
 - TypeScript strict mode everywhere
@@ -252,11 +254,11 @@ It provides:
 - disabled-by-default inbound polling that routes text commands only from the private chat whose source chat ID and sender ID both equal `TELEGRAM_OPERATOR_CHAT_ID`
 - inbound polling splits long routed replies into bounded Telegram messages so large inspection views such as `/alerts` do not fail the command update
 - a bounded `smoke:telegram:inbound` operator validation script that forces `DRY_RUN`, disables live orders and scheduler ticks, and calls only one inbound `pollOnce()` without starting the runtime loop
-- a non-mutating `smoke:dryrun:readiness` local preflight that forces DRY_RUN/live-disabled/scheduler-disabled startup settings, reads local readiness evidence, and reports next actions before the local DRY_RUN runtime starts
+- a `smoke:dryrun:readiness` local preflight that forces DRY_RUN/live-disabled/scheduler-disabled startup settings, reads local readiness evidence, reports next actions before the local DRY_RUN runtime starts, and contends for runtime-control ownership without trading or business-state mutation
 - an exchange-backed `smoke:dryrun:sync` local rehearsal that forces DRY_RUN/live-disabled/Telegram-disabled/scheduler-disabled settings, runs `/sync`, then inspects balances, positions, readiness, and sync history without running strategy or transmitting orders
 - a fixture-backed `smoke:dryrun:operator` command rehearsal that forces offline `DRY_RUN`, clears Upbit private read credentials for the process, disables Telegram delivery/inbound polling and the scheduler, then routes `/config`, `/status`, `/readiness`, `/sync`, `/balances`, `/positions`, `/run BTC|ETH`, `/orders`, `/scheduler`, and `/alerts`
 - a local DRY_RUN scheduler launcher that keeps live-send disabled, runs `smoke:dryrun:sync` and `smoke:dryrun:readiness` before startup, then starts the runtime with the scheduler enabled and `RUN_ON_START=true` for an automatic scheduled-path rehearsal
-- a persisted-evidence `smoke:dryrun:completion` gate that forces live-send, Telegram transport, and scheduler startup disabled, then reads local snapshots, reconciliation, risk, notification, and `strategy_scheduler_runs` evidence to decide whether the DRY_RUN automatic scheduler rehearsal is complete without mutating execution state
+- a persisted-evidence `smoke:dryrun:completion` gate that forces live-send, Telegram transport, and scheduler startup disabled, then reads local snapshots, reconciliation, risk, notification, and `strategy_scheduler_runs` evidence to decide whether the DRY_RUN automatic scheduler rehearsal is complete without trading or business-state mutation while contending for runtime-control ownership
 
 `/help` is intentionally contract-derived and locale-aware. Presentation defaults to `ko-KR`, supports only `ko-KR` and `en-US`, and does not read repositories, poll Telegram, inspect exchange state, start sync, start strategy runs, start scheduler ticks, mutate orders, or enable live order transmission.
 `/status` is a locale-aware, inspection-only operator summary. `/status detail` preserves the canonical technical output and uses the same bounded repository reads; neither form calls Upbit, triggers reconciliation or strategy execution, starts scheduler work, mutates orders, or enables live order transmission.

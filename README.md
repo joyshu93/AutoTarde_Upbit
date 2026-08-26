@@ -72,11 +72,11 @@ Current remaining gaps:
 - Telegram delivery now coalesces kicks received while an inline worker is already running into a follow-up pass, so notifications created during an in-flight pass are delivered without waiting for an unrelated future alert
 - `/alerts` now exposes delivery-worker queue metrics such as pending totals, due/scheduled counts, active/expired leases, abandoned-lease candidates, recent worker-run summaries, recent attempt outcome counts, and latest/oldest timestamps
 - Telegram inbound polling is now available behind `ENABLE_TELEGRAM_INBOUND_POLLING=false` by default, uses the existing command router, accepts text commands only from the private chat whose source chat ID and sender ID both match `TELEGRAM_OPERATOR_CHAT_ID`, persists `getUpdates` offset progress in `telegram_inbound_offsets`, exposes locale-aware `/inbound` inspection with canonical `/inbound detail`, and splits long command replies into bounded Telegram messages
-- `npm run smoke:dryrun:readiness` now provides a non-mutating local DRY_RUN preflight over runtime config and persisted readiness evidence before the local runtime starts
+- `npm run smoke:dryrun:readiness` now provides a local DRY_RUN preflight over runtime config and persisted readiness evidence before the local runtime starts; it makes no trading or business-state mutation but participates in runtime-control ownership
 - `npm run smoke:dryrun:sync` now provides an exchange-backed DRY_RUN `/sync` rehearsal that persists snapshots/reconciliation evidence but does not run strategy, Telegram transport, scheduler, or order transmission
 - `npm run smoke:dryrun:operator` now provides an offline, fixture-backed DRY_RUN operator rehearsal for `/config`, `/status`, `/readiness`, `/sync`, `/balances`, `/positions`, `/run BTC|ETH`, `/orders`, `/scheduler`, and `/alerts`
 - `scripts/start-company-dryrun-scheduler.example.ps1` now provides a local DRY_RUN scheduler launcher that keeps live orders disabled, runs DRY_RUN sync/readiness smokes, then starts the runtime with scheduler `RUN_ON_START=true`
-- `npm run smoke:dryrun:completion` now provides a persisted-evidence gate for marking the DRY_RUN automatic scheduler rehearsal complete without running sync, strategy, Telegram transport, scheduler timers, Upbit calls, or order transmission
+- `npm run smoke:dryrun:completion` now provides a persisted-evidence gate for marking the DRY_RUN automatic scheduler rehearsal complete without running sync, strategy, Telegram transport, scheduler timers, Upbit calls, or order transmission; it makes no trading or business-state mutation but participates in runtime-control ownership
 - startup recovery can now mark persisted operator state `DEGRADED` when unresolved portfolio drift remains after exchange-backed bootstrap checks
 - scheduler-triggered strategy cycles now persist `strategy_scheduler_runs` so scheduled run starts, completions, failures, and skips remain inspectable after process restart, including through `/scheduler`
 - `/scheduler` now shows current in-memory scheduler status and startup preflight summary before the persisted scheduler-run history
@@ -129,7 +129,7 @@ The startup banner plus Korean-first `/status` and `/readiness` summaries show s
 
 `0024_add_runtime_ownership.sql` must be deployed later through an explicit offline procedure: stop the runtime, back up the database and sidecars, apply the existing approved migration/identity operation, run read-only readiness verification, start one runtime, then separately confirm a duplicate launch has zero side effects. This repository change does not migrate, restart, deploy, or push anything.
 
-A mutable or composed smoke acquires and releases process and persisted runtime ownership even when it is non-trading and makes no business-state mutation; it must contend with an existing owner exactly like the long-running runtime. Only a provably read-only report, inspection, or smoke command that does not construct a mutable runtime composition remains ownership-free.
+A mutable or composed smoke acquires and releases process plus persisted runtime-control ownership evidence even when it is non-trading and makes no business-state mutation; it must contend with an existing owner exactly like the long-running runtime. DRY_RUN readiness and completion smokes make no trading or business-state mutation while acquiring and releasing process plus persisted runtime-control ownership evidence; each contends with an existing owner. Only a provably read-only report, inspection, or smoke command that does not construct a mutable runtime composition remains ownership-free.
 
 ### BTC Candidate Pilot Is Available, Not Activated
 
@@ -557,7 +557,7 @@ For repeated checks with the same DRY_RUN environment, copy `scripts/smoke-dryru
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke-dryrun-readiness.local.ps1
 ```
 
-This smoke forces `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, `STRATEGY_SCHEDULER_ENABLED=false`, and `STRATEGY_SCHEDULER_RUN_ON_START=false`. It reads local runtime configuration, persisted execution state, latest snapshots, latest reconciliation, active orders, recent risk blocks, and pending notifications. It does not run `/sync`, run strategy, start the scheduler, poll Telegram, call Upbit, deliver notifications, or send orders. A `WARN` is expected on a fresh DB before `/sync`; a `BLOCK` must be resolved before continuing.
+This smoke forces `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, `STRATEGY_SCHEDULER_ENABLED=false`, and `STRATEGY_SCHEDULER_RUN_ON_START=false`. It reads local runtime configuration, persisted execution state, latest snapshots, latest reconciliation, active orders, recent risk blocks, and pending notifications. It does not run `/sync`, run strategy, start the scheduler, poll Telegram, call Upbit, deliver notifications, or send orders. It does acquire and release process plus persisted runtime-control ownership evidence and contends with an existing owner, without a trading or business-state mutation. A `WARN` is expected on a fresh DB before `/sync`; a `BLOCK` must be resolved before continuing.
 
 After readiness is clean enough to proceed and Upbit read credentials are configured, run one exchange-backed DRY_RUN sync rehearsal:
 
@@ -626,7 +626,7 @@ For repeated checks with the same DRY_RUN scheduler database, copy `scripts/smok
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke-dryrun-completion.local.ps1
 ```
 
-This smoke forces `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, disables Telegram delivery and inbound polling, disables scheduler startup, and reads only persisted local evidence: latest balance snapshot, latest position snapshot, latest reconciliation, active orders, recent risk blocks, pending operator notifications, and latest `strategy_scheduler_runs` for `KRW-BTC` and `KRW-ETH`. It does not run `/sync`, run strategy, start the scheduler, poll Telegram, call Upbit, deliver notifications, create orders, or transmit orders.
+This smoke forces `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, disables Telegram delivery and inbound polling, disables scheduler startup, and reads persisted local evidence: latest balance snapshot, latest position snapshot, latest reconciliation, active orders, recent risk blocks, pending operator notifications, and latest `strategy_scheduler_runs` for `KRW-BTC` and `KRW-ETH`. It does not run `/sync`, run strategy, start the scheduler, poll Telegram, call Upbit, deliver notifications, create orders, or transmit orders. It does acquire and release process plus persisted runtime-control ownership evidence and contends with an existing owner, without a trading or business-state mutation.
 
 ## Local LIVE Script
 

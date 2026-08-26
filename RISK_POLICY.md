@@ -7,6 +7,8 @@ Heartbeat loss, lock loss, expiry, or a persisted generation mismatch fails clos
 
 Ownership health is safe to expose only as non-secret status, generation, mode, heartbeat time/age, takeover, and reason. Owner tokens, raw/canonical database paths, lock identifiers, scope digests, and key fingerprints are never operator output. `RUNTIME_ALREADY_OWNED` is console-only for a duplicate that never acquired authority. Migration `0024_add_runtime_ownership.sql` requires a separately approved offline stop, backup, migration, read-only verification, and restart procedure.
 
+DRY_RUN readiness and completion smokes make no trading or business-state mutation while acquiring and releasing process plus persisted runtime-control ownership evidence; each contends with an existing owner. Their ownership-control writes are not a reason to describe them as globally read-only or non-mutating. Only a provably read-only report, inspection, or smoke that does not construct a mutable runtime composition is ownership-free.
+
 ## LIVE Database Selection Guard
 
 LIVE must fail before runtime construction when `DATABASE_PATH` is relative, missing, not a regular file, passes through a symlink/junction, has a non-canonical migration ledger, lacks its singleton identity, or does not match the configured database UUID, primary account, or Upbit access-key fingerprint. The guard must not reveal credentials or fingerprints in errors. It must not create a replacement DB or silently bind/rebind an identity. `DRY_RUN` retains its existing local DB creation behavior.

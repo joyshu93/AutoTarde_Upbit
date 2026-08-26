@@ -56,6 +56,8 @@ The owner renews a 10-second heartbeat with a 45-second TTL. Lock loss, generati
 
 Telegram `/status`, `/readiness`, and the startup banner report only non-secret ownership health: state, generation, mode, heartbeat time and age, takeover, and reason. They never render an owner token, database path, scope digest, named-pipe name, or key fingerprint. A duplicate process reports `RUNTIME_ALREADY_OWNED` only to its own console because it has neither database nor Telegram authority.
 
+DRY_RUN readiness and completion smokes make no trading or business-state mutation while acquiring and releasing process plus persisted runtime-control ownership evidence; each contends with an existing owner. Only a provably read-only report, inspection, or smoke that does not construct a mutable runtime composition is ownership-free.
+
 Migration `0024_add_runtime_ownership.sql` is deployed only offline: explicitly stop the runtime, back up the database and sidecars, apply the approved migration/identity procedure, perform read-only readiness verification, then start one runtime and separately rehearse a duplicate start. No deployment, restart, or migration is implied by this source change.
 
 ## BTC Candidate Pilot Boundary

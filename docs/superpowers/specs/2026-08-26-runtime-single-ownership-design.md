@@ -171,7 +171,7 @@ A duplicate that cannot acquire the process lock stops after step 4. It does not
 
 ### Scoped Smoke Ownership
 
-A mutable or composed smoke acquires and releases process and persisted runtime ownership even when it is non-trading and makes no business-state mutation; it must contend with an existing owner exactly like the long-running runtime. This includes one-shot smoke paths that construct a writable application composition or can touch mutable runtime-control state. Only a provably read-only report, inspection, or smoke command that does not construct a mutable runtime composition remains ownership-free.
+A mutable or composed smoke acquires and releases process plus persisted runtime-control ownership evidence even when it is non-trading and makes no business-state mutation; it must contend with an existing owner exactly like the long-running runtime. This includes one-shot smoke paths that construct a writable application composition or can touch mutable runtime-control state. DRY_RUN readiness and completion smokes make no trading or business-state mutation while acquiring and releasing process plus persisted runtime-control ownership evidence; each contends with an existing owner. Only a provably read-only report, inspection, or smoke command that does not construct a mutable runtime composition remains ownership-free.
 
 ## Takeover Rules
 
