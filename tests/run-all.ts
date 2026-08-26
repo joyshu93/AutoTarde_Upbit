@@ -36,6 +36,7 @@ await import("./runtime-process-lock.test.js");
 await import("./runtime-lifecycle.test.js");
 await import("./runtime-startup-gate.test.js");
 await import("./scoped-runtime-ownership.test.js");
+await import("./runtime-single-ownership-integration.test.js");
 await import("./index-startup.test.js");
 await import("./sync-controller.test.js");
 await import("./scheduler-preflight.test.js");

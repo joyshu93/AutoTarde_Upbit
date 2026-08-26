@@ -4,6 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import type {
   BalanceSnapshotRecord,
   ExecutionStateRecord,
@@ -475,6 +476,7 @@ test("two SQLite connections preserve a terminal winner when missing reconciliat
     await first.repositories.saveOrder(original);
     const projectedOrderIds: string[] = [];
     const service = new ReconciliationService({
+      runtimeOwnership: createAlwaysOwnedRuntimeAuthority(),
       repositories: first.repositories,
       operatorState: first.operatorState,
       orderReader: {
@@ -715,6 +717,7 @@ test("reconciliation stays lookup-eligible after atomic fill failure and project
       injector.close();
     }
     const service = new ReconciliationService({
+      runtimeOwnership: createAlwaysOwnedRuntimeAuthority(),
       repositories: bundle.repositories,
       operatorState: bundle.operatorState,
       orderReader: { async getOrder() { return snapshot; } },
@@ -746,6 +749,7 @@ test("reconciliation stays lookup-eligible after atomic fill failure and project
   bundle = createSqlitePersistence(bootstrap);
   try {
     const restarted = new ReconciliationService({
+      runtimeOwnership: createAlwaysOwnedRuntimeAuthority(),
       repositories: bundle.repositories,
       operatorState: bundle.operatorState,
       orderReader: { async getOrder() { return snapshot; } },
@@ -919,6 +923,33 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
     await cleanupTempDatabase(databasePath);
   }
 });
+
+function createAlwaysOwnedRuntimeAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "a"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+  };
+}
 
 test("runtime ownership migration and ledger insertion roll back atomically", async () => {
   const databasePath = await createTempDatabasePath("migration-0024-ledger-atomicity");

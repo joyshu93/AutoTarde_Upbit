@@ -516,6 +516,9 @@ test("runAppStartup subscribes ownership loss before candidate startup initializ
     }),
   } satisfies RuntimeOwnershipContext;
   const app = {
+    telegramRouter: {
+      setRuntimeOwnershipSnapshotProvider() {},
+    },
     candidatePilotStartupAuthority: {
       async initialize() {
         events.push("candidate:initialize");

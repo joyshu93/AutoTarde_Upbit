@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import type { CandidateExecutionBindingRecord } from "../src/domain/pilot-types.js";
 import type {
   ExecutionStateRecord,
@@ -118,7 +119,7 @@ test("candidate final order reread uses exact account and order id despite refer
   assert.equal(fixture.repositories.referenceLookupCalls, 0);
 });
 
-test("final exact order read and sole send have no helper-resolution microtask seam", async () => {
+test("final runtime ownership check is the sole awaited boundary before the send", async () => {
   const fixture = await createFixture("HELPER_RESOLUTION_PAUSE");
 
   const result = await fixture.service.submitOrderFromDecision(candidateInput());
@@ -126,13 +127,13 @@ test("final exact order read and sole send have no helper-resolution microtask s
 
   assert.equal(result.accepted, true);
   assert.equal(fixture.adapter.createOrderCalls, 1);
-  assert.equal(fixture.adapter.systemStatusAtSend, "RUNNING");
+  assert.equal(fixture.adapter.systemStatusAtSend, "PAUSED");
   assert.deepEqual(fixture.trace.slice(-5), [
     "operatorState",
     "activeOrders",
     "order",
-    "createOrder",
     "finalOrderMicrotaskPause",
+    "createOrder",
   ]);
 });
 
@@ -226,18 +227,27 @@ test("candidate final authority keeps the exact account/order revalidation immed
     "this.assertFinalPersistedSubmissionAuthority",
     exactOrderRead,
   );
+  const runtimeOwnershipCheck = submitMethod.indexOf(
+    "await this.runtimeOwnership.assertCurrent",
+    persistedHelperCall,
+  );
   const sendSite = submitMethod.indexOf(
     "this.dependencies.executionAdapter.createOrder",
-    persistedHelperCall,
+    runtimeOwnershipCheck,
   );
   assert.ok(
     candidateHelperCall >= 0 && finalStateRead > candidateHelperCall &&
     blockerRead > finalStateRead && exactOrderRead > blockerRead &&
-    persistedHelperCall > exactOrderRead && sendSite > persistedHelperCall,
+    persistedHelperCall > exactOrderRead && runtimeOwnershipCheck > persistedHelperCall &&
+    sendSite > runtimeOwnershipCheck,
   );
   const afterFinalPersistedRead = submitMethod.slice(exactOrderRead, sendSite);
-  assert.equal((afterFinalPersistedRead.match(/\bawait\b/gu) ?? []).length, 1);
+  assert.equal((afterFinalPersistedRead.match(/\bawait\b/gu) ?? []).length, 2);
   assert.doesNotMatch(afterFinalPersistedRead, /operatorState\.getState|candidatePilots/u);
+  assert.doesNotMatch(
+    submitMethod.slice(runtimeOwnershipCheck + "await".length, sendSite),
+    /\bawait\b/u,
+  );
 });
 
 async function assertFinalCandidateFault(mutation: FinalMutation): Promise<void> {
@@ -494,11 +504,39 @@ async function createFixture(mutation: FinalMutation) {
     accountExecutionLeases: leases,
     accountExecutionLeaseMs: 30_000,
     operatorState,
+    runtimeOwnership: createAlwaysOwnedRuntimeAuthority(),
     candidatePilots: finalCandidatePilotReads(candidatePilots, repositories, mutation, trace),
     now: () => ATTEMPT_AT,
   });
 
   return { adapter, candidatePilots, leases, operatorState, repositories, service, trace };
+}
+
+function createAlwaysOwnedRuntimeAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "a"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+  };
 }
 
 function finalCandidatePilotReads(

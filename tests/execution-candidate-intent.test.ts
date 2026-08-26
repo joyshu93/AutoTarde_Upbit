@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import type { CandidateExecutionBindingRecord } from "../src/domain/pilot-types.js";
 import type { ExecutionStateRecord, StrategyDecisionRecord } from "../src/domain/types.js";
 import type { CandidatePilotRepository } from "../src/modules/db/pilot-interfaces.js";
@@ -445,6 +446,7 @@ async function createFixture(options: {
     accountExecutionLeases: leases,
     accountExecutionLeaseMs: 30_000,
     operatorState,
+    runtimeOwnership: createAlwaysOwnedRuntimeAuthority(options.live ? "LIVE" : "DRY_RUN"),
     now: () => ATTEMPT_AT,
     ...(options.includeCandidateDependency === false
       ? {}
@@ -453,6 +455,35 @@ async function createFixture(options: {
   const service = new ExecutionService(dependencies);
 
   return { adapter, candidatePilots, leases, operatorState, repositories, service };
+}
+
+function createAlwaysOwnedRuntimeAuthority(
+  executionMode: "DRY_RUN" | "LIVE",
+): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "a"),
+    generation: 1,
+    executionMode,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+  };
 }
 
 async function seedCandidate(
