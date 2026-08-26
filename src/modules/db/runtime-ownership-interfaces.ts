@@ -48,7 +48,7 @@ export interface RuntimeOwnershipStore {
   getCurrent(): Promise<RuntimeOwnershipRecord | null>;
   getCurrentExecutionAuthority?(
     exchangeAccountId: string,
-  ): Promise<PersistedRuntimeExecutionAuthority | null>;
+  ): PersistedRuntimeExecutionAuthority | null;
   acquireAfterProcessLock(
     input: AcquireRuntimeOwnershipInput,
   ): Promise<RuntimeOwnershipAcquisition>;

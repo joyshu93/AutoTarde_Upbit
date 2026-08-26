@@ -14,10 +14,13 @@ export interface RuntimeOwnershipAuthority {
   snapshot(): RuntimeOwnershipSnapshot;
   assertLocallyHeld(): void;
   assertCurrent(atEpochMs: number): Promise<RuntimeOwnershipRecord>;
-  assertCurrentExecutionAuthority?(
+  runWithCurrentExecutionAuthority?(
     input: AssertCurrentExecutionAuthorityInput,
+    callback: SynchronousExecutionAuthorityCallback,
   ): Promise<CurrentRuntimeExecutionAuthority>;
 }
+
+export type SynchronousExecutionAuthorityCallback = () => undefined;
 
 export interface CurrentRuntimeExecutionAuthority {
   readonly runtimeOwnership: RuntimeOwnershipRecord;
@@ -157,46 +160,50 @@ export class RuntimeOwnershipGuard implements RuntimeOwnershipAuthority {
     return { ...persisted };
   }
 
-  async assertCurrentExecutionAuthority(
+  runWithCurrentExecutionAuthority(
     input: AssertCurrentExecutionAuthorityInput,
+    callback: SynchronousExecutionAuthorityCallback,
   ): Promise<CurrentRuntimeExecutionAuthority> {
-    validateEpochMs(input.atEpochMs);
-    if (typeof input.exchangeAccountId !== "string" || input.exchangeAccountId.length === 0) {
-      throw new Error("Final runtime execution authority requires an exchange account id.");
-    }
-    this.assertLocallyHeld();
-    const expectedOwnership = this.requireRecord();
-    const readAuthority = this.dependencies.store.getCurrentExecutionAuthority;
-    if (readAuthority === undefined) {
-      throw new RuntimeOwnershipGuardError(
-        "RUNTIME_OWNERSHIP_NOT_HELD",
-        "RUNTIME_OWNERSHIP_NOT_HELD: Persisted combined execution authority is unavailable.",
-      );
-    }
-    const persisted = await readAuthority.call(
-      this.dependencies.store,
-      input.exchangeAccountId,
-    );
-    this.assertLocallyHeld();
+    try {
+      validateEpochMs(input.atEpochMs);
+      if (typeof input.exchangeAccountId !== "string" || input.exchangeAccountId.length === 0) {
+        throw new Error("Final runtime execution authority requires an exchange account id.");
+      }
+      this.assertLocallyHeld();
+      const expectedOwnership = this.requireRecord();
+      const readAuthority = this.dependencies.store.getCurrentExecutionAuthority;
+      if (readAuthority === undefined) {
+        throw new RuntimeOwnershipGuardError(
+          "RUNTIME_OWNERSHIP_NOT_HELD",
+          "RUNTIME_OWNERSHIP_NOT_HELD: Persisted combined execution authority is unavailable.",
+        );
+      }
+      const persisted = readAuthority.call(this.dependencies.store, input.exchangeAccountId);
+      this.assertLocallyHeld();
 
-    if (persisted === null || !sameOwnership(expectedOwnership, persisted.runtimeOwnership)) {
-      this.markLost("PERSISTED_OWNERSHIP_MISMATCH");
-      this.throwLost();
-    }
-    if (input.atEpochMs >= persisted.runtimeOwnership.expiresAtEpochMs) {
-      this.markLost("OWNERSHIP_EXPIRED");
-      this.throwLost();
-    }
+      if (persisted === null || !sameOwnership(expectedOwnership, persisted.runtimeOwnership)) {
+        this.markLost("PERSISTED_OWNERSHIP_MISMATCH");
+        this.throwLost();
+      }
+      if (input.atEpochMs >= persisted.runtimeOwnership.expiresAtEpochMs) {
+        this.markLost("OWNERSHIP_EXPIRED");
+        this.throwLost();
+      }
 
-    const state = persisted.executionState;
-    if (!isExecutionAllowed(state, input)) {
-      throw new Error("final pre-send authority is blocked");
+      const state = persisted.executionState;
+      if (!isExecutionAllowed(state, input)) {
+        throw new Error("final pre-send authority is blocked");
+      }
+      this.record = { ...persisted.runtimeOwnership };
+      const authority = {
+        runtimeOwnership: { ...persisted.runtimeOwnership },
+        executionState: { ...state },
+      };
+      callback();
+      return Promise.resolve(authority);
+    } catch (error) {
+      return Promise.reject(error);
     }
-    this.record = { ...persisted.runtimeOwnership };
-    return {
-      runtimeOwnership: { ...persisted.runtimeOwnership },
-      executionState: { ...state },
-    };
   }
 
   markLost(reason: string): boolean {

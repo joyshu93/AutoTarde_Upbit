@@ -276,9 +276,10 @@ test("execution service checks persisted runtime ownership at the final send bou
         expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
       };
     },
-    async assertCurrentExecutionAuthority(input) {
+    runWithCurrentExecutionAuthority(input, callback) {
       checkedAt.push(input.atEpochMs);
-      return {
+      callback();
+      return Promise.resolve({
         runtimeOwnership: {
           ownerToken: "owner".padEnd(64, "x"),
           generation: 7,
@@ -294,7 +295,7 @@ test("execution service checks persisted runtime ownership at the final send bou
           systemStatus: "RUNNING",
           killSwitchActive: false,
         },
-      };
+      });
     },
   };
   const { service, repositories } = createExecutionService({ runtimeOwnership });
@@ -1269,9 +1270,9 @@ function createAlwaysOwnedRuntimeOwnershipAuthority(
     async assertCurrent() {
       return { ...record };
     },
-    async assertCurrentExecutionAuthority() {
-      const executionState = await operatorState.getState();
-      return {
+    runWithCurrentExecutionAuthority(_input, callback) {
+      callback();
+      return operatorState.getState().then((executionState) => ({
         runtimeOwnership: { ...record },
         executionState: {
           exchangeAccountId: executionState.exchangeAccountId,
@@ -1280,7 +1281,7 @@ function createAlwaysOwnedRuntimeOwnershipAuthority(
           systemStatus: executionState.systemStatus,
           killSwitchActive: executionState.killSwitchActive,
         },
-      };
+      }));
     },
   };
 }

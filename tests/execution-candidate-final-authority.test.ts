@@ -54,7 +54,7 @@ type FinalMutation =
   | "REJECTED_COMPETING_ORDER"
   | "ORDER_ID_REFERENCE_COLLISION"
   | "ORDER_CANCELED_DURING_OPERATOR_STATE"
-  | "HELPER_RESOLUTION_PAUSE"
+  | "AUTHORITY_POST_SNAPSHOT_PAUSE"
   | "OPERATOR_STATE";
 
 test("bound candidate success rereads every final authority in strict order and sends exactly once", async () => {
@@ -74,7 +74,6 @@ test("bound candidate success rereads every final authority in strict order and 
     "activeOrders",
     "order",
     "combinedAuthority",
-    "operatorState",
     "createOrder",
   ]);
 });
@@ -121,21 +120,20 @@ test("candidate final order reread uses exact account and order id despite refer
   assert.equal(fixture.repositories.referenceLookupCalls, 0);
 });
 
-test("a persisted pause settling during the final combined authority await sends zero", async () => {
-  const fixture = await createFixture("HELPER_RESOLUTION_PAUSE");
+test("the final persisted authority callback sends before a queued post-snapshot pause", async () => {
+  const fixture = await createFixture("AUTHORITY_POST_SNAPSHOT_PAUSE");
 
-  await assert.rejects(
-    () => fixture.service.submitOrderFromDecision(candidateInput()),
-    /final pre-send authority is blocked/u,
-  );
+  const result = await fixture.service.submitOrderFromDecision(candidateInput());
+  await fixture.waitForFinalPause();
 
-  assert.equal(fixture.adapter.createOrderCalls, 0);
+  assert.equal(result.accepted, true);
+  assert.equal(fixture.adapter.createOrderCalls, 1);
+  assert.equal(fixture.adapter.systemStatusAtSend, "RUNNING");
   assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
-  const orderRead = fixture.trace.indexOf("order");
   const combinedRead = fixture.trace.indexOf("combinedAuthority");
-  const pauseStarted = fixture.trace.indexOf("finalOrderMicrotaskPause");
-  assert.ok(orderRead >= 0 && combinedRead > orderRead && pauseStarted > combinedRead);
-  assert.equal(fixture.trace.includes("createOrder"), false);
+  const send = fixture.trace.indexOf("createOrder");
+  const pauseStarted = fixture.trace.indexOf("postSnapshotPause");
+  assert.ok(combinedRead >= 0 && send > combinedRead && pauseStarted > send);
 });
 
 test("a final operator-state race occurs after all candidate reads and sends zero", async () => {
@@ -229,7 +227,7 @@ test("candidate final authority keeps the exact account/order revalidation immed
     exactOrderRead,
   );
   const combinedAuthorityCheck = submitMethod.indexOf(
-    "await this.runtimeOwnership.assertCurrentExecutionAuthority",
+    "await this.runtimeOwnership.runWithCurrentExecutionAuthority",
     persistedHelperCall,
   );
   const sendSite = submitMethod.indexOf(
@@ -245,10 +243,9 @@ test("candidate final authority keeps the exact account/order revalidation immed
   const afterFinalPersistedRead = submitMethod.slice(persistedHelperCall, sendSite);
   assert.equal((afterFinalPersistedRead.match(/\bawait\b/gu) ?? []).length, 1);
   assert.doesNotMatch(afterFinalPersistedRead, /operatorState\.getState|candidatePilots/u);
-  assert.doesNotMatch(
-    submitMethod.slice(combinedAuthorityCheck + "await".length, sendSite),
-    /\bawait\b/u,
-  );
+  const callbackEnd = submitMethod.indexOf("return undefined;", sendSite);
+  assert.ok(callbackEnd > sendSite);
+  assert.doesNotMatch(submitMethod.slice(combinedAuthorityCheck, callbackEnd), /=>\s*async|async\s*\(/u);
 });
 
 async function assertFinalCandidateFault(mutation: FinalMutation): Promise<void> {
@@ -289,13 +286,11 @@ class FinalAuthorityRepository extends InMemoryExecutionRepository {
   finalReadsArmed = false;
   referenceLookupCalls = 0;
   cancellationMutations = 0;
-  private submittingOrder: OrderRecord | null = null;
 
   constructor(
     candidatePilots: InMemoryCandidatePilotRepository,
     private readonly mutation: FinalMutation,
     readonly trace: string[],
-    private readonly onFinalOrderResolved: () => void,
   ) {
     super(undefined, candidatePilots);
   }
@@ -304,7 +299,6 @@ class FinalAuthorityRepository extends InMemoryExecutionRepository {
     await super.updateOrder(record);
     if (record.status === "SUBMITTING") {
       this.finalReadsArmed = true;
-      this.submittingOrder = record;
     }
   }
 
@@ -353,24 +347,6 @@ class FinalAuthorityRepository extends InMemoryExecutionRepository {
   }
 
   findOrderById(exchangeAccountId: string, orderId: string): Promise<OrderRecord | null> {
-    if (
-      this.finalReadsArmed &&
-      this.mutation === "HELPER_RESOLUTION_PAUSE" &&
-      this.submittingOrder?.id === orderId &&
-      this.submittingOrder.exchangeAccountId === exchangeAccountId
-    ) {
-      const order = this.submittingOrder;
-      this.trace.push("order");
-      return {
-        then: (resolve: (value: OrderRecord) => unknown) => {
-          resolve(order);
-          queueMicrotask(() => {
-            this.onFinalOrderResolved();
-            this.trace.push("finalOrderMicrotaskPause");
-          });
-        },
-      } as unknown as Promise<OrderRecord>;
-    }
     return super.findOrderById(exchangeAccountId, orderId).then((order) => {
       if (!this.finalReadsArmed) return order;
     this.trace.push("order");
@@ -483,11 +459,13 @@ async function createFixture(mutation: FinalMutation) {
     () => repositories.cancelSubmittingOrderDuringOperatorState(),
   );
   const candidatePilots = new InMemoryCandidatePilotRepository(operatorState);
-  repositories = new FinalAuthorityRepository(candidatePilots, mutation, trace, () => {
+  const pauseAfterSnapshot = (): Promise<void> => {
     finalPausePromise = operatorState.pause("final combined authority race").then(() => {
       operatorState.visibleSystemStatus = "PAUSED";
     });
-  });
+    return finalPausePromise;
+  };
+  repositories = new FinalAuthorityRepository(candidatePilots, mutation, trace);
   const leases = new InMemoryAccountExecutionLeaseStore();
   const adapter = new TracingDryRunAdapter(
     trace,
@@ -511,19 +489,30 @@ async function createFixture(mutation: FinalMutation) {
     runtimeOwnership: createAlwaysOwnedRuntimeAuthority({
       operatorState,
       trace,
-      waitForFinalPause: () => finalPausePromise,
+      pauseAfterSnapshot,
+      postSnapshotPause: mutation === "AUTHORITY_POST_SNAPSHOT_PAUSE",
     }),
     candidatePilots: finalCandidatePilotReads(candidatePilots, repositories, mutation, trace),
     now: () => ATTEMPT_AT,
   });
 
-  return { adapter, candidatePilots, leases, operatorState, repositories, service, trace };
+  return {
+    adapter,
+    candidatePilots,
+    leases,
+    operatorState,
+    repositories,
+    service,
+    trace,
+    waitForFinalPause: () => finalPausePromise,
+  };
 }
 
 function createAlwaysOwnedRuntimeAuthority(input: {
   readonly operatorState: TracingOperatorStateStore;
   readonly trace: string[];
-  waitForFinalPause(): Promise<void>;
+  readonly postSnapshotPause: boolean;
+  pauseAfterSnapshot(): Promise<void>;
 }): RuntimeOwnershipAuthority {
   const record = {
     ownerToken: "owner".padEnd(64, "a"),
@@ -548,15 +537,29 @@ function createAlwaysOwnedRuntimeAuthority(input: {
     async assertCurrent() {
       return { ...record };
     },
-    async assertCurrentExecutionAuthority() {
+    runWithCurrentExecutionAuthority(
+      _authorityInput: Parameters<NonNullable<RuntimeOwnershipAuthority["runWithCurrentExecutionAuthority"]>>[0],
+      callback: () => undefined,
+    ) {
       input.trace.push("combinedAuthority");
-      await Promise.resolve();
-      await input.waitForFinalPause();
-      const executionState = await input.operatorState.getState();
-      if (executionState.systemStatus !== "RUNNING" || executionState.killSwitchActive) {
-        throw new Error("final pre-send authority is blocked");
+      const executionAuthorityState = {
+        ...executionState(),
+        systemStatus: input.operatorState.visibleSystemStatus,
+      };
+      if (input.operatorState.visibleSystemStatus !== "RUNNING") {
+        return Promise.reject(new Error("final pre-send authority is blocked"));
       }
-      return { runtimeOwnership: { ...record }, executionState };
+      if (input.postSnapshotPause) {
+        queueMicrotask(() => {
+          input.trace.push("postSnapshotPause");
+          void input.pauseAfterSnapshot();
+        });
+      }
+      callback();
+      return Promise.resolve({
+        runtimeOwnership: { ...record },
+        executionState: executionAuthorityState,
+      });
     },
   };
   return authority;

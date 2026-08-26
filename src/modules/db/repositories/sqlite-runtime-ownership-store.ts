@@ -59,9 +59,9 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
     return selectCurrent(this.db);
   }
 
-  async getCurrentExecutionAuthority(
+  getCurrentExecutionAuthority(
     exchangeAccountId: string,
-  ): Promise<PersistedRuntimeExecutionAuthority | null> {
+  ): PersistedRuntimeExecutionAuthority | null {
     if (typeof exchangeAccountId !== "string" || exchangeAccountId.length === 0) {
       throw new Error("Runtime execution authority requires an exchange account id.");
     }

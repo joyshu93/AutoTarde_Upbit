@@ -487,9 +487,9 @@ function createAlwaysOwnedRuntimeAuthority(
     async assertCurrent() {
       return { ...record };
     },
-    async assertCurrentExecutionAuthority() {
-      const executionState = await operatorState.getState();
-      return {
+    runWithCurrentExecutionAuthority(_input, callback) {
+      callback();
+      return operatorState.getState().then((executionState) => ({
         runtimeOwnership: { ...record },
         executionState: {
           exchangeAccountId: executionState.exchangeAccountId,
@@ -498,7 +498,7 @@ function createAlwaysOwnedRuntimeAuthority(
           systemStatus: executionState.systemStatus,
           killSwitchActive: executionState.killSwitchActive,
         },
-      };
+      }));
     },
   };
 }

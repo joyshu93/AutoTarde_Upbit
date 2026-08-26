@@ -31,13 +31,14 @@ export class InMemoryRuntimeOwnershipStore implements RuntimeOwnershipStore {
     return { ...this.current };
   }
 
-  async getCurrentExecutionAuthority(
+  getCurrentExecutionAuthority(
     _exchangeAccountId: string,
-  ): Promise<PersistedRuntimeExecutionAuthority | null> {
-    const runtimeOwnership = await this.getCurrent();
+  ): PersistedRuntimeExecutionAuthority | null {
+    const runtimeOwnership = this.current;
+    if (runtimeOwnership !== null) validateRuntimeOwnershipRecord(runtimeOwnership);
     return runtimeOwnership === null
       ? null
-      : { runtimeOwnership, executionState: null };
+      : { runtimeOwnership: { ...runtimeOwnership }, executionState: null };
   }
 
   async acquireAfterProcessLock(

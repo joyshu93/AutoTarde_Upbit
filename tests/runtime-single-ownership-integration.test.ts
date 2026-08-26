@@ -15,6 +15,7 @@ import {
 } from "../src/app/runtime-ownership-context.js";
 import {
   RuntimeOwnershipGuard,
+  RuntimeOwnershipGuardError,
 } from "../src/app/runtime-ownership-guard.js";
 import {
   RuntimeHeartbeat,
@@ -32,6 +33,17 @@ import { createSqliteRuntimeOwnershipPersistence } from
   "../src/modules/db/repositories/sqlite-repositories.js";
 import { createSqlitePersistence } from
   "../src/modules/db/repositories/sqlite-repositories.js";
+import { InMemoryAccountExecutionLeaseStore } from
+  "../src/modules/db/repositories/in-memory-account-execution-lease-store.js";
+import {
+  InMemoryExecutionRepository,
+  InMemoryOperatorStateStore,
+} from "../src/modules/db/repositories/in-memory-repositories.js";
+import { ExecutionService } from "../src/modules/execution/execution-service.js";
+import {
+  DryRunExchangeAdapter,
+  type UpbitOrderRequest,
+} from "../src/modules/exchange/interfaces.js";
 import { test } from "./harness.js";
 
 const CHILD_ARGUMENT = "--runtime-single-ownership-child";
@@ -139,7 +151,7 @@ function registerIntegrationTests(): void {
     const events: string[] = [];
     const runtime = await createDeterministicOwnedRuntime(fixture.databasePath, events);
     const replacement = createSqliteRuntimeOwnershipPersistence(fixture.databasePath);
-    const mutations = new GuardedMutationGateway(runtime.guard);
+    const execution = await createExecutionBoundary(runtime.guard);
 
     try {
       const replacementOwnership = await replacement.runtimeOwnership.acquireAfterProcessLock({
@@ -151,12 +163,16 @@ function registerIntegrationTests(): void {
       assert.equal(replacementOwnership.record.generation, 2);
       assert.equal(replacementOwnership.takeover, true);
 
-      await assert.rejects(() => mutations.createOrder(2_001), /RUNTIME_OWNERSHIP_LOST/u);
-      await assert.rejects(() => mutations.cancelOrder(2_001), /RUNTIME_OWNERSHIP_LOST/u);
+      await assert.rejects(
+        () => execution.service.submitOrderFromDecision(validExecutionInput()),
+        (error) => error instanceof RuntimeOwnershipGuardError &&
+          error.code === "RUNTIME_OWNERSHIP_LOST" &&
+          error.message === "RUNTIME_OWNERSHIP_LOST: PERSISTED_OWNERSHIP_MISMATCH",
+      );
       const exitCode = await runtime.exitCode;
 
       assert.equal(exitCode, 1);
-      assert.deepEqual(mutations.calls, { createOrder: 0, cancelOrder: 0 });
+      assert.equal(execution.adapter.createOrderCalls, 0);
       assertWorkersStoppedAndLockReleasedLast(events);
       assert.equal(
         runtime.shutdownSummary()?.steps.find((step) =>
@@ -179,24 +195,22 @@ function registerIntegrationTests(): void {
     const fixture = await createTempDatabase("heartbeat-expiry");
     const events: string[] = [];
     const runtime = await createDeterministicOwnedRuntime(fixture.databasePath, events);
-    const mutations = new GuardedMutationGateway(runtime.guard);
+    const execution = await createExecutionBoundary(runtime.guard);
 
     try {
       runtime.clock.set(46_000);
       await runtime.timer.fire();
       await assert.rejects(
-        () => mutations.createOrder(runtime.clock.nowEpochMs()),
-        /RUNTIME_OWNERSHIP_LOST/u,
-      );
-      await assert.rejects(
-        () => mutations.cancelOrder(runtime.clock.nowEpochMs()),
-        /RUNTIME_OWNERSHIP_LOST/u,
+        () => execution.service.submitOrderFromDecision(validExecutionInput()),
+        (error) => error instanceof RuntimeOwnershipGuardError &&
+          error.code === "RUNTIME_OWNERSHIP_LOST" &&
+          error.message === "RUNTIME_OWNERSHIP_LOST: HEARTBEAT_EXPIRED",
       );
       const exitCode = await runtime.exitCode;
 
       assert.equal(exitCode, 1);
       assert.equal(runtime.guard.snapshot().lossReason, "HEARTBEAT_EXPIRED");
-      assert.deepEqual(mutations.calls, { createOrder: 0, cancelOrder: 0 });
+      assert.equal(execution.adapter.createOrderCalls, 0);
       assertWorkersStoppedAndLockReleasedLast(events);
 
       const inspection = createSqliteRuntimeOwnershipPersistence(fixture.databasePath);
@@ -242,22 +256,91 @@ function registerIntegrationTests(): void {
 
     try {
       await guard.acquire({ executionMode: "DRY_RUN", acquiredAtEpochMs: 1_000 });
-      const runningAuthority = await guard.assertCurrentExecutionAuthority(expected);
+      let callbackCalls = 0;
+      const invoke = () => guard.runWithCurrentExecutionAuthority(expected, () => {
+        callbackCalls += 1;
+        return undefined;
+      });
+      const runningAuthority = await invoke();
       assert.notEqual(runningAuthority.executionState, null);
       assert.equal(runningAuthority.executionState?.systemStatus, "RUNNING");
+      assert.equal(callbackCalls, 1);
+
+      if (false) {
+        // @ts-expect-error Final authority callbacks cannot be async.
+        await guard.runWithCurrentExecutionAuthority(expected, async () => undefined);
+      }
 
       await appPersistence.operatorState.setExecutionMode("LIVE");
-      await assert.rejects(() => guard.assertCurrentExecutionAuthority(expected), /blocked/u);
+      await assert.rejects(invoke, /blocked/u);
       await appPersistence.operatorState.setExecutionMode("DRY_RUN");
       await appPersistence.operatorState.setLiveExecutionGate("ENABLED");
-      await assert.rejects(() => guard.assertCurrentExecutionAuthority(expected), /blocked/u);
+      await assert.rejects(invoke, /blocked/u);
       await appPersistence.operatorState.setLiveExecutionGate("DISABLED");
       await appPersistence.operatorState.pause("test pause");
-      await assert.rejects(() => guard.assertCurrentExecutionAuthority(expected), /blocked/u);
+      await assert.rejects(invoke, /blocked/u);
       await appPersistence.operatorState.resume();
       await appPersistence.operatorState.activateKillSwitch("test kill switch");
-      await assert.rejects(() => guard.assertCurrentExecutionAuthority(expected), /blocked/u);
+      await assert.rejects(invoke, /blocked/u);
+      assert.equal(callbackCalls, 1);
       assert.equal(guard.snapshot().status, "OWNED");
+    } finally {
+      ownershipPersistence.close();
+      appPersistence.close();
+      await fixture.cleanup();
+    }
+  });
+
+  test("SQLite final authority invokes synchronously before a queued post-snapshot pause", async () => {
+    const fixture = await createTempDatabase("combined-authority-no-promise-seam");
+    const appPersistence = createSqlitePersistence({
+      databasePath: fixture.databasePath,
+      exchangeAccountId: TEST_ACCOUNT_ID,
+      userId: "test-user",
+      userTelegramId: "test-telegram-user",
+      userDisplayName: "Test Operator",
+      accessKeyRef: "TEST_ONLY_UNCONFIGURED",
+      secretKeyRef: "TEST_ONLY_UNCONFIGURED",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      killSwitchActive: false,
+    });
+    const ownershipPersistence = createSqliteRuntimeOwnershipPersistence(fixture.databasePath);
+    const store = ownershipPersistence.runtimeOwnership;
+    const readAuthorityMethod = store.getCurrentExecutionAuthority;
+    assert.ok(readAuthorityMethod);
+    const readAuthority = readAuthorityMethod.bind(store);
+    const trace: string[] = [];
+    let pausePromise: Promise<unknown> = Promise.resolve();
+    store.getCurrentExecutionAuthority = (exchangeAccountId) => {
+      const snapshot = readAuthority(exchangeAccountId);
+      queueMicrotask(() => {
+        trace.push("pause");
+        pausePromise = appPersistence.operatorState.pause("post-snapshot pause");
+      });
+      return snapshot;
+    };
+    const guard = new RuntimeOwnershipGuard({
+      processLock: new FakeProcessLock([]),
+      store,
+      ownerToken: "a".repeat(64),
+    });
+
+    try {
+      await guard.acquire({ executionMode: "DRY_RUN", acquiredAtEpochMs: 1_000 });
+      await guard.runWithCurrentExecutionAuthority({
+        atEpochMs: 1_001,
+        exchangeAccountId: TEST_ACCOUNT_ID,
+        expectedExecutionMode: "DRY_RUN",
+        expectedLiveExecutionGate: "DISABLED",
+      }, () => {
+        trace.push("createOrder");
+        return undefined;
+      });
+      await pausePromise;
+
+      assert.deepEqual(trace, ["createOrder", "pause"]);
+      assert.equal((await appPersistence.operatorState.getState()).systemStatus, "PAUSED");
     } finally {
       ownershipPersistence.close();
       appPersistence.close();
@@ -575,20 +658,83 @@ class ManualHeartbeatTimer implements RuntimeHeartbeatTimer {
   }
 }
 
-class GuardedMutationGateway {
-  readonly calls = { createOrder: 0, cancelOrder: 0 };
+async function createExecutionBoundary(runtimeOwnership: RuntimeOwnershipGuard) {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = new InMemoryOperatorStateStore({
+    id: "state-1",
+    exchangeAccountId: TEST_ACCOUNT_ID,
+    executionMode: "DRY_RUN",
+    liveExecutionGate: "DISABLED",
+    systemStatus: "RUNNING",
+    killSwitchActive: false,
+    pauseReason: null,
+    degradedReason: null,
+    degradedAt: null,
+    updatedAt: "2026-08-26T00:00:00.000Z",
+  });
+  const adapter = new CountingDryRunAdapter();
+  const service = new ExecutionService({
+    riskLimits: {
+      maxAllocationByAsset: { BTC: 0.6, ETH: 0.6 },
+      totalExposureCap: 0.75,
+      stalePriceThresholdMs: 30_000,
+      minimumOrderValueKrw: 5_000,
+    },
+    executionAdapter: adapter,
+    repositories,
+    accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
+    accountExecutionLeaseMs: 30_000,
+    operatorState,
+    runtimeOwnership,
+    now: () => "2026-08-26T00:00:20.000Z",
+  });
+  await repositories.saveBalanceSnapshot({
+    id: "balance-1",
+    exchangeAccountId: TEST_ACCOUNT_ID,
+    capturedAt: "2026-08-26T00:00:00.000Z",
+    source: "EXCHANGE_POLL",
+    totalKrwValue: "10000000",
+    balancesJson: "[]",
+  });
+  await repositories.savePositionSnapshot({
+    id: "position-1",
+    exchangeAccountId: TEST_ACCOUNT_ID,
+    capturedAt: "2026-08-26T00:00:00.000Z",
+    source: "EXCHANGE_POLL",
+    positionsJson: "[]",
+  });
+  return { adapter, service };
+}
 
-  constructor(private readonly ownership: RuntimeOwnershipGuard) {}
+class CountingDryRunAdapter extends DryRunExchangeAdapter {
+  createOrderCalls = 0;
 
-  async createOrder(atEpochMs: number): Promise<void> {
-    await this.ownership.assertCurrent(atEpochMs);
-    this.calls.createOrder += 1;
+  override async createOrder(request: UpbitOrderRequest) {
+    this.createOrderCalls += 1;
+    return super.createOrder(request);
   }
+}
 
-  async cancelOrder(atEpochMs: number): Promise<void> {
-    await this.ownership.assertCurrent(atEpochMs);
-    this.calls.cancelOrder += 1;
-  }
+function validExecutionInput() {
+  return {
+    exchangeAccountId: TEST_ACCOUNT_ID,
+    strategyDecisionId: "decision-1",
+    referencePriceCapturedAt: "2026-08-26T00:00:10.000Z",
+    decision: {
+      strategyKey: "deterministic.stub.v1",
+      market: "KRW-BTC" as const,
+      action: "ENTER" as const,
+      reasonCodes: ["TEST"],
+      referencePrice: 100_000_000,
+      requestedNotionalKrw: 100_000,
+      requestedQuantity: 0.001,
+      metadata: {},
+    },
+    side: "bid" as const,
+    ordType: "limit" as const,
+    price: "100000000",
+    volume: "0.001",
+  };
 }
 
 function startChildFixture(mode: "hold" | "once", databasePath: string): ChildProcess {

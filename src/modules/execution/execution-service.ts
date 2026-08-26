@@ -579,28 +579,30 @@ export class ExecutionService {
         persistedOrder: finalPersistedOrder,
       });
       finalRuntimeExecutionAuthorityCheckStarted = true;
-      if (this.runtimeOwnership.assertCurrentExecutionAuthority === undefined) {
+      if (this.runtimeOwnership.runWithCurrentExecutionAuthority === undefined) {
         throw new RuntimeOwnershipGuardError(
           "RUNTIME_OWNERSHIP_NOT_HELD",
           "RUNTIME_OWNERSHIP_NOT_HELD: Persisted combined execution authority is unavailable.",
         );
       }
-      await this.runtimeOwnership.assertCurrentExecutionAuthority({
+      await this.runtimeOwnership.runWithCurrentExecutionAuthority({
         atEpochMs: Date.now(),
         exchangeAccountId: input.exchangeAccountId,
         expectedExecutionMode: initialAuthority.executionMode,
         expectedLiveExecutionGate: initialAuthority.liveExecutionGate,
-      });
-      createOrderInvoked = true;
-      exchangeOrderPromise = this.dependencies.executionAdapter.createOrder({
-        market,
-        side: input.side,
-        ordType: input.ordType,
-        volume: input.volume,
-        price: input.price,
-        identifier: order.identifier,
-        timeInForce: null,
-        smpType: null,
+      }, () => {
+        createOrderInvoked = true;
+        exchangeOrderPromise = this.dependencies.executionAdapter.createOrder({
+          market,
+          side: input.side,
+          ordType: input.ordType,
+          volume: input.volume,
+          price: input.price,
+          identifier: order.identifier,
+          timeInForce: null,
+          smpType: null,
+        });
+        return undefined;
       });
     } catch (error) {
       if (createOrderInvoked) {
