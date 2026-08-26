@@ -1,5 +1,12 @@
 # Risk Policy
 
+## Runtime Ownership Risk Boundary
+For a canonical local SQLite database and exchange account, one mutating runtime is permitted across `DRY_RUN` and `LIVE`. A same-host Windows operating-system lock establishes process exclusion; persisted SQLite ownership generation and heartbeat establish durable fencing. Multi-host and network-share operation are unsupported, and a stale heartbeat alone never proves another host/process is safe to replace.
+
+Heartbeat loss, lock loss, expiry, or a persisted generation mismatch fails closed: new worker work is fenced, polling and scheduler timers stop, active work is bounded during shutdown, and only the exact current generation may be released. The existing execution path retains the per-order account lease and performs its final persisted-generation assertion immediately before the reachable live order send. This changes neither risk limits, strategy decisions, sizing, nor the Telegram operator-only truth boundary.
+
+Ownership health is safe to expose only as non-secret status, generation, mode, heartbeat time/age, takeover, and reason. Owner tokens, raw/canonical database paths, lock identifiers, scope digests, and key fingerprints are never operator output. `RUNTIME_ALREADY_OWNED` is console-only for a duplicate that never acquired authority. Migration `0024_add_runtime_ownership.sql` requires a separately approved offline stop, backup, migration, read-only verification, and restart procedure.
+
 ## LIVE Database Selection Guard
 
 LIVE must fail before runtime construction when `DATABASE_PATH` is relative, missing, not a regular file, passes through a symlink/junction, has a non-canonical migration ledger, lacks its singleton identity, or does not match the configured database UUID, primary account, or Upbit access-key fingerprint. The guard must not reveal credentials or fingerprints in errors. It must not create a replacement DB or silently bind/rebind an identity. `DRY_RUN` retains its existing local DB creation behavior.

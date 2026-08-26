@@ -119,6 +119,16 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 
 ## Runtime Shape
 
+### Runtime Single Ownership
+
+One mutating runtime may own each canonical local SQLite database and exchange account across both `DRY_RUN` and `LIVE`. Windows named-pipe locking prevents a second local process from acquiring the scope; a dedicated SQLite ownership record supplies a monotonic generation, heartbeat, takeover evidence, and stale-worker fencing. This design supports one Windows host with local storage only: network shares and multi-host deployments are not supported.
+
+The owner renews every 10 seconds and expires after 45 seconds. On lock loss, expired heartbeat, or persisted-generation mismatch, it fences future work, stops Telegram polling and scheduler timers, waits up to 30 seconds for workers, and releases only its exact persisted generation during a normal shutdown. The final reachable live order send rechecks the persisted generation immediately before Upbit transmission. Existing order leases, strategy behavior, sizing, risk controls, and Telegram's operator-only truth boundary do not change.
+
+The startup banner plus Korean-first `/status` and `/readiness` summaries show secret-free ownership health: owned/lost/unavailable, generation, mode, heartbeat time/age, takeover, and reason. Their `detail` forms retain canonical fields. They never show an owner token, canonical/raw database path, scope digest, named-pipe name, key fingerprint, or another secret. A second launch prints `RUNTIME_ALREADY_OWNED` only in that duplicate process's console; it cannot write the database or Telegram.
+
+`0024_add_runtime_ownership.sql` must be deployed later through an explicit offline procedure: stop the runtime, back up the database and sidecars, apply the existing approved migration/identity operation, run read-only readiness verification, start one runtime, then separately confirm a duplicate launch has zero side effects. This repository change does not migrate, restart, deploy, or push anything.
+
 ### BTC Candidate Pilot Is Available, Not Activated
 
 Baseline remains the default policy and `DRY_RUN` remains the default execution mode. Candidate code availability does not approve or activate the pilot. The exact pilot identity is `BTC_COMBINED_CONSERVATIVE_PILOT_V1`, market `KRW-BTC`, policy `COMBINED_CONSERVATIVE`, version `PCS-2026-001.DEPLOYMENT_READINESS_V1`; ETH always remains baseline during this pilot.
@@ -217,7 +227,7 @@ Use Node.js `22.13.0` or newer so the built-in `node:sqlite` runtime module is a
 3. Run `npm run test`.
 4. Start the scaffold with `npm run start`.
 
-At startup the app prints the effective execution mode, live gate, configured `databasePath`, and supported Telegram operator commands.
+At startup the app prints the effective execution mode, live gate, secret-free runtime ownership health, and supported Telegram operator commands.
 
 ## Configuration
 

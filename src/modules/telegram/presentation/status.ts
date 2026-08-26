@@ -5,6 +5,7 @@ import type {
   StrategySchedulerStatus,
 } from "../../../domain/types.js";
 import type { PositionGuardPilotPhase } from "../../../domain/pilot-types.js";
+import type { RuntimeOwnershipSnapshot } from "../../../app/runtime-ownership-guard.js";
 import { formatTelegramTimestamp } from "./common.js";
 import type { TelegramLocale } from "./locale.js";
 
@@ -47,6 +48,8 @@ export interface StatusPresentationInput {
   schedulerStatus: StrategySchedulerStatus | null;
   latestReconciliationRun: ReconciliationRunRecord | null;
   btcPilot?: BtcCandidatePilotVisibility | null;
+  runtimeOwnership?: RuntimeOwnershipSnapshot | null;
+  runtimeOwnershipNowEpochMs?: number | null;
 }
 
 export function formatStatusPresentation(
@@ -99,6 +102,7 @@ function buildKoreanStatusLines(
       ? []
       : [`차단 사유: ${blockers.map((blocker) => describeBlocker(blocker, "ko-KR")).join(", ")}`]),
     `킬 스위치: ${input.state.killSwitchActive ? "켜짐" : "꺼짐"}`,
+    ...formatRuntimeOwnershipSummary(input.runtimeOwnership ?? null, input.runtimeOwnershipNowEpochMs, "ko-KR"),
     ...(input.state.pauseReason ? [`일시정지 사유: ${input.state.pauseReason}`] : []),
     ...(input.state.degradedReason ? [`점검 사유: ${input.state.degradedReason}`] : []),
     ...describeScheduler(input.schedulerStatus, "ko-KR"),
@@ -123,6 +127,7 @@ function buildEnglishStatusLines(
       ? []
       : [`Blocking reasons: ${blockers.map((blocker) => describeBlocker(blocker, "en-US")).join(", ")}`]),
     `Kill switch: ${input.state.killSwitchActive ? "on" : "off"}`,
+    ...formatRuntimeOwnershipSummary(input.runtimeOwnership ?? null, input.runtimeOwnershipNowEpochMs, "en-US"),
     ...(input.state.pauseReason ? [`Pause reason: ${input.state.pauseReason}`] : []),
     ...(input.state.degradedReason ? [`Degraded reason: ${input.state.degradedReason}`] : []),
     ...describeScheduler(input.schedulerStatus, "en-US"),
@@ -131,6 +136,93 @@ function buildEnglishStatusLines(
     `Updated: ${formatTelegramTimestamp(input.state.updatedAt, "en-US")}`,
     "Technical details: /status detail",
   ];
+}
+
+export function formatRuntimeOwnershipTechnicalVisibility(
+  snapshot: RuntimeOwnershipSnapshot | null | undefined,
+  nowEpochMs: number | null | undefined,
+): string {
+  const heartbeatAtEpochMs = snapshot?.heartbeatAtEpochMs ?? null;
+  const heartbeatAgeMs = heartbeatAtEpochMs === null || !isEpochMs(nowEpochMs)
+    ? null
+    : Math.max(0, nowEpochMs - heartbeatAtEpochMs);
+
+  return [
+    `runtime_ownership_status: ${runtimeOwnershipStatus(snapshot)}`,
+    `runtime_ownership_generation: ${snapshot?.generation ?? "none"}`,
+    `runtime_ownership_execution_mode: ${snapshot?.executionMode ?? "none"}`,
+    `runtime_ownership_heartbeat_at: ${heartbeatAtEpochMs === null ? "none" : new Date(heartbeatAtEpochMs).toISOString()}`,
+    `runtime_ownership_heartbeat_age_ms: ${heartbeatAgeMs ?? "none"}`,
+    `runtime_ownership_takeover: ${snapshot?.takeover ?? false}`,
+    `runtime_ownership_reason: ${snapshot?.lossReason ?? "none"}`,
+  ].join("\n");
+}
+
+function formatRuntimeOwnershipSummary(
+  snapshot: RuntimeOwnershipSnapshot | null,
+  nowEpochMs: number | null | undefined,
+  locale: TelegramLocale,
+): string[] {
+  const status = runtimeOwnershipStatus(snapshot);
+  const heartbeatAtEpochMs = snapshot?.heartbeatAtEpochMs ?? null;
+  const heartbeatAgeMs = heartbeatAtEpochMs === null || !isEpochMs(nowEpochMs)
+    ? null
+    : Math.max(0, nowEpochMs - heartbeatAtEpochMs);
+  const heartbeat = heartbeatAtEpochMs === null
+    ? localizedNone(locale)
+    : formatTelegramTimestamp(new Date(heartbeatAtEpochMs).toISOString(), locale);
+  const age = heartbeatAgeMs === null ? localizedNone(locale) : `${heartbeatAgeMs}ms`;
+
+  if (locale === "ko-KR") {
+    return [
+      `런타임 소유권: ${describeRuntimeOwnershipStatus(status, locale)} (${status})`,
+      `소유권 세대: ${snapshot?.generation ?? "없음"}`,
+      `소유권 모드: ${snapshot?.executionMode === null || snapshot?.executionMode === undefined ? "없음" : describeExecutionMode(snapshot.executionMode, locale)} (${snapshot?.executionMode ?? "none"})`,
+      `마지막 하트비트: ${heartbeat} (age: ${age})`,
+      `시작 인계: ${snapshot?.takeover ? "예" : "아니오"}`,
+      `소유권 사유: ${snapshot?.lossReason ?? "없음"}`,
+    ];
+  }
+
+  return [
+    `Runtime ownership: ${describeRuntimeOwnershipStatus(status, locale)} (${status})`,
+    `Ownership generation: ${snapshot?.generation ?? "none"}`,
+    `Ownership mode: ${snapshot?.executionMode === null || snapshot?.executionMode === undefined ? "none" : describeExecutionMode(snapshot.executionMode, locale)} (${snapshot?.executionMode ?? "none"})`,
+    `Last heartbeat: ${heartbeat} (age: ${age})`,
+    `Startup takeover: ${snapshot?.takeover ? "yes" : "no"}`,
+    `Ownership reason: ${snapshot?.lossReason ?? "none"}`,
+  ];
+}
+
+function runtimeOwnershipStatus(snapshot: RuntimeOwnershipSnapshot | null | undefined): "OWNED" | "LOST" | "UNAVAILABLE" {
+  if (snapshot?.status === "OWNED") return "OWNED";
+  if (snapshot?.status === "LOST") return "LOST";
+  return "UNAVAILABLE";
+}
+
+function describeRuntimeOwnershipStatus(
+  status: "OWNED" | "LOST" | "UNAVAILABLE",
+  locale: TelegramLocale,
+): string {
+  const labels: Record<typeof status, readonly [string, string]> = {
+    OWNED: ["보유", "owned"],
+    LOST: ["상실", "lost"],
+    UNAVAILABLE: ["확인 불가", "unavailable"],
+  };
+  return labels[status][locale === "ko-KR" ? 0 : 1];
+}
+
+function describeExecutionMode(
+  executionMode: RuntimeOwnershipSnapshot["executionMode"],
+  locale: TelegramLocale,
+): string {
+  return executionMode === "LIVE"
+    ? locale === "ko-KR" ? "실거래" : "live"
+    : locale === "ko-KR" ? "모의 실행" : "dry run";
+}
+
+function isEpochMs(value: number | null | undefined): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 export function formatPilotTechnicalVisibility(

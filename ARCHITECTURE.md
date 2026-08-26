@@ -1,5 +1,14 @@
 # Architecture
 
+## Runtime Single Ownership
+The runtime is a same-host modular-monolith boundary: exactly one mutating `DRY_RUN` or `LIVE` process may own a canonical SQLite database plus exchange account. The scope uses a Windows named-pipe operating-system lock for process-lifetime exclusion and an independent SQLite ownership connection for durable generation, heartbeat, and append-only takeover/loss evidence. The supported topology is one Windows host with local storage; network shares and multi-host operation are intentionally unsupported.
+
+Ownership begins before mutable application construction. The owner receives a monotonic persisted generation, renews every 10 seconds with a 45-second TTL, and becomes permanently fenced on process-lock loss, generation mismatch, or expiry. Shutdown fences workers first, stops Telegram polling and scheduler timers, waits up to 30 seconds for in-flight work, releases only the exact generation, closes persistence, then releases the process lock. The final live `createOrder` call rechecks persisted ownership immediately before transmission. Existing short-lived `account_execution_leases`, strategy, sizing, risk, reconciliation, and Telegram truth contracts are separate and unchanged.
+
+`RuntimeOwnershipSnapshot` is the secret-free presentation DTO for the startup banner, `/status`, and `/readiness`: status, generation, mode, heartbeat time/age, takeover, and loss reason. It excludes owner tokens, canonical/raw database paths, scope digests, pipe names, and key fingerprints. A duplicate lock failure is `RUNTIME_ALREADY_OWNED` console output only, because no duplicate has database or Telegram authority.
+
+Migration `0024_add_runtime_ownership.sql` is an offline deployment operation, never a runtime startup action: stop the runtime explicitly, back up the database and sidecars, migrate through the approved procedure, verify read-only readiness, then start one owner and separately exercise duplicate-start rejection.
+
 ## Core Principles
 
 - TypeScript strict mode everywhere

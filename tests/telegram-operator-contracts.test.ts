@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+
+import { buildRuntimeOwnershipBanner } from "../src/index.js";
+import type { RuntimeOwnershipSnapshot } from "../src/app/runtime-ownership-guard.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -42,6 +45,40 @@ import type {
   TelegramSyncResult,
 } from "../src/modules/telegram/interfaces.js";
 import { test } from "./harness.js";
+
+test("startup banner exposes runtime ownership health without secret scope identifiers", () => {
+  const snapshot = {
+    status: "OWNED",
+    generation: 4,
+    executionMode: "LIVE",
+    acquiredAtEpochMs: 1_785_000_000_000,
+    heartbeatAtEpochMs: 1_785_000_010_000,
+    expiresAtEpochMs: 1_785_000_055_000,
+    takeover: false,
+    lossReason: null,
+    ownerToken: "owner-token-must-not-render",
+    canonicalDatabasePath: "C:\\secrets\\runtime.sqlite",
+    scopeDigest: "scope-digest-must-not-render",
+    namedPipeName: "\\\\.\\pipe\\autotrade-upbit-runtime-secret",
+    keyFingerprint: "key-fingerprint-must-not-render",
+  } as RuntimeOwnershipSnapshot;
+
+  const banner = buildRuntimeOwnershipBanner(snapshot, 1_785_000_015_000);
+  const rendered = JSON.stringify(banner);
+
+  assert.deepEqual(banner, {
+    status: "OWNED",
+    generation: 4,
+    executionMode: "LIVE",
+    heartbeatAtEpochMs: 1_785_000_010_000,
+    heartbeatAgeMs: 5_000,
+    heartbeatIntervalMs: 10_000,
+    ttlMs: 45_000,
+    takeover: false,
+    lossReason: null,
+  });
+  assert.doesNotMatch(rendered, /owner-token-must-not-render|runtime\.sqlite|scope-digest-must-not-render|autotrade-upbit-runtime-secret|key-fingerprint-must-not-render/u);
+});
 
 test("formatter remains a re-export-only compatibility facade", () => {
   const formatterSource = readFileSync(

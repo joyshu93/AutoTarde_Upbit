@@ -3014,6 +3014,38 @@ test("telegram router preserves canonical technical status behind /status detail
   assert.match(status.text, /\| BOOTSTRAP \| none -> RUNNING \| mode none -> DRY_RUN \| gate none -> DISABLED \|/);
 });
 
+test("telegram router captures one immutable runtime ownership snapshot for status and readiness", async () => {
+  const router = createRouter();
+  const snapshot = {
+    status: "LOST",
+    generation: 9,
+    executionMode: "DRY_RUN",
+    acquiredAtEpochMs: 1_785_000_000_000,
+    heartbeatAtEpochMs: 1_785_000_010_000,
+    expiresAtEpochMs: 1_785_000_055_000,
+    takeover: true,
+    lossReason: "PERSISTED_OWNERSHIP_MISMATCH",
+  } as const;
+  let snapshotCalls = 0;
+  router.setRuntimeOwnershipSnapshotProvider(() => {
+    snapshotCalls += 1;
+    return snapshot;
+  });
+
+  const status = await router.route("/status detail");
+  const readiness = await router.route("/readiness detail");
+
+  assert.equal(snapshotCalls, 2);
+  for (const message of [status.text, readiness.text]) {
+    assert.match(message, /runtime_ownership_status: LOST/u);
+    assert.match(message, /runtime_ownership_generation: 9/u);
+    assert.match(message, /runtime_ownership_execution_mode: DRY_RUN/u);
+    assert.match(message, /runtime_ownership_heartbeat_age_ms:/u);
+    assert.match(message, /runtime_ownership_takeover: true/u);
+    assert.match(message, /runtime_ownership_reason: PERSISTED_OWNERSHIP_MISMATCH/u);
+  }
+});
+
 test("/status detail exactly equals the canonical formatStatusMessage output", async () => {
   const repository = new InMemoryExecutionRepository();
   await repository.saveReconciliationRun({

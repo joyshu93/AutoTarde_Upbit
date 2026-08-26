@@ -11,7 +11,12 @@ import {
 import {
   RuntimeOwnershipGuardError,
   type RuntimeOwnershipAuthority,
+  type RuntimeOwnershipSnapshot,
 } from "./app/runtime-ownership-guard.js";
+import {
+  RUNTIME_HEARTBEAT_INTERVAL_MS,
+  RUNTIME_OWNERSHIP_TTL_MS,
+} from "./app/runtime-heartbeat.js";
 import {
   acquireRuntimeProcessLock,
   type RuntimeProcessLock,
@@ -74,6 +79,37 @@ export interface CreateVerifiedApplicationOperations {
   runWithScopedRuntimeOwnership: typeof runWithScopedRuntimeOwnership;
 }
 
+export function buildRuntimeOwnershipBanner(
+  snapshot: RuntimeOwnershipSnapshot | null | undefined,
+  nowEpochMs: number,
+): Readonly<{
+  status: "OWNED" | "LOST" | "UNAVAILABLE";
+  generation: number | null;
+  executionMode: RuntimeOwnershipSnapshot["executionMode"];
+  heartbeatAtEpochMs: number | null;
+  heartbeatAgeMs: number | null;
+  heartbeatIntervalMs: number;
+  ttlMs: number;
+  takeover: boolean;
+  lossReason: string | null;
+}> {
+  const heartbeatAtEpochMs = snapshot?.heartbeatAtEpochMs ?? null;
+  const heartbeatAgeMs = heartbeatAtEpochMs === null || !Number.isSafeInteger(nowEpochMs)
+    ? null
+    : Math.max(0, nowEpochMs - heartbeatAtEpochMs);
+  return {
+    status: snapshot?.status === "OWNED" ? "OWNED" : snapshot?.status === "LOST" ? "LOST" : "UNAVAILABLE",
+    generation: snapshot?.generation ?? null,
+    executionMode: snapshot?.executionMode ?? null,
+    heartbeatAtEpochMs,
+    heartbeatAgeMs,
+    heartbeatIntervalMs: RUNTIME_HEARTBEAT_INTERVAL_MS,
+    ttlMs: RUNTIME_OWNERSHIP_TTL_MS,
+    takeover: snapshot?.takeover ?? false,
+    lossReason: snapshot?.lossReason ?? null,
+  };
+}
+
 export async function startTelegramRuntime(input: {
   strategyScheduler: {
     start(onRuntimeOwnershipLost?: (error: unknown) => void): { readonly started: boolean };
@@ -130,6 +166,9 @@ export async function runAppStartup(
     ? createRuntimeShutdown(app, operations.runtimeOwnership)
     : async () => appOnlyShutdown!();
   const ownershipLossSource = resolveOwnershipLossSource(operations.runtimeOwnership);
+  if (operations.runtimeOwnership) {
+    app.telegramRouter.setRuntimeOwnershipSnapshotProvider(() => operations.runtimeOwnership!.snapshot());
+  }
   if (ownershipLossSource) {
     installRuntimeOwnershipLossHandler({
       shutdown: runtimeShutdown,
@@ -243,7 +282,10 @@ export async function runAppStartup(
     liveSendPath: app.liveSendPath,
     seedMismatches,
     upbitBaseUrl: app.config.upbitBaseUrl,
-    databasePath: app.config.databasePath,
+    runtimeOwnership: buildRuntimeOwnershipBanner(
+      operations.runtimeOwnership?.snapshot(),
+      Date.now(),
+    ),
     recoveryReader: app.exchangeBackedReadEnabled ? "UPBIT_PRIVATE_READER" : "DISABLED",
     reconciliationMaxOrderLookupsPerRun: app.config.reconciliationMaxOrderLookupsPerRun,
     reconciliationHistoryMaxPagesPerMarket: app.config.reconciliationHistoryMaxPagesPerMarket,

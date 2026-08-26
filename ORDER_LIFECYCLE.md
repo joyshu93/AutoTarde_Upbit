@@ -155,6 +155,12 @@ Cancellation must preserve lifecycle evidence:
 - exchange response
 - terminal state or follow-up reconciliation requirement
 
+There is no reachable production `cancelOrder` caller today, and runtime single-ownership work does not invent one. If a future reachable cancellation sender is introduced, it must perform the same final persisted runtime-generation check immediately before exchange cancellation, with no awaited local work between that check and starting the exchange call. This is a future requirement, not a claim that a current cancellation path exists.
+
+Runtime ownership is an outer process authority boundary, not an order lifecycle transition or replacement for `account_execution_leases`. One mutating `DRY_RUN` or `LIVE` runtime may own a canonical local database/account on the supported single Windows host; OS locking prevents concurrent process ownership and persisted generations fence stale workers. Lock loss, heartbeat expiry, or a generation mismatch fences lifecycle-adjacent workers before normal shutdown/quiescence. Multi-host and network-share deployments are unsupported.
+
+Migration `0024_add_runtime_ownership.sql` is applied only through a separately approved offline stop, backup, migration, and read-only verification sequence. It does not alter existing lifecycle, strategy, sizing, risk, or Telegram-truth semantics.
+
 ## Reconciliation Triggers
 
 Reconciliation should run when:
