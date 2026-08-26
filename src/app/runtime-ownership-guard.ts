@@ -2,7 +2,11 @@ import type {
   RuntimeOwnershipExecutionMode,
   RuntimeOwnershipRecord,
 } from "../domain/runtime-ownership.js";
-import type { RuntimeOwnershipStore } from "../modules/db/runtime-ownership-interfaces.js";
+import type { ExecutionMode, ExecutionStateRecord, LiveExecutionGate } from "../domain/types.js";
+import type {
+  PersistedRuntimeExecutionAuthority,
+  RuntimeOwnershipStore,
+} from "../modules/db/runtime-ownership-interfaces.js";
 import { RUNTIME_OWNERSHIP_TTL_MS } from "./runtime-heartbeat.js";
 import type { RuntimeProcessLock } from "./runtime-process-lock.js";
 
@@ -10,6 +14,21 @@ export interface RuntimeOwnershipAuthority {
   snapshot(): RuntimeOwnershipSnapshot;
   assertLocallyHeld(): void;
   assertCurrent(atEpochMs: number): Promise<RuntimeOwnershipRecord>;
+  assertCurrentExecutionAuthority?(
+    input: AssertCurrentExecutionAuthorityInput,
+  ): Promise<CurrentRuntimeExecutionAuthority>;
+}
+
+export interface CurrentRuntimeExecutionAuthority {
+  readonly runtimeOwnership: RuntimeOwnershipRecord;
+  readonly executionState: NonNullable<PersistedRuntimeExecutionAuthority["executionState"]>;
+}
+
+export interface AssertCurrentExecutionAuthorityInput {
+  readonly atEpochMs: number;
+  readonly exchangeAccountId: string;
+  readonly expectedExecutionMode: ExecutionMode;
+  readonly expectedLiveExecutionGate: LiveExecutionGate;
 }
 
 export interface RuntimeOwnershipSnapshot {
@@ -138,6 +157,48 @@ export class RuntimeOwnershipGuard implements RuntimeOwnershipAuthority {
     return { ...persisted };
   }
 
+  async assertCurrentExecutionAuthority(
+    input: AssertCurrentExecutionAuthorityInput,
+  ): Promise<CurrentRuntimeExecutionAuthority> {
+    validateEpochMs(input.atEpochMs);
+    if (typeof input.exchangeAccountId !== "string" || input.exchangeAccountId.length === 0) {
+      throw new Error("Final runtime execution authority requires an exchange account id.");
+    }
+    this.assertLocallyHeld();
+    const expectedOwnership = this.requireRecord();
+    const readAuthority = this.dependencies.store.getCurrentExecutionAuthority;
+    if (readAuthority === undefined) {
+      throw new RuntimeOwnershipGuardError(
+        "RUNTIME_OWNERSHIP_NOT_HELD",
+        "RUNTIME_OWNERSHIP_NOT_HELD: Persisted combined execution authority is unavailable.",
+      );
+    }
+    const persisted = await readAuthority.call(
+      this.dependencies.store,
+      input.exchangeAccountId,
+    );
+    this.assertLocallyHeld();
+
+    if (persisted === null || !sameOwnership(expectedOwnership, persisted.runtimeOwnership)) {
+      this.markLost("PERSISTED_OWNERSHIP_MISMATCH");
+      this.throwLost();
+    }
+    if (input.atEpochMs >= persisted.runtimeOwnership.expiresAtEpochMs) {
+      this.markLost("OWNERSHIP_EXPIRED");
+      this.throwLost();
+    }
+
+    const state = persisted.executionState;
+    if (!isExecutionAllowed(state, input)) {
+      throw new Error("final pre-send authority is blocked");
+    }
+    this.record = { ...persisted.runtimeOwnership };
+    return {
+      runtimeOwnership: { ...persisted.runtimeOwnership },
+      executionState: { ...state },
+    };
+  }
+
   markLost(reason: string): boolean {
     if (this.status === "LOST") return false;
     if (!/^[A-Z][A-Z0-9_]{0,63}$/u.test(reason)) {
@@ -198,4 +259,19 @@ function validateEpochMs(value: number): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error("Runtime ownership assertion time must be a non-negative safe integer.");
   }
+}
+
+function isExecutionAllowed(
+  state: PersistedRuntimeExecutionAuthority["executionState"],
+  expected: AssertCurrentExecutionAuthorityInput,
+): state is Pick<
+  ExecutionStateRecord,
+  "exchangeAccountId" | "executionMode" | "liveExecutionGate" | "systemStatus" | "killSwitchActive"
+> {
+  return state !== null &&
+    state.exchangeAccountId === expected.exchangeAccountId &&
+    state.systemStatus === "RUNNING" &&
+    !state.killSwitchActive &&
+    state.executionMode === expected.expectedExecutionMode &&
+    state.liveExecutionGate === expected.expectedLiveExecutionGate;
 }

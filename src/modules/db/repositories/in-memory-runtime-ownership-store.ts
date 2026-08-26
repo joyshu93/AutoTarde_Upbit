@@ -13,6 +13,7 @@ import {
   validateRuntimeOwnershipEventRecord,
   validateRuntimeOwnershipRecord,
   type AcquireRuntimeOwnershipInput,
+  type PersistedRuntimeExecutionAuthority,
   type RecordRuntimeOwnershipLostInput,
   type ReleaseRuntimeOwnershipInput,
   type RenewRuntimeOwnershipInput,
@@ -28,6 +29,15 @@ export class InMemoryRuntimeOwnershipStore implements RuntimeOwnershipStore {
     if (this.current === null) return null;
     validateRuntimeOwnershipRecord(this.current);
     return { ...this.current };
+  }
+
+  async getCurrentExecutionAuthority(
+    _exchangeAccountId: string,
+  ): Promise<PersistedRuntimeExecutionAuthority | null> {
+    const runtimeOwnership = await this.getCurrent();
+    return runtimeOwnership === null
+      ? null
+      : { runtimeOwnership, executionState: null };
   }
 
   async acquireAfterProcessLock(

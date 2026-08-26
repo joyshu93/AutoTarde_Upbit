@@ -4,6 +4,18 @@ import type {
   RuntimeOwnershipExecutionMode,
   RuntimeOwnershipRecord,
 } from "../../domain/runtime-ownership.js";
+import type { ExecutionMode, LiveExecutionGate, SystemStatus } from "../../domain/types.js";
+
+export interface PersistedRuntimeExecutionAuthority {
+  readonly runtimeOwnership: RuntimeOwnershipRecord;
+  readonly executionState: {
+    readonly exchangeAccountId: string;
+    readonly executionMode: ExecutionMode;
+    readonly liveExecutionGate: LiveExecutionGate;
+    readonly systemStatus: SystemStatus;
+    readonly killSwitchActive: boolean;
+  } | null;
+}
 
 export interface AcquireRuntimeOwnershipInput {
   readonly ownerToken: string;
@@ -34,6 +46,9 @@ export interface RecordRuntimeOwnershipLostInput {
 
 export interface RuntimeOwnershipStore {
   getCurrent(): Promise<RuntimeOwnershipRecord | null>;
+  getCurrentExecutionAuthority?(
+    exchangeAccountId: string,
+  ): Promise<PersistedRuntimeExecutionAuthority | null>;
   acquireAfterProcessLock(
     input: AcquireRuntimeOwnershipInput,
   ): Promise<RuntimeOwnershipAcquisition>;

@@ -144,7 +144,9 @@ function createOwnedThenLostRuntimeOwnershipAuthority(): {
   };
 }
 
-function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+function createAlwaysOwnedRuntimeOwnershipAuthority(
+  operatorState?: Pick<InMemoryOperatorStateStore, "getState">,
+): RuntimeOwnershipAuthority {
   const record = {
     ownerToken: "owner".padEnd(64, "x"),
     generation: 1,
@@ -167,6 +169,27 @@ function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority
     assertLocallyHeld() {},
     async assertCurrent() {
       return { ...record };
+    },
+    async assertCurrentExecutionAuthority(input) {
+      const state = operatorState === undefined
+        ? {
+            exchangeAccountId: input.exchangeAccountId,
+            executionMode: input.expectedExecutionMode,
+            liveExecutionGate: input.expectedLiveExecutionGate,
+            systemStatus: "RUNNING" as const,
+            killSwitchActive: false,
+          }
+        : await operatorState.getState();
+      return {
+        runtimeOwnership: { ...record },
+        executionState: {
+          exchangeAccountId: state.exchangeAccountId,
+          executionMode: state.executionMode,
+          liveExecutionGate: state.liveExecutionGate,
+          systemStatus: state.systemStatus,
+          killSwitchActive: state.killSwitchActive,
+        },
+      };
     },
   };
 }
@@ -592,6 +615,7 @@ function createExecutionService(
     listClosedOrders: exchangeAdapterOverrides.listClosedOrders ?? baseAdapter.listClosedOrders.bind(baseAdapter),
   };
 
+  const operatorState = new InMemoryOperatorStateStore(createExecutionState());
   return new ExecutionService({
     riskLimits: {
       maxAllocationByAsset: {
@@ -607,8 +631,8 @@ function createExecutionService(
     repositories,
     accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
     accountExecutionLeaseMs: 30_000,
-    operatorState: new InMemoryOperatorStateStore(createExecutionState()),
-    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(),
+    operatorState,
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(operatorState),
     now: () => "2026-04-20T01:05:10.000Z",
   });
 }

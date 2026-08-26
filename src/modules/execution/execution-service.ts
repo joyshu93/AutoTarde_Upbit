@@ -536,7 +536,7 @@ export class ExecutionService {
 
     let exchangeOrderPromise: ReturnType<ExecutionExchangeAdapter["createOrder"]> | undefined;
     let createOrderInvoked = false;
-    let finalRuntimeOwnershipCheckStarted = false;
+    let finalRuntimeExecutionAuthorityCheckStarted = false;
     let synchronousSubmissionError: unknown = null;
     try {
       await this.assertFinalCandidatePreSendAuthority({
@@ -578,8 +578,19 @@ export class ExecutionService {
         activeOrders: finalActiveOrders,
         persistedOrder: finalPersistedOrder,
       });
-      finalRuntimeOwnershipCheckStarted = true;
-      await this.runtimeOwnership.assertCurrent(Date.now());
+      finalRuntimeExecutionAuthorityCheckStarted = true;
+      if (this.runtimeOwnership.assertCurrentExecutionAuthority === undefined) {
+        throw new RuntimeOwnershipGuardError(
+          "RUNTIME_OWNERSHIP_NOT_HELD",
+          "RUNTIME_OWNERSHIP_NOT_HELD: Persisted combined execution authority is unavailable.",
+        );
+      }
+      await this.runtimeOwnership.assertCurrentExecutionAuthority({
+        atEpochMs: Date.now(),
+        exchangeAccountId: input.exchangeAccountId,
+        expectedExecutionMode: initialAuthority.executionMode,
+        expectedLiveExecutionGate: initialAuthority.liveExecutionGate,
+      });
       createOrderInvoked = true;
       exchangeOrderPromise = this.dependencies.executionAdapter.createOrder({
         market,
@@ -596,7 +607,7 @@ export class ExecutionService {
         synchronousSubmissionError = error;
       } else {
         releaseLease = false;
-        if (finalRuntimeOwnershipCheckStarted) {
+        if (finalRuntimeExecutionAuthorityCheckStarted) {
           throw error;
         }
         if (candidateContext && candidateBinding) {
@@ -1442,7 +1453,9 @@ function hasExecutedVolume(executedVolume: string | null): boolean {
 
 type ExecutionAuthorityTuple = Pick<ExecutionStateRecord, "executionMode" | "liveExecutionGate">;
 
-function selectExecutionAuthority(state: ExecutionStateRecord): ExecutionAuthorityTuple {
+function selectExecutionAuthority(
+  state: Pick<ExecutionStateRecord, "executionMode" | "liveExecutionGate">,
+): ExecutionAuthorityTuple {
   return {
     executionMode: state.executionMode,
     liveExecutionGate: state.liveExecutionGate,

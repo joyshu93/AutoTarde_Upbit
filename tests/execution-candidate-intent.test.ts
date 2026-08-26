@@ -446,7 +446,10 @@ async function createFixture(options: {
     accountExecutionLeases: leases,
     accountExecutionLeaseMs: 30_000,
     operatorState,
-    runtimeOwnership: createAlwaysOwnedRuntimeAuthority(options.live ? "LIVE" : "DRY_RUN"),
+    runtimeOwnership: createAlwaysOwnedRuntimeAuthority(
+      operatorState,
+      options.live ? "LIVE" : "DRY_RUN",
+    ),
     now: () => ATTEMPT_AT,
     ...(options.includeCandidateDependency === false
       ? {}
@@ -458,6 +461,7 @@ async function createFixture(options: {
 }
 
 function createAlwaysOwnedRuntimeAuthority(
+  operatorState: InMemoryOperatorStateStore,
   executionMode: "DRY_RUN" | "LIVE",
 ): RuntimeOwnershipAuthority {
   const record = {
@@ -482,6 +486,19 @@ function createAlwaysOwnedRuntimeAuthority(
     assertLocallyHeld() {},
     async assertCurrent() {
       return { ...record };
+    },
+    async assertCurrentExecutionAuthority() {
+      const executionState = await operatorState.getState();
+      return {
+        runtimeOwnership: { ...record },
+        executionState: {
+          exchangeAccountId: executionState.exchangeAccountId,
+          executionMode: executionState.executionMode,
+          liveExecutionGate: executionState.liveExecutionGate,
+          systemStatus: executionState.systemStatus,
+          killSwitchActive: executionState.killSwitchActive,
+        },
+      };
     },
   };
 }

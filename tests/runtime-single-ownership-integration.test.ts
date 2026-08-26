@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { fork, type ChildProcess } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -28,6 +29,8 @@ import {
   type RuntimeProcessLockLossReason,
 } from "../src/app/runtime-process-lock.js";
 import { createSqliteRuntimeOwnershipPersistence } from
+  "../src/modules/db/repositories/sqlite-repositories.js";
+import { createSqlitePersistence } from
   "../src/modules/db/repositories/sqlite-repositories.js";
 import { test } from "./harness.js";
 
@@ -136,7 +139,7 @@ function registerIntegrationTests(): void {
     const events: string[] = [];
     const runtime = await createDeterministicOwnedRuntime(fixture.databasePath, events);
     const replacement = createSqliteRuntimeOwnershipPersistence(fixture.databasePath);
-    const externalCalls = { createOrder: 0, cancelOrder: 0 };
+    const mutations = new GuardedMutationGateway(runtime.guard);
 
     try {
       const replacementOwnership = await replacement.runtimeOwnership.acquireAfterProcessLock({
@@ -148,15 +151,12 @@ function registerIntegrationTests(): void {
       assert.equal(replacementOwnership.record.generation, 2);
       assert.equal(replacementOwnership.takeover, true);
 
-      await assert.rejects(async () => {
-        await runtime.guard.assertCurrent(2_001);
-        externalCalls.createOrder += 1;
-      }, /RUNTIME_OWNERSHIP_LOST/u);
+      await assert.rejects(() => mutations.createOrder(2_001), /RUNTIME_OWNERSHIP_LOST/u);
+      await assert.rejects(() => mutations.cancelOrder(2_001), /RUNTIME_OWNERSHIP_LOST/u);
       const exitCode = await runtime.exitCode;
 
       assert.equal(exitCode, 1);
-      assert.equal(externalCalls.createOrder, 0);
-      assert.equal(externalCalls.cancelOrder, 0);
+      assert.deepEqual(mutations.calls, { createOrder: 0, cancelOrder: 0 });
       assertWorkersStoppedAndLockReleasedLast(events);
       assert.equal(
         runtime.shutdownSummary()?.steps.find((step) =>
@@ -179,21 +179,24 @@ function registerIntegrationTests(): void {
     const fixture = await createTempDatabase("heartbeat-expiry");
     const events: string[] = [];
     const runtime = await createDeterministicOwnedRuntime(fixture.databasePath, events);
-    const externalCalls = { createOrder: 0, cancelOrder: 0 };
+    const mutations = new GuardedMutationGateway(runtime.guard);
 
     try {
       runtime.clock.set(46_000);
       await runtime.timer.fire();
-      await assert.rejects(async () => {
-        await runtime.guard.assertCurrent(runtime.clock.nowEpochMs());
-        externalCalls.createOrder += 1;
-      }, /RUNTIME_OWNERSHIP_LOST/u);
+      await assert.rejects(
+        () => mutations.createOrder(runtime.clock.nowEpochMs()),
+        /RUNTIME_OWNERSHIP_LOST/u,
+      );
+      await assert.rejects(
+        () => mutations.cancelOrder(runtime.clock.nowEpochMs()),
+        /RUNTIME_OWNERSHIP_LOST/u,
+      );
       const exitCode = await runtime.exitCode;
 
       assert.equal(exitCode, 1);
       assert.equal(runtime.guard.snapshot().lossReason, "HEARTBEAT_EXPIRED");
-      assert.equal(externalCalls.createOrder, 0);
-      assert.equal(externalCalls.cancelOrder, 0);
+      assert.deepEqual(mutations.calls, { createOrder: 0, cancelOrder: 0 });
       assertWorkersStoppedAndLockReleasedLast(events);
 
       const inspection = createSqliteRuntimeOwnershipPersistence(fixture.databasePath);
@@ -206,6 +209,75 @@ function registerIntegrationTests(): void {
       }
     } finally {
       await runtime.ensureStopped();
+      await fixture.cleanup();
+    }
+  });
+
+  test("persisted combined authority atomically fences every execution-state blocker", async () => {
+    const fixture = await createTempDatabase("combined-authority");
+    const appPersistence = createSqlitePersistence({
+      databasePath: fixture.databasePath,
+      exchangeAccountId: TEST_ACCOUNT_ID,
+      userId: "test-user",
+      userTelegramId: "test-telegram-user",
+      userDisplayName: "Test Operator",
+      accessKeyRef: "TEST_ONLY_UNCONFIGURED",
+      secretKeyRef: "TEST_ONLY_UNCONFIGURED",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      killSwitchActive: false,
+    });
+    const ownershipPersistence = createSqliteRuntimeOwnershipPersistence(fixture.databasePath);
+    const guard = new RuntimeOwnershipGuard({
+      processLock: new FakeProcessLock([]),
+      store: ownershipPersistence.runtimeOwnership,
+      ownerToken: "a".repeat(64),
+    });
+    const expected = {
+      atEpochMs: 1_001,
+      exchangeAccountId: TEST_ACCOUNT_ID,
+      expectedExecutionMode: "DRY_RUN" as const,
+      expectedLiveExecutionGate: "DISABLED" as const,
+    };
+
+    try {
+      await guard.acquire({ executionMode: "DRY_RUN", acquiredAtEpochMs: 1_000 });
+      const runningAuthority = await guard.assertCurrentExecutionAuthority(expected);
+      assert.notEqual(runningAuthority.executionState, null);
+      assert.equal(runningAuthority.executionState?.systemStatus, "RUNNING");
+
+      await appPersistence.operatorState.setExecutionMode("LIVE");
+      await assert.rejects(() => guard.assertCurrentExecutionAuthority(expected), /blocked/u);
+      await appPersistence.operatorState.setExecutionMode("DRY_RUN");
+      await appPersistence.operatorState.setLiveExecutionGate("ENABLED");
+      await assert.rejects(() => guard.assertCurrentExecutionAuthority(expected), /blocked/u);
+      await appPersistence.operatorState.setLiveExecutionGate("DISABLED");
+      await appPersistence.operatorState.pause("test pause");
+      await assert.rejects(() => guard.assertCurrentExecutionAuthority(expected), /blocked/u);
+      await appPersistence.operatorState.resume();
+      await appPersistence.operatorState.activateKillSwitch("test kill switch");
+      await assert.rejects(() => guard.assertCurrentExecutionAuthority(expected), /blocked/u);
+      assert.equal(guard.snapshot().status, "OWNED");
+    } finally {
+      ownershipPersistence.close();
+      appPersistence.close();
+      await fixture.cleanup();
+    }
+  });
+
+  test("production ownership boundary has no reachable cancellation caller", async () => {
+    const executionSource = await readFile(
+      path.resolve("src", "modules", "execution", "execution-service.ts"),
+      "utf8",
+    );
+    assert.doesNotMatch(executionSource, /\.cancelOrder\s*\(/u);
+  });
+
+  test("temporary database fixtures are uniquely owned directly beneath the OS temp root", async () => {
+    const fixture = await createTempDatabase("os-temp-root");
+    try {
+      assert.equal(path.dirname(path.dirname(fixture.databasePath)), path.resolve(tmpdir()));
+    } finally {
       await fixture.cleanup();
     }
   });
@@ -503,6 +575,22 @@ class ManualHeartbeatTimer implements RuntimeHeartbeatTimer {
   }
 }
 
+class GuardedMutationGateway {
+  readonly calls = { createOrder: 0, cancelOrder: 0 };
+
+  constructor(private readonly ownership: RuntimeOwnershipGuard) {}
+
+  async createOrder(atEpochMs: number): Promise<void> {
+    await this.ownership.assertCurrent(atEpochMs);
+    this.calls.createOrder += 1;
+  }
+
+  async cancelOrder(atEpochMs: number): Promise<void> {
+    await this.ownership.assertCurrent(atEpochMs);
+    this.calls.cancelOrder += 1;
+  }
+}
+
 function startChildFixture(mode: "hold" | "once", databasePath: string): ChildProcess {
   return fork(fileURLToPath(import.meta.url), [CHILD_ARGUMENT, mode, databasePath], {
     execArgv: [],
@@ -599,9 +687,8 @@ async function createTempDatabase(label: string): Promise<{
   readonly databasePath: string;
   cleanup(): Promise<void>;
 }> {
-  const baseDirectory = path.resolve("tmp", "runtime-single-ownership-integration");
-  await mkdir(baseDirectory, { recursive: true });
-  const directory = await mkdtemp(path.join(baseDirectory, `${label}-`));
+  const baseDirectory = path.resolve(tmpdir());
+  const directory = await mkdtemp(path.join(baseDirectory, `autotrade-runtime-${label}-`));
   const resolvedDirectory = path.resolve(directory);
   const expectedPrefix = `${baseDirectory}${path.sep}`;
   if (!resolvedDirectory.startsWith(expectedPrefix)) {

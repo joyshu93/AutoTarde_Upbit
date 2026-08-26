@@ -73,6 +73,8 @@ test("bound candidate success rereads every final authority in strict order and 
     "operatorState",
     "activeOrders",
     "order",
+    "combinedAuthority",
+    "operatorState",
     "createOrder",
   ]);
 });
@@ -119,22 +121,21 @@ test("candidate final order reread uses exact account and order id despite refer
   assert.equal(fixture.repositories.referenceLookupCalls, 0);
 });
 
-test("final runtime ownership check is the sole awaited boundary before the send", async () => {
+test("a persisted pause settling during the final combined authority await sends zero", async () => {
   const fixture = await createFixture("HELPER_RESOLUTION_PAUSE");
 
-  const result = await fixture.service.submitOrderFromDecision(candidateInput());
-  await Promise.resolve();
+  await assert.rejects(
+    () => fixture.service.submitOrderFromDecision(candidateInput()),
+    /final pre-send authority is blocked/u,
+  );
 
-  assert.equal(result.accepted, true);
-  assert.equal(fixture.adapter.createOrderCalls, 1);
-  assert.equal(fixture.adapter.systemStatusAtSend, "PAUSED");
-  assert.deepEqual(fixture.trace.slice(-5), [
-    "operatorState",
-    "activeOrders",
-    "order",
-    "finalOrderMicrotaskPause",
-    "createOrder",
-  ]);
+  assert.equal(fixture.adapter.createOrderCalls, 0);
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  const orderRead = fixture.trace.indexOf("order");
+  const combinedRead = fixture.trace.indexOf("combinedAuthority");
+  const pauseStarted = fixture.trace.indexOf("finalOrderMicrotaskPause");
+  assert.ok(orderRead >= 0 && combinedRead > orderRead && pauseStarted > combinedRead);
+  assert.equal(fixture.trace.includes("createOrder"), false);
 });
 
 test("a final operator-state race occurs after all candidate reads and sends zero", async () => {
@@ -227,25 +228,25 @@ test("candidate final authority keeps the exact account/order revalidation immed
     "this.assertFinalPersistedSubmissionAuthority",
     exactOrderRead,
   );
-  const runtimeOwnershipCheck = submitMethod.indexOf(
-    "await this.runtimeOwnership.assertCurrent",
+  const combinedAuthorityCheck = submitMethod.indexOf(
+    "await this.runtimeOwnership.assertCurrentExecutionAuthority",
     persistedHelperCall,
   );
   const sendSite = submitMethod.indexOf(
     "this.dependencies.executionAdapter.createOrder",
-    runtimeOwnershipCheck,
+    combinedAuthorityCheck,
   );
   assert.ok(
     candidateHelperCall >= 0 && finalStateRead > candidateHelperCall &&
     blockerRead > finalStateRead && exactOrderRead > blockerRead &&
-    persistedHelperCall > exactOrderRead && runtimeOwnershipCheck > persistedHelperCall &&
-    sendSite > runtimeOwnershipCheck,
+    persistedHelperCall > exactOrderRead &&
+    combinedAuthorityCheck > persistedHelperCall && sendSite > combinedAuthorityCheck,
   );
-  const afterFinalPersistedRead = submitMethod.slice(exactOrderRead, sendSite);
-  assert.equal((afterFinalPersistedRead.match(/\bawait\b/gu) ?? []).length, 2);
+  const afterFinalPersistedRead = submitMethod.slice(persistedHelperCall, sendSite);
+  assert.equal((afterFinalPersistedRead.match(/\bawait\b/gu) ?? []).length, 1);
   assert.doesNotMatch(afterFinalPersistedRead, /operatorState\.getState|candidatePilots/u);
   assert.doesNotMatch(
-    submitMethod.slice(runtimeOwnershipCheck + "await".length, sendSite),
+    submitMethod.slice(combinedAuthorityCheck + "await".length, sendSite),
     /\bawait\b/u,
   );
 });
@@ -473,6 +474,7 @@ class TracingDryRunAdapter extends DryRunExchangeAdapter {
 async function createFixture(mutation: FinalMutation) {
   const trace: string[] = [];
   let repositories: FinalAuthorityRepository;
+  let finalPausePromise: Promise<void> = Promise.resolve();
   const operatorState = new TracingOperatorStateStore(
     executionState(),
     () => repositories?.finalReadsArmed ?? false,
@@ -482,7 +484,9 @@ async function createFixture(mutation: FinalMutation) {
   );
   const candidatePilots = new InMemoryCandidatePilotRepository(operatorState);
   repositories = new FinalAuthorityRepository(candidatePilots, mutation, trace, () => {
-    operatorState.visibleSystemStatus = "PAUSED";
+    finalPausePromise = operatorState.pause("final combined authority race").then(() => {
+      operatorState.visibleSystemStatus = "PAUSED";
+    });
   });
   const leases = new InMemoryAccountExecutionLeaseStore();
   const adapter = new TracingDryRunAdapter(
@@ -504,7 +508,11 @@ async function createFixture(mutation: FinalMutation) {
     accountExecutionLeases: leases,
     accountExecutionLeaseMs: 30_000,
     operatorState,
-    runtimeOwnership: createAlwaysOwnedRuntimeAuthority(),
+    runtimeOwnership: createAlwaysOwnedRuntimeAuthority({
+      operatorState,
+      trace,
+      waitForFinalPause: () => finalPausePromise,
+    }),
     candidatePilots: finalCandidatePilotReads(candidatePilots, repositories, mutation, trace),
     now: () => ATTEMPT_AT,
   });
@@ -512,7 +520,11 @@ async function createFixture(mutation: FinalMutation) {
   return { adapter, candidatePilots, leases, operatorState, repositories, service, trace };
 }
 
-function createAlwaysOwnedRuntimeAuthority(): RuntimeOwnershipAuthority {
+function createAlwaysOwnedRuntimeAuthority(input: {
+  readonly operatorState: TracingOperatorStateStore;
+  readonly trace: string[];
+  waitForFinalPause(): Promise<void>;
+}): RuntimeOwnershipAuthority {
   const record = {
     ownerToken: "owner".padEnd(64, "a"),
     generation: 1,
@@ -521,9 +533,9 @@ function createAlwaysOwnedRuntimeAuthority(): RuntimeOwnershipAuthority {
     heartbeatAtEpochMs: 1,
     expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
   };
-  return {
+  const authority = {
     snapshot: () => ({
-      status: "OWNED",
+      status: "OWNED" as const,
       generation: record.generation,
       executionMode: record.executionMode,
       acquiredAtEpochMs: record.acquiredAtEpochMs,
@@ -536,7 +548,18 @@ function createAlwaysOwnedRuntimeAuthority(): RuntimeOwnershipAuthority {
     async assertCurrent() {
       return { ...record };
     },
+    async assertCurrentExecutionAuthority() {
+      input.trace.push("combinedAuthority");
+      await Promise.resolve();
+      await input.waitForFinalPause();
+      const executionState = await input.operatorState.getState();
+      if (executionState.systemStatus !== "RUNNING" || executionState.killSwitchActive) {
+        throw new Error("final pre-send authority is blocked");
+      }
+      return { runtimeOwnership: { ...record }, executionState };
+    },
   };
+  return authority;
 }
 
 function finalCandidatePilotReads(

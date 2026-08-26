@@ -717,7 +717,10 @@ async function createService(overrides: {
     operatorState,
     ...(overrides.runtimeOwnership === null
       ? {}
-      : { runtimeOwnership: overrides.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority() }),
+      : {
+          runtimeOwnership: overrides.runtimeOwnership ??
+            createAlwaysOwnedRuntimeOwnershipAuthority(operatorState),
+        }),
     now: overrides.now ?? (() => "2026-04-20T00:00:20.000Z"),
   });
   await repositories.saveBalanceSnapshot({
@@ -821,7 +824,9 @@ function createRunningState(overrides: Partial<ExecutionStateRecord> = {}): Exec
   };
 }
 
-function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+function createAlwaysOwnedRuntimeOwnershipAuthority(
+  operatorState: InMemoryOperatorStateStore,
+): RuntimeOwnershipAuthority {
   const record = {
     ownerToken: "owner".padEnd(64, "x"),
     generation: 1,
@@ -844,6 +849,19 @@ function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority
     assertLocallyHeld() {},
     async assertCurrent() {
       return { ...record };
+    },
+    async assertCurrentExecutionAuthority() {
+      const executionState = await operatorState.getState();
+      return {
+        runtimeOwnership: { ...record },
+        executionState: {
+          exchangeAccountId: executionState.exchangeAccountId,
+          executionMode: executionState.executionMode,
+          liveExecutionGate: executionState.liveExecutionGate,
+          systemStatus: executionState.systemStatus,
+          killSwitchActive: executionState.killSwitchActive,
+        },
+      };
     },
   };
 }

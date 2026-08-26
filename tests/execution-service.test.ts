@@ -51,7 +51,10 @@ function createExecutionService(overrides?: {
     accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
     accountExecutionLeaseMs: 30_000,
     operatorState,
-    runtimeOwnership: overrides?.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    runtimeOwnership: overrides?.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(
+      operatorState,
+      overrides?.initialState?.executionMode ?? "DRY_RUN",
+    ),
     now: () => "2026-04-20T00:00:20.000Z",
     ...(overrides?.validationAdapter ? { validationAdapter: overrides.validationAdapter } : {}),
     ...(overrides?.reporter ? { reporter: overrides.reporter } : {}),
@@ -214,7 +217,7 @@ test("baseline final send requires its own exact persisted SUBMITTING intent", a
       accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
       accountExecutionLeaseMs: 30_000,
       operatorState,
-      runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(),
+      runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(operatorState, "LIVE"),
       now: () => "2026-04-20T00:00:20.000Z",
     });
 
@@ -271,6 +274,26 @@ test("execution service checks persisted runtime ownership at the final send bou
         acquiredAtEpochMs: 1,
         heartbeatAtEpochMs: 1,
         expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+      };
+    },
+    async assertCurrentExecutionAuthority(input) {
+      checkedAt.push(input.atEpochMs);
+      return {
+        runtimeOwnership: {
+          ownerToken: "owner".padEnd(64, "x"),
+          generation: 7,
+          executionMode: "DRY_RUN",
+          acquiredAtEpochMs: 1,
+          heartbeatAtEpochMs: 1,
+          expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+        },
+        executionState: {
+          exchangeAccountId: input.exchangeAccountId,
+          executionMode: "DRY_RUN",
+          liveExecutionGate: "DISABLED",
+          systemStatus: "RUNNING",
+          killSwitchActive: false,
+        },
       };
     },
   };
@@ -828,7 +851,7 @@ test("execution service queues an operator notification when an order is rejecte
     accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
     accountExecutionLeaseMs: 30_000,
     operatorState,
-    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(),
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(operatorState),
     reporter,
     now: () => "2026-04-20T00:00:20.000Z",
   });
@@ -1109,7 +1132,7 @@ test("execution service records lifecycle evidence from the live execution adapt
     accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
     accountExecutionLeaseMs: 30_000,
     operatorState,
-    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(),
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(operatorState, "LIVE"),
     now: () => "2026-04-20T00:00:20.000Z",
   });
 
@@ -1219,11 +1242,14 @@ function countingLiveAdapter(): Readonly<{
   };
 }
 
-function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+function createAlwaysOwnedRuntimeOwnershipAuthority(
+  operatorState: InMemoryOperatorStateStore,
+  executionMode: "DRY_RUN" | "LIVE" = "DRY_RUN",
+): RuntimeOwnershipAuthority {
   const record = {
     ownerToken: "owner".padEnd(64, "x"),
     generation: 1,
-    executionMode: "DRY_RUN" as const,
+    executionMode,
     acquiredAtEpochMs: 1,
     heartbeatAtEpochMs: 1,
     expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
@@ -1242,6 +1268,19 @@ function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority
     assertLocallyHeld() {},
     async assertCurrent() {
       return { ...record };
+    },
+    async assertCurrentExecutionAuthority() {
+      const executionState = await operatorState.getState();
+      return {
+        runtimeOwnership: { ...record },
+        executionState: {
+          exchangeAccountId: executionState.exchangeAccountId,
+          executionMode: executionState.executionMode,
+          liveExecutionGate: executionState.liveExecutionGate,
+          systemStatus: executionState.systemStatus,
+          killSwitchActive: executionState.killSwitchActive,
+        },
+      };
     },
   };
 }

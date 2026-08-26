@@ -5,6 +5,7 @@ import type {
   RuntimeOwnershipEventRecord,
   RuntimeOwnershipRecord,
 } from "../../../domain/runtime-ownership.js";
+import type { ExecutionMode, LiveExecutionGate, SystemStatus } from "../../../domain/types.js";
 import {
   assertNoTimestampRollback,
   validateAcquireRuntimeOwnershipInput,
@@ -15,6 +16,7 @@ import {
   validateRuntimeOwnershipEventRecord,
   validateRuntimeOwnershipRecord,
   type AcquireRuntimeOwnershipInput,
+  type PersistedRuntimeExecutionAuthority,
   type RecordRuntimeOwnershipLostInput,
   type ReleaseRuntimeOwnershipInput,
   type RenewRuntimeOwnershipInput,
@@ -42,11 +44,67 @@ interface RuntimeOwnershipEventRow {
   event_at_epoch_ms: number;
 }
 
+interface RuntimeExecutionAuthorityRow extends RuntimeOwnershipRow {
+  state_exchange_account_id: string | null;
+  state_execution_mode: ExecutionMode | null;
+  state_live_execution_gate: LiveExecutionGate | null;
+  state_system_status: SystemStatus | null;
+  state_kill_switch_active: number | null;
+}
+
 export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
   constructor(private readonly db: DatabaseSync) {}
 
   async getCurrent(): Promise<RuntimeOwnershipRecord | null> {
     return selectCurrent(this.db);
+  }
+
+  async getCurrentExecutionAuthority(
+    exchangeAccountId: string,
+  ): Promise<PersistedRuntimeExecutionAuthority | null> {
+    if (typeof exchangeAccountId !== "string" || exchangeAccountId.length === 0) {
+      throw new Error("Runtime execution authority requires an exchange account id.");
+    }
+    const row = this.db.prepare(`
+      SELECT r.owner_token, r.generation, r.execution_mode,
+        r.acquired_at_epoch_ms, r.heartbeat_at_epoch_ms, r.expires_at_epoch_ms,
+        s.exchange_account_id AS state_exchange_account_id,
+        s.execution_mode AS state_execution_mode,
+        s.live_execution_gate AS state_live_execution_gate,
+        s.system_status AS state_system_status,
+        s.kill_switch_active AS state_kill_switch_active
+      FROM runtime_ownership r
+      LEFT JOIN execution_state s ON s.exchange_account_id = ?
+      WHERE r.lease_scope = ?
+      LIMIT 1
+    `).get(exchangeAccountId, LEASE_SCOPE) as RuntimeExecutionAuthorityRow | undefined;
+    if (row === undefined) return null;
+
+    const runtimeOwnership = ownershipFromRow(row);
+    const exchangeAccountIdValue = row.state_exchange_account_id;
+    const executionMode = row.state_execution_mode;
+    const liveExecutionGate = row.state_live_execution_gate;
+    const systemStatus = row.state_system_status;
+    const killSwitchActive = row.state_kill_switch_active;
+    const hasExecutionState = exchangeAccountIdValue !== null &&
+      executionMode !== null && liveExecutionGate !== null &&
+      systemStatus !== null && killSwitchActive !== null;
+    if (!hasExecutionState) {
+      return { runtimeOwnership, executionState: null };
+    }
+    if (killSwitchActive !== 0 && killSwitchActive !== 1) {
+      throw new Error("Persisted runtime execution kill-switch state is invalid.");
+    }
+    return {
+      runtimeOwnership,
+      executionState: {
+        exchangeAccountId: exchangeAccountIdValue,
+        executionMode,
+        liveExecutionGate,
+        systemStatus,
+        killSwitchActive: killSwitchActive === 1,
+      },
+    };
   }
 
   async acquireAfterProcessLock(
@@ -244,6 +302,10 @@ function selectCurrent(db: DatabaseSync): RuntimeOwnershipRecord | null {
     WHERE lease_scope = ?
   `).get(LEASE_SCOPE) as RuntimeOwnershipRow | undefined;
   if (row === undefined) return null;
+  return ownershipFromRow(row);
+}
+
+function ownershipFromRow(row: RuntimeOwnershipRow): RuntimeOwnershipRecord {
   const record: RuntimeOwnershipRecord = {
     ownerToken: row.owner_token,
     generation: row.generation,

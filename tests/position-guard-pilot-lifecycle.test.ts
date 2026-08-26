@@ -52,7 +52,8 @@ class ExecutionService extends ProductionExecutionService {
   constructor(dependencies: ConstructorParameters<typeof ProductionExecutionService>[0]) {
     super({
       ...dependencies,
-      runtimeOwnership: dependencies.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+      runtimeOwnership: dependencies.runtimeOwnership ??
+        createAlwaysOwnedRuntimeOwnershipAuthority(dependencies.operatorState),
     });
   }
 }
@@ -89,7 +90,9 @@ const SNAPSHOT_AT = "2026-08-21T00:00:30.000Z";
 const RECONCILIATION_COMPLETED_AT = "2026-08-21T00:00:31.000Z";
 const NOW = "2026-08-21T00:00:40.000Z";
 
-function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+function createAlwaysOwnedRuntimeOwnershipAuthority(
+  operatorState?: Pick<InMemoryOperatorStateStore, "getState">,
+): RuntimeOwnershipAuthority {
   const record = {
     ownerToken: "owner".padEnd(64, "x"),
     generation: 1,
@@ -112,6 +115,27 @@ function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority
     assertLocallyHeld() {},
     async assertCurrent() {
       return { ...record };
+    },
+    async assertCurrentExecutionAuthority(input) {
+      const state = operatorState === undefined
+        ? {
+            exchangeAccountId: input.exchangeAccountId,
+            executionMode: input.expectedExecutionMode,
+            liveExecutionGate: input.expectedLiveExecutionGate,
+            systemStatus: "RUNNING" as const,
+            killSwitchActive: false,
+          }
+        : await operatorState.getState();
+      return {
+        runtimeOwnership: { ...record },
+        executionState: {
+          exchangeAccountId: state.exchangeAccountId,
+          executionMode: state.executionMode,
+          liveExecutionGate: state.liveExecutionGate,
+          systemStatus: state.systemStatus,
+          killSwitchActive: state.killSwitchActive,
+        },
+      };
     },
   };
 }
