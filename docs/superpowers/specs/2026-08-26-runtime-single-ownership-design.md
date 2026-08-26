@@ -5,7 +5,7 @@
 - Date: 2026-08-26
 - Scope: mutating `AutoTrade_Upbit` long-running runtimes
 - Applies to: `LIVE` and `DRY_RUN`
-- Does not apply to: read-only reports, inspections, and non-runtime smoke commands
+- Does not apply to: provably read-only reports, inspections, and smoke commands that do not construct a mutable runtime composition
 - Safety posture: fail closed
 
 ## Problem
@@ -32,7 +32,7 @@ The system needs one authoritative mutating runtime per canonical SQLite file an
 - Implementing a distributed lock service.
 - Changing strategy decisions, position sizing, risk limits, or order lifecycle rules.
 - Starting, stopping, or migrating the currently running LIVE process during implementation.
-- Giving read-only CLI tools or smoke commands runtime ownership.
+- Giving provably read-only CLI tools, reports, inspections, or smoke commands runtime ownership.
 
 ## Considered Approaches
 
@@ -169,6 +169,10 @@ If any step after process-lock acquisition fails, startup fences the guard, stop
 
 A duplicate that cannot acquire the process lock stops after step 4. It does not open mutable SQLite, bootstrap state, construct exchange or Telegram clients, run recovery, deliver notifications, install timers, or transmit an order.
 
+### Scoped Smoke Ownership
+
+A mutable or composed smoke acquires and releases process and persisted runtime ownership even when it is non-trading and makes no business-state mutation; it must contend with an existing owner exactly like the long-running runtime. This includes one-shot smoke paths that construct a writable application composition or can touch mutable runtime-control state. Only a provably read-only report, inspection, or smoke command that does not construct a mutable runtime composition remains ownership-free.
+
 ## Takeover Rules
 
 Persisted ownership may be replaced only when the new process already owns the same operating-system lock. This proves that no other process on the supported single Windows host currently owns that lock.
@@ -191,7 +195,7 @@ Required boundaries include:
 - notification delivery before Telegram transmission
 - sync and strategy controllers before exchange access
 - execution service immediately before Upbit `createOrder`
-- cancel execution immediately before exchange cancellation
+- any future reachable cancellation sender immediately before exchange cancellation; no current cancellation sender exists
 
 Read-only Telegram inspection may continue only while the process still owns the operating-system lock. Once ownership is lost, all routing stops to avoid duplicate operator responses.
 
@@ -202,7 +206,7 @@ Ownership loss is terminal for the process.
 1. Mark the guard `LOST` synchronously.
 2. Reject queued and future worker entry.
 3. Stop Telegram polling and scheduler timers.
-4. Prevent notification, sync, strategy, create-order, and cancel-order network calls.
+4. Prevent notification, sync, strategy, create-order, and any future cancellation-sender network calls.
 5. Append `LOST` evidence if the process still has safe database authority to do so.
 6. Quiesce active workers within a bounded shutdown interval.
 7. Close persistence and release the operating-system lock.
@@ -308,9 +312,9 @@ Implementation proceeds test first.
 - expiry after simulated sleep fences the runtime
 - SQLite busy that persists through expiry fences the runtime
 - queued scheduler and Telegram work cannot proceed after loss
-- final create-order and cancel-order checks reject stale generations
+- final create-order checks reject stale generations, and any future reachable cancellation sender must apply the same final check
 - existing `account_execution_leases` behavior remains unchanged
-- read-only report and smoke commands do not acquire ownership
+- provably read-only report, inspection, and smoke commands do not acquire ownership
 
 ### Final Verification
 

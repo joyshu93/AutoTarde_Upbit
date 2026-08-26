@@ -264,6 +264,8 @@ export function formatReadinessSummaryMessage(
     recentRiskBlockCount: countRiskBlocks(input.recentRiskEvents),
     pendingNotificationCount: input.pendingNotifications.length,
     checks,
+    runtimeOwnership: input.runtimeOwnership ?? null,
+    runtimeOwnershipNowEpochMs: input.runtimeOwnershipNowEpochMs ?? null,
   }, locale);
 }
 

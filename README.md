@@ -129,6 +129,8 @@ The startup banner plus Korean-first `/status` and `/readiness` summaries show s
 
 `0024_add_runtime_ownership.sql` must be deployed later through an explicit offline procedure: stop the runtime, back up the database and sidecars, apply the existing approved migration/identity operation, run read-only readiness verification, start one runtime, then separately confirm a duplicate launch has zero side effects. This repository change does not migrate, restart, deploy, or push anything.
 
+A mutable or composed smoke acquires and releases process and persisted runtime ownership even when it is non-trading and makes no business-state mutation; it must contend with an existing owner exactly like the long-running runtime. Only a provably read-only report, inspection, or smoke command that does not construct a mutable runtime composition remains ownership-free.
+
 ### BTC Candidate Pilot Is Available, Not Activated
 
 Baseline remains the default policy and `DRY_RUN` remains the default execution mode. Candidate code availability does not approve or activate the pilot. The exact pilot identity is `BTC_COMBINED_CONSERVATIVE_PILOT_V1`, market `KRW-BTC`, policy `COMBINED_CONSERVATIVE`, version `PCS-2026-001.DEPLOYMENT_READINESS_V1`; ETH always remains baseline during this pilot.

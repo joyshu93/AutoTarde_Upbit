@@ -3046,6 +3046,87 @@ test("telegram router captures one immutable runtime ownership snapshot for stat
   }
 });
 
+test("telegram routes and callbacks retain the complete runtime ownership matrix without secret scope data", async () => {
+  const router = createRouter();
+  const cases = [
+    {
+      expectedStatus: "OWNED",
+      snapshot: {
+        status: "OWNED",
+        generation: 4,
+        executionMode: "LIVE",
+        acquiredAtEpochMs: 1_785_000_000_000,
+        heartbeatAtEpochMs: 1_785_000_010_000,
+        expiresAtEpochMs: 1_785_000_055_000,
+        takeover: false,
+        lossReason: null,
+        ownerToken: "owned-route-owner-token-canary",
+        canonicalDatabasePath: "C:\\owned-route\\runtime.sqlite",
+        scopeDigest: "owned-route-scope-digest-canary",
+        namedPipeName: "\\\\.\\pipe\\owned-route-runtime-canary",
+        keyFingerprint: "owned-route-key-fingerprint-canary",
+      },
+    },
+    {
+      expectedStatus: "LOST",
+      snapshot: {
+        status: "LOST",
+        generation: 5,
+        executionMode: "DRY_RUN",
+        acquiredAtEpochMs: 1_785_000_000_000,
+        heartbeatAtEpochMs: 1_785_000_010_000,
+        expiresAtEpochMs: 1_785_000_055_000,
+        takeover: true,
+        lossReason: "PERSISTED_OWNERSHIP_MISMATCH",
+        ownerToken: "lost-route-owner-token-canary",
+        canonicalDatabasePath: "C:\\lost-route\\runtime.sqlite",
+        scopeDigest: "lost-route-scope-digest-canary",
+        namedPipeName: "\\\\.\\pipe\\lost-route-runtime-canary",
+        keyFingerprint: "lost-route-key-fingerprint-canary",
+      },
+    },
+    {
+      expectedStatus: "UNAVAILABLE",
+      snapshot: {
+        status: "UNOWNED",
+        generation: null,
+        executionMode: null,
+        acquiredAtEpochMs: null,
+        heartbeatAtEpochMs: null,
+        expiresAtEpochMs: null,
+        takeover: false,
+        lossReason: null,
+        ownerToken: "unavailable-route-owner-token-canary",
+        canonicalDatabasePath: "C:\\unavailable-route\\runtime.sqlite",
+        scopeDigest: "unavailable-route-scope-digest-canary",
+        namedPipeName: "\\\\.\\pipe\\unavailable-route-runtime-canary",
+        keyFingerprint: "unavailable-route-key-fingerprint-canary",
+      },
+    },
+  ] as const;
+  let current = cases[0].snapshot as (typeof cases)[number]["snapshot"];
+  router.setRuntimeOwnershipSnapshotProvider(() => current);
+
+  for (const ownership of cases) {
+    current = ownership.snapshot;
+    const responses = await Promise.all([
+      router.route("/status"),
+      router.route("/status detail"),
+      router.route("/readiness"),
+      router.route("/readiness detail"),
+      router.routeReadOnlyCallback({ type: "STATUS" }),
+      router.routeReadOnlyCallback({ type: "STATUS_DETAIL" }),
+      router.routeReadOnlyCallback({ type: "READINESS" }),
+      router.routeReadOnlyCallback({ type: "READINESS_DETAIL" }),
+    ]);
+
+    for (const response of responses) {
+      assert.match(response.text, new RegExp(`runtime_ownership_status: ${ownership.expectedStatus}|\\(${ownership.expectedStatus}\\)`, "u"));
+      assert.doesNotMatch(response.text, /route-owner-token-canary|runtime\.sqlite|route-scope-digest-canary|route-runtime-canary|route-key-fingerprint-canary/u);
+    }
+  }
+});
+
 test("/status detail exactly equals the canonical formatStatusMessage output", async () => {
   const repository = new InMemoryExecutionRepository();
   await repository.saveReconciliationRun({
