@@ -80,11 +80,8 @@ export class RuntimeHeartbeat {
     this.stopped = true;
     this.started = false;
     this.clearScheduledTimer();
-    this.unsubscribeGuardLoss?.();
-    this.unsubscribeGuardLoss = null;
     const pendingAttempt = this.inFlight ?? Promise.resolve();
-    const pendingLossCallback = this.lossCallbackPromise ?? Promise.resolve();
-    this.stopPromise = Promise.all([pendingAttempt, pendingLossCallback]).then(() => undefined);
+    this.stopPromise = this.finishStop(pendingAttempt);
     return this.stopPromise;
   }
 
@@ -184,6 +181,16 @@ export class RuntimeHeartbeat {
     if (this.timerHandle === null) return;
     this.timer.clear(this.timerHandle);
     this.timerHandle = null;
+  }
+
+  private async finishStop(pendingAttempt: Promise<void>): Promise<void> {
+    try {
+      await pendingAttempt;
+      await (this.lossCallbackPromise ?? Promise.resolve());
+    } finally {
+      this.unsubscribeGuardLoss?.();
+      this.unsubscribeGuardLoss = null;
+    }
   }
 }
 

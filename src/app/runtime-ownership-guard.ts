@@ -49,6 +49,7 @@ interface RuntimeOwnershipGuardDependencies {
 
 export class RuntimeOwnershipGuard implements RuntimeOwnershipAuthority {
   private status: RuntimeOwnershipSnapshot["status"] = "UNOWNED";
+  private acquisitionReserved = false;
   private record: RuntimeOwnershipRecord | null = null;
   private takeover = false;
   private lossReason: string | null = null;
@@ -60,12 +61,13 @@ export class RuntimeOwnershipGuard implements RuntimeOwnershipAuthority {
   }
 
   async acquire(input: AcquireGuardOwnershipInput): Promise<RuntimeOwnershipRecord> {
-    if (this.status !== "UNOWNED") {
+    if (this.status !== "UNOWNED" || this.acquisitionReserved) {
       throw new RuntimeOwnershipGuardError(
         "RUNTIME_OWNERSHIP_REACQUISITION_FORBIDDEN",
         "RUNTIME_OWNERSHIP_REACQUISITION_FORBIDDEN: A runtime ownership guard can acquire only once.",
       );
     }
+    this.acquisitionReserved = true;
     if (!this.dependencies.processLock.isHeld()) {
       this.markLost("PROCESS_LOCK_LOST");
       this.throwLost();

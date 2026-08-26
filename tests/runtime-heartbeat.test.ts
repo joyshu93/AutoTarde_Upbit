@@ -160,6 +160,45 @@ test("runtime heartbeat stop is asynchronous and idempotently prevents future re
   assert.deepEqual(fixture.losses, []);
 });
 
+test("runtime heartbeat stop observes an in-flight mismatch and awaits its loss callback", async () => {
+  const store = new DeferredRenewalStore(new InMemoryRuntimeOwnershipStore());
+  let releaseLossCallback: (() => void) | null = null;
+  const lossCallbackGate = new Promise<void>((resolve) => {
+    releaseLossCallback = resolve;
+  });
+  let lossCallbackStarted = false;
+  const fixture = await createHeartbeatFixture(store, async () => {
+    lossCallbackStarted = true;
+    await lossCallbackGate;
+  });
+  fixture.heartbeat.start();
+  fixture.clock.set(11_000);
+  const timerRun = fixture.timer.fireNext();
+  assert.equal(store.renewCalls, 1);
+
+  let stopSettled = false;
+  const stop = fixture.heartbeat.stop().then(() => {
+    stopSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(stopSettled, false);
+
+  store.completeWithMismatch();
+  await timerRun;
+  await Promise.resolve();
+
+  assert.equal(fixture.guard.snapshot().status, "LOST");
+  assert.deepEqual(fixture.losses, ["HEARTBEAT_RENEWAL_MISMATCH"]);
+  assert.equal(lossCallbackStarted, true);
+  assert.equal(stopSettled, false);
+
+  const release = releaseLossCallback as (() => void) | null;
+  if (release === null) throw new Error("Expected the loss callback to start.");
+  release();
+  await stop;
+  assert.equal(stopSettled, true);
+});
+
 interface HeartbeatFixture {
   readonly clock: ManualClock;
   readonly timer: ManualTimer;
@@ -172,6 +211,7 @@ interface HeartbeatFixture {
 
 async function createHeartbeatFixture(
   store: RuntimeOwnershipStore = new InMemoryRuntimeOwnershipStore(),
+  afterLoss?: (reason: string) => void | Promise<void>,
 ): Promise<HeartbeatFixture> {
   const clock = new ManualClock(1_000);
   const timer = new ManualTimer();
@@ -187,6 +227,7 @@ async function createHeartbeatFixture(
     timer,
     onLoss: (reason) => {
       losses.push(reason);
+      return afterLoss?.(reason);
     },
   });
   return { clock, timer, processLock, store, guard, heartbeat, losses };
@@ -290,6 +331,48 @@ class TransientRenewalStore implements RuntimeOwnershipStore {
       return Promise.reject(new Error("SQLITE_BUSY"));
     }
     return this.delegate.renew(input);
+  }
+
+  release(input: ReleaseRuntimeOwnershipInput) {
+    return this.delegate.release(input);
+  }
+
+  recordLost(input: RecordRuntimeOwnershipLostInput) {
+    return this.delegate.recordLost(input);
+  }
+
+  listRecentEvents(limit: number) {
+    return this.delegate.listRecentEvents(limit);
+  }
+}
+
+class DeferredRenewalStore implements RuntimeOwnershipStore {
+  renewCalls = 0;
+
+  private pendingRenewal: ((value: null) => void) | null = null;
+
+  constructor(private readonly delegate: RuntimeOwnershipStore) {}
+
+  getCurrent() {
+    return this.delegate.getCurrent();
+  }
+
+  acquireAfterProcessLock(input: AcquireRuntimeOwnershipInput) {
+    return this.delegate.acquireAfterProcessLock(input);
+  }
+
+  renew(_input: RenewRuntimeOwnershipInput) {
+    this.renewCalls += 1;
+    return new Promise<null>((resolve) => {
+      this.pendingRenewal = resolve;
+    });
+  }
+
+  completeWithMismatch(): void {
+    const resolve = this.pendingRenewal;
+    if (resolve === null) throw new Error("Expected one deferred heartbeat renewal.");
+    this.pendingRenewal = null;
+    resolve(null);
   }
 
   release(input: ReleaseRuntimeOwnershipInput) {

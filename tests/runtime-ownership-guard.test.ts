@@ -8,6 +8,13 @@ import type {
   RuntimeProcessLock,
   RuntimeProcessLockLossReason,
 } from "../src/app/runtime-process-lock.js";
+import type {
+  AcquireRuntimeOwnershipInput,
+  RecordRuntimeOwnershipLostInput,
+  ReleaseRuntimeOwnershipInput,
+  RenewRuntimeOwnershipInput,
+  RuntimeOwnershipStore,
+} from "../src/modules/db/runtime-ownership-interfaces.js";
 import { InMemoryRuntimeOwnershipStore } from
   "../src/modules/db/repositories/in-memory-runtime-ownership-store.js";
 import { test } from "./harness.js";
@@ -60,6 +67,27 @@ test("runtime ownership guard transitions from UNOWNED to OWNED and forbids reac
     () => guard.acquire({ executionMode: "LIVE", acquiredAtEpochMs: 3_000 }),
     /RUNTIME_OWNERSHIP_REACQUISITION_FORBIDDEN/u,
   );
+});
+
+test("runtime ownership guard reserves acquisition before awaiting persistence", async () => {
+  const store = new DeferredAcquisitionStore();
+  const guard = new RuntimeOwnershipGuard({
+    processLock: new FakeProcessLock(),
+    store,
+    ownerToken: OWNER_A,
+  });
+
+  const firstAcquire = guard.acquire({ executionMode: "LIVE", acquiredAtEpochMs: 1_000 });
+  const concurrentAcquire = guard.acquire({ executionMode: "LIVE", acquiredAtEpochMs: 1_001 });
+
+  await assert.rejects(
+    () => concurrentAcquire,
+    /RUNTIME_OWNERSHIP_REACQUISITION_FORBIDDEN/u,
+  );
+  assert.equal(store.acquireCalls, 1);
+  await store.completeAcquisition();
+  assert.equal((await firstAcquire).generation, 1);
+  assert.equal(guard.snapshot().status, "OWNED");
 });
 
 test("runtime ownership guard permanently fences synchronous process-lock loss", async () => {
@@ -166,5 +194,57 @@ class FakeProcessLock implements RuntimeProcessLock {
 
   dropWithoutEvent(): void {
     this.held = false;
+  }
+}
+
+class DeferredAcquisitionStore implements RuntimeOwnershipStore {
+  acquireCalls = 0;
+
+  private readonly delegate = new InMemoryRuntimeOwnershipStore();
+  private pending: {
+    readonly input: AcquireRuntimeOwnershipInput;
+    readonly resolve: (value: Awaited<ReturnType<RuntimeOwnershipStore["acquireAfterProcessLock"]>>) => void;
+    readonly reject: (reason: unknown) => void;
+  } | null = null;
+
+  getCurrent() {
+    return this.delegate.getCurrent();
+  }
+
+  acquireAfterProcessLock(input: AcquireRuntimeOwnershipInput) {
+    this.acquireCalls += 1;
+    if (this.pending !== null) {
+      return Promise.reject(new Error("STORE_CONCURRENT_ACQUIRE"));
+    }
+    return new Promise<Awaited<ReturnType<RuntimeOwnershipStore["acquireAfterProcessLock"]>>>((resolve, reject) => {
+      this.pending = { input, resolve, reject };
+    });
+  }
+
+  async completeAcquisition(): Promise<void> {
+    const pending = this.pending;
+    if (pending === null) throw new Error("Expected one deferred acquisition.");
+    this.pending = null;
+    try {
+      pending.resolve(await this.delegate.acquireAfterProcessLock(pending.input));
+    } catch (error) {
+      pending.reject(error);
+    }
+  }
+
+  renew(input: RenewRuntimeOwnershipInput) {
+    return this.delegate.renew(input);
+  }
+
+  release(input: ReleaseRuntimeOwnershipInput) {
+    return this.delegate.release(input);
+  }
+
+  recordLost(input: RecordRuntimeOwnershipLostInput) {
+    return this.delegate.recordLost(input);
+  }
+
+  listRecentEvents(limit: number) {
+    return this.delegate.listRecentEvents(limit);
   }
 }
