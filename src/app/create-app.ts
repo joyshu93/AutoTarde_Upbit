@@ -59,6 +59,10 @@ import type {
 import {
   verifyLiveDatabaseIdentity,
 } from "./live-database-identity.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "./runtime-ownership-guard.js";
 
 export interface AppServices {
   config: AppConfig;
@@ -88,6 +92,7 @@ export interface AppServices {
 export interface CreateAppOverrides {
   publicMarketDataReader?: PositionGuardPublicMarketDataReader;
   privateExchangeAdapter?: LiveExecutionAdapter;
+  runtimeOwnershipAuthority?: RuntimeOwnershipAuthority;
   afterCandidatePilotAuthorityValidated?: (authority: PositionGuardPilotAbandonmentValidation) => void;
   candidatePilotInitializerClock?: PositionGuardPilotInitializerClock;
   candidatePilotInitializerRepository?: PositionGuardPilotInitializerRepository;
@@ -112,6 +117,30 @@ export function createApp(
     exchangeAccountId: "primary",
     upbitAccessKey: process.env.UPBIT_ACCESS_KEY?.trim() || null,
   });
+  const exchangeBackedReadEnabled = Boolean(
+    process.env.UPBIT_ACCESS_KEY && process.env.UPBIT_SECRET_KEY,
+  );
+  const liveSendEnabled =
+    config.executionMode === "LIVE" &&
+    config.liveExecutionGate === "ENABLED" &&
+    exchangeBackedReadEnabled;
+  if (liveSendEnabled) {
+    const runtimeAuthority = overrides.runtimeOwnershipAuthority;
+    if (runtimeAuthority === undefined) {
+      throw new RuntimeOwnershipGuardError(
+        "RUNTIME_OWNERSHIP_NOT_HELD",
+        "RUNTIME_OWNERSHIP_NOT_HELD: LIVE application construction requires acquired runtime authority.",
+      );
+    }
+    runtimeAuthority.assertLocallyHeld();
+    const ownership = runtimeAuthority.snapshot();
+    if (ownership.status !== "OWNED" || ownership.executionMode !== "LIVE") {
+      throw new RuntimeOwnershipGuardError(
+        "RUNTIME_OWNERSHIP_NOT_HELD",
+        "RUNTIME_OWNERSHIP_NOT_HELD: LIVE application construction requires matching LIVE runtime authority.",
+      );
+    }
+  }
   const persistence = createSqlitePersistence({
     databasePath: config.databasePath,
     exchangeAccountId: "primary",
@@ -164,12 +193,7 @@ export function createApp(
     baseUrl: config.upbitBaseUrl,
   });
   const dryRunExchangeAdapter = new DryRunExchangeAdapter();
-  const exchangeBackedReadEnabled = Boolean(process.env.UPBIT_ACCESS_KEY && process.env.UPBIT_SECRET_KEY);
   const syncExchangeAdapter = exchangeBackedReadEnabled ? privateExchangeAdapter : dryRunExchangeAdapter;
-  const liveSendEnabled =
-    config.executionMode === "LIVE" &&
-    config.liveExecutionGate === "ENABLED" &&
-    exchangeBackedReadEnabled;
   const executionAdapter: ExecutionExchangeAdapter = liveSendEnabled ? privateExchangeAdapter : dryRunExchangeAdapter;
   const liveSendPath = executionAdapter.sendPath;
   const telegramMessageClient = config.telegramBotToken

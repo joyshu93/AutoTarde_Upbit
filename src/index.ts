@@ -1,8 +1,17 @@
 import { fileURLToPath } from "node:url";
 
 import { createApp, type AppServices } from "./app/create-app.js";
-import { loadAppConfig } from "./app/env.js";
-import { verifyLiveDatabaseIdentity } from "./app/live-database-identity.js";
+import { loadAppConfig, type AppConfig } from "./app/env.js";
+import {
+  createRuntimeOwnershipContext,
+  verifyAndResolveRuntimeDatabase,
+  type RuntimeOwnershipContext,
+  type VerifiedRuntimeDatabase,
+} from "./app/runtime-ownership-context.js";
+import {
+  acquireRuntimeProcessLock,
+  type RuntimeProcessLock,
+} from "./app/runtime-process-lock.js";
 import {
   hasBackgroundRuntime,
   createRuntimeShutdown,
@@ -28,6 +37,24 @@ export interface AppStartupOperations {
   readonly installRuntimeSignalHandlers?: typeof installRuntimeSignalHandlers;
   readonly startTelegramRuntime?: typeof startTelegramRuntime;
   readonly writeBanner?: (banner: unknown) => void;
+  readonly runtimeOwnership?: RuntimeOwnershipContext;
+}
+
+export interface RunMainOperations {
+  loadAppConfig(): AppConfig;
+  verifyAndResolveRuntimeDatabase(config: AppConfig): VerifiedRuntimeDatabase;
+  acquireRuntimeProcessLock(
+    identity: VerifiedRuntimeDatabase["lockIdentity"],
+  ): Promise<RuntimeProcessLock>;
+  createRuntimeOwnershipContext(input: {
+    readonly config: AppConfig;
+    readonly processLock: RuntimeProcessLock;
+  }): Promise<RuntimeOwnershipContext>;
+  createApp(
+    config: AppConfig,
+    overrides: { readonly runtimeOwnershipAuthority: RuntimeOwnershipContext["guard"] },
+  ): AppServices;
+  runAppStartup(app: AppServices, operations: AppStartupOperations): Promise<void>;
 }
 
 export async function startTelegramRuntime(input: {
@@ -221,21 +248,35 @@ export async function runAppStartup(
 }
 
 export async function runMain(
-  createApplication: () => AppServices = createVerifiedApplication,
+  overrides: Partial<RunMainOperations> = {},
 ): Promise<void> {
-  const app = createApplication();
-  await runAppStartup(app);
+  const operations: RunMainOperations = {
+    loadAppConfig,
+    verifyAndResolveRuntimeDatabase,
+    acquireRuntimeProcessLock,
+    createRuntimeOwnershipContext,
+    createApp,
+    runAppStartup,
+    ...overrides,
+  };
+  const config = operations.loadAppConfig();
+  const verified = operations.verifyAndResolveRuntimeDatabase(config);
+  const processLock = await operations.acquireRuntimeProcessLock(verified.lockIdentity);
+  const ownership = await operations.createRuntimeOwnershipContext({ config, processLock });
+  try {
+    const app = operations.createApp(config, {
+      runtimeOwnershipAuthority: ownership.guard,
+    });
+    await operations.runAppStartup(app, { runtimeOwnership: ownership });
+  } catch (error) {
+    await ownership.shutdownAfterStartupFailure();
+    throw error;
+  }
 }
 
 export function createVerifiedApplication(): AppServices {
   const config = loadAppConfig();
-  verifyLiveDatabaseIdentity({
-    executionMode: config.executionMode,
-    databasePath: config.databasePath,
-    expectedDatabaseInstanceId: config.liveDatabaseInstanceId ?? null,
-    exchangeAccountId: "primary",
-    upbitAccessKey: process.env.UPBIT_ACCESS_KEY?.trim() || null,
-  });
+  verifyAndResolveRuntimeDatabase(config);
   return createApp(config);
 }
 

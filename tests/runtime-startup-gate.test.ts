@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdir, rm } from "node:fs/promises";
+import path from "node:path";
 
 import { runRuntimeStartupGate, stopAppRuntime } from "../src/app/runtime-lifecycle.js";
+import { createRuntimeOwnershipContext } from "../src/app/runtime-ownership-context.js";
+import type { RuntimeProcessLock, RuntimeProcessLockLossReason } from
+  "../src/app/runtime-process-lock.js";
+import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
 import { test } from "./harness.js";
 
 test("runtime startup gate continues without candidate initialization when initializer is null", async () => {
@@ -81,6 +87,79 @@ test("runtime startup gate stops every resource once and preserves continuation 
   assert.deepEqual(calls, ["telegram", "scheduler", "persistence"]);
 });
 
+test("runtime ownership context closes its dedicated SQLite connection independently", async () => {
+  const databasePath = await createTempDatabasePath("dedicated-connection");
+  const processLock = new FakeRuntimeProcessLock();
+  let ownership: Awaited<ReturnType<typeof createRuntimeOwnershipContext>> | null = null;
+  let appPersistence: ReturnType<typeof createSqlitePersistence> | null = null;
+
+  try {
+    ownership = await createRuntimeOwnershipContext({
+      config: { databasePath, executionMode: "DRY_RUN" },
+      processLock,
+    });
+    appPersistence = createSqlitePersistence({
+      databasePath,
+      exchangeAccountId: "primary",
+      userId: "system_operator",
+      userTelegramId: "system_operator",
+      userDisplayName: "System Operator",
+      accessKeyRef: "UNCONFIGURED",
+      secretKeyRef: "UNCONFIGURED",
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "DISABLED",
+      killSwitchActive: false,
+    });
+
+    assert.equal(ownership.snapshot().status, "OWNED");
+    assert.equal(await ownership.releaseCurrentOwnership(Date.now()), true);
+    ownership.closeOwnershipDatabase();
+    assert.equal((await appPersistence.operatorState.getState()).exchangeAccountId, "primary");
+  } finally {
+    appPersistence?.close();
+    ownership?.closeOwnershipDatabase();
+    await ownership?.releaseProcessLock();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("startup-failure ownership cleanup is idempotent and releases only acquired resources", async () => {
+  const databasePath = await createTempDatabasePath("startup-failure-cleanup");
+  const processLock = new FakeRuntimeProcessLock();
+  const ownership = await createRuntimeOwnershipContext({
+    config: { databasePath, executionMode: "DRY_RUN" },
+    processLock,
+  });
+
+  await ownership.shutdownAfterStartupFailure();
+  await ownership.shutdownAfterStartupFailure();
+
+  assert.equal(ownership.snapshot().status, "LOST");
+  assert.equal(processLock.releaseCalls, 1);
+  await cleanupTempDatabase(databasePath);
+});
+
+test("ownership database open failure preserves its error and releases the acquired process lock", async () => {
+  const databasePath = await createTempDatabasePath("ownership-open-failure");
+  const processLock = new FakeRuntimeProcessLock();
+  await mkdir(databasePath);
+  let originalError: unknown;
+
+  try {
+    await createRuntimeOwnershipContext({
+      config: { databasePath, executionMode: "DRY_RUN" },
+      processLock,
+    });
+  } catch (error) {
+    originalError = error;
+  }
+
+  assert.ok(originalError instanceof Error);
+  assert.match(originalError.message, /SQLite|database|open/u);
+  assert.equal(processLock.releaseCalls, 1);
+  await rm(databasePath, { recursive: true, force: true });
+});
+
 function createRuntimeApp(calls: string[], failTelegramStop = false) {
   return {
     telegramInboundPolling: {
@@ -135,4 +214,43 @@ function createSchedulerStatus(started: boolean) {
     startupPreflight: null,
     markets: [],
   };
+}
+
+class FakeRuntimeProcessLock implements RuntimeProcessLock {
+  readonly identity = { scopeDigest: "b".repeat(64) };
+  releaseCalls = 0;
+  private held = true;
+  private readonly listeners = new Set<(reason: RuntimeProcessLockLossReason) => void>();
+
+  isHeld(): boolean {
+    return this.held;
+  }
+
+  onLost(listener: (reason: RuntimeProcessLockLossReason) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  async release(): Promise<void> {
+    if (!this.held) return;
+    this.held = false;
+    this.releaseCalls += 1;
+  }
+}
+
+async function createTempDatabasePath(label: string): Promise<string> {
+  const directory = path.resolve(process.cwd(), ".tmp-db-tests");
+  await mkdir(directory, { recursive: true });
+  return path.join(
+    directory,
+    `runtime-startup-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}.sqlite`,
+  );
+}
+
+async function cleanupTempDatabase(databasePath: string): Promise<void> {
+  await Promise.all([
+    rm(databasePath, { force: true }),
+    rm(`${databasePath}-wal`, { force: true }),
+    rm(`${databasePath}-shm`, { force: true }),
+  ]);
 }
