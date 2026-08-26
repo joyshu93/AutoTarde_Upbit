@@ -29,6 +29,7 @@ await import("./portfolio-sync-service.test.js");
 await import("./candidate-btc-run-preparation.test.js");
 await import("./history-recovery-validation.test.js");
 await import("./startup-recovery.test.js");
+await import("./runtime-process-lock.test.js");
 await import("./runtime-lifecycle.test.js");
 await import("./runtime-startup-gate.test.js");
 await import("./index-startup.test.js");
