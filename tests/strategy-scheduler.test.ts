@@ -1594,6 +1594,98 @@ test("run-on-start resolves ownership per market sequentially before later timer
   assert.deepEqual(scheduledDelays, [1_800_000, 2_700_000]);
 });
 
+test("strategy scheduler stopAndWait clears timers, rejects new work, and waits for the active run", async () => {
+  const activeRun = createDeferred<void>();
+  const scheduledCallbacks: Array<() => void> = [];
+  let clearTimerCalls = 0;
+  let requestRunCalls = 0;
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(request) {
+        requestRunCalls += 1;
+        await activeRun.promise;
+        return createController().requestRun(request);
+      },
+    }),
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:01.000Z",
+      "2026-04-20T00:00:02.000Z",
+    ]),
+    setTimer: (callback) => {
+      scheduledCallbacks.push(callback);
+      return setTimeout(() => undefined, 60_000);
+    },
+    clearTimer: (timer) => {
+      clearTimerCalls += 1;
+      clearTimeout(timer);
+    },
+  });
+
+  scheduler.start();
+  const currentRun = scheduler.runMarketNow("KRW-BTC");
+  await waitForMicrotasks();
+  let stopResolved = false;
+  const stopping = scheduler.stopAndWait(1_000).then((status) => {
+    stopResolved = true;
+    return status;
+  });
+
+  assert.equal(clearTimerCalls, 1);
+  assert.throws(() => scheduler.start(), /cannot start after stop/i);
+  await assert.rejects(() => scheduler.runMarketNow("KRW-BTC"), /cannot run after stop/i);
+  scheduledCallbacks[0]?.();
+  await waitForMicrotasks();
+  assert.equal(requestRunCalls, 1);
+  assert.equal(stopResolved, false);
+
+  activeRun.resolve();
+  await currentRun;
+  const status = await stopping;
+  assert.equal(status.started, false);
+  assert.equal(status.markets[0]?.running, false);
+});
+
+test("strategy scheduler stopAndWait returns at its bound while active work remains visible", async () => {
+  const activeRun = createDeferred<void>();
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(request) {
+        await activeRun.promise;
+        return createController().requestRun(request);
+      },
+    }),
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:01.000Z",
+    ]),
+  });
+
+  const currentRun = scheduler.runMarketNow("KRW-BTC");
+  await waitForMicrotasks();
+  const status = await scheduler.stopAndWait(0);
+
+  assert.equal(status.started, false);
+  assert.equal(status.markets[0]?.running, true);
+
+  activeRun.resolve();
+  await currentRun;
+});
+
 function createController(
   overrides: Partial<TelegramStrategyRunController> = {},
 ): TelegramStrategyRunController {
@@ -1653,4 +1745,12 @@ function createNowSequence(values: string[]): () => string {
 
 async function waitForMicrotasks(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }

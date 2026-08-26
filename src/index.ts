@@ -17,6 +17,8 @@ import {
   createRuntimeShutdown,
   installRuntimeSignalHandlers,
   runRuntimeStartupGate,
+  type RuntimeOwnershipLossSource,
+  type RuntimeShutdown,
 } from "./app/runtime-lifecycle.js";
 import { buildStrategySchedulerStartupPreflight } from "./app/scheduler-preflight.js";
 import { applyStartupRecoveryPolicy, runStartupRecovery } from "./app/startup-recovery.js";
@@ -105,11 +107,16 @@ export async function runAppStartup(
   const writeBanner = operations.writeBanner ?? ((banner: unknown) => {
     console.log(JSON.stringify(banner, null, 2));
   });
-  const runtimeShutdown = createRuntimeShutdown(app);
+  const appOnlyShutdown = operations.runtimeOwnership
+    ? null
+    : createRuntimeShutdown(app);
+  const runtimeShutdown: RuntimeShutdown = operations.runtimeOwnership
+    ? createRuntimeShutdown(app, operations.runtimeOwnership)
+    : async () => appOnlyShutdown!();
 
   await runRuntimeStartupGate({
     initializer: app.candidatePilotStartupAuthority,
-    shutdown: runtimeShutdown,
+    shutdown: () => runtimeShutdown("STARTUP_FAILED"),
     continueStartup: async () => {
   await app.candidatePilotStartupRecovery?.prepareAndRecover();
   const startupRecovery = await runStartupRecoveryOperation({
@@ -171,12 +178,14 @@ export async function runAppStartup(
     liveSendPath: app.liveSendPath,
   });
   app.strategyScheduler.setStartupPreflight(strategySchedulerStartupPreflight);
+  const ownershipLossSource = resolveOwnershipLossSource(operations.runtimeOwnership);
   const telegramRuntime = await startTelegramRuntimeOperation({
     strategyScheduler: app.strategyScheduler,
     telegramInboundPolling: app.telegramInboundPolling,
     installRuntimeSignalHandlers: () => installRuntimeSignalHandlersOperation({
       app,
-      shutdown: runtimeShutdown,
+      shutdown: (reason) => runtimeShutdown(reason ?? "RUNTIME_SHUTDOWN"),
+      ...(ownershipLossSource === undefined ? {} : { ownershipLossSource }),
     }),
     telegramCommandMenuSetup: app.telegramCommandMenuSetup,
   });
@@ -241,10 +250,21 @@ export async function runAppStartup(
   writeBanner(banner);
 
   if (!runtimeHasBackgroundWork) {
-    runtimeShutdown();
+    await runtimeShutdown("NO_BACKGROUND_RUNTIME");
   }
     },
   });
+}
+
+function resolveOwnershipLossSource(
+  runtimeOwnership: RuntimeOwnershipContext | undefined,
+): RuntimeOwnershipLossSource | undefined {
+  if (!runtimeOwnership) return undefined;
+  const guard = runtimeOwnership.guard as RuntimeOwnershipContext["guard"] &
+    Partial<RuntimeOwnershipLossSource>;
+  return typeof guard.onLost === "function"
+    ? guard as RuntimeOwnershipContext["guard"] & RuntimeOwnershipLossSource
+    : undefined;
 }
 
 export async function runMain(

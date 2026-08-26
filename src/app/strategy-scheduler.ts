@@ -80,9 +80,11 @@ const SCHEDULER_BATCH_KEY_GRANULARITY_MS = 1_000;
 
 export class StrategyScheduler {
   private started = false;
+  private stopBegun = false;
   private startupBlockReported = false;
   private readonly timers = new Map<SupportedMarket, SchedulerTimer>();
   private readonly statusByMarket = new Map<SupportedMarket, StrategySchedulerMarketStatus>();
+  private readonly inFlightRuns = new Set<Promise<TelegramStrategyRunResult>>();
   private startupPreflight: StrategySchedulerStartupPreflight | null;
   private accountRefreshInFlight: Promise<StrategySchedulerAccountRefreshResult | null> | null = null;
   private scheduledRunQueue: Promise<void> = Promise.resolve();
@@ -105,6 +107,9 @@ export class StrategyScheduler {
   }
 
   start(): StrategySchedulerStatus {
+    if (this.stopBegun) {
+      throw new Error("Strategy scheduler cannot start after stop has begun.");
+    }
     if (!this.dependencies.config.enabled || this.started) {
       return this.getStatus();
     }
@@ -138,6 +143,7 @@ export class StrategyScheduler {
   }
 
   stop(): StrategySchedulerStatus {
+    this.stopBegun = true;
     for (const timer of this.timers.values()) {
       (this.dependencies.clearTimer ?? clearTimeout)(timer);
     }
@@ -146,11 +152,20 @@ export class StrategyScheduler {
     this.started = false;
     for (const market of this.dependencies.config.markets) {
       this.updateMarketStatus(market.market, {
-        running: false,
         nextRunAt: null,
       });
     }
 
+    return this.getStatus();
+  }
+
+  async stopAndWait(timeoutMs: number): Promise<StrategySchedulerStatus> {
+    this.stop();
+    const pending = [
+      ...this.inFlightRuns,
+      this.scheduledRunQueue,
+    ];
+    await waitForWorkOrTimeout(Promise.allSettled(pending), timeoutMs);
     return this.getStatus();
   }
 
@@ -168,7 +183,21 @@ export class StrategyScheduler {
     };
   }
 
-  async runMarketNow(market: SupportedMarket): Promise<TelegramStrategyRunResult> {
+  runMarketNow(market: SupportedMarket): Promise<TelegramStrategyRunResult> {
+    if (this.stopBegun) {
+      return Promise.reject(new Error("Strategy scheduler cannot run after stop has begun."));
+    }
+
+    const run = this.executeMarketNow(market);
+    this.inFlightRuns.add(run);
+    void run.then(
+      () => this.inFlightRuns.delete(run),
+      () => this.inFlightRuns.delete(run),
+    );
+    return run;
+  }
+
+  private async executeMarketNow(market: SupportedMarket): Promise<TelegramStrategyRunResult> {
     const config = this.dependencies.config.markets.find((candidate) => candidate.market === market);
     if (!config) {
       throw new Error(`Unsupported scheduled market: ${market}`);
@@ -775,6 +804,22 @@ export class StrategyScheduler {
 
   private now(): string {
     return this.dependencies.now?.() ?? new Date().toISOString();
+  }
+}
+
+async function waitForWorkOrTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new Error("Strategy scheduler stop timeout must be a finite non-negative number.");
+  }
+
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, Math.trunc(timeoutMs));
+  });
+  try {
+    await Promise.race([promise.then(() => undefined), timeout]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
   }
 }
 

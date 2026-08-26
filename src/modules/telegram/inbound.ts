@@ -124,6 +124,8 @@ export class TelegramInboundPollingService {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private nextOffset: number | null;
   private running = false;
+  private stopBegun = false;
+  private readonly inFlightPolls = new Set<Promise<TelegramInboundPollSummary>>();
   private lastPollAt: string | null = null;
   private lastUpdateId: number | null = null;
   private processedCount = 0;
@@ -148,6 +150,8 @@ export class TelegramInboundPollingService {
       longPollTimeoutSeconds?: number;
       limit?: number;
       now?: () => string;
+      setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+      clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
     },
   ) {
     this.nextOffset = dependencies.initialOffset ?? null;
@@ -166,7 +170,7 @@ export class TelegramInboundPollingService {
     return {
       enabled: this.dependencies.enabled,
       configured: this.isConfigured(),
-      running: this.running,
+      running: this.running || this.inFlightPolls.size > 0,
       nextOffset: this.nextOffset,
       pollIntervalMs: this.pollIntervalMs(),
       longPollTimeoutSeconds: this.longPollTimeoutSeconds(),
@@ -183,6 +187,9 @@ export class TelegramInboundPollingService {
   }
 
   start(): TelegramInboundPollingStatus {
+    if (this.stopBegun) {
+      throw new Error("Telegram inbound polling cannot start after stop has begun.");
+    }
     if (this.running || !this.isConfigured()) {
       return this.getStatus();
     }
@@ -193,16 +200,37 @@ export class TelegramInboundPollingService {
   }
 
   stop(): TelegramInboundPollingStatus {
+    this.stopBegun = true;
     this.running = false;
     if (this.timer) {
-      clearTimeout(this.timer);
+      (this.dependencies.clearTimer ?? clearTimeout)(this.timer);
       this.timer = null;
     }
 
     return this.getStatus();
   }
 
-  async pollOnce(): Promise<TelegramInboundPollSummary> {
+  async stopAndWait(timeoutMs: number): Promise<TelegramInboundPollingStatus> {
+    this.stop();
+    await waitForWorkOrTimeout(Promise.allSettled([...this.inFlightPolls]), timeoutMs);
+    return this.getStatus();
+  }
+
+  pollOnce(): Promise<TelegramInboundPollSummary> {
+    if (this.stopBegun) {
+      return Promise.reject(new Error("Telegram inbound polling cannot poll after stop has begun."));
+    }
+
+    const poll = this.executePollOnce();
+    this.inFlightPolls.add(poll);
+    void poll.then(
+      () => this.inFlightPolls.delete(poll),
+      () => this.inFlightPolls.delete(poll),
+    );
+    return poll;
+  }
+
+  private async executePollOnce(): Promise<TelegramInboundPollSummary> {
     this.lastPollAt = this.now();
 
     if (!this.isConfigured()) {
@@ -318,8 +346,9 @@ export class TelegramInboundPollingService {
       return;
     }
 
-    this.timer = setTimeout(() => {
-      void this.pollOnce().finally(() => {
+    this.timer = (this.dependencies.setTimer ?? setTimeout)(() => {
+      this.timer = null;
+      void this.pollOnce().catch(() => undefined).finally(() => {
         this.scheduleNextPoll(this.pollIntervalMs());
       });
     }, delayMs);
@@ -480,6 +509,22 @@ export class TelegramInboundPollingService {
 
   private now(): string {
     return this.dependencies.now?.() ?? new Date().toISOString();
+  }
+}
+
+async function waitForWorkOrTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new Error("Telegram inbound stop timeout must be a finite non-negative number.");
+  }
+
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, Math.trunc(timeoutMs));
+  });
+  try {
+    await Promise.race([promise.then(() => undefined), timeout]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
   }
 }
 

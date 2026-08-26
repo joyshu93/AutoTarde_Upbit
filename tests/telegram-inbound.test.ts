@@ -1006,6 +1006,87 @@ test("telegram inbound polling starts from a durable offset scoped by bot token 
   assert.equal(service.getStatus().offsetLoaded, true);
 });
 
+test("telegram inbound stopAndWait clears timers, rejects new work, and waits for the active poll", async () => {
+  const activePoll = createDeferred<TelegramInboundUpdate[]>();
+  let getUpdatesCalls = 0;
+  let clearTimerCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        getUpdatesCalls += 1;
+        return activePoll.promise;
+      },
+    },
+    messageClient: {
+      async sendMessage() {},
+    },
+    router: {
+      async route() {
+        return { text: "unused" };
+      },
+    },
+    operatorChatId: "123",
+    pollIntervalMs: 60_000,
+    setTimer: () => setTimeout(() => undefined, 60_000),
+    clearTimer: (timer) => {
+      clearTimerCalls += 1;
+      clearTimeout(timer);
+    },
+  });
+
+  service.start();
+  const currentPoll = service.pollOnce();
+  await waitForMicrotasks();
+  let stopResolved = false;
+  const stopping = service.stopAndWait(1_000).then((status) => {
+    stopResolved = true;
+    return status;
+  });
+
+  assert.equal(clearTimerCalls, 1);
+  assert.equal(service.getStatus().running, true);
+  assert.throws(() => service.start(), /cannot start after stop/i);
+  await assert.rejects(() => service.pollOnce(), /cannot poll after stop/i);
+  assert.equal(getUpdatesCalls, 1);
+  assert.equal(stopResolved, false);
+
+  activePoll.resolve([]);
+  await currentPoll;
+  const status = await stopping;
+  assert.equal(status.running, false);
+});
+
+test("telegram inbound stopAndWait returns at its bound while the active poll remains visible", async () => {
+  const activePoll = createDeferred<TelegramInboundUpdate[]>();
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        return activePoll.promise;
+      },
+    },
+    messageClient: {
+      async sendMessage() {},
+    },
+    router: {
+      async route() {
+        return { text: "unused" };
+      },
+    },
+    operatorChatId: "123",
+  });
+
+  const currentPoll = service.pollOnce();
+  await waitForMicrotasks();
+  const status = await service.stopAndWait(0);
+
+  assert.equal(status.running, true);
+
+  activePoll.resolve([]);
+  await currentPoll;
+});
+
 test("telegram bot update client posts getUpdates payload and normalizes messages", async () => {
   const requests: Array<{ url: string; body: string }> = [];
   const client = new TelegramBotUpdateClient({
@@ -1166,4 +1247,16 @@ function createOffsetStore(input: {
       input.savedOffsets.push(record);
     },
   };
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+async function waitForMicrotasks(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }

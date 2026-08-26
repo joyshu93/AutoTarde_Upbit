@@ -7,6 +7,7 @@ import {
   stopAppRuntime,
   type RuntimeSignalTarget,
 } from "../src/app/runtime-lifecycle.js";
+import type { RuntimeOwnershipContext } from "../src/app/runtime-ownership-context.js";
 import { test } from "./harness.js";
 
 test("runtime lifecycle detects whether background timers are active", () => {
@@ -73,7 +74,7 @@ test("runtime lifecycle records shutdown failures instead of throwing", () => {
   assert.equal(summary.steps[0]?.errorMessage, "telegram_stop_failed");
 });
 
-test("runtime lifecycle signal handler is idempotent and exits by shutdown status", () => {
+test("runtime lifecycle signal handler is idempotent and exits by shutdown status", async () => {
   const writes: string[] = [];
   const exits: number[] = [];
   const listeners = new Map<"SIGINT" | "SIGTERM", () => void>();
@@ -110,7 +111,8 @@ test("runtime lifecycle signal handler is idempotent and exits by shutdown statu
   });
 
   listeners.get("SIGINT")?.();
-  const second = handler.shutdown("manual");
+  const second = await handler.shutdown("manual");
+  await waitFor(() => exits.length === 1);
 
   assert.equal(closeCount, 1);
   assert.deepEqual(exits, [0]);
@@ -118,7 +120,7 @@ test("runtime lifecycle signal handler is idempotent and exits by shutdown statu
   assert.equal(second.status, "STOPPED");
 });
 
-test("runtime lifecycle signal handler reuses an external shutdown owner", () => {
+test("runtime lifecycle signal handler reuses an external shutdown owner", async () => {
   const calls: string[] = [];
   const shutdown = createRuntimeShutdown({
     telegramInboundPolling: {
@@ -153,10 +155,227 @@ test("runtime lifecycle signal handler reuses an external shutdown owner", () =>
     writeLine() {},
   });
 
-  handler.shutdown("manual");
+  await handler.shutdown("manual");
   listeners.get("SIGTERM")?.();
+  await waitFor(() => calls.length === 3);
 
   assert.deepEqual(calls, ["telegram", "scheduler", "persistence"]);
+});
+
+test("owned runtime shutdown fences first and releases the process lock last", async () => {
+  const events: string[] = [];
+  const ownership = createOwnershipContext(events);
+  const shutdown = createRuntimeShutdown(createAsyncRuntimeApp(events), ownership, {
+    nowEpochMs: () => 123_456,
+    timeoutMs: 1_000,
+  });
+
+  const summary = await shutdown("SIGTERM");
+
+  assert.deepEqual(events, [
+    "ownership:fence",
+    "telegram:stop",
+    "scheduler:stop",
+    "workers:quiesce",
+    "ownership:release",
+    "app-db:close",
+    "ownership-db:close",
+    "process-lock:release",
+  ]);
+  assert.equal(summary.reason, "SIGTERM");
+  assert.equal(summary.status, "STOPPED");
+  assert.deepEqual(summary.steps.map((step) => step.status), [
+    "STOPPED",
+    "STOPPED",
+    "STOPPED",
+    "STOPPED",
+    "STOPPED",
+    "STOPPED",
+    "STOPPED",
+    "STOPPED",
+  ]);
+});
+
+test("owned runtime shutdown shares one promise and preserves the first reason", async () => {
+  const events: string[] = [];
+  const quiescence = createDeferred<void>();
+  const app = createAsyncRuntimeApp(events, {
+    async telegramStopAndWait() {
+      events.push("workers:quiesce");
+      await quiescence.promise;
+      return createTelegramStatus(false);
+    },
+  });
+  const shutdown = createRuntimeShutdown(app, createOwnershipContext(events), {
+    nowEpochMs: () => 123_456,
+    timeoutMs: 1_000,
+  });
+
+  const first = shutdown("SIGINT");
+  const second = shutdown("RUNTIME_OWNERSHIP_LOST");
+
+  assert.equal(first, second);
+  quiescence.resolve();
+  const [firstSummary, secondSummary] = await Promise.all([first, second]);
+  assert.equal(firstSummary, secondSummary);
+  assert.equal(firstSummary.reason, "SIGINT");
+  assert.equal(events.filter((event) => event === "process-lock:release").length, 1);
+});
+
+test("ownership loss skips persisted release for an already mismatched generation", async () => {
+  const events: string[] = [];
+  let releaseCalls = 0;
+  const ownership = createOwnershipContext(events, {
+    status: "LOST",
+    lossReason: "PERSISTED_OWNERSHIP_MISMATCH",
+    releaseCurrentOwnership: async () => {
+      releaseCalls += 1;
+      return true;
+    },
+  });
+  const shutdown = createRuntimeShutdown(createAsyncRuntimeApp(events), ownership, {
+    nowEpochMs: () => 123_456,
+    timeoutMs: 1_000,
+  });
+
+  const summary = await shutdown("RUNTIME_OWNERSHIP_LOST");
+
+  assert.equal(releaseCalls, 0);
+  assert.equal(summary.status, "STOPPED");
+  assert.equal(
+    summary.steps.find((step) => step.name === "runtime_ownership_release")?.status,
+    "SKIPPED",
+  );
+  assert.deepEqual(events, [
+    "ownership:fence",
+    "telegram:stop",
+    "scheduler:stop",
+    "workers:quiesce",
+    "app-db:close",
+    "ownership-db:close",
+    "process-lock:release",
+  ]);
+});
+
+test("release and database close failures produce partial shutdown", async () => {
+  const events: string[] = [];
+  const ownership = createOwnershipContext(events, {
+    releaseCurrentOwnership: async () => {
+      events.push("ownership:release");
+      return false;
+    },
+    closeOwnershipDatabase() {
+      events.push("ownership-db:close");
+      throw new Error("ownership_db_close_failed");
+    },
+  });
+  const app = createAsyncRuntimeApp(events, {
+    closeAppDatabase() {
+      events.push("app-db:close");
+      throw new Error("app_db_close_failed");
+    },
+  });
+
+  const summary = await createRuntimeShutdown(app, ownership, {
+    nowEpochMs: () => 123_456,
+    timeoutMs: 1_000,
+  })("SIGTERM");
+
+  assert.equal(summary.status, "PARTIAL_FAILURE");
+  assert.deepEqual(
+    summary.steps.filter((step) => step.status === "FAILED").map((step) => step.name),
+    ["runtime_ownership_release", "sqlite_persistence", "runtime_ownership_database"],
+  );
+  assert.equal(events.at(-1), "process-lock:release");
+});
+
+test("worker quiescence timeout prevents ownership release and still closes lock last", async () => {
+  const events: string[] = [];
+  const never = new Promise<void>(() => undefined);
+  const ownership = createOwnershipContext(events);
+  const app = createAsyncRuntimeApp(events, {
+    async telegramStopAndWait() {
+      events.push("workers:quiesce");
+      await never;
+      return createTelegramStatus(false);
+    },
+  });
+
+  const summary = await createRuntimeShutdown(app, ownership, {
+    nowEpochMs: () => 123_456,
+    timeoutMs: 0,
+  })("SIGTERM");
+
+  assert.equal(summary.status, "PARTIAL_FAILURE");
+  assert.equal(
+    summary.steps.find((step) => step.name === "workers_quiescence")?.status,
+    "FAILED",
+  );
+  assert.equal(
+    summary.steps.find((step) => step.name === "runtime_ownership_release")?.status,
+    "SKIPPED",
+  );
+  assert.equal(events.includes("ownership:release"), false);
+  assert.equal(events.at(-1), "process-lock:release");
+});
+
+test("partial signal shutdown exits non-zero after asynchronous cleanup", async () => {
+  const exits: number[] = [];
+  const listeners = new Map<"SIGINT" | "SIGTERM", () => void>();
+  installRuntimeSignalHandlers({
+    shutdown: async (reason = "MISSING_REASON") => ({
+      reason,
+      status: "PARTIAL_FAILURE",
+      steps: [],
+    }),
+    signalTarget: {
+      on(signal, listener) {
+        listeners.set(signal, listener);
+      },
+      exit(code) {
+        exits.push(code ?? 0);
+        return undefined as never;
+      },
+    },
+    writeLine() {},
+  });
+
+  listeners.get("SIGTERM")?.();
+  await waitFor(() => exits.length === 1);
+
+  assert.deepEqual(exits, [1]);
+});
+
+test("ownership loss uses the signal shutdown owner and always exits non-zero", async () => {
+  const reasons: string[] = [];
+  const exits: number[] = [];
+  let lose: ((reason: string) => void) | null = null;
+  installRuntimeSignalHandlers({
+    shutdown: async (reason = "MISSING_REASON") => {
+      reasons.push(reason);
+      return { reason, status: "STOPPED", steps: [] };
+    },
+    ownershipLossSource: {
+      onLost(listener) {
+        lose = listener;
+        return () => undefined;
+      },
+    },
+    signalTarget: {
+      on() {},
+      exit(code) {
+        exits.push(code ?? 0);
+        return undefined as never;
+      },
+    },
+    writeLine() {},
+  });
+
+  (lose as ((reason: string) => void) | null)?.("PERSISTED_OWNERSHIP_MISMATCH");
+  await waitFor(() => exits.length === 1);
+
+  assert.deepEqual(reasons, ["RUNTIME_OWNERSHIP_LOST"]);
+  assert.deepEqual(exits, [1]);
 });
 
 function createTelegramStatus(running: boolean) {
@@ -188,4 +407,96 @@ function createSchedulerStatus(started: boolean) {
     startupPreflight: null,
     markets: [],
   };
+}
+
+function createAsyncRuntimeApp(
+  events: string[],
+  overrides: {
+    telegramStopAndWait?: (timeoutMs: number) => Promise<ReturnType<typeof createTelegramStatus>>;
+    schedulerStopAndWait?: (timeoutMs: number) => Promise<ReturnType<typeof createSchedulerStatus>>;
+    closeAppDatabase?: () => void;
+  } = {},
+) {
+  return {
+    telegramInboundPolling: {
+      stop() {
+        events.push("telegram:stop");
+        return createTelegramStatus(false);
+      },
+      stopAndWait: overrides.telegramStopAndWait ?? (async () => {
+        events.push("workers:quiesce");
+        return createTelegramStatus(false);
+      }),
+    },
+    strategyScheduler: {
+      stop() {
+        events.push("scheduler:stop");
+        return createSchedulerStatus(false);
+      },
+      stopAndWait: overrides.schedulerStopAndWait ?? (async () => createSchedulerStatus(false)),
+    },
+    persistence: {
+      close: overrides.closeAppDatabase ?? (() => {
+        events.push("app-db:close");
+      }),
+    },
+  };
+}
+
+function createOwnershipContext(
+  events: string[],
+  overrides: {
+    status?: "OWNED" | "LOST";
+    lossReason?: string | null;
+    releaseCurrentOwnership?: (releasedAtEpochMs: number) => Promise<boolean>;
+    closeOwnershipDatabase?: () => void;
+  } = {},
+): RuntimeOwnershipContext {
+  const status = overrides.status ?? "OWNED";
+  return {
+    guard: {} as RuntimeOwnershipContext["guard"],
+    heartbeat: {
+      async stop() {},
+    } as RuntimeOwnershipContext["heartbeat"],
+    snapshot: () => ({
+      status,
+      generation: 7,
+      executionMode: "LIVE",
+      acquiredAtEpochMs: 1_000,
+      heartbeatAtEpochMs: 2_000,
+      expiresAtEpochMs: 47_000,
+      takeover: false,
+      lossReason: overrides.lossReason ?? null,
+    }),
+    fence() {
+      events.push("ownership:fence");
+    },
+    releaseCurrentOwnership: overrides.releaseCurrentOwnership ?? (async () => {
+      events.push("ownership:release");
+      return true;
+    }),
+    closeOwnershipDatabase: overrides.closeOwnershipDatabase ?? (() => {
+      events.push("ownership-db:close");
+    }),
+    async releaseProcessLock() {
+      events.push("process-lock:release");
+    },
+    async shutdownAfterStartupFailure() {},
+  };
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.fail("Timed out waiting for asynchronous lifecycle event.");
 }
