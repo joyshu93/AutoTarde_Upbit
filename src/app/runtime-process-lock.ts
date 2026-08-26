@@ -82,15 +82,18 @@ class ListenerRuntimeProcessLock implements RuntimeProcessLock {
   readonly identity: RuntimeLockIdentity;
 
   private held = true;
-  private releasing = false;
+  private listenerClosed = false;
+  private releaseInProgress = false;
+  private releasePromise: Promise<void> | null = null;
   private readonly lossListeners = new Set<(reason: RuntimeProcessLockLossReason) => void>();
 
   private readonly handleClose = (): void => {
-    if (!this.releasing) this.markLost("LISTENER_CLOSED");
+    this.listenerClosed = true;
+    if (!this.releaseInProgress) this.markLost("LISTENER_CLOSED");
   };
 
   private readonly handleError = (): void => {
-    if (!this.releasing) this.markLost("LISTENER_ERROR");
+    this.markLost("LISTENER_ERROR");
   };
 
   constructor(identity: RuntimeLockIdentity, private readonly listener: RuntimeLockListener) {
@@ -108,22 +111,45 @@ class ListenerRuntimeProcessLock implements RuntimeProcessLock {
     return () => this.lossListeners.delete(listener);
   }
 
-  async release(): Promise<void> {
-    if (!this.held || this.releasing) return;
+  release(): Promise<void> {
+    if (this.releasePromise !== null) return this.releasePromise;
 
-    this.releasing = true;
-    this.held = false;
-    await new Promise<void>((resolve, reject) => {
-      this.listener.close((error) => error === undefined ? resolve() : reject(error));
+    if (this.listenerClosed) {
+      this.releasePromise = Promise.resolve();
+      this.detachListenerHandlers();
+      return this.releasePromise;
+    }
+
+    this.releaseInProgress = true;
+    this.releasePromise = new Promise<void>((resolve, reject) => {
+      try {
+        this.listener.close((error) => {
+          this.releaseInProgress = false;
+          if (error !== undefined) {
+            reject(error);
+            return;
+          }
+          this.held = false;
+          this.detachListenerHandlers();
+          resolve();
+        });
+      } catch (error) {
+        this.releaseInProgress = false;
+        reject(error);
+      }
     });
-    this.listener.off("close", this.handleClose);
-    this.listener.off("error", this.handleError);
+    return this.releasePromise;
   }
 
   private markLost(reason: RuntimeProcessLockLossReason): void {
     if (!this.held) return;
     this.held = false;
     for (const listener of this.lossListeners) listener(reason);
+  }
+
+  private detachListenerHandlers(): void {
+    this.listener.off("close", this.handleClose);
+    this.listener.off("error", this.handleError);
   }
 }
 

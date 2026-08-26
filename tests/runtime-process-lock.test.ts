@@ -32,6 +32,7 @@ test("runtime lock identity is deterministic, domain-separated, and redacts its 
   });
 
   assert.match(identity.scopeDigest, /^[a-f0-9]{64}$/u);
+  assert.equal(identity.scopeDigest, "6390ec07b759af3feb8e7d19657f47ec41618501e1b2b1f5a718a2004754ada0");
   assert.deepEqual(deriveRuntimeLockIdentity(IDENTITY_INPUT), identity);
   assert.notEqual(differentPath.scopeDigest, identity.scopeDigest);
   assert.notEqual(differentAccount.scopeDigest, identity.scopeDigest);
@@ -53,6 +54,40 @@ test("runtime process lock permanently reports unexpected listener closure", asy
   assert.equal(lock.isHeld(), false);
   assert.deepEqual(losses, ["LISTENER_CLOSED"]);
   await lock.release();
+  assert.equal(lock.isHeld(), false);
+});
+
+test("runtime process lock release shares close completion and preserves a close failure", async () => {
+  const listener = new ControlledFakeListener();
+  const lock = createRuntimeProcessLockForTesting(deriveRuntimeLockIdentity(IDENTITY_INPUT), listener);
+
+  const firstRelease = lock.release();
+  const secondRelease = lock.release();
+  assert.equal(firstRelease, secondRelease);
+  assert.equal(listener.closeCalls, 1);
+  assert.equal(lock.isHeld(), true);
+
+  const closeError = new Error("close failed");
+  listener.completeClose(closeError);
+  await assert.rejects(() => firstRelease, closeError);
+  await assert.rejects(() => lock.release(), closeError);
+  assert.equal(listener.closeCalls, 1);
+  assert.equal(lock.isHeld(), true);
+});
+
+test("runtime process lock closes an error-lost listener without reporting a second loss", async () => {
+  const listener = new ControlledFakeListener();
+  const lock = createRuntimeProcessLockForTesting(deriveRuntimeLockIdentity(IDENTITY_INPUT), listener);
+  const losses: RuntimeProcessLockLossReason[] = [];
+  lock.onLost((reason) => losses.push(reason));
+
+  listener.emit("error", new Error("listener fault"));
+  const release = lock.release();
+  assert.equal(listener.closeCalls, 1);
+  listener.completeClose();
+  await release;
+
+  assert.deepEqual(losses, ["LISTENER_ERROR"]);
   assert.equal(lock.isHeld(), false);
 });
 
@@ -90,5 +125,22 @@ class FakeListener extends EventEmitter {
   close(callback: (error?: Error) => void): this {
     callback();
     return this;
+  }
+}
+
+class ControlledFakeListener extends EventEmitter {
+  closeCalls = 0;
+  private readonly callbacks: Array<(error?: Error) => void> = [];
+
+  close(callback: (error?: Error) => void): this {
+    this.closeCalls += 1;
+    this.callbacks.push(callback);
+    return this;
+  }
+
+  completeClose(error?: Error): void {
+    const callback = this.callbacks.shift();
+    if (error === undefined) this.emit("close");
+    callback?.(error);
   }
 }
