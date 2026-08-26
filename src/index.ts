@@ -15,6 +15,7 @@ import {
 import {
   hasBackgroundRuntime,
   createRuntimeShutdown,
+  installRuntimeOwnershipLossHandler,
   installRuntimeSignalHandlers,
   runRuntimeStartupGate,
   type RuntimeOwnershipLossSource,
@@ -113,6 +114,13 @@ export async function runAppStartup(
   const runtimeShutdown: RuntimeShutdown = operations.runtimeOwnership
     ? createRuntimeShutdown(app, operations.runtimeOwnership)
     : async () => appOnlyShutdown!();
+  const ownershipLossSource = resolveOwnershipLossSource(operations.runtimeOwnership);
+  if (ownershipLossSource) {
+    installRuntimeOwnershipLossHandler({
+      shutdown: runtimeShutdown,
+      ownershipLossSource,
+    });
+  }
 
   await runRuntimeStartupGate({
     initializer: app.candidatePilotStartupAuthority,
@@ -178,14 +186,12 @@ export async function runAppStartup(
     liveSendPath: app.liveSendPath,
   });
   app.strategyScheduler.setStartupPreflight(strategySchedulerStartupPreflight);
-  const ownershipLossSource = resolveOwnershipLossSource(operations.runtimeOwnership);
   const telegramRuntime = await startTelegramRuntimeOperation({
     strategyScheduler: app.strategyScheduler,
     telegramInboundPolling: app.telegramInboundPolling,
     installRuntimeSignalHandlers: () => installRuntimeSignalHandlersOperation({
       app,
       shutdown: (reason) => runtimeShutdown(reason ?? "RUNTIME_SHUTDOWN"),
-      ...(ownershipLossSource === undefined ? {} : { ownershipLossSource }),
     }),
     telegramCommandMenuSetup: app.telegramCommandMenuSetup,
   });

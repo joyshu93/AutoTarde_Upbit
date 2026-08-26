@@ -61,6 +61,42 @@ export interface RuntimeOwnershipLossSource {
   onLost(listener: (reason: string) => void): () => void;
 }
 
+export function installRuntimeOwnershipLossHandler(input: {
+  shutdown: RuntimeShutdown;
+  ownershipLossSource: RuntimeOwnershipLossSource;
+  signalTarget?: RuntimeSignalTarget;
+  writeLine?: (line: string) => void;
+}): () => void {
+  const signalTarget = input.signalTarget ?? process;
+  const writeLine = input.writeLine ?? ((line: string) => console.log(line));
+  let exitRequested = false;
+
+  return input.ownershipLossSource.onLost((lossReason) => {
+    if (lossReason === "RUNTIME_SHUTDOWN" || exitRequested) {
+      return;
+    }
+
+    exitRequested = true;
+    void input.shutdown("RUNTIME_OWNERSHIP_LOST")
+      .then((runtimeShutdown) => {
+        writeLine(JSON.stringify({
+          service: "AutoTrade_Upbit",
+          runtimeOwnershipLossReason: lossReason,
+          runtimeShutdown,
+        }, null, 2));
+        signalTarget.exit(1);
+      })
+      .catch((error: unknown) => {
+        writeLine(JSON.stringify({
+          service: "AutoTrade_Upbit",
+          runtimeOwnershipLossReason: lossReason,
+          runtimeShutdownError: error instanceof Error ? error.message : String(error),
+        }, null, 2));
+        signalTarget.exit(1);
+      });
+  });
+}
+
 export interface RuntimeStartupInitializer {
   initialize(): Promise<unknown>;
 }

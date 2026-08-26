@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   createRuntimeShutdown,
   hasBackgroundRuntime,
+  installRuntimeOwnershipLossHandler,
   installRuntimeSignalHandlers,
   stopAppRuntime,
   type RuntimeSignalTarget,
@@ -372,6 +373,38 @@ test("ownership loss uses the signal shutdown owner and always exits non-zero", 
   });
 
   (lose as ((reason: string) => void) | null)?.("PERSISTED_OWNERSHIP_MISMATCH");
+  await waitFor(() => exits.length === 1);
+
+  assert.deepEqual(reasons, ["RUNTIME_OWNERSHIP_LOST"]);
+  assert.deepEqual(exits, [1]);
+});
+
+test("ownership loss can attach to the shared shutdown owner before signal installation", async () => {
+  const reasons: string[] = [];
+  const exits: number[] = [];
+  let lose: ((reason: string) => void) | null = null;
+  installRuntimeOwnershipLossHandler({
+    shutdown: async (reason) => {
+      reasons.push(reason);
+      return { reason, status: "STOPPED", steps: [] };
+    },
+    ownershipLossSource: {
+      onLost(listener) {
+        lose = listener;
+        return () => undefined;
+      },
+    },
+    signalTarget: {
+      on() {},
+      exit(code) {
+        exits.push(code ?? 0);
+        return undefined as never;
+      },
+    },
+    writeLine() {},
+  });
+
+  (lose as ((reason: string) => void) | null)?.("HEARTBEAT_EXPIRED");
   await waitFor(() => exits.length === 1);
 
   assert.deepEqual(reasons, ["RUNTIME_OWNERSHIP_LOST"]);
