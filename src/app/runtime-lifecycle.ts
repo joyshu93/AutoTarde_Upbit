@@ -45,7 +45,9 @@ export interface RuntimeStoppableApp {
   };
   readonly strategyScheduler: {
     stop(): StrategySchedulerStatus;
-    stopAndWait?(timeoutMs: number): Promise<StrategySchedulerStatus>;
+    stopAndWait?(timeoutMs: number): Promise<StrategySchedulerStatus & {
+      readonly quiesced?: boolean;
+    }>;
   };
   readonly persistence: {
     close(): void;
@@ -262,7 +264,10 @@ async function stopOwnedAppRuntime(input: {
     const telegramWait = input.app.telegramInboundPolling.stopAndWait?.(input.timeoutMs) ??
       Promise.resolve(input.app.telegramInboundPolling.stop());
     const schedulerWait = input.app.strategyScheduler.stopAndWait?.(input.timeoutMs) ??
-      Promise.resolve(input.app.strategyScheduler.stop());
+      Promise.resolve({
+        ...input.app.strategyScheduler.stop(),
+        quiesced: true,
+      });
     const [telegramStatus, schedulerStatus] = await waitWithTimeout(
       Promise.all([
         telegramWait,
@@ -274,6 +279,7 @@ async function stopOwnedAppRuntime(input: {
 
     if (
       telegramStatus.running ||
+      schedulerStatus.quiesced === false ||
       schedulerStatus.markets.some((market) => market.running)
     ) {
       throw new Error("Runtime workers did not quiesce before the shutdown timeout.");

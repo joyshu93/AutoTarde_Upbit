@@ -1650,6 +1650,7 @@ test("strategy scheduler stopAndWait clears timers, rejects new work, and waits 
   await currentRun;
   const status = await stopping;
   assert.equal(status.started, false);
+  assert.equal(status.quiesced, true);
   assert.equal(status.markets[0]?.running, false);
 });
 
@@ -1680,6 +1681,7 @@ test("strategy scheduler stopAndWait returns at its bound while active work rema
   const status = await scheduler.stopAndWait(0);
 
   assert.equal(status.started, false);
+  assert.equal(status.quiesced, false);
   assert.equal(status.markets[0]?.running, true);
 
   activeRun.resolve();

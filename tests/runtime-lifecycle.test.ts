@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 
+import type { AppServices } from "../src/app/create-app.js";
 import {
   createRuntimeShutdown,
   hasBackgroundRuntime,
@@ -9,6 +10,8 @@ import {
   type RuntimeSignalTarget,
 } from "../src/app/runtime-lifecycle.js";
 import type { RuntimeOwnershipContext } from "../src/app/runtime-ownership-context.js";
+import { StrategyScheduler } from "../src/app/strategy-scheduler.js";
+import { runAppStartup } from "../src/index.js";
 import { test } from "./harness.js";
 
 test("runtime lifecycle detects whether background timers are active", () => {
@@ -320,6 +323,93 @@ test("worker quiescence timeout prevents ownership release and still closes lock
   assert.equal(events.at(-1), "process-lock:release");
 });
 
+test("scheduler final persistence timeout prevents ownership release after running clears", async () => {
+  const events: string[] = [];
+  const finalPersistence = createDeferred<void>();
+  let finalPersistenceStarted = false;
+  let runSettled = false;
+  let releaseCalled = false;
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: {
+      async requestRun(request) {
+        return {
+          status: "COMPLETED",
+          requestedAt: "2026-08-26T00:00:00.000Z",
+          market: request.market,
+          strategyDecisionId: "decision-1",
+          action: "HOLD",
+          orderId: null,
+          orderStatus: null,
+          submissionAccepted: null,
+          detail: "Decision completed.",
+        };
+      },
+      async requestPreview() {
+        throw new Error("Preview is not used by this regression.");
+      },
+    },
+    repositories: {
+      async saveStrategySchedulerRun() {},
+      async updateStrategySchedulerRun() {
+        finalPersistenceStarted = true;
+        await finalPersistence.promise;
+      },
+    },
+    now: () => "2026-08-26T00:00:00.000Z",
+  });
+  const currentRun = scheduler.runMarketNow("KRW-BTC").finally(() => {
+    runSettled = true;
+  });
+  await waitFor(() => finalPersistenceStarted);
+  assert.equal(scheduler.getStatus().markets[0]?.running, false);
+
+  const ownership = createOwnershipContext(events, {
+    async releaseCurrentOwnership() {
+      releaseCalled = true;
+      events.push("ownership:release");
+      return true;
+    },
+  });
+  const summary = await createRuntimeShutdown({
+    telegramInboundPolling: {
+      stop: () => createTelegramStatus(false),
+      stopAndWait: async () => createTelegramStatus(false),
+    },
+    strategyScheduler: scheduler,
+    persistence: {
+      close() {
+        events.push("app-db:close");
+      },
+    },
+  }, ownership, {
+    nowEpochMs: () => 123_456,
+    timeoutMs: 0,
+  })("SIGTERM");
+
+  assert.equal(summary.status, "PARTIAL_FAILURE");
+  assert.equal(
+    summary.steps.find((step) => step.name === "workers_quiescence")?.status,
+    "FAILED",
+  );
+  assert.equal(
+    summary.steps.find((step) => step.name === "runtime_ownership_release")?.status,
+    "SKIPPED",
+  );
+  assert.equal(releaseCalled, false);
+  assert.equal(runSettled, false);
+  assert.equal(events.at(-1), "process-lock:release");
+
+  finalPersistence.resolve();
+  await currentRun;
+});
+
 test("partial signal shutdown exits non-zero after asynchronous cleanup", async () => {
   const exits: number[] = [];
   const listeners = new Map<"SIGINT" | "SIGTERM", () => void>();
@@ -409,6 +499,54 @@ test("ownership loss can attach to the shared shutdown owner before signal insta
 
   assert.deepEqual(reasons, ["RUNTIME_OWNERSHIP_LOST"]);
   assert.deepEqual(exits, [1]);
+});
+
+test("runAppStartup subscribes ownership loss before candidate startup initialization", async () => {
+  const events: string[] = [];
+  const startupError = new Error("stop_after_ordering_check");
+  const baseOwnership = createOwnershipContext(events);
+  const ownership = {
+    ...baseOwnership,
+    guard: Object.assign(baseOwnership.guard, {
+      onLost() {
+        events.push("ownership-loss:subscribe");
+        return () => undefined;
+      },
+    }),
+  } satisfies RuntimeOwnershipContext;
+  const app = {
+    candidatePilotStartupAuthority: {
+      async initialize() {
+        events.push("candidate:initialize");
+        assert.deepEqual(events.slice(0, 2), [
+          "ownership-loss:subscribe",
+          "candidate:initialize",
+        ]);
+        throw startupError;
+      },
+    },
+    telegramInboundPolling: {
+      stop: () => createTelegramStatus(false),
+      stopAndWait: async () => createTelegramStatus(false),
+    },
+    strategyScheduler: {
+      stop: () => createSchedulerStatus(false),
+      stopAndWait: async () => createSchedulerStatus(false),
+    },
+    persistence: {
+      close() {},
+    },
+  } as unknown as AppServices;
+
+  await assert.rejects(
+    () => runAppStartup(app, { runtimeOwnership: ownership }),
+    (error) => error === startupError,
+  );
+
+  assert.deepEqual(events.slice(0, 2), [
+    "ownership-loss:subscribe",
+    "candidate:initialize",
+  ]);
 });
 
 function createTelegramStatus(running: boolean) {

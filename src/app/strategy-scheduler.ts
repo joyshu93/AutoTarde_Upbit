@@ -33,6 +33,10 @@ export interface StrategySchedulerAccountRefreshResult {
   detail: string;
 }
 
+export interface StrategySchedulerStopStatus extends StrategySchedulerStatus {
+  readonly quiesced: boolean;
+}
+
 export type StrategySchedulerRunPreparationOwner = "SCHEDULER" | "CONTROLLER";
 
 type StrategySchedulerRunPreparationOwnerResolver = (
@@ -159,14 +163,17 @@ export class StrategyScheduler {
     return this.getStatus();
   }
 
-  async stopAndWait(timeoutMs: number): Promise<StrategySchedulerStatus> {
+  async stopAndWait(timeoutMs: number): Promise<StrategySchedulerStopStatus> {
     this.stop();
     const pending = [
       ...this.inFlightRuns,
       this.scheduledRunQueue,
     ];
-    await waitForWorkOrTimeout(Promise.allSettled(pending), timeoutMs);
-    return this.getStatus();
+    const quiesced = await waitForWorkOrTimeout(Promise.allSettled(pending), timeoutMs);
+    return {
+      ...this.getStatus(),
+      quiesced,
+    };
   }
 
   getStatus(): StrategySchedulerStatus {
@@ -807,17 +814,24 @@ export class StrategyScheduler {
   }
 }
 
-async function waitForWorkOrTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
+async function waitForWorkOrTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
     throw new Error("Strategy scheduler stop timeout must be a finite non-negative number.");
   }
 
+  let quiesced = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   const timeout = new Promise<void>((resolve) => {
     timer = setTimeout(resolve, Math.trunc(timeoutMs));
   });
   try {
-    await Promise.race([promise.then(() => undefined), timeout]);
+    await Promise.race([
+      promise.then(() => {
+        quiesced = true;
+      }),
+      timeout,
+    ]);
+    return quiesced;
   } finally {
     if (timer !== null) clearTimeout(timer);
   }
