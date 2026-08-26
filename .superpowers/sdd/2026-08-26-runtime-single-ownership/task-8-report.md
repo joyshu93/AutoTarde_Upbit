@@ -291,3 +291,56 @@ Both Important findings are closed. The only concern remains the explicitly pres
 ### Concerns
 
 1. `npm.cmd test` remains non-zero only because of the preserved pre-existing prospective-shadow validator bundle mismatch described above.
+
+---
+
+## Fix Round 3/5: Remove Invented Cancellation Counters
+
+### Status
+
+DONE_WITH_CONCERNS
+
+The narrow test-contract finding is closed. Real zero-`createOrder` loss coverage and the recursive production-source no-cancellation-caller proof are unchanged.
+
+### Strict TDD Evidence
+
+#### RED
+
+- Pre-change scan found exactly two stale `cancelOrderCalls` occurrences in `tests/runtime-single-ownership-integration.test.ts`: one `OperationalSideEffects` field and one zero initializer.
+- Explicit absence-contract command: `rg -q "cancelOrderCalls" tests/runtime-single-ownership-integration.test.ts; if ($LASTEXITCODE -eq 0) { Write-Error "RED: unused test-only cancelOrderCalls contract remains"; exit 1 }; exit 0`.
+- Result: exit 1 with exact evidence `RED: unused test-only cancelOrderCalls contract remains`.
+- Inspection confirmed there was no callable integration cancellation path and no direct cancellation assertion to preserve. The real replacement/expiry tests asserted `execution.adapter.createOrderCalls === 0`, and `tests/execution-send-authority.test.ts` recursively scanned all production TypeScript and asserted `cancelOrderCallers` equals `[]`.
+
+#### GREEN
+
+- The same absence-contract command exited 0 after removing the two stale declarations.
+- Fresh build: `npm.cmd run build` exited 0.
+- Exact Task 8 focused integration command exited 0 with 8/8 passed, including real Windows named-pipe takeover, real `ExecutionService` zero-create-order generation/expiry loss, synchronous SQLite authority ordering, and temporary cleanup.
+- Focused execution-send-authority command exited 0 with 36/36 passed, including `only ExecutionService has production createOrder authority`; its recursive production scan still asserted zero `.cancelOrder(` callers.
+- `npm.cmd run typecheck` exited 0.
+- `git diff --check` exited 0; only Git's Windows LF-to-CRLF notice was printed.
+- Pre-commit `git status --short` contained only `tests/runtime-single-ownership-integration.test.ts`.
+
+### Files Changed And Justification
+
+- `tests/runtime-single-ownership-integration.test.ts`: removed only the unused `cancelOrderCalls` side-effect field and zero initialization. Real `createOrderCalls` counters and both zero-send ownership-loss assertions remain. No cancellation method, fake, counter, or assertion was added.
+- `.superpowers/sdd/2026-08-26-runtime-single-ownership/task-8-report.md`: appends this RED/GREEN evidence, changed-file justification, commit, safety confirmation, and concern.
+
+No production, root-document, bundle, workflow, migration, launcher, or other test file changed in this round.
+
+### Commit
+
+- Test-contract correction: `dd78aa052b99c50a3489909af620cb9e050298fc` (`test: verify single runtime ownership`).
+- This report is committed separately with the same required subject so it can truthfully record the correction hash.
+
+### Safety Confirmation
+
+- Work remained confined to the isolated `runtime-single-ownership` worktree.
+- No subagent was used.
+- The original checkout, LIVE process, operational database, APIs, network, secrets, and local launchers were not accessed.
+- No production cancellation path was added or invented.
+- No bundle rebuild, push, merge, deploy, or restart occurred.
+
+### Concerns
+
+1. The preserved pre-existing prospective-shadow validator bundle mismatch remains the only known full-suite concern; full `npm.cmd test` was not requested or rerun in this narrow round.
