@@ -807,6 +807,7 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
     assert.ok(migrationRows.some(
       (row) => row.filename === "0018_scope_candidate_evidence_identity_to_deployment.sql",
     ));
+    assert.ok(migrationRows.some((row) => row.filename === "0024_add_runtime_ownership.sql"));
 
     const foreignKeyViolations = handle.db.prepare("PRAGMA foreign_key_check").all();
     assert.deepEqual(foreignKeyViolations, []);
@@ -835,11 +836,148 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
       "strategy_pilot_audit_events",
       "account_execution_leases",
       "order_submission_recovery_observations",
+      "runtime_ownership",
+      "runtime_ownership_events",
     ]) {
       assert.ok(tableNames.has(tableName), `Expected migrated table ${tableName} to exist.`);
     }
+
+    const ownershipSchemaObjects = handle.db.prepare(`
+      SELECT type, name FROM sqlite_master
+      WHERE name IN (
+        'idx_runtime_ownership_expires_at',
+        'idx_runtime_ownership_events_recent',
+        'idx_runtime_ownership_events_generation_acquisition',
+        'runtime_ownership_events_no_update',
+        'runtime_ownership_events_no_delete'
+      )
+      ORDER BY type ASC, name ASC
+    `).all() as Array<{ type: string; name: string }>;
+    assert.deepEqual(ownershipSchemaObjects.map((row) => ({ ...row })), [
+      { type: "index", name: "idx_runtime_ownership_events_generation_acquisition" },
+      { type: "index", name: "idx_runtime_ownership_events_recent" },
+      { type: "index", name: "idx_runtime_ownership_expires_at" },
+      { type: "trigger", name: "runtime_ownership_events_no_delete" },
+      { type: "trigger", name: "runtime_ownership_events_no_update" },
+    ]);
+
+    assert.throws(() => handle.db.prepare(`
+      INSERT INTO runtime_ownership (
+        lease_scope, owner_token, generation, execution_mode,
+        acquired_at_epoch_ms, heartbeat_at_epoch_ms, expires_at_epoch_ms
+      ) VALUES ('WRONG_SCOPE', ?, 1, 'LIVE', 1000, 1000, 46000)
+    `).run("a".repeat(64)), /constraint/u);
+    assert.throws(() => handle.db.prepare(`
+      INSERT INTO runtime_ownership (
+        lease_scope, owner_token, generation, execution_mode,
+        acquired_at_epoch_ms, heartbeat_at_epoch_ms, expires_at_epoch_ms
+      ) VALUES ('APPLICATION_RUNTIME', 'invalid', 1, 'LIVE', 1000, 1000, 46000)
+    `).run(), /constraint/u);
+    assert.throws(() => handle.db.prepare(`
+      INSERT INTO runtime_ownership (
+        lease_scope, owner_token, generation, execution_mode,
+        acquired_at_epoch_ms, heartbeat_at_epoch_ms, expires_at_epoch_ms
+      ) VALUES ('APPLICATION_RUNTIME', ?, 0, 'LIVE', 1000, 1000, 46000)
+    `).run("a".repeat(64)), /constraint/u);
+    assert.throws(() => handle.db.prepare(`
+      INSERT INTO runtime_ownership (
+        lease_scope, owner_token, generation, execution_mode,
+        acquired_at_epoch_ms, heartbeat_at_epoch_ms, expires_at_epoch_ms
+      ) VALUES ('APPLICATION_RUNTIME', ?, 1, 'LIVE', 1000, 999, 46000)
+    `).run("a".repeat(64)), /constraint/u);
+    assert.throws(() => handle.db.prepare(`
+      INSERT INTO runtime_ownership_events (
+        lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
+      ) VALUES ('APPLICATION_RUNTIME', 1, 'INVALID', 'LIVE', 'PROCESS_LOCK_ACQUIRED', 1000)
+    `).run(), /constraint/u);
+    assert.throws(() => handle.db.prepare(`
+      INSERT INTO runtime_ownership_events (
+        lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
+      ) VALUES ('APPLICATION_RUNTIME', 1, 'LOST', 'LIVE', 'invalid reason', 1000)
+    `).run(), /constraint/u);
+
+    handle.db.prepare(`
+      INSERT INTO runtime_ownership_events (
+        lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
+      ) VALUES ('APPLICATION_RUNTIME', 1, 'ACQUIRED', 'LIVE', 'PROCESS_LOCK_ACQUIRED', 1000)
+    `).run();
+    assert.throws(() => handle.db.prepare(`
+      INSERT INTO runtime_ownership_events (
+        lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
+      ) VALUES ('APPLICATION_RUNTIME', 1, 'TAKEN_OVER', 'LIVE', 'PROCESS_LOCK_ACQUIRED', 1001)
+    `).run(), /unique/iu);
+    assert.throws(
+      () => handle.db.prepare("UPDATE runtime_ownership_events SET reason_code = 'ALTERED'").run(),
+      /append-only/u,
+    );
+    assert.throws(
+      () => handle.db.prepare("DELETE FROM runtime_ownership_events").run(),
+      /append-only/u,
+    );
   } finally {
     handle.close();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("runtime ownership migration and ledger insertion roll back atomically", async () => {
+  const databasePath = await createTempDatabasePath("migration-0024-ledger-atomicity");
+  const bootstrap = openSqliteDatabase(databasePath);
+  bootstrap.close();
+
+  const setup = new DatabaseSync(databasePath);
+  try {
+    setup.exec(`
+      DROP TRIGGER runtime_ownership_events_no_update;
+      DROP TRIGGER runtime_ownership_events_no_delete;
+      DROP INDEX idx_runtime_ownership_events_recent;
+      DROP INDEX idx_runtime_ownership_expires_at;
+      DROP TABLE runtime_ownership_events;
+      DROP TABLE runtime_ownership;
+      DELETE FROM _schema_migrations WHERE filename = '0024_add_runtime_ownership.sql';
+      CREATE TRIGGER fail_runtime_ownership_migration_ledger
+      BEFORE INSERT ON _schema_migrations
+      WHEN NEW.filename = '0024_add_runtime_ownership.sql'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected migration ledger failure');
+      END;
+    `);
+  } finally {
+    setup.close();
+  }
+
+  try {
+    assert.throws(() => openSqliteDatabase(databasePath), /injected migration ledger failure/u);
+
+    const afterFailure = new DatabaseSync(databasePath);
+    try {
+      const tables = afterFailure.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name IN ('runtime_ownership', 'runtime_ownership_events')
+      `).all();
+      const ledger = afterFailure.prepare(
+        "SELECT filename FROM _schema_migrations WHERE filename = '0024_add_runtime_ownership.sql'",
+      ).get();
+      assert.deepEqual(tables, []);
+      assert.equal(ledger, undefined);
+      afterFailure.exec("DROP TRIGGER fail_runtime_ownership_migration_ledger;");
+    } finally {
+      afterFailure.close();
+    }
+
+    const recovered = openSqliteDatabase(databasePath);
+    try {
+      assert.ok(recovered.db.prepare(
+        "SELECT filename FROM _schema_migrations WHERE filename = '0024_add_runtime_ownership.sql'",
+      ).get());
+      assert.ok(recovered.db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runtime_ownership'",
+      ).get());
+      assert.deepEqual(recovered.db.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      recovered.close();
+    }
+  } finally {
     await cleanupTempDatabase(databasePath);
   }
 });

@@ -145,13 +145,13 @@ test("LIVE identity verification rejects database, account credential, and migra
 
     const db = new DatabaseSync(fixture.databasePath);
     db.prepare("DELETE FROM _schema_migrations WHERE filename = ?")
-      .run("0023_add_live_database_identity.sql");
+      .run("0024_add_runtime_ownership.sql");
     db.close();
     assert.throws(() => verify(fixture.databasePath), /missing required migration/u);
 
     const futureDb = new DatabaseSync(fixture.databasePath);
     futureDb.prepare("INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)")
-      .run("0023_add_live_database_identity.sql", "2026-08-25T00:00:00.000Z");
+      .run("0024_add_runtime_ownership.sql", "2026-08-25T00:00:00.000Z");
     futureDb.prepare("INSERT INTO _schema_migrations (filename, applied_at) VALUES (?, ?)")
       .run("9999_unknown_future.sql", "2026-08-25T00:00:00.000Z");
     futureDb.close();

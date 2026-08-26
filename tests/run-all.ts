@@ -13,6 +13,7 @@ await import("./position-guard-pilot-initializer.test.js");
 await import("./position-guard-pilot-registry-loader.test.js");
 await import("./create-app.test.js");
 await import("./db-sqlite-wiring.test.js");
+await import("./runtime-ownership-store-contract.test.js");
 await import("./candidate-pilot-repository-contract.test.js");
 await import("./candidate-evidence-service.test.js");
 await import("./account-execution-lease-contract.test.js");
