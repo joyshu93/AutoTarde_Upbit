@@ -3,8 +3,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { Worker } from "node:worker_threads";
 
-import type { RuntimeOwnershipEventRecord } from "../src/domain/runtime-ownership.js";
+import type {
+  RuntimeOwnershipAcquisition,
+  RuntimeOwnershipEventRecord,
+} from "../src/domain/runtime-ownership.js";
 import type { RuntimeOwnershipStore } from
   "../src/modules/db/runtime-ownership-interfaces.js";
 import { InMemoryRuntimeOwnershipStore } from
@@ -149,6 +153,13 @@ async function verifyRuntimeOwnershipValidationContract(
       acquiredAtEpochMs: 1_000,
       expiresAtEpochMs: 46_000,
     });
+    assert.equal(await fixture.store.renew({
+      ownerToken: OWNER_A,
+      generation: 1,
+      heartbeatAtEpochMs: 1_000,
+      expiresAtEpochMs: 47_000,
+    }), null);
+    assert.equal((await fixture.store.getCurrent())?.expiresAtEpochMs, 46_000);
     await assert.rejects(() => fixture.store.renew({
       ownerToken: OWNER_A,
       generation: 1,
@@ -207,6 +218,12 @@ async function verifyAuditChronologyContract(
       reasonCode: "PROCESS_LOCK_LOST",
     }), true);
 
+    await assert.rejects(() => fixture.store.renew({
+      ownerToken: OWNER_A,
+      generation: 1,
+      heartbeatAtEpochMs: 15_000,
+      expiresAtEpochMs: 60_000,
+    }), /timestamp rollback/u);
     await assert.rejects(() => fixture.store.recordLost({
       ownerToken: OWNER_A,
       generation: 1,
@@ -324,45 +341,155 @@ test("SQLite runtime ownership generation allocation fails closed on safe-intege
   }
 });
 
-test("two independent SQLite ownership stores serialize generation takeover", async () => {
+test("two concurrent SQLite worker connections serialize generation takeover", async () => {
   const directory = await mkdtemp(join(tmpdir(), "autotrade-runtime-ownership-race-"));
   const databasePath = join(directory, "runtime.sqlite");
-  const firstHandle = openSqliteDatabase(databasePath);
-  const secondDb = new DatabaseSync(databasePath);
-  secondDb.exec("PRAGMA foreign_keys = ON;");
-  secondDb.exec("PRAGMA busy_timeout = 5000;");
-  const firstStore = new SqliteRuntimeOwnershipStore(firstHandle.db);
-  const secondStore = new SqliteRuntimeOwnershipStore(secondDb);
+  const bootstrap = openSqliteDatabase(databasePath);
+  bootstrap.close();
+  const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+  const storeModuleUrl = new URL(
+    "../src/modules/db/repositories/sqlite-runtime-ownership-store.js",
+    import.meta.url,
+  ).href;
 
   try {
-    const acquisitions = await Promise.all([
-      firstStore.acquireAfterProcessLock({
+    const workerResults = await Promise.all([
+      runOwnershipWorker({
+        databasePath,
+        storeModuleUrl,
+        barrier,
         ownerToken: OWNER_A,
         executionMode: "DRY_RUN",
-        acquiredAtEpochMs: 1_000,
-        expiresAtEpochMs: 46_000,
       }),
-      secondStore.acquireAfterProcessLock({
+      runOwnershipWorker({
+        databasePath,
+        storeModuleUrl,
+        barrier,
         ownerToken: OWNER_B,
         executionMode: "LIVE",
-        acquiredAtEpochMs: 2_000,
-        expiresAtEpochMs: 47_000,
       }),
     ]);
 
+    assert.notEqual(workerResults[0]?.threadId, workerResults[1]?.threadId);
+    assert.equal(Atomics.load(new Int32Array(barrier), 0), 2);
+    const acquisitions = workerResults
+      .map((result) => result.acquisition)
+      .sort((left, right) => left.record.generation - right.record.generation);
     assert.deepEqual(acquisitions.map((result) => result.record.generation), [1, 2]);
     assert.deepEqual(acquisitions.map((result) => result.takeover), [false, true]);
-    assert.equal((await firstStore.getCurrent())?.generation, 2);
-    assert.deepEqual(
-      (await secondStore.listRecentEvents(10)).map((event) => event.eventType),
-      ["TAKEN_OVER", "ACQUIRED"],
-    );
+
+    const inspectionDb = new DatabaseSync(databasePath);
+    const inspectionStore = new SqliteRuntimeOwnershipStore(inspectionDb);
+    try {
+      const current = await inspectionStore.getCurrent();
+      assert.equal(current?.generation, 2);
+      assert.equal(current?.ownerToken, acquisitions[1]?.record.ownerToken);
+      assert.deepEqual(
+        (await inspectionStore.listRecentEvents(10)).map((event) => event.eventType),
+        ["TAKEN_OVER", "ACQUIRED"],
+      );
+    } finally {
+      inspectionDb.close();
+    }
   } finally {
-    secondDb.close();
-    firstHandle.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+interface OwnershipWorkerInput {
+  readonly databasePath: string;
+  readonly storeModuleUrl: string;
+  readonly barrier: SharedArrayBuffer;
+  readonly ownerToken: string;
+  readonly executionMode: "DRY_RUN" | "LIVE";
+}
+
+interface OwnershipWorkerResult {
+  readonly threadId: number;
+  readonly acquisition: RuntimeOwnershipAcquisition;
+}
+
+function runOwnershipWorker(input: OwnershipWorkerInput): Promise<OwnershipWorkerResult> {
+  const source = `
+    import { parentPort, threadId, workerData } from "node:worker_threads";
+    import { DatabaseSync } from "node:sqlite";
+
+    void (async () => {
+      let db;
+      try {
+        const { SqliteRuntimeOwnershipStore } = await import(workerData.storeModuleUrl);
+        db = new DatabaseSync(workerData.databasePath);
+        db.exec("PRAGMA foreign_keys = ON;");
+        db.exec("PRAGMA busy_timeout = 5000;");
+        const barrier = new Int32Array(workerData.barrier);
+        const arrived = Atomics.add(barrier, 0, 1) + 1;
+        if (arrived === 2) Atomics.notify(barrier, 0, 2);
+        while (Atomics.load(barrier, 0) < 2) {
+          const observed = Atomics.load(barrier, 0);
+          if (Atomics.wait(barrier, 0, observed, 5000) === "timed-out") {
+            throw new Error("Runtime ownership worker barrier timed out.");
+          }
+        }
+        const store = new SqliteRuntimeOwnershipStore(db);
+        const acquisition = await store.acquireAfterProcessLock({
+          ownerToken: workerData.ownerToken,
+          executionMode: workerData.executionMode,
+          acquiredAtEpochMs: 1000,
+          expiresAtEpochMs: 46000,
+        });
+        parentPort.postMessage({ ok: true, threadId, acquisition });
+      } catch (error) {
+        parentPort.postMessage({
+          ok: false,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        if (db !== undefined) db.close();
+      }
+    })();
+  `;
+
+  return new Promise<OwnershipWorkerResult>((resolve, reject) => {
+    const workerUrl = new URL(`data:text/javascript,${encodeURIComponent(source)}`);
+    const worker = new Worker(workerUrl, { workerData: input });
+    let settled = false;
+    let workerResult: OwnershipWorkerResult | null = null;
+    worker.once("message", (message: unknown) => {
+      const result = message as {
+        readonly ok: boolean;
+        readonly threadId?: number;
+        readonly acquisition?: RuntimeOwnershipAcquisition;
+        readonly message?: string;
+      };
+      if (
+        !result.ok ||
+        result.threadId === undefined ||
+        result.acquisition === undefined
+      ) {
+        settled = true;
+        reject(new Error(result.message ?? "Runtime ownership worker failed."));
+        return;
+      }
+      workerResult = { threadId: result.threadId, acquisition: result.acquisition };
+    });
+    worker.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    worker.once("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      if (code !== 0) {
+        reject(new Error(`Runtime ownership worker exited with code ${code}.`));
+      } else if (workerResult === null) {
+        reject(new Error("Runtime ownership worker exited without a result."));
+      } else {
+        resolve(workerResult);
+      }
+    });
+  });
+}
 
 function eventIdentity(event: RuntimeOwnershipEventRecord): string {
   return `${event.eventType}:${event.generation}:${event.reasonCode}`;

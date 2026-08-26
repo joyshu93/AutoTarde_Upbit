@@ -80,8 +80,12 @@ export class InMemoryRuntimeOwnershipStore implements RuntimeOwnershipStore {
     if (current.ownerToken !== input.ownerToken || current.generation !== input.generation) {
       return null;
     }
-    assertNoTimestampRollback(input.heartbeatAtEpochMs, current.heartbeatAtEpochMs);
+    assertNoTimestampRollback(
+      input.heartbeatAtEpochMs,
+      Math.max(current.heartbeatAtEpochMs, this.maximumEventTimestamp()),
+    );
     if (
+      input.heartbeatAtEpochMs === current.heartbeatAtEpochMs ||
       input.heartbeatAtEpochMs >= current.expiresAtEpochMs ||
       input.expiresAtEpochMs <= current.expiresAtEpochMs
     ) {

@@ -122,8 +122,13 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
       ) {
         return null;
       }
-      assertNoTimestampRollback(input.heartbeatAtEpochMs, current.heartbeatAtEpochMs);
+      const maximum = selectMaximumEvent(this.db);
+      assertNoTimestampRollback(
+        input.heartbeatAtEpochMs,
+        Math.max(current.heartbeatAtEpochMs, maximum.latestEventAtEpochMs ?? 0),
+      );
       if (
+        input.heartbeatAtEpochMs === current.heartbeatAtEpochMs ||
         input.heartbeatAtEpochMs >= current.expiresAtEpochMs ||
         input.expiresAtEpochMs <= current.expiresAtEpochMs
       ) {
