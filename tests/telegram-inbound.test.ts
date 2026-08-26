@@ -5,10 +5,38 @@ import type { TelegramInboundOffsetRecord } from "../src/domain/types.js";
 import {
   splitTelegramReplyText,
   TelegramBotUpdateClient,
-  TelegramInboundPollingService,
+  TelegramInboundPollingService as ProductionTelegramInboundPollingService,
   type TelegramInboundUpdate,
 } from "../src/modules/telegram/inbound.js";
 import { test } from "./harness.js";
+
+class TelegramInboundPollingService extends ProductionTelegramInboundPollingService {
+  constructor(dependencies: ConstructorParameters<typeof ProductionTelegramInboundPollingService>[0]) {
+    super({
+      ...dependencies,
+      runtimeOwnership: dependencies.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    });
+  }
+}
+
+test("telegram inbound fails closed when runtime authority is omitted", async () => {
+  let pollCalls = 0;
+  const service = new ProductionTelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        pollCalls += 1;
+        return [];
+      },
+    },
+    messageClient: { async sendMessage() {} },
+    router: { async route() { return { text: "unused" }; } },
+    operatorChatId: "123",
+  });
+
+  await assert.rejects(() => service.pollOnce(), /RUNTIME_OWNERSHIP_NOT_HELD/u);
+  assert.equal(pollCalls, 0);
+});
 
 test("telegram inbound rejects all routing and responses after runtime ownership is lost", async () => {
   let pollCalls = 0;
@@ -130,6 +158,33 @@ function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
     },
     async assertCurrent(): Promise<never> {
       throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+  };
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
     },
   };
 }

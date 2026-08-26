@@ -124,16 +124,16 @@ export function createApp(
     config.executionMode === "LIVE" &&
     config.liveExecutionGate === "ENABLED" &&
     exchangeBackedReadEnabled;
-  const runtimeOwnership = overrides.runtimeOwnershipAuthority;
+  const suppliedRuntimeOwnership = overrides.runtimeOwnershipAuthority;
   if (liveSendEnabled) {
-    if (runtimeOwnership === undefined) {
+    if (suppliedRuntimeOwnership === undefined) {
       throw new RuntimeOwnershipGuardError(
         "RUNTIME_OWNERSHIP_NOT_HELD",
         "RUNTIME_OWNERSHIP_NOT_HELD: LIVE application construction requires acquired runtime authority.",
       );
     }
-    runtimeOwnership.assertLocallyHeld();
-    const ownership = runtimeOwnership.snapshot();
+    suppliedRuntimeOwnership.assertLocallyHeld();
+    const ownership = suppliedRuntimeOwnership.snapshot();
     if (ownership.status !== "OWNED" || ownership.executionMode !== "LIVE") {
       throw new RuntimeOwnershipGuardError(
         "RUNTIME_OWNERSHIP_NOT_HELD",
@@ -141,6 +141,7 @@ export function createApp(
       );
     }
   }
+  const runtimeOwnership = suppliedRuntimeOwnership ?? createUnavailableRuntimeOwnershipAuthority();
   const persistence = createSqlitePersistence({
     databasePath: config.databasePath,
     exchangeAccountId: "primary",
@@ -211,7 +212,7 @@ export function createApp(
     maxBackoffMs: config.telegramDeliveryMaxBackoffMs,
     leaseDurationMs: config.telegramDeliveryLeaseMs,
     locale: telegramLocale,
-    ...(runtimeOwnership ? { runtimeOwnership } : {}),
+    runtimeOwnership,
   });
   const telegramCommandMenuSetup = new TelegramCommandMenuSetupService({
     client: telegramMessageClient,
@@ -230,7 +231,7 @@ export function createApp(
     accountExecutionLeases,
     accountExecutionLeaseMs: config.accountExecutionLeaseMs,
     operatorState,
-    runtimeOwnership: runtimeOwnership ?? createUnavailableRuntimeOwnershipAuthority(),
+    runtimeOwnership,
     reporter,
     ...(candidatePolicySelection ? { candidatePilots: persistence.candidatePilots } : {}),
   });
@@ -272,6 +273,7 @@ export function createApp(
     executionService,
     marketDataReader: publicMarketDataReader,
     config: createDefaultPositionGuardRunnerConfig("primary"),
+    runtimeOwnership,
     ...(candidatePolicySelection && candidatePilotRecovery
       ? {
           policySelection: candidatePolicySelection,
@@ -290,6 +292,7 @@ export function createApp(
     historyRetentionAssumptionDays: config.reconciliationHistoryRetentionAssumptionDays,
     identifierRecovery: DEFAULT_IDENTIFIER_RECOVERY_POLICY,
     recoveryClock,
+    runtimeOwnership,
     ...(candidateEvidenceService ? { candidateEvidenceService } : {}),
     ...(exchangeBackedReadEnabled ? {
       orderReader: privateExchangeAdapter,
@@ -302,6 +305,7 @@ export function createApp(
     marketPriceReader: publicMarketDataReader,
     repositories,
     reconciliationService,
+    runtimeOwnership,
   });
   const candidateBtcRunPreparation = candidatePolicySelection
     ? new CandidateBtcRunPreparationService({
@@ -338,7 +342,7 @@ export function createApp(
         exchangeBackedReadEnabled,
         liveSendPath,
       }),
-    ...(runtimeOwnership ? { runtimeOwnership } : {}),
+    runtimeOwnership,
   });
   const strategyScheduler = new StrategyScheduler({
     config: createDefaultStrategySchedulerConfig({
@@ -392,7 +396,7 @@ export function createApp(
         exchangeBackedReadEnabled,
         liveSendPath,
       }),
-    ...(runtimeOwnership ? { runtimeOwnership } : {}),
+    runtimeOwnership,
   });
 
   let telegramInboundPolling: TelegramInboundPollingService | null = null;
@@ -439,7 +443,7 @@ export function createApp(
     syncController: new InlineTelegramSyncController({
       portfolioSyncService,
       reporter,
-      ...(runtimeOwnership ? { runtimeOwnership } : {}),
+      runtimeOwnership,
     }),
     strategyRunController,
     schedulerStatus: () => strategyScheduler.getStatus(),
@@ -467,7 +471,7 @@ export function createApp(
     exchangeAccountId: "primary",
     offsetStore: persistence.telegramInboundOffsets,
     botTokenRef: telegramBotTokenRef,
-    ...(runtimeOwnership ? { runtimeOwnership } : {}),
+    runtimeOwnership,
     pollIntervalMs: config.telegramInboundPollIntervalMs,
     longPollTimeoutSeconds: config.telegramInboundPollTimeoutSeconds,
     limit: config.telegramInboundPollLimit,

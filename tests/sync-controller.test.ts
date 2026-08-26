@@ -1,12 +1,70 @@
 import assert from "node:assert/strict";
 
-import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
-import { InlineTelegramSyncController } from "../src/app/sync-controller.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../src/app/runtime-ownership-guard.js";
+import {
+  InlineTelegramSyncController as ProductionInlineTelegramSyncController,
+} from "../src/app/sync-controller.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
-import { PortfolioSyncService } from "../src/modules/reconciliation/portfolio-sync-service.js";
-import { ReconciliationService } from "../src/modules/reconciliation/reconciliation-service.js";
+import {
+  PortfolioSyncService as ProductionPortfolioSyncService,
+} from "../src/modules/reconciliation/portfolio-sync-service.js";
+import {
+  ReconciliationService as ProductionReconciliationService,
+} from "../src/modules/reconciliation/reconciliation-service.js";
 import { DurableTelegramReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
+
+class InlineTelegramSyncController extends ProductionInlineTelegramSyncController {
+  constructor(dependencies: ConstructorParameters<typeof ProductionInlineTelegramSyncController>[0]) {
+    super({
+      ...dependencies,
+      runtimeOwnership: dependencies.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    });
+  }
+}
+
+class PortfolioSyncService extends ProductionPortfolioSyncService {
+  constructor(dependencies: ConstructorParameters<typeof ProductionPortfolioSyncService>[0]) {
+    super({
+      ...dependencies,
+      runtimeOwnership: dependencies.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    });
+  }
+}
+
+class ReconciliationService extends ProductionReconciliationService {
+  constructor(dependencies: ConstructorParameters<typeof ProductionReconciliationService>[0]) {
+    super({
+      ...dependencies,
+      runtimeOwnership: dependencies.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    });
+  }
+}
+
+test("inline telegram sync controller fails closed when runtime authority is omitted", async () => {
+  let syncCalls = 0;
+  const controller = new ProductionInlineTelegramSyncController({
+    portfolioSyncService: {
+      async run(): Promise<never> {
+        syncCalls += 1;
+        throw new Error("sync must not run without ownership authority");
+      },
+    },
+  });
+
+  await assert.rejects(
+    () => controller.requestSync({
+      exchangeAccountId: "primary",
+      requestedBy: "TELEGRAM",
+      requestedCommand: "/sync",
+    }),
+    /RUNTIME_OWNERSHIP_NOT_HELD/u,
+  );
+  assert.equal(syncCalls, 0);
+});
 
 function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
   return {
@@ -25,6 +83,33 @@ function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
     },
     async assertCurrent(): Promise<never> {
       throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+  };
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
     },
   };
 }
@@ -52,6 +137,80 @@ test("inline telegram sync controller rejects before sync after runtime ownershi
 
   assert.equal(syncCalls, 0);
 });
+
+test("inline telegram sync controller rethrows ownership loss from an active sync without failure reporting", async () => {
+  const ownership = createOwnedThenLostRuntimeOwnershipAuthority();
+  let reportCalls = 0;
+  const controller = new InlineTelegramSyncController({
+    portfolioSyncService: {
+      async run(): Promise<never> {
+        ownership.lose();
+        throw ownership.lossError;
+      },
+    },
+    reporter: {
+      async report() {
+        reportCalls += 1;
+      },
+    },
+    runtimeOwnership: ownership.authority,
+  });
+
+  await assert.rejects(
+    () => controller.requestSync({
+      exchangeAccountId: "primary",
+      requestedBy: "TELEGRAM",
+      requestedCommand: "/sync",
+    }),
+    (error) => error === ownership.lossError,
+  );
+
+  assert.equal(reportCalls, 0);
+});
+
+function createOwnedThenLostRuntimeOwnershipAuthority(): {
+  authority: RuntimeOwnershipAuthority;
+  lose(): void;
+  lossError: RuntimeOwnershipGuardError;
+} {
+  let held = true;
+  const lossError = new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_LOST",
+    "RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED",
+  );
+  return {
+    lossError,
+    lose() {
+      held = false;
+    },
+    authority: {
+      snapshot: () => ({
+        status: held ? "OWNED" : "LOST",
+        generation: 1,
+        executionMode: "DRY_RUN",
+        acquiredAtEpochMs: 1,
+        heartbeatAtEpochMs: 1,
+        expiresAtEpochMs: 45_001,
+        takeover: false,
+        lossReason: held ? null : "TEST_GENERATION_REPLACED",
+      }),
+      assertLocallyHeld() {
+        if (!held) throw lossError;
+      },
+      async assertCurrent() {
+        if (!held) throw lossError;
+        return {
+          ownerToken: "owner".padEnd(64, "x"),
+          generation: 1,
+          executionMode: "DRY_RUN",
+          acquiredAtEpochMs: 1,
+          heartbeatAtEpochMs: 1,
+          expiresAtEpochMs: 45_001,
+        };
+      },
+    },
+  };
+}
 
 function createPortfolioSyncService(input: {
   exchangeAdapter: ConstructorParameters<typeof PortfolioSyncService>[0]["exchangeAdapter"];

@@ -12,7 +12,10 @@ import type {
 } from "../modules/telegram/interfaces.js";
 import type { OperatorNotificationReporter } from "../modules/telegram/reporter.js";
 import { createId } from "../shared/ids.js";
-import type { RuntimeOwnershipAuthority } from "./runtime-ownership-guard.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "./runtime-ownership-guard.js";
 
 export interface StrategySchedulerMarketConfig {
   market: SupportedMarket;
@@ -96,11 +99,13 @@ export class StrategyScheduler {
   private scheduledRunQueue: Promise<void> = Promise.resolve();
   private orderSubmittedBatchKey: string | null = null;
   private readonly runPreparationOwnerAuthority: StrategySchedulerRunPreparationOwnerAuthority;
+  private readonly runtimeOwnership: RuntimeOwnershipAuthority;
 
   constructor(
     private readonly dependencies: StrategySchedulerDependencies,
   ) {
     this.runPreparationOwnerAuthority = snapshotRunPreparationOwnerAuthority(dependencies);
+    this.runtimeOwnership = dependencies.runtimeOwnership ?? createUnavailableRuntimeOwnershipAuthority();
     this.startupPreflight = dependencies.config.startupPreflight ?? null;
     for (const market of dependencies.config.markets) {
       this.statusByMarket.set(market.market, createInitialMarketStatus(market));
@@ -194,7 +199,7 @@ export class StrategyScheduler {
 
   runMarketNow(market: SupportedMarket): Promise<TelegramStrategyRunResult> {
     try {
-      this.dependencies.runtimeOwnership?.assertLocallyHeld();
+      this.runtimeOwnership.assertLocallyHeld();
     } catch (error) {
       return Promise.reject(error);
     }
@@ -212,7 +217,7 @@ export class StrategyScheduler {
   }
 
   private async executeMarketNow(market: SupportedMarket): Promise<TelegramStrategyRunResult> {
-    this.dependencies.runtimeOwnership?.assertLocallyHeld();
+    this.runtimeOwnership.assertLocallyHeld();
     const config = this.dependencies.config.markets.find((candidate) => candidate.market === market);
     if (!config) {
       throw new Error(`Unsupported scheduled market: ${market}`);
@@ -274,6 +279,8 @@ export class StrategyScheduler {
     try {
       preparationOwner = this.resolveRunPreparationOwner(market);
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
+      this.runtimeOwnership.assertLocallyHeld();
       return this.recordPreparationOwnershipFailure({
         market,
         config,
@@ -287,6 +294,8 @@ export class StrategyScheduler {
       try {
         refresh = await this.runBeforeRunAccountRefresh();
       } catch (error) {
+        if (isRuntimeOwnershipFailure(error)) throw error;
+        this.runtimeOwnership.assertLocallyHeld();
         const failedAt = this.now();
         const failed = createFailedRunResult({
           requestedAt: startedAt,
@@ -317,6 +326,7 @@ export class StrategyScheduler {
         });
         return failed;
       }
+      this.runtimeOwnership.assertLocallyHeld();
 
       if (refresh?.status === "FAILED") {
         const failedAt = this.now();
@@ -357,6 +367,8 @@ export class StrategyScheduler {
       try {
         preflight = await beforeRunPreflight();
       } catch (error) {
+        if (isRuntimeOwnershipFailure(error)) throw error;
+        this.runtimeOwnership.assertLocallyHeld();
         const failedAt = this.now();
         const failed = createFailedRunResult({
           requestedAt: startedAt,
@@ -385,6 +397,7 @@ export class StrategyScheduler {
         });
         return failed;
       }
+      this.runtimeOwnership.assertLocallyHeld();
 
       if (preflight?.status === "BLOCK") {
         const blockedAt = this.now();
@@ -461,6 +474,7 @@ export class StrategyScheduler {
       requestedBy: "SCHEDULER",
       requestedCommand: "SCHEDULER_TICK",
     });
+    this.runtimeOwnership.assertLocallyHeld();
     const completedAt = this.now();
     this.applyRunResult(market, result, startedAt, completedAt);
     await this.persistSchedulerRun({
@@ -584,6 +598,8 @@ export class StrategyScheduler {
     try {
       return await this.runMarketNow(config.market);
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
+      this.runtimeOwnership.assertLocallyHeld();
       const message = error instanceof Error ? error.message : String(error);
       const completedAt = this.now();
       const result = {
@@ -694,14 +710,19 @@ export class StrategyScheduler {
     }
 
     try {
+      this.runtimeOwnership.assertLocallyHeld();
       if (input.update) {
         await repositories.updateStrategySchedulerRun(input.run);
+        this.runtimeOwnership.assertLocallyHeld();
         return true;
       }
 
       await repositories.saveStrategySchedulerRun(input.run);
+      this.runtimeOwnership.assertLocallyHeld();
       return true;
-    } catch {
+    } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
+      this.runtimeOwnership.assertLocallyHeld();
       return false;
     }
   }
@@ -772,8 +793,12 @@ export class StrategyScheduler {
     }
 
     try {
+      this.runtimeOwnership.assertLocallyHeld();
       await this.dependencies.reporter.report(notification);
-    } catch {
+      this.runtimeOwnership.assertLocallyHeld();
+    } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
+      this.runtimeOwnership.assertLocallyHeld();
       // Scheduler execution outcomes must not be changed by Telegram reporting failures.
     }
   }
@@ -820,6 +845,29 @@ export class StrategyScheduler {
   private now(): string {
     return this.dependencies.now?.() ?? new Date().toISOString();
   }
+}
+
+function createUnavailableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "UNOWNED", generation: null, executionMode: null, acquiredAtEpochMs: null,
+      heartbeatAtEpochMs: null, expiresAtEpochMs: null, takeover: false, lossReason: null,
+    }),
+    assertLocallyHeld: throwRuntimeOwnershipNotHeld,
+    async assertCurrent(): Promise<never> { return throwRuntimeOwnershipNotHeld(); },
+  };
+}
+
+function throwRuntimeOwnershipNotHeld(): never {
+  throw new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_NOT_HELD",
+    "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
+  );
+}
+
+function isRuntimeOwnershipFailure(error: unknown): boolean {
+  return error instanceof RuntimeOwnershipGuardError ||
+    (error instanceof Error && /^RUNTIME_OWNERSHIP_(?:LOST|NOT_HELD):/u.test(error.message));
 }
 
 async function waitForWorkOrTimeout(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {

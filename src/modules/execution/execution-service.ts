@@ -46,16 +46,12 @@ import type {
   SubmitOrderFromDecisionResult,
 } from "./interfaces.js";
 import { parseCandidateEvidenceTimestamp } from "./candidate-evidence-decimals.js";
-import type { RuntimeOwnershipAuthority } from "../../app/runtime-ownership-guard.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../../app/runtime-ownership-guard.js";
 
 const CANDIDATE_FINAL_ORDER_SCAN_LIMIT = 100;
-
-class RuntimeOwnershipLostBeforeSendError extends Error {
-  constructor(readonly cause: unknown) {
-    super("RUNTIME_OWNERSHIP_LOST: Final persisted runtime ownership check failed before order transmission.");
-    this.name = "RuntimeOwnershipLostBeforeSendError";
-  }
-}
 
 const EXACT_ORDER_RECORD_FIELDS = Object.freeze([
   "id",
@@ -87,6 +83,8 @@ function sameOrderRecord(left: OrderRecord, right: OrderRecord): boolean {
 }
 
 export class ExecutionService {
+  private readonly runtimeOwnership: RuntimeOwnershipAuthority;
+
   constructor(
     private readonly dependencies: {
       riskLimits: ExecutionRiskLimits;
@@ -105,9 +103,12 @@ export class ExecutionService {
       reporter?: OperatorNotificationReporter;
       now?: () => string;
     },
-  ) {}
+  ) {
+    this.runtimeOwnership = dependencies.runtimeOwnership ?? createUnavailableRuntimeOwnershipAuthority();
+  }
 
   async submitOrderFromDecision(input: SubmitOrderFromDecisionInput): Promise<SubmitOrderFromDecisionResult> {
+    this.runtimeOwnership.assertLocallyHeld();
     assertCanonicalUpbitMarketBuyQuote(input);
     const attemptStartedAt = this.dependencies.now?.() ?? new Date().toISOString();
     const decision = input.decision;
@@ -577,10 +578,8 @@ export class ExecutionService {
         activeOrders: finalActiveOrders,
         persistedOrder: finalPersistedOrder,
       });
-      if (this.dependencies.runtimeOwnership) {
-        finalRuntimeOwnershipCheckStarted = true;
-        await this.dependencies.runtimeOwnership.assertCurrent(Date.now());
-      }
+      finalRuntimeOwnershipCheckStarted = true;
+      await this.runtimeOwnership.assertCurrent(Date.now());
       createOrderInvoked = true;
       exchangeOrderPromise = this.dependencies.executionAdapter.createOrder({
         market,
@@ -598,7 +597,7 @@ export class ExecutionService {
       } else {
         releaseLease = false;
         if (finalRuntimeOwnershipCheckStarted) {
-          throw new RuntimeOwnershipLostBeforeSendError(error);
+          throw error;
         }
         if (candidateContext && candidateBinding) {
           await this.pauseCandidateIntentFault({
@@ -1548,6 +1547,24 @@ export class LeaseBlockPersistenceSafetyError extends Error {
     super(message);
     this.name = "LeaseBlockPersistenceSafetyError";
   }
+}
+
+function createUnavailableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "UNOWNED", generation: null, executionMode: null, acquiredAtEpochMs: null,
+      heartbeatAtEpochMs: null, expiresAtEpochMs: null, takeover: false, lossReason: null,
+    }),
+    assertLocallyHeld: throwRuntimeOwnershipNotHeld,
+    async assertCurrent(): Promise<never> { return throwRuntimeOwnershipNotHeld(); },
+  };
+}
+
+function throwRuntimeOwnershipNotHeld(): never {
+  throw new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_NOT_HELD",
+    "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
+  );
 }
 
 function createDryRunSyntheticFill(input: {

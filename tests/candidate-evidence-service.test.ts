@@ -1,15 +1,53 @@
 import assert from "node:assert/strict";
 
 import type { FillRecord } from "../src/domain/types.js";
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import { CandidateExecutionEvidenceService } from "../src/modules/execution/candidate-evidence-service.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { InMemoryCandidatePilotRepository } from "../src/modules/db/repositories/in-memory-candidate-pilot-repository.js";
 import { candidateExecutionBindingMaterialHash } from "../src/modules/db/pilot-interfaces.js";
-import { ReconciliationService } from "../src/modules/reconciliation/reconciliation-service.js";
+import { ReconciliationService as ProductionReconciliationService } from
+  "../src/modules/reconciliation/reconciliation-service.js";
 import { TerminalCandidateProjectionSweep } from "../src/modules/reconciliation/terminal-candidate-sweep.js";
 import { createEmptyPositionGuardCandidateState } from "../src/modules/strategy/position-guard-candidate-state.js";
 import { parsePositionGuardCandidateTimestamp } from "../src/modules/strategy/position-guard-candidate-state.js";
 import { test } from "./harness.js";
+
+class ReconciliationService extends ProductionReconciliationService {
+  constructor(dependencies: ConstructorParameters<typeof ProductionReconciliationService>[0]) {
+    super({
+      ...dependencies,
+      runtimeOwnership: dependencies.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    });
+  }
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+  };
+}
 
 test("partial fills aggregate once per terminal order and canceled-with-fill advances once", async () => {
   const pilotRepository = new InMemoryCandidatePilotRepository();

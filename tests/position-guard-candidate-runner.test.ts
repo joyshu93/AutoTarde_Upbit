@@ -5,6 +5,7 @@ import type {
   PositionGuardPolicySelection,
 } from "../src/domain/pilot-types.js";
 import type { StrategyDecisionRecord } from "../src/domain/types.js";
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import type { SubmitOrderFromDecisionInput } from "../src/modules/execution/interfaces.js";
 import {
   toStrategyDecision,
@@ -569,6 +570,7 @@ function createHarness(options: HarnessOptions = {}) {
         return options.verify?.() ?? readyVerification();
       },
     },
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(),
     ...(options.route === undefined ? {} : { policyRouter: options.route }),
   };
   const runner = new PositionGuardStrategyRunner(dependencies as never);
@@ -579,6 +581,33 @@ function createHarness(options: HarnessOptions = {}) {
     ),
   });
   return { runner, saved, submitted };
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+  };
 }
 
 function candidateRunInput() {

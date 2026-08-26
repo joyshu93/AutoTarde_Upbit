@@ -2,7 +2,15 @@ import assert from "node:assert/strict";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
-import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
+import {
+  RuntimeOwnershipGuard,
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../src/app/runtime-ownership-guard.js";
+import type {
+  RuntimeProcessLock,
+  RuntimeProcessLockLossReason,
+} from "../src/app/runtime-process-lock.js";
 import type { ExecutionStateRecord } from "../src/domain/types.js";
 import { ExecutionService } from "../src/modules/execution/execution-service.js";
 import { ExchangeOrderSubmissionError } from "../src/modules/exchange/errors.js";
@@ -13,8 +21,26 @@ import {
 } from "../src/modules/exchange/interfaces.js";
 import { InMemoryAccountExecutionLeaseStore } from "../src/modules/db/repositories/in-memory-account-execution-lease-store.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
+import { InMemoryRuntimeOwnershipStore } from "../src/modules/db/repositories/in-memory-runtime-ownership-store.js";
 import type { AccountExecutionLeaseStore } from "../src/modules/db/pilot-interfaces.js";
 import { test } from "./harness.js";
+
+test("execution service fails closed before persistence when runtime authority is omitted", async () => {
+  const exchange = createCountingAdapter();
+  const { service, repositories } = await createService({
+    exchangeAdapter: exchange,
+    runtimeOwnership: null,
+  });
+
+  await assert.rejects(
+    () => service.submitOrderFromDecision(validInput()),
+    /RUNTIME_OWNERSHIP_NOT_HELD/u,
+  );
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await repositories.listOrders("primary")).length, 0);
+  assert.equal((await repositories.listRiskEvents("primary")).length, 0);
+});
 
 test("a lease conflict creates no order row and calls createOrder zero times", async () => {
   const exchange = createCountingAdapter();
@@ -96,44 +122,71 @@ test("renewal loss after SUBMITTING retains recovery evidence and sends nothing"
 
 test("a replaced runtime generation after final order checks leaves immutable evidence and never sends", async () => {
   const exchange = createCountingAdapter();
-  let persistedAuthorityChecks = 0;
-  const runtimeOwnership: RuntimeOwnershipAuthority = {
-    snapshot: () => ({
-      status: "OWNED",
-      generation: 1,
+  const ownershipStore = new InMemoryRuntimeOwnershipStore();
+  const runtimeOwnership = new RuntimeOwnershipGuard({
+    processLock: new HeldProcessLock(),
+    store: ownershipStore,
+    ownerToken: "owner-a".padEnd(64, "x"),
+  });
+  await runtimeOwnership.acquire({ executionMode: "DRY_RUN", acquiredAtEpochMs: 1 });
+  const repositories = new ReplaceOwnershipOnFinalOrderReadRepository(async () => {
+    await ownershipStore.acquireAfterProcessLock({
+      ownerToken: "owner-b".padEnd(64, "x"),
       executionMode: "DRY_RUN",
-      acquiredAtEpochMs: 1,
-      heartbeatAtEpochMs: 1,
+      acquiredAtEpochMs: 2,
       expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
-      takeover: false,
-      lossReason: null,
-    }),
-    assertLocallyHeld() {},
-    async assertCurrent(atEpochMs): Promise<never> {
-      assert.equal(Number.isSafeInteger(atEpochMs), true);
-      persistedAuthorityChecks += 1;
-      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
-    },
-  };
+    });
+  });
   const leaseStore = new InMemoryAccountExecutionLeaseStore();
-  const { service, repositories, operatorState } = await createService({
+  const { service, operatorState } = await createService({
     exchangeAdapter: exchange,
     accountExecutionLeases: leaseStore,
+    repositories,
     runtimeOwnership,
   });
 
   await assert.rejects(
     () => service.submitOrderFromDecision(validInput()),
-    /RUNTIME_OWNERSHIP_LOST/u,
+    (error) => error instanceof RuntimeOwnershipGuardError &&
+      error.code === "RUNTIME_OWNERSHIP_LOST",
   );
 
-  assert.equal(persistedAuthorityChecks, 1);
+  assert.equal(repositories.replacementCalls, 1);
   assert.equal(exchange.createOrderCalls, 0);
   assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING");
   assert.equal((await repositories.listRiskEvents("primary")).length, 0);
   assert.equal((await operatorState.getState()).systemStatus, "RUNNING");
   assert.notEqual(await leaseStore.getLease("primary"), null);
 });
+
+class ReplaceOwnershipOnFinalOrderReadRepository extends InMemoryExecutionRepository {
+  replacementCalls = 0;
+
+  constructor(private readonly replaceOwnership: () => Promise<void>) {
+    super();
+  }
+
+  override async findOrderById(exchangeAccountId: string, orderId: string) {
+    const order = await super.findOrderById(exchangeAccountId, orderId);
+    this.replacementCalls += 1;
+    await this.replaceOwnership();
+    return order;
+  }
+}
+
+class HeldProcessLock implements RuntimeProcessLock {
+  readonly identity = { scopeDigest: "f".repeat(64) };
+
+  isHeld(): boolean {
+    return true;
+  }
+
+  onLost(_listener: (reason: RuntimeProcessLockLossReason) => void): () => void {
+    return () => undefined;
+  }
+
+  async release(): Promise<void> {}
+}
 
 test("slow validation expiry cannot turn into a concurrent send because pre-send renewal verifies ownership", async () => {
   const base = new InMemoryAccountExecutionLeaseStore();
@@ -643,7 +696,7 @@ async function createService(overrides: {
   accountExecutionLeases?: AccountExecutionLeaseStore;
   repositories?: InMemoryExecutionRepository;
   operatorState?: InMemoryOperatorStateStore;
-  runtimeOwnership?: RuntimeOwnershipAuthority;
+  runtimeOwnership?: RuntimeOwnershipAuthority | null;
   accountExecutionLeaseMs?: number;
   now?: () => string;
 } = {}) {
@@ -662,7 +715,9 @@ async function createService(overrides: {
     accountExecutionLeases,
     accountExecutionLeaseMs: overrides.accountExecutionLeaseMs ?? 30_000,
     operatorState,
-    runtimeOwnership: overrides.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    ...(overrides.runtimeOwnership === null
+      ? {}
+      : { runtimeOwnership: overrides.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority() }),
     now: overrides.now ?? (() => "2026-04-20T00:00:20.000Z"),
   });
   await repositories.saveBalanceSnapshot({

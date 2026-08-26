@@ -9,7 +9,10 @@ import type {
   TelegramStrategyRunRequest,
   TelegramStrategyRunResult,
 } from "../modules/telegram/interfaces.js";
-import type { RuntimeOwnershipAuthority } from "./runtime-ownership-guard.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "./runtime-ownership-guard.js";
 
 export type CandidateBtcRunPreparationResult =
   | Readonly<{
@@ -46,7 +49,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
   }
 
   async requestRun(request: TelegramStrategyRunRequest): Promise<TelegramStrategyRunResult> {
-    this.dependencies.runtimeOwnership?.assertLocallyHeld();
+    this.dependencies.runtimeOwnership!.assertLocallyHeld();
     const requestSnapshot = snapshotRunRequest(request);
     const requestedAt = this.dependencies.now?.() ?? new Date().toISOString();
     if (this.running) {
@@ -78,6 +81,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
           requestedAt,
           requestedBy: requestSnapshot.requestedBy,
         }));
+        this.dependencies.runtimeOwnership!.assertLocallyHeld();
         if (preparation.status === "BLOCKED") {
           return failedRunResult({
             requestedAt,
@@ -96,6 +100,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
         );
       } else if (requestSnapshot.requestedBy === "TELEGRAM" && this.dependencies.beforeManualRunPreflight) {
         const preflight = await this.dependencies.beforeManualRunPreflight();
+        this.dependencies.runtimeOwnership!.assertLocallyHeld();
         if (preflight?.status === "BLOCK") {
           return failedRunResult({
             requestedAt,
@@ -110,6 +115,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
         generatedAt: requestedAt,
         ...(refreshReceipt === undefined ? {} : { refreshReceipt }),
       });
+      this.dependencies.runtimeOwnership!.assertLocallyHeld();
 
       const submissionOutcome = result.submission?.outcome ?? null;
       return {
@@ -127,6 +133,8 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
         detail: buildStrategyRunDetail(result),
       };
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
+      this.dependencies.runtimeOwnership!.assertLocallyHeld();
       const message = error instanceof Error ? error.message : "Unknown strategy run failure.";
 
       return {
@@ -147,6 +155,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
   }
 
   async requestPreview(request: TelegramStrategyPreviewRequest): Promise<TelegramStrategyPreviewResult> {
+    this.dependencies.runtimeOwnership!.assertLocallyHeld();
     const requestSnapshot = snapshotPreviewRequest(request);
     const requestedAt = this.dependencies.now?.() ?? new Date().toISOString();
     if (this.running) {
@@ -174,6 +183,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
         market: requestSnapshot.market,
         generatedAt: requestedAt,
       });
+      this.dependencies.runtimeOwnership!.assertLocallyHeld();
 
       return {
         status: "COMPLETED",
@@ -191,6 +201,8 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
         detail: buildStrategyPreviewDetail(result),
       };
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
+      this.dependencies.runtimeOwnership!.assertLocallyHeld();
       const message = error instanceof Error ? error.message : "Unknown strategy preview failure.";
 
       return {
@@ -225,9 +237,7 @@ function snapshotControllerDependencies(
     ...(dependencies.beforeManualRunPreflight === undefined
       ? {}
       : { beforeManualRunPreflight: dependencies.beforeManualRunPreflight }),
-    ...(dependencies.runtimeOwnership === undefined
-      ? {}
-      : { runtimeOwnership: dependencies.runtimeOwnership }),
+    runtimeOwnership: dependencies.runtimeOwnership ?? createUnavailableRuntimeOwnershipAuthority(),
     ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
   });
 }
@@ -314,6 +324,29 @@ function failedRunResult(input: {
     submissionOutcome: null,
     detail: input.detail,
   };
+}
+
+function createUnavailableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "UNOWNED", generation: null, executionMode: null, acquiredAtEpochMs: null,
+      heartbeatAtEpochMs: null, expiresAtEpochMs: null, takeover: false, lossReason: null,
+    }),
+    assertLocallyHeld: throwRuntimeOwnershipNotHeld,
+    async assertCurrent(): Promise<never> { return throwRuntimeOwnershipNotHeld(); },
+  };
+}
+
+function throwRuntimeOwnershipNotHeld(): never {
+  throw new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_NOT_HELD",
+    "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
+  );
+}
+
+function isRuntimeOwnershipFailure(error: unknown): boolean {
+  return error instanceof RuntimeOwnershipGuardError ||
+    (error instanceof Error && /^RUNTIME_OWNERSHIP_(?:LOST|NOT_HELD):/u.test(error.message));
 }
 
 const REFRESH_RECEIPT_KEYS = [

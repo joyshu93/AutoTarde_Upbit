@@ -362,6 +362,7 @@ test("scheduler final persistence timeout prevents ownership release after runni
         await finalPersistence.promise;
       },
     },
+    runtimeOwnership: createAlwaysOwnedRuntimeAuthority(),
     now: () => "2026-08-26T00:00:00.000Z",
   });
   const currentRun = scheduler.runMarketNow("KRW-BTC").finally(() => {
@@ -653,6 +654,33 @@ function createOwnershipContext(
       events.push("process-lock:release");
     },
     async shutdownAfterStartupFailure() {},
+  };
+}
+
+function createAlwaysOwnedRuntimeAuthority(): RuntimeOwnershipContext["guard"] {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
   };
 }
 

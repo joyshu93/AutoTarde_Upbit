@@ -28,7 +28,10 @@ const TEST_LIVE_ACCESS_KEY = "create-app-test-access-key";
 
 function createApp(config?: AppConfig, overrides: CreateAppOverrides = {}) {
   if (!config || config.executionMode !== "LIVE") {
-    return createProductionApp(config, overrides);
+    return createProductionApp(config, {
+      runtimeOwnershipAuthority: createAlwaysOwnedRuntimeAuthority(),
+      ...overrides,
+    });
   }
 
   const previousAccessKey = process.env.UPBIT_ACCESS_KEY;

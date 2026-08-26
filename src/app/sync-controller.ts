@@ -5,10 +5,14 @@ import type {
   TelegramSyncRequest,
   TelegramSyncResult,
 } from "../modules/telegram/interfaces.js";
-import type { RuntimeOwnershipAuthority } from "./runtime-ownership-guard.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "./runtime-ownership-guard.js";
 
 export class InlineTelegramSyncController implements TelegramSyncController {
   private running = false;
+  private readonly runtimeOwnership: RuntimeOwnershipAuthority;
 
   constructor(
     private readonly dependencies: {
@@ -17,10 +21,12 @@ export class InlineTelegramSyncController implements TelegramSyncController {
       runtimeOwnership?: RuntimeOwnershipAuthority;
       now?: () => string;
     },
-  ) {}
+  ) {
+    this.runtimeOwnership = dependencies.runtimeOwnership ?? createUnavailableRuntimeOwnershipAuthority();
+  }
 
   async requestSync(request: TelegramSyncRequest): Promise<TelegramSyncResult> {
-    this.dependencies.runtimeOwnership?.assertLocallyHeld();
+    this.runtimeOwnership.assertLocallyHeld();
     const requestedAt = this.dependencies.now?.() ?? new Date().toISOString();
     if (this.running) {
       return {
@@ -37,6 +43,7 @@ export class InlineTelegramSyncController implements TelegramSyncController {
         exchangeAccountId: request.exchangeAccountId,
         source: "OPERATOR_SYNC",
       });
+      this.runtimeOwnership.assertLocallyHeld();
       const positionCount = safeCountJsonArray(result.positionSnapshot.positionsJson);
       const driftCodes = result.reconciliationSummary.issues.map((issue) => issue.code);
 
@@ -54,6 +61,8 @@ export class InlineTelegramSyncController implements TelegramSyncController {
         ].join(" "),
       };
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
+      this.runtimeOwnership.assertLocallyHeld();
       const message = error instanceof Error ? error.message : "Unknown sync failure.";
       await this.safeReport({
         exchangeAccountId: request.exchangeAccountId,
@@ -90,8 +99,12 @@ export class InlineTelegramSyncController implements TelegramSyncController {
     }
 
     try {
+      this.runtimeOwnership.assertLocallyHeld();
       await this.dependencies.reporter.report(input);
-    } catch {
+      this.runtimeOwnership.assertLocallyHeld();
+    } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
+      this.runtimeOwnership.assertLocallyHeld();
       // Reporting is best-effort and must not change sync outcomes.
     }
   }
@@ -104,4 +117,29 @@ function safeCountJsonArray(rawJson: string): number {
   } catch {
     return 0;
   }
+}
+
+function createUnavailableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return unavailableRuntimeOwnershipAuthority();
+}
+
+function unavailableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({ status: "UNOWNED", generation: null, executionMode: null, acquiredAtEpochMs: null,
+      heartbeatAtEpochMs: null, expiresAtEpochMs: null, takeover: false, lossReason: null }),
+    assertLocallyHeld: throwRuntimeOwnershipNotHeld,
+    async assertCurrent(): Promise<never> { return throwRuntimeOwnershipNotHeld(); },
+  };
+}
+
+function throwRuntimeOwnershipNotHeld(): never {
+  throw new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_NOT_HELD",
+    "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
+  );
+}
+
+function isRuntimeOwnershipFailure(error: unknown): boolean {
+  return error instanceof RuntimeOwnershipGuardError ||
+    (error instanceof Error && /^RUNTIME_OWNERSHIP_(?:LOST|NOT_HELD):/u.test(error.message));
 }

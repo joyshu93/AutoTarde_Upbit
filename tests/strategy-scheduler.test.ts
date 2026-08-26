@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 
-import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
-import { StrategyScheduler } from "../src/app/strategy-scheduler.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../src/app/runtime-ownership-guard.js";
+import { StrategyScheduler as ProductionStrategyScheduler } from "../src/app/strategy-scheduler.js";
 import { InMemoryExecutionRepository } from "../src/modules/db/repositories/in-memory-repositories.js";
 import type {
   TelegramStrategyPreviewResult,
@@ -11,6 +14,45 @@ import type {
 } from "../src/modules/telegram/interfaces.js";
 import type { OperatorNotificationReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
+
+class StrategyScheduler extends ProductionStrategyScheduler {
+  constructor(dependencies: ConstructorParameters<typeof ProductionStrategyScheduler>[0]) {
+    if (!Object.hasOwn(dependencies, "runtimeOwnership")) {
+      Object.defineProperty(dependencies, "runtimeOwnership", {
+        value: createAlwaysOwnedRuntimeOwnershipAuthority(),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+    super(dependencies);
+  }
+}
+
+test("strategy scheduler fails closed when runtime authority is omitted", async () => {
+  let controllerCalls = 0;
+  const scheduler = new ProductionStrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(): Promise<never> {
+        controllerCalls += 1;
+        throw new Error("controller must not run without ownership authority");
+      },
+    }),
+  });
+
+  await assert.rejects(
+    () => scheduler.runMarketNow("KRW-BTC"),
+    /RUNTIME_OWNERSHIP_NOT_HELD/u,
+  );
+  assert.equal(controllerCalls, 0);
+});
 
 function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
   return {
@@ -29,6 +71,33 @@ function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
     },
     async assertCurrent(): Promise<never> {
       throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+  };
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
     },
   };
 }
@@ -63,6 +132,83 @@ test("strategy scheduler rejects a cycle after runtime ownership is lost", async
 
   assert.equal(controllerCalls, 0);
 });
+
+test("strategy scheduler rethrows ownership loss during account refresh without stale failure evidence", async () => {
+  const ownership = createOwnedThenLostRuntimeOwnershipAuthority();
+  const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
+  const repositories = new InMemoryExecutionRepository();
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController(),
+    repositories,
+    reporter: createReporter(notifications),
+    beforeRunAccountRefresh: async () => {
+      ownership.lose();
+      throw ownership.lossError;
+    },
+    runtimeOwnership: ownership.authority,
+    now: () => "2026-04-20T00:00:00.000Z",
+  });
+
+  await assert.rejects(
+    () => scheduler.runMarketNow("KRW-BTC"),
+    (error) => error === ownership.lossError,
+  );
+
+  assert.equal((await repositories.listStrategySchedulerRuns("primary", 10)).length, 0);
+  assert.equal(notifications.length, 0);
+  assert.equal(scheduler.getStatus().markets[0]?.failureCount, 0);
+});
+
+function createOwnedThenLostRuntimeOwnershipAuthority(): {
+  authority: RuntimeOwnershipAuthority;
+  lose(): void;
+  lossError: RuntimeOwnershipGuardError;
+} {
+  let held = true;
+  const lossError = new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_LOST",
+    "RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED",
+  );
+  return {
+    lossError,
+    lose() {
+      held = false;
+    },
+    authority: {
+      snapshot: () => ({
+        status: held ? "OWNED" : "LOST",
+        generation: 1,
+        executionMode: "DRY_RUN",
+        acquiredAtEpochMs: 1,
+        heartbeatAtEpochMs: 1,
+        expiresAtEpochMs: 45_001,
+        takeover: false,
+        lossReason: held ? null : "TEST_GENERATION_REPLACED",
+      }),
+      assertLocallyHeld() {
+        if (!held) throw lossError;
+      },
+      async assertCurrent() {
+        if (!held) throw lossError;
+        return {
+          ownerToken: "owner".padEnd(64, "x"),
+          generation: 1,
+          executionMode: "DRY_RUN",
+          acquiredAtEpochMs: 1,
+          heartbeatAtEpochMs: 1,
+          expiresAtEpochMs: 45_001,
+        };
+      },
+    },
+  };
+}
 
 test("strategy scheduler is disabled by default and does not schedule timers", () => {
   const scheduledDelays: number[] = [];

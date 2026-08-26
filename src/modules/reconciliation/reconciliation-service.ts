@@ -17,6 +17,10 @@ import { ExchangeOrderLookupError } from "../exchange/errors.js";
 import type { ExchangeAdapter, ExchangeOrderSnapshot, ExchangeFillSnapshot } from "../exchange/interfaces.js";
 import { parseCandidateEvidenceTimestamp } from "../execution/candidate-evidence-decimals.js";
 import type { OperatorNotificationReporter } from "../telegram/reporter.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../../app/runtime-ownership-guard.js";
 import type { ReconciliationIssue, ReconciliationSummary, ReconciliationTrigger } from "./interfaces.js";
 import { detectPortfolioDrift } from "./portfolio-drift.js";
 import {
@@ -141,6 +145,8 @@ function projectReconciliationRunIdentity(input: unknown): Readonly<Reconciliati
 }
 
 export class ReconciliationService {
+  private readonly runtimeOwnership: RuntimeOwnershipAuthority;
+
   constructor(
     private readonly dependencies: {
       repositories: ExecutionRepository;
@@ -158,8 +164,28 @@ export class ReconciliationService {
       candidateEvidenceService?: Pick<CandidateExecutionEvidenceService, "processTerminalOrder"> &
         Partial<Pick<CandidateExecutionEvidenceService, "classifyTerminalOrderForSweep">>;
       maxTerminalCandidateProjectionsPerRun?: number;
+      runtimeOwnership?: RuntimeOwnershipAuthority;
     },
-  ) {}
+  ) {
+    this.runtimeOwnership = dependencies.runtimeOwnership ?? createUnavailableRuntimeOwnershipAuthority();
+    dependencies.repositories = fenceAsyncBoundary(dependencies.repositories, this.runtimeOwnership);
+    dependencies.operatorState = fenceAsyncBoundary(dependencies.operatorState, this.runtimeOwnership);
+    if (dependencies.orderReader) {
+      dependencies.orderReader = fenceAsyncBoundary(dependencies.orderReader, this.runtimeOwnership);
+    }
+    if (dependencies.orderHistoryReader) {
+      dependencies.orderHistoryReader = fenceAsyncBoundary(dependencies.orderHistoryReader, this.runtimeOwnership);
+    }
+    if (dependencies.candidateEvidenceService) {
+      dependencies.candidateEvidenceService = fenceAsyncBoundary(
+        dependencies.candidateEvidenceService,
+        this.runtimeOwnership,
+      );
+    }
+    if (dependencies.reporter) {
+      dependencies.reporter = fenceAsyncBoundary(dependencies.reporter, this.runtimeOwnership);
+    }
+  }
 
   async recoverOrderByIdentifier(order: OrderRecord): Promise<IdentifierRecoverySummary> {
     if (isSubmissionAbsenceConfirmed(order)) {
@@ -330,6 +356,7 @@ export class ReconciliationService {
     exchangeAccountId: string,
     options?: ReconciliationRunOptions,
   ): Promise<ReconciliationRunResult> {
+    this.runtimeOwnership.assertLocallyHeld();
     const maxOrderLookupsPerRun = this.dependencies.maxOrderLookupsPerRun ?? 10;
     const runIdentity = options?.runIdentity === undefined
       ? Object.freeze({
@@ -1370,10 +1397,71 @@ export class ReconciliationService {
 
     try {
       await this.dependencies.reporter.report(input);
-    } catch {
+    } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
+      this.runtimeOwnership.assertLocallyHeld();
       // Reporting is best-effort and must not change reconciliation outcomes.
     }
   }
+}
+
+function createUnavailableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "UNOWNED", generation: null, executionMode: null, acquiredAtEpochMs: null,
+      heartbeatAtEpochMs: null, expiresAtEpochMs: null, takeover: false, lossReason: null,
+    }),
+    assertLocallyHeld: throwRuntimeOwnershipNotHeld,
+    async assertCurrent(): Promise<never> { return throwRuntimeOwnershipNotHeld(); },
+  };
+}
+
+function throwRuntimeOwnershipNotHeld(): never {
+  throw new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_NOT_HELD",
+    "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
+  );
+}
+
+function isRuntimeOwnershipFailure(error: unknown): boolean {
+  return error instanceof RuntimeOwnershipGuardError ||
+    (error instanceof Error && /^RUNTIME_OWNERSHIP_(?:LOST|NOT_HELD):/u.test(error.message));
+}
+
+function fenceAsyncBoundary<T extends object>(
+  target: T,
+  runtimeOwnership: RuntimeOwnershipAuthority,
+): T {
+  return new Proxy(target, {
+    get(boundaryTarget, property) {
+      const value = Reflect.get(boundaryTarget, property, boundaryTarget) as unknown;
+      if (typeof value !== "function") return value;
+
+      return (...args: unknown[]) => {
+        runtimeOwnership.assertLocallyHeld();
+        const result = Reflect.apply(value, boundaryTarget, args) as unknown;
+        if (!isPromiseLike(result)) {
+          runtimeOwnership.assertLocallyHeld();
+          return result;
+        }
+        return Promise.resolve(result).then(
+          (settled) => {
+            runtimeOwnership.assertLocallyHeld();
+            return settled;
+          },
+          (error: unknown) => {
+            runtimeOwnership.assertLocallyHeld();
+            throw error;
+          },
+        );
+      };
+    },
+  });
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return typeof value === "object" && value !== null && "then" in value &&
+    typeof (value as { then?: unknown }).then === "function";
 }
 
 function summarizeHistoryRecoveryConfidence(

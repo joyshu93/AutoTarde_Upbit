@@ -13,6 +13,10 @@ import type {
   PositionGuardPolicySelection,
 } from "../../domain/pilot-types.js";
 import { createId } from "../../shared/ids.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../../app/runtime-ownership-guard.js";
 import type { ExecutionRepository } from "../db/interfaces.js";
 import {
   parseCandidatePilotTimestamp,
@@ -157,6 +161,8 @@ const BASELINE_POLICY_SELECTION: PositionGuardPolicySelection = Object.freeze({
 });
 
 export class PositionGuardStrategyRunner {
+  private readonly runtimeOwnership: RuntimeOwnershipAuthority;
+
   constructor(
     private readonly dependencies: {
       repositories: ExecutionRepository;
@@ -166,11 +172,16 @@ export class PositionGuardStrategyRunner {
       policySelection?: PositionGuardPolicySelection;
       candidateRunVerifier?: PositionGuardCandidateRunVerifier;
       policyRouter?: typeof routePositionGuardPolicy;
+      runtimeOwnership?: RuntimeOwnershipAuthority;
     },
-  ) {}
+  ) {
+    this.runtimeOwnership = dependencies.runtimeOwnership ?? createUnavailableRuntimeOwnershipAuthority();
+  }
 
   async runOnce(input: PositionGuardRunInput): Promise<PositionGuardRunResult> {
+    this.runtimeOwnership.assertLocallyHeld();
     const baselineDecision = await this.buildDecision(input);
+    this.runtimeOwnership.assertLocallyHeld();
     const selection = this.dependencies.policySelection ?? BASELINE_POLICY_SELECTION;
     if (selection.kind === "BASELINE") {
       return this.persistAndExecuteBaseline(input, baselineDecision);
@@ -179,6 +190,7 @@ export class PositionGuardStrategyRunner {
     const verification = input.market === "KRW-BTC"
       ? await this.verifyCandidateRun(input)
       : null;
+    this.runtimeOwnership.assertLocallyHeld();
     const route = (this.dependencies.policyRouter ?? routePositionGuardPolicy)({
       market: input.market,
       generatedAt: input.generatedAt,
@@ -223,6 +235,7 @@ export class PositionGuardStrategyRunner {
     });
 
     await this.dependencies.repositories.saveStrategyDecision(strategyDecisionRecord);
+    this.runtimeOwnership.assertLocallyHeld();
 
     const orderInput = route.executionBlocked || executionStrategyDecision === null
       ? null
@@ -259,6 +272,7 @@ export class PositionGuardStrategyRunner {
     });
 
     await this.dependencies.repositories.saveStrategyDecision(strategyDecisionRecord);
+    this.runtimeOwnership.assertLocallyHeld();
 
     const orderInput = toOrderSubmissionInput({
       exchangeAccountId: this.dependencies.config.exchangeAccountId,
@@ -329,6 +343,7 @@ export class PositionGuardStrategyRunner {
       candleCount: this.dependencies.config.candleCount,
       ...(input.candleTo === undefined ? {} : { to: input.candleTo }),
     });
+    this.runtimeOwnership.assertLocallyHeld();
     const preliminaryAnalysis = analyzePositionGuardMarketStructure(marketSnapshot);
     const context = await loadPositionGuardStrategyContext(this.dependencies.repositories, {
       exchangeAccountId: this.dependencies.config.exchangeAccountId,
@@ -337,6 +352,7 @@ export class PositionGuardStrategyRunner {
       settings: this.dependencies.config.settings,
       analysis: preliminaryAnalysis,
     });
+    this.runtimeOwnership.assertLocallyHeld();
     const engineDecision = decidePositionGuardCore(context);
     const strategyDecision = toStrategyDecision(context, engineDecision);
     const referencePriceCapturedAt = resolveReferencePriceCapturedAt(marketSnapshot);
@@ -348,6 +364,24 @@ export class PositionGuardStrategyRunner {
       referencePriceCapturedAt,
     };
   }
+}
+
+function createUnavailableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "UNOWNED", generation: null, executionMode: null, acquiredAtEpochMs: null,
+      heartbeatAtEpochMs: null, expiresAtEpochMs: null, takeover: false, lossReason: null,
+    }),
+    assertLocallyHeld: throwRuntimeOwnershipNotHeld,
+    async assertCurrent(): Promise<never> { return throwRuntimeOwnershipNotHeld(); },
+  };
+}
+
+function throwRuntimeOwnershipNotHeld(): never {
+  throw new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_NOT_HELD",
+    "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
+  );
 }
 
 function createPolicyRouteAudit(input: {
