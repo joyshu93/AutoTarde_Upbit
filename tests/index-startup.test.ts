@@ -480,6 +480,7 @@ function createRunMainFixture(events: string[]): {
     async releaseCurrentOwnership() {
       return true;
     },
+    async waitForLossRecording() {},
     closeOwnershipDatabase() {},
     async releaseProcessLock() {},
     async shutdownAfterStartupFailure() {

@@ -1,6 +1,7 @@
 import type { SupportedTelegramCommand } from "./interfaces.js";
 import { listTelegramCommandContracts } from "./contracts.js";
 import type { TelegramCommandMenuClient } from "./delivery.js";
+import type { RuntimeOwnershipAuthority } from "../../app/runtime-ownership-guard.js";
 
 export type TelegramCommandMenuRegistrationStatus = "COMPLETED" | "FAILED" | "NOT_ATTEMPTED";
 
@@ -66,6 +67,7 @@ export class TelegramCommandMenuSetupService {
     private readonly dependencies: {
       client: TelegramCommandMenuClient | null;
       operatorChatId: string | null;
+      runtimeOwnership: RuntimeOwnershipAuthority;
     },
   ) {}
 
@@ -87,6 +89,7 @@ export class TelegramCommandMenuSetupService {
       };
     }
 
+    this.dependencies.runtimeOwnership.assertLocallyHeld();
     try {
       await client.setMyCommands({
         commands: buildCommandMenu(KOREAN_DESCRIPTIONS),
@@ -96,6 +99,7 @@ export class TelegramCommandMenuSetupService {
         },
       });
     } catch {
+      this.dependencies.runtimeOwnership.assertLocallyHeld();
       return {
         configured: true,
         attempted: true,
@@ -105,7 +109,9 @@ export class TelegramCommandMenuSetupService {
         english: "NOT_ATTEMPTED",
       };
     }
+    this.dependencies.runtimeOwnership.assertLocallyHeld();
 
+    this.dependencies.runtimeOwnership.assertLocallyHeld();
     try {
       await client.setMyCommands({
         commands: buildCommandMenu(ENGLISH_DESCRIPTIONS),
@@ -116,6 +122,7 @@ export class TelegramCommandMenuSetupService {
         languageCode: "en",
       });
     } catch {
+      this.dependencies.runtimeOwnership.assertLocallyHeld();
       return {
         configured: true,
         attempted: true,
@@ -125,6 +132,7 @@ export class TelegramCommandMenuSetupService {
         english: "FAILED",
       };
     }
+    this.dependencies.runtimeOwnership.assertLocallyHeld();
 
     return {
       configured: true,

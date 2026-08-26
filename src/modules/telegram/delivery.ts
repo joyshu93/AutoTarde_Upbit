@@ -199,10 +199,17 @@ export class TelegramBotApiClient implements TelegramMessageClient, TelegramMess
   }
 }
 
+export interface OperatorNotificationDeliveryStopStatus {
+  readonly stopped: boolean;
+  readonly inFlightCount: number;
+  readonly quiesced: boolean;
+}
+
 export class OperatorNotificationDeliveryService {
   private readonly inFlightByExchangeAccount = new Map<string, Promise<OperatorNotificationDeliverySummary>>();
   private readonly rerunRequestedByExchangeAccount = new Set<string>();
   private readonly runtimeOwnership: RuntimeOwnershipAuthority;
+  private stopped = false;
 
   constructor(
     private readonly dependencies: {
@@ -235,6 +242,7 @@ export class OperatorNotificationDeliveryService {
   }
 
   kick(exchangeAccountId: string, limit = DEFAULT_PENDING_DELIVERY_LIMIT): void {
+    if (this.stopped) return;
     if (this.inFlightByExchangeAccount.has(exchangeAccountId)) {
       this.rerunRequestedByExchangeAccount.add(exchangeAccountId);
       return;
@@ -250,6 +258,9 @@ export class OperatorNotificationDeliveryService {
     limit = DEFAULT_PENDING_DELIVERY_LIMIT,
   ): Promise<OperatorNotificationDeliverySummary> {
     this.runtimeOwnership.assertLocallyHeld();
+    if (this.stopped) {
+      throw new Error("Operator notification delivery is stopped.");
+    }
     const inFlight = this.inFlightByExchangeAccount.get(exchangeAccountId);
     if (inFlight) {
       return inFlight;
@@ -258,7 +269,7 @@ export class OperatorNotificationDeliveryService {
     const deliveryRun = this.runDeliveryUntilIdle(exchangeAccountId, limit).finally(() => {
       if (this.inFlightByExchangeAccount.get(exchangeAccountId) === deliveryRun) {
         this.inFlightByExchangeAccount.delete(exchangeAccountId);
-        if (this.rerunRequestedByExchangeAccount.delete(exchangeAccountId)) {
+        if (!this.stopped && this.rerunRequestedByExchangeAccount.delete(exchangeAccountId)) {
           this.kick(exchangeAccountId, limit);
         }
       }
@@ -268,13 +279,35 @@ export class OperatorNotificationDeliveryService {
     return deliveryRun;
   }
 
+  stop(): OperatorNotificationDeliveryStopStatus {
+    this.stopped = true;
+    this.rerunRequestedByExchangeAccount.clear();
+    const inFlightCount = this.inFlightByExchangeAccount.size;
+    return {
+      stopped: true,
+      inFlightCount,
+      quiesced: inFlightCount === 0,
+    };
+  }
+
+  async stopAndWait(timeoutMs: number): Promise<OperatorNotificationDeliveryStopStatus> {
+    this.stop();
+    const pending = [...this.inFlightByExchangeAccount.values()];
+    await waitForDeliverySettlement(Promise.allSettled(pending), timeoutMs);
+    return {
+      stopped: true,
+      inFlightCount: this.inFlightByExchangeAccount.size,
+      quiesced: this.inFlightByExchangeAccount.size === 0,
+    };
+  }
+
   private async runDeliveryUntilIdle(
     exchangeAccountId: string,
     limit: number,
   ): Promise<OperatorNotificationDeliverySummary> {
     let summary = await this.runDelivery(exchangeAccountId, limit);
 
-    while (this.rerunRequestedByExchangeAccount.delete(exchangeAccountId)) {
+    while (!this.stopped && this.rerunRequestedByExchangeAccount.delete(exchangeAccountId)) {
       const followUpSummary = await this.runDelivery(exchangeAccountId, limit);
       summary = mergeDeliverySummaries(summary, followUpSummary);
     }
@@ -936,6 +969,25 @@ function createUnavailableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority
     assertLocallyHeld: throwRuntimeOwnershipNotHeld,
     async assertCurrent(): Promise<never> { return throwRuntimeOwnershipNotHeld(); },
   };
+}
+
+function waitForDeliverySettlement<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  const boundedTimeoutMs = Number.isSafeInteger(timeoutMs) && timeoutMs >= 0 ? timeoutMs : 0;
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error("Operator notification delivery did not quiesce before the shutdown timeout."));
+    }, boundedTimeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
 }
 
 function throwRuntimeOwnershipNotHeld(): never {

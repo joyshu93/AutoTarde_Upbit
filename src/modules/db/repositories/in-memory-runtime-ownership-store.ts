@@ -12,6 +12,7 @@ import {
   validateRuntimeOwnershipEventLimit,
   validateRuntimeOwnershipEventRecord,
   validateRuntimeOwnershipRecord,
+  validateRuntimeOwnershipScopeKey,
   type AcquireRuntimeOwnershipInput,
   type PersistedRuntimeExecutionAuthority,
   type RecordRuntimeOwnershipLostInput,
@@ -24,6 +25,10 @@ export class InMemoryRuntimeOwnershipStore implements RuntimeOwnershipStore {
   private current: RuntimeOwnershipRecord | null = null;
   private readonly events: RuntimeOwnershipEventRecord[] = [];
   private nextEventId = 1;
+
+  constructor(private readonly scopeKey: string) {
+    validateRuntimeOwnershipScopeKey(scopeKey);
+  }
 
   async getCurrent(): Promise<RuntimeOwnershipRecord | null> {
     if (this.current === null) return null;

@@ -79,7 +79,7 @@ test("runtime heartbeat never renews a newer persisted generation", async () => 
 });
 
 test("runtime heartbeat retries transient store errors only before persisted expiry", async () => {
-  const baseStore = new InMemoryRuntimeOwnershipStore();
+  const baseStore = new InMemoryRuntimeOwnershipStore("0".repeat(64));
   const store = new TransientRenewalStore(baseStore, 10);
   const fixture = await createHeartbeatFixture(store);
   fixture.heartbeat.start();
@@ -103,7 +103,7 @@ test("runtime heartbeat retries transient store errors only before persisted exp
 });
 
 test("runtime heartbeat recovers from a transient error before expiry", async () => {
-  const baseStore = new InMemoryRuntimeOwnershipStore();
+  const baseStore = new InMemoryRuntimeOwnershipStore("0".repeat(64));
   const store = new TransientRenewalStore(baseStore, 1);
   const fixture = await createHeartbeatFixture(store);
   fixture.heartbeat.start();
@@ -161,7 +161,7 @@ test("runtime heartbeat stop is asynchronous and idempotently prevents future re
 });
 
 test("runtime heartbeat stop observes an in-flight mismatch and awaits its loss callback", async () => {
-  const store = new DeferredRenewalStore(new InMemoryRuntimeOwnershipStore());
+  const store = new DeferredRenewalStore(new InMemoryRuntimeOwnershipStore("0".repeat(64)));
   let releaseLossCallback: (() => void) | null = null;
   const lossCallbackGate = new Promise<void>((resolve) => {
     releaseLossCallback = resolve;
@@ -210,7 +210,7 @@ interface HeartbeatFixture {
 }
 
 async function createHeartbeatFixture(
-  store: RuntimeOwnershipStore = new InMemoryRuntimeOwnershipStore(),
+  store: RuntimeOwnershipStore = new InMemoryRuntimeOwnershipStore("0".repeat(64)),
   afterLoss?: (reason: string) => void | Promise<void>,
 ): Promise<HeartbeatFixture> {
   const clock = new ManualClock(1_000);

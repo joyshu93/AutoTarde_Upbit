@@ -3,7 +3,10 @@ import { pathToFileURL } from "node:url";
 import { createApp, type AppServices } from "../app/create-app.js";
 import { loadAppConfig, type AppConfig } from "../app/env.js";
 import type { RuntimeOwnershipAuthority } from "../app/runtime-ownership-guard.js";
-import { runWithScopedRuntimeOwnership } from "../app/scoped-runtime-ownership.js";
+import {
+  runWithScopedRuntimeOwnership,
+  stopScopedApplicationRuntime,
+} from "../app/scoped-runtime-ownership.js";
 import type {
   UpbitCandleSnapshot,
   UpbitGetDayCandlesRequest,
@@ -214,8 +217,12 @@ export async function runDryRunOperatorSmoke(
     createApp(appConfig, appOverrides));
   const runOwned = overrides.runWithScopedRuntimeOwnership ?? runWithScopedRuntimeOwnership;
 
-  return runOwned(config, async (runtimeOwnershipAuthority) => {
-    const app = createApplication(config, {
+  return runOwned(config, async (
+    runtimeOwnershipAuthority,
+    verifiedConfig,
+    fenceApplication,
+  ) => {
+    const app = createApplication(verifiedConfig, {
       runtimeOwnershipAuthority,
       publicMarketDataReader: createDryRunOperatorMarketDataReader(),
     });
@@ -223,9 +230,7 @@ export async function runDryRunOperatorSmoke(
     try {
       return await buildDryRunOperatorSmokeResult(app, safetyEnv);
     } finally {
-      app.telegramInboundPolling.stop();
-      app.strategyScheduler.stop();
-      app.persistence.close();
+      await stopScopedApplicationRuntime(app, fenceApplication);
     }
   });
 }

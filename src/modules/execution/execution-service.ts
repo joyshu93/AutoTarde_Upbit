@@ -639,10 +639,28 @@ export class ExecutionService {
       }
     }
 
+    let postAdapterOwnershipAssertionFailed = false;
     try {
       if (synchronousSubmissionError !== null) throw synchronousSubmissionError;
       if (!exchangeOrderPromise) throw new Error("Exchange order submission did not start.");
-      const exchangeOrder = await exchangeOrderPromise;
+      let exchangeOrder: Awaited<typeof exchangeOrderPromise>;
+      try {
+        exchangeOrder = await exchangeOrderPromise;
+      } catch (error) {
+        try {
+          await this.runtimeOwnership.assertCurrent(Date.now());
+        } catch (ownershipError) {
+          postAdapterOwnershipAssertionFailed = true;
+          throw ownershipError;
+        }
+        throw error;
+      }
+      try {
+        await this.runtimeOwnership.assertCurrent(Date.now());
+      } catch (ownershipError) {
+        postAdapterOwnershipAssertionFailed = true;
+        throw ownershipError;
+      }
 
       const submittedAt = this.currentTimestamp();
       let updatedOrder: OrderRecord = {
@@ -755,6 +773,10 @@ export class ExecutionService {
         reason: null,
       };
     } catch (error) {
+      if (postAdapterOwnershipAssertionFailed || error instanceof RuntimeOwnershipGuardError) {
+        releaseLease = false;
+        throw error;
+      }
       if (error instanceof PostSendPersistenceSafetyError) {
         throw error;
       }

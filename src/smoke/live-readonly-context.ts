@@ -1,5 +1,3 @@
-import { DatabaseSync } from "node:sqlite";
-
 import type { AppConfig } from "../app/env.js";
 import { loadAppConfig } from "../app/env.js";
 import { verifyLiveDatabaseIdentity } from "../app/live-database-identity.js";
@@ -7,6 +5,7 @@ import {
   SqliteExecutionRepository,
   SqliteOperatorStateStore,
 } from "../modules/db/repositories/sqlite-repositories.js";
+import { openReadOnlySqliteDatabase } from "../modules/db/repositories/sqlite-database.js";
 
 export interface LiveReadOnlyContext {
   config: AppConfig;
@@ -36,7 +35,7 @@ export function openLiveReadOnlyContext(
     upbitAccessKey: accessKey,
   });
 
-  const db = new DatabaseSync(config.databasePath, { readOnly: true });
+  const db = openReadOnlySqliteDatabase(config.databasePath);
   const exchangeBackedReadEnabled = Boolean(accessKey && secretKey);
   return {
     config,

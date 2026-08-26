@@ -251,7 +251,7 @@ test("baseline final send requires its own exact persisted SUBMITTING intent", a
   }
 });
 
-test("execution service checks persisted runtime ownership at the final send boundary", async () => {
+test("execution service checks persisted ownership before send and after adapter settlement", async () => {
   const checkedAt: number[] = [];
   const runtimeOwnership: RuntimeOwnershipAuthority = {
     snapshot: () => ({
@@ -336,8 +336,8 @@ test("execution service checks persisted runtime ownership at the final send bou
   });
 
   assert.equal(result.outcome, "SIMULATED_FILLED");
-  assert.equal(checkedAt.length, 1);
-  assert.equal(Number.isSafeInteger(checkedAt[0]), true);
+  assert.equal(checkedAt.length, 2);
+  assert.equal(checkedAt.every(Number.isSafeInteger), true);
 });
 
 test("execution service persists a dry-run order and blocks duplicate idempotent submissions", async () => {

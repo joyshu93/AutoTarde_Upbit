@@ -178,9 +178,12 @@ test("owned runtime shutdown fences first and releases the process lock last", a
 
   assert.deepEqual(events, [
     "ownership:fence",
+    "delivery:stop",
     "telegram:stop",
     "scheduler:stop",
+    "delivery:quiesce",
     "workers:quiesce",
+    "ownership:loss-recording",
     "ownership:release",
     "app-db:close",
     "ownership-db:close",
@@ -197,7 +200,73 @@ test("owned runtime shutdown fences first and releases the process lock last", a
     "STOPPED",
     "STOPPED",
     "STOPPED",
+    "STOPPED",
+    "STOPPED",
   ]);
+});
+
+test("owned runtime waits for notification delivery settlement before closing databases", async () => {
+  const events: string[] = [];
+  const deliverySettlement = createDeferred<void>();
+  const app = createAsyncRuntimeApp(events, {
+    async deliveryStopAndWait() {
+      events.push("delivery:quiesce");
+      await deliverySettlement.promise;
+      return { stopped: true, inFlightCount: 0, quiesced: true };
+    },
+  });
+  const shutdown = createRuntimeShutdown(app, createOwnershipContext(events), {
+    nowEpochMs: () => 123_456,
+    timeoutMs: 1_000,
+  });
+
+  const stopping = shutdown("SIGTERM");
+  await waitFor(() => events.includes("delivery:quiesce"));
+  assert.equal(events.includes("app-db:close"), false);
+  assert.equal(events.includes("process-lock:release"), false);
+
+  deliverySettlement.resolve();
+  assert.equal((await stopping).status, "STOPPED");
+  assert.ok(events.indexOf("delivery:quiesce") < events.indexOf("app-db:close"));
+  assert.equal(events.at(-1), "process-lock:release");
+});
+
+test("worker rejection still waits for notification delivery settlement before database close", async () => {
+  const events: string[] = [];
+  const deliverySettlement = createDeferred<void>();
+  const inboundError = new Error("inbound_quiescence_failed");
+  const app = createAsyncRuntimeApp(events, {
+    async deliveryStopAndWait() {
+      events.push("delivery:quiesce");
+      await deliverySettlement.promise;
+      return { stopped: true, inFlightCount: 0, quiesced: true };
+    },
+    async telegramStopAndWait() {
+      events.push("workers:quiesce");
+      throw inboundError;
+    },
+  });
+  const shutdown = createRuntimeShutdown(app, createOwnershipContext(events), {
+    nowEpochMs: () => 123_456,
+    timeoutMs: 1_000,
+  });
+
+  const stopping = shutdown("SIGTERM");
+  await waitFor(() => events.includes("workers:quiesce"));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(events.includes("app-db:close"), false);
+  assert.equal(events.includes("process-lock:release"), false);
+
+  deliverySettlement.resolve();
+  const summary = await stopping;
+  assert.equal(summary.status, "PARTIAL_FAILURE");
+  assert.equal(
+    summary.steps.find((step) => step.name === "workers_quiescence")?.errorMessage,
+    inboundError.message,
+  );
+  assert.equal(events.includes("ownership:release"), false);
+  assert.ok(events.indexOf("delivery:quiesce") < events.indexOf("app-db:close"));
+  assert.equal(events.at(-1), "process-lock:release");
 });
 
 test("owned runtime shutdown shares one promise and preserves the first reason", async () => {
@@ -252,9 +321,12 @@ test("ownership loss skips persisted release for an already mismatched generatio
   );
   assert.deepEqual(events, [
     "ownership:fence",
+    "delivery:stop",
     "telegram:stop",
     "scheduler:stop",
+    "delivery:quiesce",
     "workers:quiesce",
+    "ownership:loss-recording",
     "app-db:close",
     "ownership-db:close",
     "process-lock:release",
@@ -298,10 +370,10 @@ test("worker quiescence timeout prevents ownership release and still closes lock
   const never = new Promise<void>(() => undefined);
   const ownership = createOwnershipContext(events);
   const app = createAsyncRuntimeApp(events, {
-    async telegramStopAndWait() {
-      events.push("workers:quiesce");
+    async deliveryStopAndWait() {
+      events.push("delivery:quiesce");
       await never;
-      return createTelegramStatus(false);
+      return { stopped: true, inFlightCount: 1, quiesced: false };
     },
   });
 
@@ -587,12 +659,27 @@ function createSchedulerStatus(started: boolean) {
 function createAsyncRuntimeApp(
   events: string[],
   overrides: {
+    deliveryStopAndWait?: (timeoutMs: number) => Promise<{
+      stopped: boolean;
+      inFlightCount: number;
+      quiesced: boolean;
+    }>;
     telegramStopAndWait?: (timeoutMs: number) => Promise<ReturnType<typeof createTelegramStatus>>;
     schedulerStopAndWait?: (timeoutMs: number) => Promise<ReturnType<typeof createSchedulerStatus>>;
     closeAppDatabase?: () => void;
   } = {},
 ) {
   return {
+    notificationDelivery: {
+      stop() {
+        events.push("delivery:stop");
+        return { stopped: true, inFlightCount: 0, quiesced: true };
+      },
+      stopAndWait: overrides.deliveryStopAndWait ?? (async () => {
+        events.push("delivery:quiesce");
+        return { stopped: true, inFlightCount: 0, quiesced: true };
+      }),
+    },
     telegramInboundPolling: {
       stop() {
         events.push("telegram:stop");
@@ -650,6 +737,9 @@ function createOwnershipContext(
       events.push("ownership:release");
       return true;
     }),
+    async waitForLossRecording() {
+      events.push("ownership:loss-recording");
+    },
     closeOwnershipDatabase: overrides.closeOwnershipDatabase ?? (() => {
       events.push("ownership-db:close");
     }),

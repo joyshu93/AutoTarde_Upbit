@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -9,6 +9,10 @@ import {
   provisionLiveDatabaseIdentity,
   verifyLiveDatabaseIdentity,
 } from "../src/app/live-database-identity.js";
+import {
+  canonicalizeLocalDatabasePath,
+  LocalDatabasePathError,
+} from "../src/modules/db/local-database-path.js";
 import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
 import { runLiveReadinessSmoke } from "../src/smoke/live-readiness.js";
 import { runLiveSchedulerPreflightSmoke } from "../src/smoke/live-scheduler-preflight.js";
@@ -19,6 +23,66 @@ import { createApp as createProductionApp } from "../src/app/create-app.js";
 
 const INSTANCE_ID = "7d66cf9c-c739-4b39-a7ac-41a9a6f75e59";
 const ACCESS_KEY = "test-access-key";
+
+test("local database canonicalization rejects network, device, and short-path forms", () => {
+  const rejected: Array<readonly [string, string]> = [
+    [String.raw`\\server\share\runtime.sqlite`, "DATABASE_PATH_NETWORK"],
+    [String.raw`\\?\C:\runtime\runtime.sqlite`, "DATABASE_PATH_DEVICE"],
+    [String.raw`\\.\C:\runtime\runtime.sqlite`, "DATABASE_PATH_DEVICE"],
+    [String.raw`\??\C:\runtime\runtime.sqlite`, "DATABASE_PATH_DEVICE"],
+  ];
+  if (process.platform === "win32") {
+    rejected.push([String.raw`C:\RUNTIME~1\runtime.sqlite`, "DATABASE_PATH_SHORT_NAME"]);
+    rejected.push([String.raw`C:\runtime\RUNTIM~1.SQL`, "DATABASE_PATH_SHORT_NAME"]);
+  }
+
+  for (const [databasePath, code] of rejected) {
+    assert.throws(
+      () => canonicalizeLocalDatabasePath(databasePath),
+      (error: unknown) => error instanceof LocalDatabasePathError && error.code === code,
+      databasePath,
+    );
+  }
+});
+
+test("local database canonicalization rejects reparse and hardlink aliases", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "autotrade-local-db-alias-"));
+  const targetDirectory = join(directory, "target");
+  const aliasDirectory = join(directory, "alias");
+  const databasePath = join(targetDirectory, "runtime.sqlite");
+  const hardlinkPath = join(targetDirectory, "runtime-hardlink.sqlite");
+  try {
+    await mkdir(targetDirectory);
+    await writeFile(databasePath, "sqlite-fixture");
+    await symlink(targetDirectory, aliasDirectory, process.platform === "win32" ? "junction" : "dir");
+    assert.throws(
+      () => canonicalizeLocalDatabasePath(join(aliasDirectory, "runtime.sqlite")),
+      (error: unknown) => error instanceof LocalDatabasePathError &&
+        error.code === "DATABASE_PATH_REPARSE_POINT",
+    );
+
+    await link(databasePath, hardlinkPath);
+    for (const candidate of [databasePath, hardlinkPath]) {
+      assert.throws(
+        () => canonicalizeLocalDatabasePath(candidate),
+        (error: unknown) => error instanceof LocalDatabasePathError &&
+          error.code === "DATABASE_PATH_HARDLINK_AMBIGUOUS",
+      );
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("local database canonicalization resolves a missing DRY_RUN target beneath verified parents", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "autotrade-local-db-missing-"));
+  try {
+    const databasePath = join(directory, "nested", "runtime.sqlite");
+    assert.equal(canonicalizeLocalDatabasePath(databasePath), resolve(databasePath));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("DRY_RUN database identity verification is a filesystem-free no-op", () => {
   const missingPath = resolve("definitely-missing", "dry-run.sqlite");

@@ -4,7 +4,10 @@ import path from "node:path";
 
 import { loadAppConfig } from "../src/app/env.js";
 import { RuntimeProcessLockError } from "../src/app/runtime-process-lock.js";
-import { runWithScopedRuntimeOwnership } from "../src/app/scoped-runtime-ownership.js";
+import {
+  runWithScopedRuntimeOwnership,
+  stopScopedApplicationRuntime,
+} from "../src/app/scoped-runtime-ownership.js";
 import { createVerifiedApplication } from "../src/index.js";
 import { runDryRunCompletionSmoke } from "../src/smoke/dryrun-completion.js";
 import { runDryRunReadinessSmoke } from "../src/smoke/dryrun-readiness.js";
@@ -159,6 +162,64 @@ test("every writable createApp composition contends on one real scope and cleans
   }
 });
 
+test("scoped application cleanup fences and quiesces delivery before database close", async () => {
+  const events: string[] = [];
+  const deliverySettlement = createDeferred<void>();
+  const stopping = stopScopedApplicationRuntime({
+    notificationDelivery: {
+      stop() {
+        events.push("delivery:stop");
+        return { stopped: true, inFlightCount: 1, quiesced: false };
+      },
+      async stopAndWait() {
+        events.push("delivery:quiesce");
+        await deliverySettlement.promise;
+        return { stopped: true, inFlightCount: 0, quiesced: true };
+      },
+    },
+    telegramInboundPolling: {
+      stop() {
+        events.push("inbound:stop");
+        return { running: false } as never;
+      },
+      async stopAndWait() {
+        events.push("inbound:quiesce");
+        return { running: false } as never;
+      },
+    },
+    strategyScheduler: {
+      stop() {
+        events.push("scheduler:stop");
+        return { markets: [] } as never;
+      },
+      async stopAndWait() {
+        events.push("scheduler:quiesce");
+        return { markets: [], quiesced: true } as never;
+      },
+    },
+    persistence: {
+      close() {
+        events.push("database:close");
+      },
+    },
+  }, (reason) => events.push(`ownership:fence:${reason}`), 1_000);
+
+  await waitFor(() => events.includes("delivery:quiesce"));
+  assert.equal(events.includes("database:close"), false);
+  deliverySettlement.resolve();
+  await stopping;
+  assert.deepEqual(events, [
+    "ownership:fence:SCOPED_WORK_COMPLETE",
+    "delivery:stop",
+    "inbound:stop",
+    "scheduler:stop",
+    "delivery:quiesce",
+    "inbound:quiesce",
+    "scheduler:quiesce",
+    "database:close",
+  ]);
+});
+
 function createDryRunConfig(databasePath: string) {
   return loadAppConfig({
     APP_EXECUTION_MODE: "DRY_RUN",
@@ -187,6 +248,14 @@ function createDeferred<T>() {
     resolve = resolvePromise;
   });
   return { promise, resolve };
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.fail("Timed out waiting for scoped application cleanup.");
 }
 
 function isRuntimeContention(error: unknown): boolean {

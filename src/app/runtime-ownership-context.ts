@@ -1,5 +1,4 @@
 import { randomBytes } from "node:crypto";
-import { resolve } from "node:path";
 
 import type { AppConfig } from "./env.js";
 import { RuntimeHeartbeat } from "./runtime-heartbeat.js";
@@ -16,6 +15,7 @@ import {
 import { verifyLiveDatabaseIdentity } from "./live-database-identity.js";
 import { createSqliteRuntimeOwnershipPersistence } from
   "../modules/db/repositories/sqlite-repositories.js";
+import { canonicalizeLocalDatabasePath } from "../modules/db/local-database-path.js";
 
 const EXCHANGE_ACCOUNT_ID = "primary";
 
@@ -30,19 +30,22 @@ export interface RuntimeOwnershipContext {
   snapshot(): RuntimeOwnershipSnapshot;
   fence(reason: string): void;
   releaseCurrentOwnership(releasedAtEpochMs: number): Promise<boolean>;
+  waitForLossRecording(): Promise<void>;
   closeOwnershipDatabase(): void;
   releaseProcessLock(): Promise<void>;
   shutdownAfterStartupFailure(): Promise<void>;
 }
 
 export interface CreateRuntimeOwnershipContextInput {
-  readonly config: Pick<AppConfig, "databasePath" | "executionMode">;
+  readonly executionMode: AppConfig["executionMode"];
+  readonly verifiedDatabase: VerifiedRuntimeDatabase;
   readonly processLock: RuntimeProcessLock;
 }
 
 export interface RuntimeOwnershipContextDependencies {
   createOwnershipPersistence(
     databasePath: string,
+    scopeKey: string,
   ): ReturnType<typeof createSqliteRuntimeOwnershipPersistence>;
   createOwnerToken(): string;
   nowEpochMs(): number;
@@ -58,7 +61,7 @@ export function verifyAndResolveRuntimeDatabase(config: AppConfig): VerifiedRunt
   });
   const canonicalDatabasePath = verification.status === "VERIFIED"
     ? verification.canonicalDatabasePath
-    : resolve(config.databasePath);
+    : canonicalizeLocalDatabasePath(config.databasePath);
   return {
     canonicalDatabasePath,
     lockIdentity: deriveRuntimeLockIdentity({
@@ -94,8 +97,15 @@ export async function createRuntimeOwnershipContext(
   };
 
   try {
+    if (
+      input.processLock.identity.scopeDigest !==
+      input.verifiedDatabase.lockIdentity.scopeDigest
+    ) {
+      throw new Error("Runtime process lock does not match the verified database scope.");
+    }
     ownershipPersistence = createOwnershipPersistence(
-      resolve(input.config.databasePath),
+      input.verifiedDatabase.canonicalDatabasePath,
+      input.verifiedDatabase.lockIdentity.scopeDigest,
     );
     const ownerToken = createOwnerToken();
     const store = ownershipPersistence.runtimeOwnership;
@@ -105,6 +115,27 @@ export async function createRuntimeOwnershipContext(
       ownerToken,
     });
     const heartbeat = new RuntimeHeartbeat({ guard, store, ownerToken });
+    let lossRecordingPromise = Promise.resolve();
+    guard.onLost((reason) => {
+      if (!shouldRecordRuntimeOwnershipLoss(reason)) return;
+      const snapshot = guard.snapshot();
+      if (snapshot.generation === null) return;
+      const lostAtEpochMs = Math.max(
+        nowEpochMs(),
+        snapshot.heartbeatAtEpochMs ?? 0,
+        reason.endsWith("EXPIRED") ? snapshot.expiresAtEpochMs ?? 0 : 0,
+      );
+      lossRecordingPromise = lossRecordingPromise
+        .then(async () => {
+          await store.recordLost({
+            ownerToken,
+            generation: snapshot.generation!,
+            lostAtEpochMs,
+            reasonCode: reason,
+          });
+        })
+        .catch(() => undefined);
+    });
     let releasePromise: Promise<boolean> | null = null;
     let startupFailureShutdownPromise: Promise<void> | null = null;
 
@@ -128,6 +159,7 @@ export async function createRuntimeOwnershipContext(
         })();
         return releasePromise;
       },
+      waitForLossRecording: () => lossRecordingPromise,
       closeOwnershipDatabase,
       releaseProcessLock,
       shutdownAfterStartupFailure() {
@@ -138,7 +170,7 @@ export async function createRuntimeOwnershipContext(
 
     const acquiredAtEpochMs = nowEpochMs();
     await guard.acquire({
-      executionMode: input.config.executionMode,
+      executionMode: input.executionMode,
       acquiredAtEpochMs,
     });
     heartbeat.start();
@@ -180,6 +212,11 @@ async function shutdownAfterStartupFailure(context: RuntimeOwnershipContext): Pr
     // Preserve the startup failure.
   }
   try {
+    await context.waitForLossRecording();
+  } catch {
+    // Preserve the startup failure.
+  }
+  try {
     context.closeOwnershipDatabase();
   } catch {
     // Preserve the startup failure.
@@ -189,4 +226,13 @@ async function shutdownAfterStartupFailure(context: RuntimeOwnershipContext): Pr
   } catch {
     // Preserve the startup failure.
   }
+}
+
+function shouldRecordRuntimeOwnershipLoss(reason: string): boolean {
+  return reason === "PROCESS_LOCK_LOST" ||
+    reason === "PERSISTED_OWNERSHIP_MISMATCH" ||
+    reason === "OWNERSHIP_EXPIRED" ||
+    reason === "HEARTBEAT_EXPIRED" ||
+    reason === "HEARTBEAT_RENEWAL_MISMATCH" ||
+    reason === "HEARTBEAT_RENEWAL_FAILED";
 }

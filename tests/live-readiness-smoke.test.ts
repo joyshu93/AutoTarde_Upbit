@@ -472,6 +472,9 @@ function createSmokeApp(
       isConfigured() {
         return false;
       },
+      stop() {
+        return { stopped: true, inFlightCount: 0, quiesced: true };
+      },
     } as never,
     persistence: {
       close() {

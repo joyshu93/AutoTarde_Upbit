@@ -1,14 +1,17 @@
 import type { StrategySchedulerStatus } from "../domain/types.js";
 import type { TelegramInboundPollingStatus } from "../modules/telegram/inbound.js";
+import type { OperatorNotificationDeliveryStopStatus } from "../modules/telegram/delivery.js";
 import { RUNTIME_SHUTDOWN_TIMEOUT_MS } from "./runtime-heartbeat.js";
 import type { RuntimeOwnershipContext } from "./runtime-ownership-context.js";
 
 export interface RuntimeStopStep {
   readonly name:
     | "runtime_ownership_fence"
+    | "operator_notification_delivery"
     | "telegram_inbound_polling"
     | "strategy_scheduler"
     | "workers_quiescence"
+    | "runtime_ownership_loss_recording"
     | "runtime_ownership_release"
     | "sqlite_persistence"
     | "runtime_ownership_database"
@@ -39,6 +42,10 @@ type RuntimeSignalShutdown = (
 ) => RuntimeStopSummary | Promise<RuntimeStopSummary>;
 
 export interface RuntimeStoppableApp {
+  readonly notificationDelivery?: {
+    stop(): OperatorNotificationDeliveryStopStatus;
+    stopAndWait?(timeoutMs: number): Promise<OperatorNotificationDeliveryStopStatus>;
+  };
   readonly telegramInboundPolling: {
     stop(): TelegramInboundPollingStatus;
     stopAndWait?(timeoutMs: number): Promise<TelegramInboundPollingStatus>;
@@ -128,6 +135,11 @@ export function hasBackgroundRuntime(status: RuntimeBackgroundStatus): boolean {
 // Read-only smoke compositions still use this synchronous, app-only cleanup path.
 export function stopAppRuntime(app: RuntimeStoppableApp): RuntimeStopSummary {
   const steps: RuntimeStopStep[] = [
+    ...(app.notificationDelivery
+      ? [stopStep("operator_notification_delivery", () => {
+          app.notificationDelivery!.stop();
+        })]
+      : []),
     stopStep("telegram_inbound_polling", () => {
       app.telegramInboundPolling.stop();
     }),
@@ -250,6 +262,11 @@ async function stopOwnedAppRuntime(input: {
   });
   steps.push(fenceStep);
 
+  const deliveryStopStep = stopStep("operator_notification_delivery", () => {
+    input.app.notificationDelivery?.stop();
+  });
+  steps.push(deliveryStopStep);
+
   const telegramStopStep = stopStep("telegram_inbound_polling", () => {
     input.app.telegramInboundPolling.stop();
   });
@@ -261,6 +278,8 @@ async function stopOwnedAppRuntime(input: {
   steps.push(schedulerStopStep);
 
   const quiescenceStep = await stopAsyncStep("workers_quiescence", async () => {
+    const deliveryWait = input.app.notificationDelivery?.stopAndWait?.(input.timeoutMs) ??
+      Promise.resolve({ stopped: true, inFlightCount: 0, quiesced: true });
     const telegramWait = input.app.telegramInboundPolling.stopAndWait?.(input.timeoutMs) ??
       Promise.resolve(input.app.telegramInboundPolling.stop());
     const schedulerWait = input.app.strategyScheduler.stopAndWait?.(input.timeoutMs) ??
@@ -268,30 +287,47 @@ async function stopOwnedAppRuntime(input: {
         ...input.app.strategyScheduler.stop(),
         quiesced: true,
       });
-    const [telegramStatus, schedulerStatus] = await waitWithTimeout(
-      Promise.all([
+    const [deliveryResult, telegramResult, schedulerResult, heartbeatResult] = await waitWithTimeout(
+      Promise.allSettled([
+        deliveryWait,
         telegramWait,
         schedulerWait,
         input.runtimeOwnership.heartbeat.stop(),
-      ]).then(([telegram, scheduler]) => [telegram, scheduler] as const),
+      ]),
       input.timeoutMs,
     );
 
+    if (deliveryResult.status === "rejected") throw deliveryResult.reason;
+    if (telegramResult.status === "rejected") throw telegramResult.reason;
+    if (schedulerResult.status === "rejected") throw schedulerResult.reason;
+    if (heartbeatResult.status === "rejected") throw heartbeatResult.reason;
+
     if (
-      telegramStatus.running ||
-      schedulerStatus.quiesced === false ||
-      schedulerStatus.markets.some((market) => market.running)
+      !deliveryResult.value.quiesced ||
+      telegramResult.value.running ||
+      schedulerResult.value.quiesced === false ||
+      schedulerResult.value.markets.some((market) => market.running)
     ) {
       throw new Error("Runtime workers did not quiesce before the shutdown timeout.");
     }
   });
   steps.push(quiescenceStep);
 
+  const lossRecordingStep = await stopAsyncStep(
+    "runtime_ownership_loss_recording",
+    async () => {
+      await waitWithTimeout(input.runtimeOwnership.waitForLossRecording(), input.timeoutMs);
+    },
+  );
+  steps.push(lossRecordingStep);
+
   const canRelease = initialOwnership.status === "OWNED" &&
     fenceStep.status === "STOPPED" &&
+    deliveryStopStep.status === "STOPPED" &&
     telegramStopStep.status === "STOPPED" &&
     schedulerStopStep.status === "STOPPED" &&
-    quiescenceStep.status === "STOPPED";
+    quiescenceStep.status === "STOPPED" &&
+    lossRecordingStep.status === "STOPPED";
   if (!canRelease) {
     steps.push(skippedStep(
       "runtime_ownership_release",

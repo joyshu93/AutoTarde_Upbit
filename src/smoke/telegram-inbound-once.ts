@@ -3,7 +3,10 @@ import { pathToFileURL } from "node:url";
 import { createApp } from "../app/create-app.js";
 import { loadAppConfig, type AppConfig } from "../app/env.js";
 import type { RuntimeOwnershipAuthority } from "../app/runtime-ownership-guard.js";
-import { runWithScopedRuntimeOwnership } from "../app/scoped-runtime-ownership.js";
+import {
+  runWithScopedRuntimeOwnership,
+  stopScopedApplicationRuntime,
+} from "../app/scoped-runtime-ownership.js";
 import type {
   TelegramInboundPollingStatus,
   TelegramInboundPollSummary,
@@ -123,8 +126,12 @@ export async function runTelegramInboundSmokeOnce(
     createApp(appConfig, appOverrides));
   const runOwned = overrides.runWithScopedRuntimeOwnership ?? runWithScopedRuntimeOwnership;
 
-  return runOwned(config, async (runtimeOwnershipAuthority) => {
-    const app = createApplication(config, { runtimeOwnershipAuthority });
+  return runOwned(config, async (
+    runtimeOwnershipAuthority,
+    verifiedConfig,
+    fenceApplication,
+  ) => {
+    const app = createApplication(verifiedConfig, { runtimeOwnershipAuthority });
     let before: TelegramInboundPollingStatus | null = null;
     let summary: TelegramInboundPollSummary | null = null;
     let after: TelegramInboundPollingStatus | null = null;
@@ -159,9 +166,7 @@ export async function runTelegramInboundSmokeOnce(
         after,
       });
     } finally {
-      app.telegramInboundPolling.stop();
-      app.strategyScheduler.stop();
-      app.persistence.close();
+      await stopScopedApplicationRuntime(app, fenceApplication);
     }
   });
 }

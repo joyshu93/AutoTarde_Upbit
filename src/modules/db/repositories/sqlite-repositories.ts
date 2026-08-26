@@ -244,10 +244,11 @@ export function createSqlitePersistence(options: SqliteBootstrapOptions): Sqlite
 
 export function createSqliteRuntimeOwnershipPersistence(
   databasePath: string,
+  scopeKey: string,
 ): SqliteRuntimeOwnershipBundle {
   const handle = openSqliteDatabase(databasePath);
   return {
-    runtimeOwnership: new SqliteRuntimeOwnershipStore(handle.db),
+    runtimeOwnership: new SqliteRuntimeOwnershipStore(handle.db, scopeKey),
     close() {
       handle.close();
     },

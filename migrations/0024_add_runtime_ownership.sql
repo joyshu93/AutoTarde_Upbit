@@ -1,7 +1,11 @@
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE runtime_ownership (
-  lease_scope TEXT PRIMARY KEY CHECK (lease_scope = 'APPLICATION_RUNTIME'),
+  scope_key TEXT NOT NULL CHECK (
+    length(scope_key) = 64
+    AND scope_key NOT GLOB '*[^a-f0-9]*'
+  ),
+  lease_scope TEXT NOT NULL CHECK (lease_scope = 'APPLICATION_RUNTIME'),
   owner_token TEXT NOT NULL CHECK (
     length(owner_token) = 64
     AND owner_token NOT GLOB '*[^A-Za-z0-9_-]*'
@@ -20,11 +24,16 @@ CREATE TABLE runtime_ownership (
   expires_at_epoch_ms INTEGER NOT NULL CHECK (
     expires_at_epoch_ms > heartbeat_at_epoch_ms
     AND expires_at_epoch_ms <= 9007199254740991
-  )
+  ),
+  PRIMARY KEY (scope_key, lease_scope)
 );
 
 CREATE TABLE runtime_ownership_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT CHECK (id >= 1 AND id <= 9007199254740991),
+  scope_key TEXT NOT NULL CHECK (
+    length(scope_key) = 64
+    AND scope_key NOT GLOB '*[^a-f0-9]*'
+  ),
   lease_scope TEXT NOT NULL CHECK (lease_scope = 'APPLICATION_RUNTIME'),
   generation INTEGER NOT NULL CHECK (
     generation >= 1 AND generation <= 9007199254740991
@@ -44,13 +53,13 @@ CREATE TABLE runtime_ownership_events (
 );
 
 CREATE INDEX idx_runtime_ownership_expires_at
-  ON runtime_ownership(expires_at_epoch_ms, generation);
+  ON runtime_ownership(scope_key, expires_at_epoch_ms, generation);
 
 CREATE INDEX idx_runtime_ownership_events_recent
-  ON runtime_ownership_events(lease_scope, event_at_epoch_ms DESC, id DESC);
+  ON runtime_ownership_events(scope_key, lease_scope, event_at_epoch_ms DESC, id DESC);
 
 CREATE UNIQUE INDEX idx_runtime_ownership_events_generation_acquisition
-  ON runtime_ownership_events(generation)
+  ON runtime_ownership_events(scope_key, generation)
   WHERE event_type IN ('ACQUIRED', 'TAKEN_OVER');
 
 CREATE TRIGGER runtime_ownership_events_no_update

@@ -3,7 +3,10 @@ import { pathToFileURL } from "node:url";
 import { createApp } from "../app/create-app.js";
 import { loadAppConfig, type AppConfig } from "../app/env.js";
 import type { RuntimeOwnershipAuthority } from "../app/runtime-ownership-guard.js";
-import { runWithScopedRuntimeOwnership } from "../app/scoped-runtime-ownership.js";
+import {
+  runWithScopedRuntimeOwnership,
+  stopScopedApplicationRuntime,
+} from "../app/scoped-runtime-ownership.js";
 import {
   SUPPORTED_MARKETS,
   type ExecutionStateRecord,
@@ -241,14 +244,16 @@ export async function runDryRunCompletionSmoke(
     createApp(appConfig, appOverrides));
   const runOwned = overrides.runWithScopedRuntimeOwnership ?? runWithScopedRuntimeOwnership;
 
-  return runOwned(config, async (runtimeOwnershipAuthority) => {
-    const app = createApplication(config, { runtimeOwnershipAuthority });
+  return runOwned(config, async (
+    runtimeOwnershipAuthority,
+    verifiedConfig,
+    fenceApplication,
+  ) => {
+    const app = createApplication(verifiedConfig, { runtimeOwnershipAuthority });
     try {
       return await buildDryRunCompletionSmokeResult(app, safetyEnv);
     } finally {
-      app.telegramInboundPolling.stop();
-      app.strategyScheduler.stop();
-      app.persistence.close();
+      await stopScopedApplicationRuntime(app, fenceApplication);
     }
   });
 }

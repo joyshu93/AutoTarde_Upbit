@@ -1,4 +1,4 @@
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 
 import type { ExecutionMode, OrderOrigin } from "../../domain/types.js";
 import type {
@@ -8,6 +8,7 @@ import type {
   PerformanceOpeningPosition,
 } from "./performance-calculator.js";
 import type { PerformanceMarkObservation } from "./performance-diagnostics.js";
+import { openReadOnlySqliteDatabase } from "../db/repositories/sqlite-database.js";
 import type {
   PerformanceDecisionAction,
   PerformanceTradeFill,
@@ -132,7 +133,7 @@ type PersistedPosition = {
 
 export function readPerformanceInput(filters: PerformanceReadFilters): PerformanceReadResult {
   const normalizedFilters = validateFilters(filters);
-  const db = new DatabaseSync(normalizedFilters.databasePath, { readOnly: true });
+  const db = openReadOnlySqliteDatabase(normalizedFilters.databasePath);
   try {
     const fillRead = readFills(db, normalizedFilters);
     const fills = fillRead.fills;

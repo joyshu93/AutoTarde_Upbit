@@ -59,6 +59,7 @@ export interface RuntimeOwnershipStore {
 }
 
 const OWNER_TOKEN_PATTERN = /^[A-Za-z0-9_-]{64}$/u;
+const SCOPE_KEY_PATTERN = /^[a-f0-9]{64}$/u;
 const REASON_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
 const EXECUTION_MODES = new Set<RuntimeOwnershipExecutionMode>(["DRY_RUN", "LIVE"]);
 const EVENT_TYPES = new Set<RuntimeOwnershipEventRecord["eventType"]>([
@@ -176,6 +177,12 @@ export function assertNoTimestampRollback(candidateEpochMs: number, floorEpochMs
 
 export function validateGeneration(generation: number): void {
   validatePositiveSafeInteger(generation, "Runtime ownership generation");
+}
+
+export function validateRuntimeOwnershipScopeKey(scopeKey: string): void {
+  if (typeof scopeKey !== "string" || !SCOPE_KEY_PATTERN.test(scopeKey)) {
+    throw new Error("Runtime ownership scope key must be exactly 64 lowercase hexadecimal characters.");
+  }
 }
 
 function validateOwnerToken(ownerToken: string): void {

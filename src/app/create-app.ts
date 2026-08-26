@@ -20,6 +20,7 @@ import { InlineTelegramSyncController } from "./sync-controller.js";
 import type { ExecutionRepository, OperatorStateStore } from "../modules/db/interfaces.js";
 import type { SqlitePersistenceBundle } from "../modules/db/repositories/contracts.js";
 import { createSqlitePersistence } from "../modules/db/repositories/sqlite-repositories.js";
+import { canonicalizeLocalDatabasePath } from "../modules/db/local-database-path.js";
 import { CandidateExecutionEvidenceService } from "../modules/execution/candidate-evidence-service.js";
 import { ExecutionService } from "../modules/execution/execution-service.js";
 import {
@@ -110,13 +111,19 @@ export function createApp(
     );
     overrides.afterCandidatePilotAuthorityValidated?.(authority);
   }
-  verifyLiveDatabaseIdentity({
+  const liveDatabaseVerification = verifyLiveDatabaseIdentity({
     executionMode: config.executionMode,
     databasePath: config.databasePath,
     expectedDatabaseInstanceId: config.liveDatabaseInstanceId ?? null,
     exchangeAccountId: "primary",
     upbitAccessKey: process.env.UPBIT_ACCESS_KEY?.trim() || null,
   });
+  config = {
+    ...config,
+    databasePath: liveDatabaseVerification.status === "VERIFIED"
+      ? liveDatabaseVerification.canonicalDatabasePath
+      : canonicalizeLocalDatabasePath(config.databasePath),
+  };
   const exchangeBackedReadEnabled = Boolean(
     process.env.UPBIT_ACCESS_KEY && process.env.UPBIT_SECRET_KEY,
   );
@@ -217,6 +224,7 @@ export function createApp(
   const telegramCommandMenuSetup = new TelegramCommandMenuSetupService({
     client: telegramMessageClient,
     operatorChatId: config.telegramOperatorChatId,
+    runtimeOwnership,
   });
   const reporter = new DurableTelegramReporter({
     repositories,

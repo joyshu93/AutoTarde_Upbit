@@ -3,6 +3,7 @@ import { dirname, extname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { parseMigrationScript, type ParsedMigrationScript } from "../migration-script.js";
+import { canonicalizeLocalDatabasePath } from "../local-database-path.js";
 
 export interface SqliteDatabaseHandle {
   db: DatabaseSync;
@@ -10,12 +11,19 @@ export interface SqliteDatabaseHandle {
 }
 
 export function openSqliteDatabase(databasePath: string): SqliteDatabaseHandle {
-  if (databasePath !== ":memory:") {
-    mkdirSync(dirname(databasePath), { recursive: true });
-  }
+  const openedPath = databasePath === ":memory:"
+    ? databasePath
+    : canonicalizeLocalDatabasePath(databasePath);
+  if (openedPath !== ":memory:") mkdirSync(dirname(openedPath), { recursive: true });
 
-  const db = new DatabaseSync(databasePath);
+  const db = new DatabaseSync(openedPath);
   try {
+    if (openedPath !== ":memory:") {
+      const canonicalOpenedPath = canonicalizeLocalDatabasePath(openedPath, { mustExist: true });
+      if (!sameDatabasePath(openedPath, canonicalOpenedPath)) {
+        throw new Error("SQLite opened a different canonical database path than the accepted runtime path.");
+      }
+    }
     db.exec("PRAGMA foreign_keys = ON;");
     db.exec("PRAGMA journal_mode = WAL;");
     db.exec("PRAGMA busy_timeout = 5000;");
@@ -51,6 +59,27 @@ export function openSqliteDatabase(databasePath: string): SqliteDatabaseHandle {
       db.close();
     },
   };
+}
+
+export function openReadOnlySqliteDatabase(databasePath: string): DatabaseSync {
+  const canonicalPath = canonicalizeLocalDatabasePath(databasePath, { mustExist: true });
+  const db = new DatabaseSync(canonicalPath, { readOnly: true });
+  try {
+    const canonicalOpenedPath = canonicalizeLocalDatabasePath(canonicalPath, { mustExist: true });
+    if (!sameDatabasePath(canonicalPath, canonicalOpenedPath)) {
+      throw new Error("SQLite opened a different canonical database path than the accepted read-only path.");
+    }
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+function sameDatabasePath(left: string, right: string): boolean {
+  return process.platform === "win32"
+    ? left.toUpperCase() === right.toUpperCase()
+    : left === right;
 }
 
 function formatError(error: unknown): string {

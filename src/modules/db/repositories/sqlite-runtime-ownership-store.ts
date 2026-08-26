@@ -15,6 +15,7 @@ import {
   validateRuntimeOwnershipEventLimit,
   validateRuntimeOwnershipEventRecord,
   validateRuntimeOwnershipRecord,
+  validateRuntimeOwnershipScopeKey,
   type AcquireRuntimeOwnershipInput,
   type PersistedRuntimeExecutionAuthority,
   type RecordRuntimeOwnershipLostInput,
@@ -27,6 +28,7 @@ import { withImmediateTransaction } from "./sqlite-transaction.js";
 const LEASE_SCOPE = "APPLICATION_RUNTIME";
 
 interface RuntimeOwnershipRow {
+  scope_key: string;
   owner_token: string;
   generation: number;
   execution_mode: RuntimeOwnershipRecord["executionMode"];
@@ -37,6 +39,7 @@ interface RuntimeOwnershipRow {
 
 interface RuntimeOwnershipEventRow {
   id: number;
+  scope_key: string;
   generation: number;
   event_type: RuntimeOwnershipEventRecord["eventType"];
   execution_mode: RuntimeOwnershipEventRecord["executionMode"];
@@ -53,10 +56,15 @@ interface RuntimeExecutionAuthorityRow extends RuntimeOwnershipRow {
 }
 
 export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
-  constructor(private readonly db: DatabaseSync) {}
+  constructor(
+    private readonly db: DatabaseSync,
+    private readonly scopeKey: string,
+  ) {
+    validateRuntimeOwnershipScopeKey(scopeKey);
+  }
 
   async getCurrent(): Promise<RuntimeOwnershipRecord | null> {
-    return selectCurrent(this.db);
+    return selectCurrent(this.db, this.scopeKey);
   }
 
   getCurrentExecutionAuthority(
@@ -66,7 +74,7 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
       throw new Error("Runtime execution authority requires an exchange account id.");
     }
     const row = this.db.prepare(`
-      SELECT r.owner_token, r.generation, r.execution_mode,
+      SELECT r.scope_key, r.owner_token, r.generation, r.execution_mode,
         r.acquired_at_epoch_ms, r.heartbeat_at_epoch_ms, r.expires_at_epoch_ms,
         s.exchange_account_id AS state_exchange_account_id,
         s.execution_mode AS state_execution_mode,
@@ -75,9 +83,9 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
         s.kill_switch_active AS state_kill_switch_active
       FROM runtime_ownership r
       LEFT JOIN execution_state s ON s.exchange_account_id = ?
-      WHERE r.lease_scope = ?
+      WHERE r.scope_key = ? AND r.lease_scope = ?
       LIMIT 1
-    `).get(exchangeAccountId, LEASE_SCOPE) as RuntimeExecutionAuthorityRow | undefined;
+    `).get(exchangeAccountId, this.scopeKey, LEASE_SCOPE) as RuntimeExecutionAuthorityRow | undefined;
     if (row === undefined) return null;
 
     const runtimeOwnership = ownershipFromRow(row);
@@ -112,8 +120,8 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
   ): Promise<RuntimeOwnershipAcquisition> {
     validateAcquireRuntimeOwnershipInput(input);
     return withImmediateTransaction(this.db, () => {
-      const current = selectCurrent(this.db);
-      const maximum = selectMaximumEvent(this.db);
+      const current = selectCurrent(this.db, this.scopeKey);
+      const maximum = selectMaximumEvent(this.db, this.scopeKey);
       const chronologyFloor = Math.max(
         current?.heartbeatAtEpochMs ?? 0,
         maximum.latestEventAtEpochMs ?? 0,
@@ -139,10 +147,10 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
       validateRuntimeOwnershipRecord(record);
       this.db.prepare(`
         INSERT INTO runtime_ownership (
-          lease_scope, owner_token, generation, execution_mode,
+          scope_key, lease_scope, owner_token, generation, execution_mode,
           acquired_at_epoch_ms, heartbeat_at_epoch_ms, expires_at_epoch_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(lease_scope) DO UPDATE SET
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(scope_key, lease_scope) DO UPDATE SET
           owner_token = excluded.owner_token,
           generation = excluded.generation,
           execution_mode = excluded.execution_mode,
@@ -150,6 +158,7 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
           heartbeat_at_epoch_ms = excluded.heartbeat_at_epoch_ms,
           expires_at_epoch_ms = excluded.expires_at_epoch_ms
       `).run(
+        this.scopeKey,
         LEASE_SCOPE,
         record.ownerToken,
         record.generation,
@@ -158,7 +167,7 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
         record.heartbeatAtEpochMs,
         record.expiresAtEpochMs,
       );
-      appendEvent(this.db, {
+      appendEvent(this.db, this.scopeKey, {
         generation: record.generation,
         eventType: current === null ? "ACQUIRED" : "TAKEN_OVER",
         executionMode: record.executionMode,
@@ -172,7 +181,7 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
   async renew(input: RenewRuntimeOwnershipInput): Promise<RuntimeOwnershipRecord | null> {
     validateRenewRuntimeOwnershipInput(input);
     return withImmediateTransaction(this.db, () => {
-      const current = selectCurrent(this.db);
+      const current = selectCurrent(this.db, this.scopeKey);
       if (
         current === null ||
         current.ownerToken !== input.ownerToken ||
@@ -180,7 +189,7 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
       ) {
         return null;
       }
-      const maximum = selectMaximumEvent(this.db);
+      const maximum = selectMaximumEvent(this.db, this.scopeKey);
       assertNoTimestampRollback(
         input.heartbeatAtEpochMs,
         Math.max(current.heartbeatAtEpochMs, maximum.latestEventAtEpochMs ?? 0),
@@ -197,7 +206,7 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
         UPDATE runtime_ownership SET
           heartbeat_at_epoch_ms = ?,
           expires_at_epoch_ms = ?
-        WHERE lease_scope = ?
+        WHERE scope_key = ? AND lease_scope = ?
           AND owner_token = ?
           AND generation = ?
           AND heartbeat_at_epoch_ms = ?
@@ -205,6 +214,7 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
       `).run(
         input.heartbeatAtEpochMs,
         input.expiresAtEpochMs,
+        this.scopeKey,
         LEASE_SCOPE,
         input.ownerToken,
         input.generation,
@@ -214,14 +224,14 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
       if (update.changes !== 1) {
         throw new Error("Runtime ownership renewal compare-and-set changed unexpectedly.");
       }
-      return selectCurrent(this.db);
+      return selectCurrent(this.db, this.scopeKey);
     });
   }
 
   async release(input: ReleaseRuntimeOwnershipInput): Promise<boolean> {
     validateReleaseRuntimeOwnershipInput(input);
     return withImmediateTransaction(this.db, () => {
-      const current = selectCurrent(this.db);
+      const current = selectCurrent(this.db, this.scopeKey);
       if (
         current === null ||
         current.ownerToken !== input.ownerToken ||
@@ -229,14 +239,14 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
       ) {
         return false;
       }
-      const maximum = selectMaximumEvent(this.db);
+      const maximum = selectMaximumEvent(this.db, this.scopeKey);
       assertNoTimestampRollback(
         input.releasedAtEpochMs,
         Math.max(current.heartbeatAtEpochMs, maximum.latestEventAtEpochMs ?? 0),
       );
       if (input.releasedAtEpochMs >= current.expiresAtEpochMs) return false;
 
-      appendEvent(this.db, {
+      appendEvent(this.db, this.scopeKey, {
         generation: current.generation,
         eventType: "RELEASED",
         executionMode: current.executionMode,
@@ -245,8 +255,15 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
       });
       const deletion = this.db.prepare(`
         DELETE FROM runtime_ownership
-        WHERE lease_scope = ? AND owner_token = ? AND generation = ? AND expires_at_epoch_ms > ?
-      `).run(LEASE_SCOPE, input.ownerToken, input.generation, input.releasedAtEpochMs);
+        WHERE scope_key = ? AND lease_scope = ?
+          AND owner_token = ? AND generation = ? AND expires_at_epoch_ms > ?
+      `).run(
+        this.scopeKey,
+        LEASE_SCOPE,
+        input.ownerToken,
+        input.generation,
+        input.releasedAtEpochMs,
+      );
       if (deletion.changes !== 1) {
         throw new Error("Runtime ownership release compare-and-set changed unexpectedly.");
       }
@@ -257,7 +274,7 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
   async recordLost(input: RecordRuntimeOwnershipLostInput): Promise<boolean> {
     validateRecordRuntimeOwnershipLostInput(input);
     return withImmediateTransaction(this.db, () => {
-      const current = selectCurrent(this.db);
+      const current = selectCurrent(this.db, this.scopeKey);
       if (
         current === null ||
         current.ownerToken !== input.ownerToken ||
@@ -265,12 +282,12 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
       ) {
         return false;
       }
-      const maximum = selectMaximumEvent(this.db);
+      const maximum = selectMaximumEvent(this.db, this.scopeKey);
       assertNoTimestampRollback(
         input.lostAtEpochMs,
         Math.max(current.heartbeatAtEpochMs, maximum.latestEventAtEpochMs ?? 0),
       );
-      appendEvent(this.db, {
+      appendEvent(this.db, this.scopeKey, {
         generation: current.generation,
         eventType: "LOST",
         executionMode: current.executionMode,
@@ -284,23 +301,23 @@ export class SqliteRuntimeOwnershipStore implements RuntimeOwnershipStore {
   async listRecentEvents(limit: number): Promise<readonly RuntimeOwnershipEventRecord[]> {
     validateRuntimeOwnershipEventLimit(limit);
     const rows = this.db.prepare(`
-      SELECT id, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
+      SELECT id, scope_key, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
       FROM runtime_ownership_events
-      WHERE lease_scope = ?
+      WHERE scope_key = ? AND lease_scope = ?
       ORDER BY event_at_epoch_ms DESC, id DESC
       LIMIT ?
-    `).all(LEASE_SCOPE, limit) as unknown as RuntimeOwnershipEventRow[];
+    `).all(this.scopeKey, LEASE_SCOPE, limit) as unknown as RuntimeOwnershipEventRow[];
     return rows.map(eventFromRow);
   }
 }
 
-function selectCurrent(db: DatabaseSync): RuntimeOwnershipRecord | null {
+function selectCurrent(db: DatabaseSync, scopeKey: string): RuntimeOwnershipRecord | null {
   const row = db.prepare(`
-    SELECT owner_token, generation, execution_mode,
+    SELECT scope_key, owner_token, generation, execution_mode,
       acquired_at_epoch_ms, heartbeat_at_epoch_ms, expires_at_epoch_ms
     FROM runtime_ownership
-    WHERE lease_scope = ?
-  `).get(LEASE_SCOPE) as RuntimeOwnershipRow | undefined;
+    WHERE scope_key = ? AND lease_scope = ?
+  `).get(scopeKey, LEASE_SCOPE) as RuntimeOwnershipRow | undefined;
   if (row === undefined) return null;
   return ownershipFromRow(row);
 }
@@ -318,24 +335,24 @@ function ownershipFromRow(row: RuntimeOwnershipRow): RuntimeOwnershipRecord {
   return record;
 }
 
-function selectMaximumEvent(db: DatabaseSync): {
+function selectMaximumEvent(db: DatabaseSync, scopeKey: string): {
   generation: number | null;
   latestEventAtEpochMs: number | null;
 } {
   const maximumGenerationRow = db.prepare(`
-    SELECT id, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
+    SELECT id, scope_key, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
     FROM runtime_ownership_events
-    WHERE lease_scope = ?
+    WHERE scope_key = ? AND lease_scope = ?
     ORDER BY generation DESC, id DESC
     LIMIT 1
-  `).get(LEASE_SCOPE) as unknown as RuntimeOwnershipEventRow | undefined;
+  `).get(scopeKey, LEASE_SCOPE) as unknown as RuntimeOwnershipEventRow | undefined;
   const latestTimestampRow = db.prepare(`
-    SELECT id, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
+    SELECT id, scope_key, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
     FROM runtime_ownership_events
-    WHERE lease_scope = ?
+    WHERE scope_key = ? AND lease_scope = ?
     ORDER BY event_at_epoch_ms DESC, id DESC
     LIMIT 1
-  `).get(LEASE_SCOPE) as unknown as RuntimeOwnershipEventRow | undefined;
+  `).get(scopeKey, LEASE_SCOPE) as unknown as RuntimeOwnershipEventRow | undefined;
   const maximumGenerationEvent = maximumGenerationRow === undefined
     ? null
     : eventFromRow(maximumGenerationRow);
@@ -350,13 +367,15 @@ function selectMaximumEvent(db: DatabaseSync): {
 
 function appendEvent(
   db: DatabaseSync,
+  scopeKey: string,
   event: Omit<RuntimeOwnershipEventRecord, "id">,
 ): RuntimeOwnershipEventRecord {
   const result = db.prepare(`
     INSERT INTO runtime_ownership_events (
-      lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
-    ) VALUES (?, ?, ?, ?, ?, ?)
+      scope_key, lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(
+    scopeKey,
     LEASE_SCOPE,
     event.generation,
     event.eventType,

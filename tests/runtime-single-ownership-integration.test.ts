@@ -12,7 +12,10 @@ import {
 import {
   type RuntimeOwnershipContext,
   createRuntimeOwnershipContext,
+  verifyAndResolveRuntimeDatabase,
 } from "../src/app/runtime-ownership-context.js";
+import { loadAppConfig } from "../src/app/env.js";
+import { provisionLiveDatabaseIdentity } from "../src/app/live-database-identity.js";
 import {
   RuntimeOwnershipGuard,
   RuntimeOwnershipGuardError,
@@ -49,6 +52,8 @@ import { test } from "./harness.js";
 const CHILD_ARGUMENT = "--runtime-single-ownership-child";
 const CHILD_CONTENTION_EXIT_CODE = 73;
 const TEST_ACCOUNT_ID = "primary";
+const TEST_DATABASE_INSTANCE_ID = "33333333-3333-4333-8333-333333333333";
+const TEST_ACCESS_KEY = "runtime-single-ownership-test-access-key";
 
 interface OperationalSideEffects {
   databaseOpens: number;
@@ -71,7 +76,7 @@ interface ChildFixtureMessage {
 const childMode = process.argv[2] === CHILD_ARGUMENT;
 
 if (childMode) {
-  await runChildFixture(process.argv[3], process.argv[4]);
+  await runChildFixture(process.argv[3], process.argv[4], process.argv[5], process.argv[6]);
 } else {
   registerIntegrationTests();
 }
@@ -110,7 +115,10 @@ function registerIntegrationTests(): void {
       await waitForChildMessage(childC, (message) => message.type === "CLEANED");
       assert.equal((await waitForChildExit(childC)).code, 0);
 
-      const inspection = createSqliteRuntimeOwnershipPersistence(fixture.databasePath);
+      const inspection = createSqliteRuntimeOwnershipPersistence(
+        fixture.databasePath,
+        scopeKeyForDatabase(fixture.databasePath),
+      );
       try {
         assert.equal(await inspection.runtimeOwnership.getCurrent(), null);
         const events = [...await inspection.runtimeOwnership.listRecentEvents(10)].reverse();
@@ -127,6 +135,57 @@ function registerIntegrationTests(): void {
       await terminateFixtureChild(childA);
       await terminateFixtureChild(childB);
       await terminateFixtureChild(childC);
+      await fixture.cleanup();
+    }
+  });
+
+  test("Windows DRY_RUN and LIVE child runtimes contend on one verified database scope", async () => {
+    if (process.platform !== "win32") return;
+
+    const fixture = await createTempDatabase("windows-cross-mode-contention");
+    let dryRunOwner: ChildProcess | null = null;
+    let liveContender: ChildProcess | null = null;
+    try {
+      const setup = createSqlitePersistence({
+        databasePath: fixture.databasePath,
+        exchangeAccountId: TEST_ACCOUNT_ID,
+        userId: "test-user",
+        userTelegramId: "test-telegram-user",
+        userDisplayName: "Test Operator",
+        accessKeyRef: "TEST_ONLY",
+        secretKeyRef: "TEST_ONLY",
+        executionMode: "DRY_RUN",
+        liveExecutionGate: "DISABLED",
+        killSwitchActive: false,
+      });
+      setup.close();
+      provisionLiveDatabaseIdentity({
+        databasePath: fixture.databasePath,
+        databaseInstanceId: TEST_DATABASE_INSTANCE_ID,
+        exchangeAccountId: TEST_ACCOUNT_ID,
+        upbitAccessKey: TEST_ACCESS_KEY,
+      });
+
+      dryRunOwner = startChildFixture("hold", fixture.databasePath, {
+        executionMode: "DRY_RUN",
+      });
+      await waitForChildMessage(dryRunOwner, (message) => message.type === "OWNED");
+
+      liveContender = startChildFixture("once", fixture.databasePath, {
+        executionMode: "LIVE",
+        databaseInstanceId: TEST_DATABASE_INSTANCE_ID,
+        accessKey: TEST_ACCESS_KEY,
+      });
+      const contended = await waitForChildMessage(
+        liveContender,
+        (message) => message.type === "CONTENDED",
+      );
+      assert.equal(contended.code, "RUNTIME_ALREADY_OWNED");
+      assert.deepEqual(contended.sideEffects, createZeroSideEffects());
+      assert.equal((await waitForChildExit(liveContender)).code, CHILD_CONTENTION_EXIT_CODE);
+    } finally {
+      await terminateFixtureChild(dryRunOwner);
+      await terminateFixtureChild(liveContender);
       await fixture.cleanup();
     }
   });
@@ -149,7 +208,10 @@ function registerIntegrationTests(): void {
     const fixture = await createTempDatabase("generation-replacement");
     const events: string[] = [];
     const runtime = await createDeterministicOwnedRuntime(fixture.databasePath, events);
-    const replacement = createSqliteRuntimeOwnershipPersistence(fixture.databasePath);
+    const replacement = createSqliteRuntimeOwnershipPersistence(
+      fixture.databasePath,
+      scopeKeyForDatabase(fixture.databasePath),
+    );
     const execution = await createExecutionBoundary(runtime.guard);
 
     try {
@@ -212,7 +274,10 @@ function registerIntegrationTests(): void {
       assert.equal(execution.adapter.createOrderCalls, 0);
       assertWorkersStoppedAndLockReleasedLast(events);
 
-      const inspection = createSqliteRuntimeOwnershipPersistence(fixture.databasePath);
+      const inspection = createSqliteRuntimeOwnershipPersistence(
+        fixture.databasePath,
+        scopeKeyForDatabase(fixture.databasePath),
+      );
       try {
         const current = await inspection.runtimeOwnership.getCurrent();
         assert.equal(current?.generation, 1);
@@ -240,7 +305,10 @@ function registerIntegrationTests(): void {
       liveExecutionGate: "DISABLED",
       killSwitchActive: false,
     });
-    const ownershipPersistence = createSqliteRuntimeOwnershipPersistence(fixture.databasePath);
+    const ownershipPersistence = createSqliteRuntimeOwnershipPersistence(
+      fixture.databasePath,
+      scopeKeyForDatabase(fixture.databasePath),
+    );
     const guard = new RuntimeOwnershipGuard({
       processLock: new FakeProcessLock([]),
       store: ownershipPersistence.runtimeOwnership,
@@ -304,7 +372,10 @@ function registerIntegrationTests(): void {
       liveExecutionGate: "DISABLED",
       killSwitchActive: false,
     });
-    const ownershipPersistence = createSqliteRuntimeOwnershipPersistence(fixture.databasePath);
+    const ownershipPersistence = createSqliteRuntimeOwnershipPersistence(
+      fixture.databasePath,
+      scopeKeyForDatabase(fixture.databasePath),
+    );
     const store = ownershipPersistence.runtimeOwnership;
     const readAuthorityMethod = store.getCurrentExecutionAuthority;
     assert.ok(readAuthorityMethod);
@@ -365,17 +436,32 @@ function registerIntegrationTests(): void {
   });
 }
 
-async function runChildFixture(mode: string | undefined, databasePath: string | undefined): Promise<void> {
-  if ((mode !== "hold" && mode !== "once") || !databasePath) {
+async function runChildFixture(
+  mode: string | undefined,
+  databasePath: string | undefined,
+  executionModeInput: string | undefined,
+  databaseInstanceIdInput: string | undefined,
+): Promise<void> {
+  const executionMode = executionModeInput || "DRY_RUN";
+  if (
+    (mode !== "hold" && mode !== "once") ||
+    !databasePath ||
+    (executionMode !== "DRY_RUN" && executionMode !== "LIVE")
+  ) {
     throw new Error("Runtime ownership child fixture requires a mode and temporary database path.");
   }
 
   const sideEffects = createZeroSideEffects();
-  const identity = deriveRuntimeLockIdentity({
-    canonicalDatabasePath: path.resolve(databasePath),
-    databaseInstanceId: null,
-    exchangeAccountId: TEST_ACCOUNT_ID,
+  const config = loadAppConfig({
+    APP_EXECUTION_MODE: executionMode,
+    DATABASE_PATH: databasePath,
+    ENABLE_LIVE_ORDERS: "false",
+    ...(databaseInstanceIdInput
+      ? { LIVE_DATABASE_INSTANCE_ID: databaseInstanceIdInput }
+      : {}),
   });
+  const verified = verifyAndResolveRuntimeDatabase(config);
+  const identity = verified.lockIdentity;
   let processLock: RuntimeProcessLock;
 
   try {
@@ -396,12 +482,13 @@ async function runChildFixture(mode: string | undefined, databasePath: string | 
 
   const ownerToken = mode === "hold" ? "a".repeat(64) : "c".repeat(64);
   const ownership = await createRuntimeOwnershipContext({
-    config: { databasePath, executionMode: "DRY_RUN" },
+    executionMode,
+    verifiedDatabase: verified,
     processLock,
   }, {
-    createOwnershipPersistence(openedPath) {
+    createOwnershipPersistence(openedPath, scopeKey) {
       sideEffects.databaseOpens += 1;
-      return createSqliteRuntimeOwnershipPersistence(openedPath);
+      return createSqliteRuntimeOwnershipPersistence(openedPath, scopeKey);
     },
     createOwnerToken: () => ownerToken,
   });
@@ -437,7 +524,10 @@ async function runChildFixture(mode: string | undefined, databasePath: string | 
 }
 
 async function createDeterministicOwnedRuntime(databasePath: string, events: string[]) {
-  const ownershipPersistence = createSqliteRuntimeOwnershipPersistence(databasePath);
+  const ownershipPersistence = createSqliteRuntimeOwnershipPersistence(
+    databasePath,
+    scopeKeyForDatabase(databasePath),
+  );
   const processLock = new FakeProcessLock(events);
   const ownerToken = "a".repeat(64);
   const guard = new RuntimeOwnershipGuard({
@@ -481,6 +571,7 @@ async function createDeterministicOwnedRuntime(databasePath: string, events: str
       })();
       return releasePromise;
     },
+    async waitForLossRecording() {},
     closeOwnershipDatabase() {
       if (ownershipDatabaseClosed) return;
       ownershipDatabaseClosed = true;
@@ -736,11 +827,44 @@ function validExecutionInput() {
   };
 }
 
-function startChildFixture(mode: "hold" | "once", databasePath: string): ChildProcess {
-  return fork(fileURLToPath(import.meta.url), [CHILD_ARGUMENT, mode, databasePath], {
+function scopeKeyForDatabase(databasePath: string): string {
+  return deriveRuntimeLockIdentity({
+    canonicalDatabasePath: path.resolve(databasePath),
+    databaseInstanceId: null,
+    exchangeAccountId: TEST_ACCOUNT_ID,
+  }).scopeDigest;
+}
+
+function startChildFixture(
+  mode: "hold" | "once",
+  databasePath: string,
+  options: Readonly<{
+    executionMode?: "DRY_RUN" | "LIVE";
+    databaseInstanceId?: string;
+    accessKey?: string;
+  }> = {},
+): ChildProcess {
+  return fork(fileURLToPath(import.meta.url), [
+    CHILD_ARGUMENT,
+    mode,
+    databasePath,
+    options.executionMode ?? "DRY_RUN",
+    options.databaseInstanceId ?? "",
+  ], {
     execArgv: [],
+    env: createChildEnvironment(options.accessKey),
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
+}
+
+function createChildEnvironment(accessKey: string | undefined): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {};
+  for (const name of ["SystemRoot", "WINDIR", "PATH", "TEMP", "TMP"] as const) {
+    const value = process.env[name];
+    if (value !== undefined) environment[name] = value;
+  }
+  if (accessKey !== undefined) environment.UPBIT_ACCESS_KEY = accessKey;
+  return environment;
 }
 
 function waitForChildMessage(

@@ -24,7 +24,7 @@ const OWNER_B = "owner-b".padEnd(64, "x");
 
 test("runtime ownership guard transitions from UNOWNED to OWNED and forbids reacquisition", async () => {
   const processLock = new FakeProcessLock();
-  const store = new InMemoryRuntimeOwnershipStore();
+  const store = new InMemoryRuntimeOwnershipStore("0".repeat(64));
   const guard = new RuntimeOwnershipGuard({ processLock, store, ownerToken: OWNER_A });
 
   assert.deepEqual(guard.snapshot(), {
@@ -94,7 +94,7 @@ test("runtime ownership guard permanently fences synchronous process-lock loss",
   const processLock = new FakeProcessLock();
   const guard = new RuntimeOwnershipGuard({
     processLock,
-    store: new InMemoryRuntimeOwnershipStore(),
+    store: new InMemoryRuntimeOwnershipStore("0".repeat(64)),
     ownerToken: OWNER_A,
   });
   const losses: string[] = [];
@@ -115,7 +115,7 @@ test("runtime ownership guard local assertion checks the process lock even witho
   const processLock = new FakeProcessLock();
   const guard = new RuntimeOwnershipGuard({
     processLock,
-    store: new InMemoryRuntimeOwnershipStore(),
+    store: new InMemoryRuntimeOwnershipStore("0".repeat(64)),
     ownerToken: OWNER_A,
   });
   await guard.acquire({ executionMode: "LIVE", acquiredAtEpochMs: 1_000 });
@@ -128,7 +128,7 @@ test("runtime ownership guard local assertion checks the process lock even witho
 });
 
 test("runtime ownership guard permanently fences a persisted generation mismatch", async () => {
-  const store = new InMemoryRuntimeOwnershipStore();
+  const store = new InMemoryRuntimeOwnershipStore("0".repeat(64));
   const guard = new RuntimeOwnershipGuard({
     processLock: new FakeProcessLock(),
     store,
@@ -156,7 +156,7 @@ test("runtime ownership guard permanently fences a persisted generation mismatch
 test("runtime ownership guard rejects expiry at the exact persisted deadline", async () => {
   const guard = new RuntimeOwnershipGuard({
     processLock: new FakeProcessLock(),
-    store: new InMemoryRuntimeOwnershipStore(),
+    store: new InMemoryRuntimeOwnershipStore("0".repeat(64)),
     ownerToken: OWNER_A,
   });
   await guard.acquire({ executionMode: "DRY_RUN", acquiredAtEpochMs: 1_000 });
@@ -200,7 +200,7 @@ class FakeProcessLock implements RuntimeProcessLock {
 class DeferredAcquisitionStore implements RuntimeOwnershipStore {
   acquireCalls = 0;
 
-  private readonly delegate = new InMemoryRuntimeOwnershipStore();
+  private readonly delegate = new InMemoryRuntimeOwnershipStore("0".repeat(64));
   private pending: {
     readonly input: AcquireRuntimeOwnershipInput;
     readonly resolve: (value: Awaited<ReturnType<RuntimeOwnershipStore["acquireAfterProcessLock"]>>) => void;

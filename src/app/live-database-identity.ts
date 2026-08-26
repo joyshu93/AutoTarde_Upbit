@@ -1,13 +1,17 @@
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { isAbsolute } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 
 import type { ExecutionMode } from "../domain/types.js";
 import {
   listCanonicalMigrationFilenames,
+  openReadOnlySqliteDatabase,
   openSqliteDatabase,
 } from "../modules/db/repositories/sqlite-database.js";
+import {
+  canonicalizeLocalDatabasePath,
+  LocalDatabasePathError,
+} from "../modules/db/local-database-path.js";
 
 const FINGERPRINT_DOMAIN = "AUTOTRADE_UPBIT_LIVE_ACCOUNT_V1\0";
 const RETIRED_MIGRATIONS = new Set(["0013_add_max_live_order_value_risk_code.sql"]);
@@ -83,7 +87,7 @@ export function verifyLiveDatabaseIdentity(
   const expectedInstanceId = validateInstanceId(input.expectedDatabaseInstanceId);
   const accessKeyFingerprint = fingerprintUpbitAccessKey(input.upbitAccessKey ?? "");
   const exchangeAccountId = requireNonEmpty(input.exchangeAccountId, "exchange_account_id");
-  const db = new DatabaseSync(databasePath, { readOnly: true });
+  const db = openReadOnlySqliteDatabase(databasePath);
   try {
     validateMigrationLedger(db);
     validateExchangeAccount(db, exchangeAccountId);
@@ -188,7 +192,7 @@ function inspectExistingBindingBeforeProvision(input: Readonly<{
   exchangeAccountId: string;
   upbitAccessKeyFingerprint: string;
 }>): void {
-  const db = new DatabaseSync(input.databasePath, { readOnly: true });
+  const db = openReadOnlySqliteDatabase(input.databasePath);
   try {
     validateExchangeAccount(db, input.exchangeAccountId);
     const existing = readIdentity(db);
@@ -216,38 +220,20 @@ function validateExistingAbsoluteDatabasePath(rawPath: string): string {
       "LIVE DATABASE_PATH must be an explicit absolute path to an existing SQLite file.",
     );
   }
-  const canonicalPath = resolve(databasePath);
-  if (!existsSync(canonicalPath)) {
-    throw new LiveDatabaseIdentityError(
-      "DATABASE_NOT_FOUND",
-      "LIVE database does not exist; no file or directory was created.",
-    );
+  try {
+    return canonicalizeLocalDatabasePath(databasePath, { mustExist: true });
+  } catch (error) {
+    if (!(error instanceof LocalDatabasePathError)) throw error;
+    const code = error.code === "DATABASE_PATH_NOT_FOUND"
+      ? "DATABASE_NOT_FOUND"
+      : error.code === "DATABASE_PATH_NOT_REGULAR_FILE"
+        ? "DATABASE_NOT_REGULAR_FILE"
+        : error.code;
+    const message = error.code === "DATABASE_PATH_NOT_FOUND"
+      ? "LIVE database does not exist; no file or directory was created."
+      : `LIVE ${error.message}`;
+    throw new LiveDatabaseIdentityError(code, message);
   }
-
-  let component = canonicalPath;
-  let final = true;
-  while (true) {
-    const stats = lstatSync(component);
-    if (stats.isSymbolicLink()) {
-      throw new LiveDatabaseIdentityError(
-        "DATABASE_PATH_REPARSE_POINT",
-        final
-          ? "LIVE database path must identify a regular non-symlink file."
-          : "LIVE database path has a symlink, junction, or reparse-point ancestor.",
-      );
-    }
-    if (final && !stats.isFile()) {
-      throw new LiveDatabaseIdentityError(
-        "DATABASE_NOT_REGULAR_FILE",
-        "LIVE database path must identify an existing regular file.",
-      );
-    }
-    const parent = resolve(component, "..");
-    if (parent === component) break;
-    component = parent;
-    final = false;
-  }
-  return canonicalPath;
 }
 
 function validateMigrationLedger(db: DatabaseSync): void {

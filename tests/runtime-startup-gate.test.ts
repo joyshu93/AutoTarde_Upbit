@@ -12,7 +12,10 @@ import {
 } from "../src/app/runtime-ownership-context.js";
 import type { RuntimeProcessLock, RuntimeProcessLockLossReason } from
   "../src/app/runtime-process-lock.js";
-import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
+import {
+  createSqlitePersistence,
+  createSqliteRuntimeOwnershipPersistence,
+} from "../src/modules/db/repositories/sqlite-repositories.js";
 import { test } from "./harness.js";
 
 test("runtime startup gate continues without candidate initialization when initializer is null", async () => {
@@ -100,10 +103,9 @@ test("runtime ownership context closes its dedicated SQLite connection independe
   let appPersistence: ReturnType<typeof createSqlitePersistence> | null = null;
 
   try {
-    ownership = await createRuntimeOwnershipContext({
-      config: { databasePath, executionMode: "DRY_RUN" },
-      processLock,
-    });
+    ownership = await createRuntimeOwnershipContext(
+      createOwnershipContextInput(databasePath, processLock),
+    );
     appPersistence = createSqlitePersistence({
       databasePath,
       exchangeAccountId: "primary",
@@ -132,10 +134,9 @@ test("runtime ownership context closes its dedicated SQLite connection independe
 test("startup-failure ownership cleanup is idempotent and releases only acquired resources", async () => {
   const databasePath = await createTempDatabasePath("startup-failure-cleanup");
   const processLock = new FakeRuntimeProcessLock();
-  const ownership = await createRuntimeOwnershipContext({
-    config: { databasePath, executionMode: "DRY_RUN" },
-    processLock,
-  });
+  const ownership = await createRuntimeOwnershipContext(
+    createOwnershipContextInput(databasePath, processLock),
+  );
 
   await ownership.shutdownAfterStartupFailure();
   await ownership.shutdownAfterStartupFailure();
@@ -152,10 +153,7 @@ test("ownership database open failure preserves its error and releases the acqui
   let originalError: unknown;
 
   try {
-    await createRuntimeOwnershipContext({
-      config: { databasePath, executionMode: "DRY_RUN" },
-      processLock,
-    });
+    await createRuntimeOwnershipContext(createOwnershipContextInput(databasePath, processLock));
   } catch (error) {
     originalError = error;
   }
@@ -164,6 +162,31 @@ test("ownership database open failure preserves its error and releases the acqui
   assert.match(originalError.message, /SQLite|database|open/u);
   assert.equal(processLock.releaseCalls, 1);
   await rm(databasePath, { recursive: true, force: true });
+});
+
+test("verified scope mismatch fails before ownership DB open and releases the process lock", async () => {
+  const processLock = new FakeRuntimeProcessLock();
+  let ownershipDatabaseOpenCalls = 0;
+
+  await assert.rejects(
+    () => createRuntimeOwnershipContext({
+      executionMode: "DRY_RUN",
+      verifiedDatabase: {
+        canonicalDatabasePath: path.resolve("scope-mismatch.sqlite"),
+        lockIdentity: { scopeDigest: "a".repeat(64) },
+      },
+      processLock,
+    }, {
+      createOwnershipPersistence() {
+        ownershipDatabaseOpenCalls += 1;
+        throw new Error("ownership DB must not open for a mismatched scope");
+      },
+    }),
+    /does not match the verified database scope/u,
+  );
+
+  assert.equal(ownershipDatabaseOpenCalls, 0);
+  assert.equal(processLock.releaseCalls, 1);
 });
 
 test("production lock identity is mode invariant while LIVE still verifies database identity", async () => {
@@ -246,10 +269,10 @@ test("setup failure after ownership DB open closes DB and process lock exactly o
   } satisfies Partial<RuntimeOwnershipContextDependencies>;
 
   try {
-    unexpectedContext = await createRuntimeOwnershipContext({
-      config: { databasePath, executionMode: "DRY_RUN" },
-      processLock,
-    }, dependencies);
+    unexpectedContext = await createRuntimeOwnershipContext(
+      createOwnershipContextInput(databasePath, processLock),
+      dependencies,
+    );
   } catch (error) {
     caught = error;
   }
@@ -266,6 +289,95 @@ test("setup failure after ownership DB open closes DB and process lock exactly o
   } finally {
     await unexpectedContext?.shutdownAfterStartupFailure();
     await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("runtime context records exact-generation LOST evidence for expiry and process-lock loss", async () => {
+  for (const lossKind of ["EXPIRY", "PROCESS_LOCK"] as const) {
+    const databasePath = await createTempDatabasePath(`lost-evidence-${lossKind.toLowerCase()}`);
+    const processLock = new FakeRuntimeProcessLock();
+    const ownership = await createRuntimeOwnershipContext(
+      createOwnershipContextInput(databasePath, processLock),
+      { nowEpochMs: () => 1_000 },
+    );
+    try {
+      if (lossKind === "EXPIRY") {
+        await assert.rejects(() => ownership.guard.assertCurrent(46_000), /OWNERSHIP_EXPIRED/u);
+      } else {
+        processLock.lose("LISTENER_CLOSED");
+      }
+      await ownership.waitForLossRecording();
+
+      const inspection = createSqliteRuntimeOwnershipPersistence(
+        databasePath,
+        processLock.identity.scopeDigest,
+      );
+      try {
+        const events = await inspection.runtimeOwnership.listRecentEvents(10);
+        assert.deepEqual(events.map((event) => event.eventType), ["LOST", "ACQUIRED"]);
+        assert.equal(
+          events[0]?.reasonCode,
+          lossKind === "EXPIRY" ? "OWNERSHIP_EXPIRED" : "PROCESS_LOCK_LOST",
+        );
+        assert.equal(events[0]?.generation, 1);
+      } finally {
+        inspection.close();
+      }
+    } finally {
+      await ownership.heartbeat.stop();
+      ownership.closeOwnershipDatabase();
+      await ownership.releaseProcessLock();
+      await cleanupTempDatabase(databasePath);
+    }
+  }
+});
+
+test("LOST recording cannot touch a superseding generation and normal shutdown is RELEASED", async () => {
+  for (const scenario of ["SUPERSEDED", "NORMAL_SHUTDOWN"] as const) {
+    const databasePath = await createTempDatabasePath(`lost-boundary-${scenario.toLowerCase()}`);
+    const processLock = new FakeRuntimeProcessLock();
+    const ownership = await createRuntimeOwnershipContext(
+      createOwnershipContextInput(databasePath, processLock),
+      { nowEpochMs: () => 1_000 },
+    );
+    const inspection = createSqliteRuntimeOwnershipPersistence(
+      databasePath,
+      processLock.identity.scopeDigest,
+    );
+    try {
+      if (scenario === "SUPERSEDED") {
+        await inspection.runtimeOwnership.acquireAfterProcessLock({
+          ownerToken: "new-owner".padEnd(64, "x"),
+          executionMode: "DRY_RUN",
+          acquiredAtEpochMs: 2_000,
+          expiresAtEpochMs: 47_000,
+        });
+        await assert.rejects(
+          () => ownership.guard.assertCurrent(2_001),
+          /PERSISTED_OWNERSHIP_MISMATCH/u,
+        );
+      } else {
+        ownership.fence("RUNTIME_SHUTDOWN");
+      }
+      await ownership.waitForLossRecording();
+      if (scenario === "NORMAL_SHUTDOWN") {
+        assert.equal(await ownership.releaseCurrentOwnership(2_000), true);
+      }
+
+      const events = await inspection.runtimeOwnership.listRecentEvents(10);
+      assert.equal(events.some((event) => event.eventType === "LOST"), false);
+      if (scenario === "SUPERSEDED") {
+        assert.equal((await inspection.runtimeOwnership.getCurrent())?.generation, 2);
+      } else {
+        assert.deepEqual(events.map((event) => event.eventType), ["RELEASED", "ACQUIRED"]);
+      }
+    } finally {
+      await ownership.heartbeat.stop();
+      ownership.closeOwnershipDatabase();
+      inspection.close();
+      await ownership.releaseProcessLock();
+      await cleanupTempDatabase(databasePath);
+    }
   }
 });
 
@@ -348,6 +460,26 @@ class FakeRuntimeProcessLock implements RuntimeProcessLock {
     this.releaseCalls += 1;
     this.events?.push("process-lock:release");
   }
+
+  lose(reason: RuntimeProcessLockLossReason): void {
+    if (!this.held) return;
+    this.held = false;
+    for (const listener of this.listeners) listener(reason);
+  }
+}
+
+function createOwnershipContextInput(
+  databasePath: string,
+  processLock: RuntimeProcessLock,
+) {
+  return {
+    executionMode: "DRY_RUN" as const,
+    verifiedDatabase: {
+      canonicalDatabasePath: path.resolve(databasePath),
+      lockIdentity: processLock.identity,
+    },
+    processLock,
+  };
 }
 
 function createUnexpectedRuntimeOwnershipStore(events: string[]) {

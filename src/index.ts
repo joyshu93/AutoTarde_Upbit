@@ -31,7 +31,10 @@ import {
   type RuntimeShutdown,
 } from "./app/runtime-lifecycle.js";
 import { buildStrategySchedulerStartupPreflight } from "./app/scheduler-preflight.js";
-import { runWithScopedRuntimeOwnership } from "./app/scoped-runtime-ownership.js";
+import {
+  runWithScopedRuntimeOwnership,
+  stopScopedApplicationRuntime,
+} from "./app/scoped-runtime-ownership.js";
 import { applyStartupRecoveryPolicy, runStartupRecovery } from "./app/startup-recovery.js";
 import { detectExecutionStateSeedMismatches } from "./modules/db/interfaces.js";
 import type { TelegramCommandMenuSetupResult } from "./modules/telegram/setup.js";
@@ -60,7 +63,8 @@ export interface RunMainOperations {
     identity: VerifiedRuntimeDatabase["lockIdentity"],
   ): Promise<RuntimeProcessLock>;
   createRuntimeOwnershipContext(input: {
-    readonly config: AppConfig;
+    readonly executionMode: AppConfig["executionMode"];
+    readonly verifiedDatabase: VerifiedRuntimeDatabase;
     readonly processLock: RuntimeProcessLock;
   }): Promise<RuntimeOwnershipContext>;
   createApp(
@@ -353,10 +357,15 @@ export async function runMain(
   };
   const config = operations.loadAppConfig();
   const verified = operations.verifyAndResolveRuntimeDatabase(config);
+  const verifiedConfig = { ...config, databasePath: verified.canonicalDatabasePath };
   const processLock = await operations.acquireRuntimeProcessLock(verified.lockIdentity);
-  const ownership = await operations.createRuntimeOwnershipContext({ config, processLock });
+  const ownership = await operations.createRuntimeOwnershipContext({
+    executionMode: verifiedConfig.executionMode,
+    verifiedDatabase: verified,
+    processLock,
+  });
   try {
-    const app = operations.createApp(config, {
+    const app = operations.createApp(verifiedConfig, {
       runtimeOwnershipAuthority: ownership.guard,
     });
     await operations.runAppStartup(app, { runtimeOwnership: ownership });
@@ -374,14 +383,16 @@ export async function createVerifiedApplication<T>(
   const createApplication = overrides.createApp ?? createApp;
   const runOwned = overrides.runWithScopedRuntimeOwnership ?? runWithScopedRuntimeOwnership;
 
-  return runOwned(config, async (runtimeOwnershipAuthority) => {
-    const app = createApplication(config, { runtimeOwnershipAuthority });
+  return runOwned(config, async (
+    runtimeOwnershipAuthority,
+    verifiedConfig,
+    fenceApplication,
+  ) => {
+    const app = createApplication(verifiedConfig, { runtimeOwnershipAuthority });
     try {
       return await useApplication(app);
     } finally {
-      app.telegramInboundPolling.stop();
-      app.strategyScheduler.stop();
-      app.persistence.close();
+      await stopScopedApplicationRuntime(app, fenceApplication);
     }
   });
 }

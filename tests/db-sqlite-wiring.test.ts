@@ -864,52 +864,53 @@ test("openSqliteDatabase applies the initial migrations and exposes the durable 
       { type: "trigger", name: "runtime_ownership_events_no_delete" },
       { type: "trigger", name: "runtime_ownership_events_no_update" },
     ]);
+    const ownershipScopeKey = "0".repeat(64);
 
     assert.throws(() => handle.db.prepare(`
       INSERT INTO runtime_ownership (
-        lease_scope, owner_token, generation, execution_mode,
+        scope_key, lease_scope, owner_token, generation, execution_mode,
         acquired_at_epoch_ms, heartbeat_at_epoch_ms, expires_at_epoch_ms
-      ) VALUES ('WRONG_SCOPE', ?, 1, 'LIVE', 1000, 1000, 46000)
-    `).run("a".repeat(64)), /constraint/u);
+      ) VALUES (?, 'WRONG_SCOPE', ?, 1, 'LIVE', 1000, 1000, 46000)
+    `).run(ownershipScopeKey, "a".repeat(64)), /constraint/u);
     assert.throws(() => handle.db.prepare(`
       INSERT INTO runtime_ownership (
-        lease_scope, owner_token, generation, execution_mode,
+        scope_key, lease_scope, owner_token, generation, execution_mode,
         acquired_at_epoch_ms, heartbeat_at_epoch_ms, expires_at_epoch_ms
-      ) VALUES ('APPLICATION_RUNTIME', 'invalid', 1, 'LIVE', 1000, 1000, 46000)
-    `).run(), /constraint/u);
+      ) VALUES (?, 'APPLICATION_RUNTIME', 'invalid', 1, 'LIVE', 1000, 1000, 46000)
+    `).run(ownershipScopeKey), /constraint/u);
     assert.throws(() => handle.db.prepare(`
       INSERT INTO runtime_ownership (
-        lease_scope, owner_token, generation, execution_mode,
+        scope_key, lease_scope, owner_token, generation, execution_mode,
         acquired_at_epoch_ms, heartbeat_at_epoch_ms, expires_at_epoch_ms
-      ) VALUES ('APPLICATION_RUNTIME', ?, 0, 'LIVE', 1000, 1000, 46000)
-    `).run("a".repeat(64)), /constraint/u);
+      ) VALUES (?, 'APPLICATION_RUNTIME', ?, 0, 'LIVE', 1000, 1000, 46000)
+    `).run(ownershipScopeKey, "a".repeat(64)), /constraint/u);
     assert.throws(() => handle.db.prepare(`
       INSERT INTO runtime_ownership (
-        lease_scope, owner_token, generation, execution_mode,
+        scope_key, lease_scope, owner_token, generation, execution_mode,
         acquired_at_epoch_ms, heartbeat_at_epoch_ms, expires_at_epoch_ms
-      ) VALUES ('APPLICATION_RUNTIME', ?, 1, 'LIVE', 1000, 999, 46000)
-    `).run("a".repeat(64)), /constraint/u);
+      ) VALUES (?, 'APPLICATION_RUNTIME', ?, 1, 'LIVE', 1000, 999, 46000)
+    `).run(ownershipScopeKey, "a".repeat(64)), /constraint/u);
     assert.throws(() => handle.db.prepare(`
       INSERT INTO runtime_ownership_events (
-        lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
-      ) VALUES ('APPLICATION_RUNTIME', 1, 'INVALID', 'LIVE', 'PROCESS_LOCK_ACQUIRED', 1000)
-    `).run(), /constraint/u);
+        scope_key, lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
+      ) VALUES (?, 'APPLICATION_RUNTIME', 1, 'INVALID', 'LIVE', 'PROCESS_LOCK_ACQUIRED', 1000)
+    `).run(ownershipScopeKey), /constraint/u);
     assert.throws(() => handle.db.prepare(`
       INSERT INTO runtime_ownership_events (
-        lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
-      ) VALUES ('APPLICATION_RUNTIME', 1, 'LOST', 'LIVE', 'invalid reason', 1000)
-    `).run(), /constraint/u);
+        scope_key, lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
+      ) VALUES (?, 'APPLICATION_RUNTIME', 1, 'LOST', 'LIVE', 'invalid reason', 1000)
+    `).run(ownershipScopeKey), /constraint/u);
 
     handle.db.prepare(`
       INSERT INTO runtime_ownership_events (
-        lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
-      ) VALUES ('APPLICATION_RUNTIME', 1, 'ACQUIRED', 'LIVE', 'PROCESS_LOCK_ACQUIRED', 1000)
-    `).run();
+        scope_key, lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
+      ) VALUES (?, 'APPLICATION_RUNTIME', 1, 'ACQUIRED', 'LIVE', 'PROCESS_LOCK_ACQUIRED', 1000)
+    `).run(ownershipScopeKey);
     assert.throws(() => handle.db.prepare(`
       INSERT INTO runtime_ownership_events (
-        lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
-      ) VALUES ('APPLICATION_RUNTIME', 1, 'TAKEN_OVER', 'LIVE', 'PROCESS_LOCK_ACQUIRED', 1001)
-    `).run(), /unique/iu);
+        scope_key, lease_scope, generation, event_type, execution_mode, reason_code, event_at_epoch_ms
+      ) VALUES (?, 'APPLICATION_RUNTIME', 1, 'TAKEN_OVER', 'LIVE', 'PROCESS_LOCK_ACQUIRED', 1001)
+    `).run(ownershipScopeKey), /unique/iu);
     assert.throws(
       () => handle.db.prepare("UPDATE runtime_ownership_events SET reason_code = 'ALTERED'").run(),
       /append-only/u,
