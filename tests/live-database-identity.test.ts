@@ -38,7 +38,7 @@ test("database instance identity has no hidden default and is loaded only from e
   assert.equal(loadAppConfig({ LIVE_DATABASE_INSTANCE_ID: INSTANCE_ID }).liveDatabaseInstanceId, INSTANCE_ID);
 });
 
-test("the production application composition root enforces identity before persistence creation", () => {
+test("the production application composition root enforces identity before persistence creation", async () => {
   const previous = {
     APP_EXECUTION_MODE: process.env.APP_EXECUTION_MODE,
     DATABASE_PATH: process.env.DATABASE_PATH,
@@ -58,7 +58,10 @@ test("the production application composition root enforces identity before persi
       } as unknown as Parameters<typeof createProductionApp>[1]),
       /absolute/u,
     );
-    assert.throws(() => createVerifiedApplication(), /absolute/u);
+    await assert.rejects(
+      () => createVerifiedApplication(async () => undefined),
+      /absolute/u,
+    );
   } finally {
     restoreEnv(previous);
   }

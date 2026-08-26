@@ -77,7 +77,7 @@ test("scheduled inbound ownership loss routes once without unhandled rejection o
     router: { async route() { return { text: "unused" }; } },
     operatorChatId: "123",
     runtimeOwnership: ownership.authority,
-    setTimer: (callback) => {
+    setTimer: (callback: () => void) => {
       timerCalls += 1;
       callbacks.push(callback);
       const timer = setTimeout(() => undefined, 60_000);
@@ -97,6 +97,125 @@ test("scheduled inbound ownership loss routes once without unhandled rejection o
 
     assert.deepEqual(unhandled, []);
     assert.deepEqual(routedErrors, [ownership.errors[0]]);
+    assert.equal(timerCalls, 1);
+    assert.equal(service.getStatus().running, false);
+    assert.equal(service.getStatus().failedCount, 0);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    service.stop();
+  }
+});
+
+test("scheduled reply rejection after ownership loss routes the exact loss once without retry", async () => {
+  const ownership = createFreshLossRuntimeOwnershipAuthority();
+  const callbacks: Array<() => void> = [];
+  const routedErrors: unknown[] = [];
+  const unhandled: unknown[] = [];
+  let timerCalls = 0;
+  let sendCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        return [createUpdate(1, "123", "/status")];
+      },
+    },
+    messageClient: {
+      async sendMessage() {
+        sendCalls += 1;
+        ownership.lose();
+        throw new Error("ordinary_send_rejection");
+      },
+    },
+    router: { async route() { return { text: "single reply" }; } },
+    operatorChatId: "123",
+    runtimeOwnership: ownership.authority,
+    setTimer: (callback: () => void) => {
+      timerCalls += 1;
+      callbacks.push(callback);
+      const timer = setTimeout(() => undefined, 60_000);
+      clearTimeout(timer);
+      return timer;
+    },
+  });
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+
+  try {
+    service.start((error) => routedErrors.push(error));
+    callbacks[0]?.();
+    await waitForUnhandledTurn();
+
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(routedErrors, [ownership.errors[0]]);
+    assert.equal(sendCalls, 1);
+    assert.equal(timerCalls, 1);
+    assert.equal(service.getStatus().running, false);
+    assert.equal(service.getStatus().failedCount, 0);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    service.stop();
+  }
+});
+
+test("scheduled callback edit rejection after ownership loss routes the exact loss once without retry", async () => {
+  const ownership = createFreshLossRuntimeOwnershipAuthority();
+  const callbacks: Array<() => void> = [];
+  const routedErrors: unknown[] = [];
+  const unhandled: unknown[] = [];
+  let timerCalls = 0;
+  let acknowledgementCalls = 0;
+  let editCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        return [createCallbackUpdate(1, {
+          callbackId: "callback-edit-rejection-loss",
+          senderId: "123",
+          chatId: "123",
+          messageId: 10,
+          data: "status:refresh",
+        })];
+      },
+    },
+    messageClient: {
+      async sendMessage() {},
+      async answerCallbackQuery() {
+        acknowledgementCalls += 1;
+      },
+      async editMessageText() {
+        editCalls += 1;
+        ownership.lose();
+        throw new Error("ordinary_edit_rejection");
+      },
+    },
+    router: {
+      async route() { return { text: "unused" }; },
+      async routeReadOnlyCallback() { return { text: "read-only callback" }; },
+    },
+    operatorChatId: "123",
+    runtimeOwnership: ownership.authority,
+    setTimer: (callback: () => void) => {
+      timerCalls += 1;
+      callbacks.push(callback);
+      const timer = setTimeout(() => undefined, 60_000);
+      clearTimeout(timer);
+      return timer;
+    },
+  } as unknown as ConstructorParameters<typeof TelegramInboundPollingService>[0]);
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+
+  try {
+    service.start((error) => routedErrors.push(error));
+    callbacks[0]?.();
+    await waitForUnhandledTurn();
+
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(routedErrors, [ownership.errors[0]]);
+    assert.equal(acknowledgementCalls, 1);
+    assert.equal(editCalls, 1);
     assert.equal(timerCalls, 1);
     assert.equal(service.getStatus().running, false);
     assert.equal(service.getStatus().failedCount, 0);

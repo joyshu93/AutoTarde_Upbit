@@ -290,6 +290,7 @@ export class TelegramInboundPollingService {
             }
           } catch (error) {
             if (isRuntimeOwnershipFailure(error)) throw error;
+            this.runtimeOwnership.assertLocallyHeld();
             failed += 1;
             this.lastError = sanitizeTelegramInboundError(error);
           }
@@ -330,6 +331,7 @@ export class TelegramInboundPollingService {
           processed += 1;
         } catch (error) {
           if (isRuntimeOwnershipFailure(error)) throw error;
+          this.runtimeOwnership.assertLocallyHeld();
           failed += 1;
           this.lastError = sanitizeTelegramInboundError(error);
         }
