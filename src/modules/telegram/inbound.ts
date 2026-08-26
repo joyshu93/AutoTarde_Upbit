@@ -138,6 +138,7 @@ export class TelegramInboundPollingService {
   private lastError: string | null = null;
   private offsetLoaded = false;
   private readonly runtimeOwnership: RuntimeOwnershipAuthority;
+  private runtimeOwnershipLossHandler: ((error: unknown) => void) | null = null;
 
   constructor(
     private readonly dependencies: {
@@ -193,10 +194,12 @@ export class TelegramInboundPollingService {
     };
   }
 
-  start(): TelegramInboundPollingStatus {
+  start(onRuntimeOwnershipLost?: (error: unknown) => void): TelegramInboundPollingStatus {
     if (this.stopBegun) {
       throw new Error("Telegram inbound polling cannot start after stop has begun.");
     }
+    this.runtimeOwnership.assertLocallyHeld();
+    this.runtimeOwnershipLossHandler = onRuntimeOwnershipLost ?? null;
     if (this.running || !this.isConfigured()) {
       return this.getStatus();
     }
@@ -261,11 +264,13 @@ export class TelegramInboundPollingService {
 
     try {
       await this.loadDurableOffsetIfNeeded();
+      this.runtimeOwnership.assertLocallyHeld();
       const updates = await this.dependencies.updateClient?.getUpdates({
         offset: this.nextOffset,
         timeoutSeconds: this.longPollTimeoutSeconds(),
         limit: this.limit(),
       }) ?? [];
+      this.runtimeOwnership.assertLocallyHeld();
       let processed = 0;
       let ignored = 0;
       let failed = 0;
@@ -320,6 +325,7 @@ export class TelegramInboundPollingService {
                 ? { replyMarkup: response.replyMarkup }
                 : {}),
             });
+            this.runtimeOwnership.assertLocallyHeld();
           }
           processed += 1;
         } catch (error) {
@@ -345,6 +351,7 @@ export class TelegramInboundPollingService {
       };
     } catch (error) {
       if (isRuntimeOwnershipFailure(error)) throw error;
+      this.runtimeOwnership.assertLocallyHeld();
       const errorMessage = sanitizeTelegramInboundError(error);
       this.failedCount += 1;
       this.lastError = errorMessage;
@@ -368,9 +375,13 @@ export class TelegramInboundPollingService {
 
     this.timer = (this.dependencies.setTimer ?? setTimeout)(() => {
       this.timer = null;
-      void this.pollOnce().catch(() => undefined).finally(() => {
-        this.scheduleNextPoll(this.pollIntervalMs());
-      });
+      void this.pollOnce().then(
+        () => this.scheduleNextPoll(this.pollIntervalMs()),
+        (error: unknown) => {
+          if (this.handleRuntimeOwnershipFailure(error)) return;
+          this.scheduleNextPoll(this.pollIntervalMs());
+        },
+      );
     }, delayMs);
   }
 
@@ -400,6 +411,7 @@ export class TelegramInboundPollingService {
           callbackQueryId: callbackQuery.callbackId,
           ...(acknowledgementText === undefined ? {} : { text: acknowledgementText }),
         });
+        this.runtimeOwnership.assertLocallyHeld();
       }
       return false;
     }
@@ -433,7 +445,20 @@ export class TelegramInboundPollingService {
       ...(response.parseMode === undefined ? {} : { parseMode: response.parseMode }),
       ...(response.replyMarkup === undefined ? {} : { replyMarkup: response.replyMarkup }),
     });
+    this.runtimeOwnership.assertLocallyHeld();
 
+    return true;
+  }
+
+  private handleRuntimeOwnershipFailure(error: unknown): boolean {
+    if (!isRuntimeOwnershipFailure(error)) return false;
+
+    this.stop();
+    try {
+      this.runtimeOwnershipLossHandler?.(error);
+    } catch {
+      // The worker must not turn ownership-loss shutdown routing into an unhandled rejection.
+    }
     return true;
   }
 

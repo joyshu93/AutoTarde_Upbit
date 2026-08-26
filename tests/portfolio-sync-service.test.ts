@@ -103,6 +103,79 @@ test("portfolio sync discards exchange results when ownership is lost during the
   assert.equal(reconciliationCalls, 0);
 });
 
+test("portfolio sync broad catch preserves the exact ownership error before a second assertion", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const ownership = createFreshAssertionRuntimeOwnershipAuthority();
+  const originalError = new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_LOST",
+    "RUNTIME_OWNERSHIP_LOST: EXCHANGE_READ_DETECTED_LOSS",
+  );
+  const service = new PortfolioSyncService({
+    exchangeAdapter: {
+      async getBalances(): Promise<never> {
+        ownership.lose();
+        throw originalError;
+      },
+    },
+    repositories,
+    reconciliationService: {
+      async runWithRecord(): Promise<never> {
+        throw new Error("reconciliation must not run after ownership loss");
+      },
+    },
+    runtimeOwnership: ownership.authority,
+    now: () => "2026-08-22T00:00:00.000Z",
+  });
+
+  await assert.rejects(
+    () => service.run({ exchangeAccountId: "primary", source: "SCHEDULER_PREFLIGHT" }),
+    (error) => error === originalError,
+  );
+
+  assert.equal(ownership.assertionErrors.length, 0);
+  assert.equal((await repositories.listReconciliationRuns("primary")).length, 0);
+});
+
+function createFreshAssertionRuntimeOwnershipAuthority(): {
+  authority: RuntimeOwnershipAuthority;
+  assertionErrors: RuntimeOwnershipGuardError[];
+  lose(): void;
+} {
+  let held = true;
+  const assertionErrors: RuntimeOwnershipGuardError[] = [];
+  return {
+    assertionErrors,
+    lose() {
+      held = false;
+    },
+    authority: {
+      snapshot: () => ({
+        status: held ? "OWNED" : "LOST",
+        generation: 1,
+        executionMode: "DRY_RUN",
+        acquiredAtEpochMs: 1,
+        heartbeatAtEpochMs: 1,
+        expiresAtEpochMs: 45_001,
+        takeover: false,
+        lossReason: held ? null : "TEST_GENERATION_REPLACED",
+      }),
+      assertLocallyHeld() {
+        if (!held) {
+          const error = new RuntimeOwnershipGuardError(
+            "RUNTIME_OWNERSHIP_LOST",
+            `RUNTIME_OWNERSHIP_LOST: ASSERTION_${assertionErrors.length + 1}`,
+          );
+          assertionErrors.push(error);
+          throw error;
+        }
+      },
+      async assertCurrent(): Promise<never> {
+        throw new Error("assertCurrent is not used by portfolio sync");
+      },
+    },
+  };
+}
+
 function createOwnedThenLostRuntimeOwnershipAuthority(): {
   authority: RuntimeOwnershipAuthority;
   lose(): void;

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import type { AppServices } from "../src/app/create-app.js";
 import type { AppConfig } from "../src/app/env.js";
+import { RuntimeOwnershipGuardError } from "../src/app/runtime-ownership-guard.js";
 import { RuntimeProcessLockError, type RuntimeProcessLock } from "../src/app/runtime-process-lock.js";
 import type { RuntimeOwnershipContext, VerifiedRuntimeDatabase } from
   "../src/app/runtime-ownership-context.js";
@@ -189,6 +190,68 @@ test("runMain preserves createApp failure identity while releasing acquired owne
     "heartbeat:start",
     "app:create",
     "ownership:startup-failure",
+  ]);
+});
+
+test("runAppStartup preserves notification delivery ownership loss and starts no worker", async () => {
+  const events: string[] = [];
+  const { runAppStartup } = await loadFreshIndexModule();
+  const originalError = new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_LOST",
+    "RUNTIME_OWNERSHIP_LOST: STARTUP_DELIVERY_LOST",
+  );
+  const app = createAppFixture(events, null, true);
+  Object.defineProperty(app.notificationDelivery, "deliverPending", {
+    configurable: true,
+    value: async () => {
+      events.push("delivery");
+      throw originalError;
+    },
+  });
+
+  await assert.rejects(
+    () => runAppStartup(app, createOperations(events)),
+    (error) => error === originalError,
+  );
+
+  assert.deepEqual(events, [
+    "recovery",
+    "policy",
+    "delivery",
+    "telegram:stop",
+    "scheduler:stop",
+    "persistence:close",
+  ]);
+});
+
+test("runAppStartup routes scheduled ownership loss through the shared shutdown owner", async () => {
+  const events: string[] = [];
+  const { runAppStartup } = await loadFreshIndexModule();
+  const app = createAppFixture(events, null, true);
+  let onRuntimeOwnershipLost: ((error: unknown) => void) | undefined;
+  Object.defineProperty(app.strategyScheduler, "start", {
+    configurable: true,
+    value(handler?: (error: unknown) => void) {
+      events.push("scheduler:start");
+      onRuntimeOwnershipLost = handler;
+      return { started: true };
+    },
+  });
+
+  await runAppStartup(app, createOperations(events));
+  events.length = 0;
+
+  assert.ok(onRuntimeOwnershipLost);
+  onRuntimeOwnershipLost(new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_LOST",
+    "RUNTIME_OWNERSHIP_LOST: SCHEDULED_CALLBACK_LOST",
+  ));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(events, [
+    "telegram:stop",
+    "scheduler:stop",
+    "persistence:close",
   ]);
 });
 

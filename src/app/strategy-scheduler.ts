@@ -100,6 +100,7 @@ export class StrategyScheduler {
   private orderSubmittedBatchKey: string | null = null;
   private readonly runPreparationOwnerAuthority: StrategySchedulerRunPreparationOwnerAuthority;
   private readonly runtimeOwnership: RuntimeOwnershipAuthority;
+  private runtimeOwnershipLossHandler: ((error: unknown) => void) | null = null;
 
   constructor(
     private readonly dependencies: StrategySchedulerDependencies,
@@ -117,10 +118,12 @@ export class StrategyScheduler {
     this.startupBlockReported = false;
   }
 
-  start(): StrategySchedulerStatus {
+  start(onRuntimeOwnershipLost?: (error: unknown) => void): StrategySchedulerStatus {
     if (this.stopBegun) {
       throw new Error("Strategy scheduler cannot start after stop has begun.");
     }
+    this.runtimeOwnership.assertLocallyHeld();
+    this.runtimeOwnershipLossHandler = onRuntimeOwnershipLost ?? null;
     if (!this.dependencies.config.enabled || this.started) {
       return this.getStatus();
     }
@@ -132,7 +135,9 @@ export class StrategyScheduler {
 
     this.started = true;
     if (this.dependencies.config.runOnStart) {
-      void this.runMarketsOnStartSequentially();
+      void this.runMarketsOnStartSequentially().catch((error: unknown) => {
+        if (!this.handleRuntimeOwnershipFailure(error)) throw error;
+      });
       return this.getStatus();
     }
 
@@ -576,8 +581,13 @@ export class StrategyScheduler {
     this.updateMarketStatus(config.market, { nextRunAt });
     const timer = (this.dependencies.setTimer ?? setTimeout)(() => {
       this.timers.delete(config.market);
-      void this.enqueueScheduledMarketRun(config, batchKey)
-        .finally(() => this.scheduleMarket(config, config.intervalMs));
+      void this.enqueueScheduledMarketRun(config, batchKey).then(
+        () => this.scheduleMarket(config, config.intervalMs),
+        (error: unknown) => {
+          if (this.handleRuntimeOwnershipFailure(error)) return;
+          this.scheduleMarket(config, config.intervalMs);
+        },
+      );
     }, delayMs);
 
     this.timers.set(config.market, timer);
@@ -844,6 +854,18 @@ export class StrategyScheduler {
 
   private now(): string {
     return this.dependencies.now?.() ?? new Date().toISOString();
+  }
+
+  private handleRuntimeOwnershipFailure(error: unknown): boolean {
+    if (!isRuntimeOwnershipFailure(error)) return false;
+
+    this.stop();
+    try {
+      this.runtimeOwnershipLossHandler?.(error);
+    } catch {
+      // The worker must not turn ownership-loss shutdown routing into an unhandled rejection.
+    }
+    return true;
   }
 }
 

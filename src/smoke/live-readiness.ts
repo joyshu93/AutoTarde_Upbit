@@ -1,6 +1,6 @@
 import { pathToFileURL } from "node:url";
 
-import { createApp, type AppServices } from "../app/create-app.js";
+import type { AppServices } from "../app/create-app.js";
 import type { AppConfig } from "../app/env.js";
 import {
   createRuntimeShutdown,
@@ -180,7 +180,7 @@ async function runReadOnlyLiveReadinessSmoke(): Promise<LiveReadinessSmokeResult
 }
 
 export async function runLiveReadinessSmokeWithApplicationForTest(
-  createApplication: () => AppServices = createApp,
+  createApplication: () => AppServices,
 ): Promise<LiveReadinessSmokeResult> {
   const app = createApplication();
   const runtimeShutdown = createRuntimeShutdown(app);

@@ -1,6 +1,6 @@
 import { pathToFileURL } from "node:url";
 
-import { createApp, type AppServices } from "../app/create-app.js";
+import type { AppServices } from "../app/create-app.js";
 import type { AppConfig } from "../app/env.js";
 import {
   createRuntimeShutdown,
@@ -82,7 +82,7 @@ export async function runLiveSchedulerPreflightSmoke(): Promise<LiveSchedulerPre
 }
 
 export async function runLiveSchedulerPreflightSmokeWithApplicationForTest(
-  createApplication: () => AppServices = createApp,
+  createApplication: () => AppServices,
 ): Promise<LiveSchedulerPreflightSmokeResult> {
   const app = createApplication();
   const runtimeShutdown = createRuntimeShutdown(app);

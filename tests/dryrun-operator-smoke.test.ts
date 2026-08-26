@@ -2,12 +2,10 @@ import assert from "node:assert/strict";
 import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 
-import { createApp } from "../src/app/create-app.js";
 import { loadAppConfig } from "../src/app/env.js";
 import {
   applyDryRunOperatorSmokeSafetyEnv,
-  buildDryRunOperatorSmokeResult,
-  createDryRunOperatorMarketDataReader,
+  runDryRunOperatorSmoke,
   validateDryRunOperatorSmokeSafety,
 } from "../src/smoke/dryrun-operator.js";
 import { test } from "./harness.js";
@@ -84,8 +82,6 @@ test("dry-run operator smoke routes core operator commands without live side eff
   const previousInbound = process.env.ENABLE_TELEGRAM_INBOUND_POLLING;
   const previousScheduler = process.env.STRATEGY_SCHEDULER_ENABLED;
   const previousRunOnStart = process.env.STRATEGY_SCHEDULER_RUN_ON_START;
-  let app: ReturnType<typeof createApp> | null = null;
-
   process.env.DATABASE_PATH = databasePath;
   process.env.APP_EXECUTION_MODE = "LIVE";
   process.env.ENABLE_LIVE_ORDERS = "true";
@@ -97,11 +93,7 @@ test("dry-run operator smoke routes core operator commands without live side eff
   process.env.UPBIT_SECRET_KEY = "secret-secret";
 
   try {
-    const safetyEnv = applyDryRunOperatorSmokeSafetyEnv();
-    app = createApp(undefined, {
-      publicMarketDataReader: createDryRunOperatorMarketDataReader(),
-    });
-    const result = await buildDryRunOperatorSmokeResult(app, safetyEnv);
+    const result = await runDryRunOperatorSmoke();
 
     assert.equal(result.status, "PASS");
     assert.equal(result.executionMode, "DRY_RUN");
@@ -136,9 +128,6 @@ test("dry-run operator smoke routes core operator commands without live side eff
       ],
     );
   } finally {
-    app?.telegramInboundPolling.stop();
-    app?.strategyScheduler.stop();
-    app?.persistence.close();
     restoreOptionalEnv("DATABASE_PATH", previousDatabasePath);
     restoreOptionalEnv("UPBIT_ACCESS_KEY", previousAccessKey);
     restoreOptionalEnv("UPBIT_SECRET_KEY", previousSecretKey);

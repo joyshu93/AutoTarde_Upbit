@@ -1,7 +1,9 @@
 import { pathToFileURL } from "node:url";
 
 import { createApp } from "../app/create-app.js";
-import type { AppConfig } from "../app/env.js";
+import { loadAppConfig, type AppConfig } from "../app/env.js";
+import type { RuntimeOwnershipAuthority } from "../app/runtime-ownership-guard.js";
+import { runWithScopedRuntimeOwnership } from "../app/scoped-runtime-ownership.js";
 import type {
   TelegramInboundPollingStatus,
   TelegramInboundPollSummary,
@@ -41,6 +43,14 @@ export interface TelegramInboundSmokeResult {
   readonly before: TelegramInboundPollingStatus | null;
   readonly summary: TelegramInboundPollSummary | null;
   readonly after: TelegramInboundPollingStatus | null;
+}
+
+export interface TelegramInboundSmokeOperations {
+  createApplication(
+    config: AppConfig,
+    overrides: { readonly runtimeOwnershipAuthority: RuntimeOwnershipAuthority },
+  ): ReturnType<typeof createApp>;
+  runWithScopedRuntimeOwnership: typeof runWithScopedRuntimeOwnership;
 }
 
 export function applyTelegramInboundSmokeSafetyEnv(
@@ -104,47 +114,56 @@ export function validateTelegramInboundSmokeSafety(
   return blockers;
 }
 
-export async function runTelegramInboundSmokeOnce(): Promise<TelegramInboundSmokeResult> {
+export async function runTelegramInboundSmokeOnce(
+  overrides: Partial<TelegramInboundSmokeOperations> = {},
+): Promise<TelegramInboundSmokeResult> {
   const safetyEnv = applyTelegramInboundSmokeSafetyEnv();
-  const app = createApp();
-  let before: TelegramInboundPollingStatus | null = null;
-  let summary: TelegramInboundPollSummary | null = null;
-  let after: TelegramInboundPollingStatus | null = null;
+  const config = loadAppConfig();
+  const createApplication = overrides.createApplication ?? ((appConfig, appOverrides) =>
+    createApp(appConfig, appOverrides));
+  const runOwned = overrides.runWithScopedRuntimeOwnership ?? runWithScopedRuntimeOwnership;
 
-  try {
-    before = app.telegramInboundPolling.getStatus();
-    const safetyBlockers = validateTelegramInboundSmokeSafety(app.config);
+  return runOwned(config, async (runtimeOwnershipAuthority) => {
+    const app = createApplication(config, { runtimeOwnershipAuthority });
+    let before: TelegramInboundPollingStatus | null = null;
+    let summary: TelegramInboundPollSummary | null = null;
+    let after: TelegramInboundPollingStatus | null = null;
 
-    if (safetyBlockers.length > 0) {
+    try {
+      before = app.telegramInboundPolling.getStatus();
+      const safetyBlockers = validateTelegramInboundSmokeSafety(app.config);
+
+      if (safetyBlockers.length > 0) {
+        after = app.telegramInboundPolling.getStatus();
+        return buildResult({
+          app,
+          status: "BLOCKED",
+          safetyEnv,
+          safetyBlockers,
+          before,
+          summary,
+          after,
+        });
+      }
+
+      summary = await app.telegramInboundPolling.pollOnce();
       after = app.telegramInboundPolling.getStatus();
+
       return buildResult({
         app,
-        status: "BLOCKED",
+        status: summary.status,
         safetyEnv,
         safetyBlockers,
         before,
         summary,
         after,
       });
+    } finally {
+      app.telegramInboundPolling.stop();
+      app.strategyScheduler.stop();
+      app.persistence.close();
     }
-
-    summary = await app.telegramInboundPolling.pollOnce();
-    after = app.telegramInboundPolling.getStatus();
-
-    return buildResult({
-      app,
-      status: summary.status,
-      safetyEnv,
-      safetyBlockers,
-      before,
-      summary,
-      after,
-    });
-  } finally {
-    app.telegramInboundPolling.stop();
-    app.strategyScheduler.stop();
-    app.persistence.close();
-  }
+  });
 }
 
 function buildResult(input: {

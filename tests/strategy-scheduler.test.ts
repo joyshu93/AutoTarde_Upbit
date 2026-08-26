@@ -54,6 +54,79 @@ test("strategy scheduler fails closed when runtime authority is omitted", async 
   assert.equal(controllerCalls, 0);
 });
 
+test("strategy scheduler start fails closed before installing a timer", () => {
+  let timerCalls = 0;
+  const scheduler = new ProductionStrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController(),
+    setTimer: () => {
+      timerCalls += 1;
+      return setTimeout(() => undefined, 60_000);
+    },
+  });
+
+  assert.throws(() => scheduler.start(), /RUNTIME_OWNERSHIP_NOT_HELD/u);
+  assert.equal(timerCalls, 0);
+});
+
+test("scheduled scheduler ownership loss routes once without unhandled rejection or repeat timer", async () => {
+  const ownership = createOwnedThenLostRuntimeOwnershipAuthority();
+  const callbacks: Array<() => void> = [];
+  const routedErrors: unknown[] = [];
+  const unhandled: unknown[] = [];
+  let timerCalls = 0;
+  let reportCalls = 0;
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController(),
+    reporter: {
+      async report() {
+        reportCalls += 1;
+      },
+    },
+    runtimeOwnership: ownership.authority,
+    setTimer: (callback) => {
+      timerCalls += 1;
+      callbacks.push(callback);
+      const timer = setTimeout(() => undefined, 60_000);
+      clearTimeout(timer);
+      return timer;
+    },
+  });
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+
+  try {
+    (scheduler.start as unknown as (onOwnershipLost: (error: unknown) => void) => unknown)(
+      (error) => routedErrors.push(error),
+    );
+    ownership.lose();
+    callbacks[0]?.();
+    await waitForUnhandledTurn();
+
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(routedErrors, [ownership.lossError]);
+    assert.equal(timerCalls, 1);
+    assert.equal(reportCalls, 0);
+    assert.equal(scheduler.getStatus().started, false);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    scheduler.stop();
+  }
+});
+
 function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
   return {
     snapshot: () => ({
@@ -1946,6 +2019,11 @@ function createNowSequence(values: string[]): () => string {
 
 async function waitForMicrotasks(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function waitForUnhandledTurn(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 function createDeferred<T>() {

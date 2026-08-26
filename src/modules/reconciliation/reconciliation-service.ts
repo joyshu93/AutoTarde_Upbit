@@ -224,6 +224,7 @@ export class ReconciliationService {
         }
       }
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
       const message = error instanceof Error ? error.message : "Unknown identifier recovery lookup failure.";
       if (error instanceof ExchangeOrderSnapshotBindingError) {
         await this.recordRecoveryObservation(order, "TRANSIENT_FAILURE", now, {
@@ -268,6 +269,7 @@ export class ReconciliationService {
           };
         }
       } catch (error) {
+        if (isRuntimeOwnershipFailure(error)) throw error;
         const message = error instanceof Error ? error.message : "Unknown recovered snapshot projection failure.";
         await this.persistRecoveredProjectionFailure(order, now.observedAt, message);
         return {
@@ -766,6 +768,7 @@ export class ReconciliationService {
           : undefined,
       };
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
       const message = error instanceof Error ? error.message : "Unknown exchange history lookup failure.";
       return {
         issues: [
@@ -1030,6 +1033,7 @@ export class ReconciliationService {
       const candidate = await this.dependencies.orderReader.getOrder(query);
       snapshot = candidate ? bindExchangeOrderSnapshot({ candidate, query, order }) : null;
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
       const message = error instanceof Error ? error.message : "Unknown reconciliation query failure.";
       if (isTypedTransientLookupError(error)) {
         await this.dependencies.repositories.appendOrderEvent({
@@ -1060,6 +1064,7 @@ export class ReconciliationService {
     try {
       return await this.applyExchangeSnapshot(order, snapshot, reconciledAt);
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
       const message = error instanceof Error ? error.message : "Unknown local reconciliation persistence failure.";
       return [{
         code: "OPEN_ORDER_NEEDS_REVIEW",
@@ -1101,6 +1106,7 @@ export class ReconciliationService {
       const candidate = await this.dependencies.orderReader.getOrder(query);
       snapshot = candidate ? bindExchangeOrderSnapshot({ candidate, query, order }) : null;
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
       const message = error instanceof Error ? error.message : "Unknown terminal reconciliation query failure.";
       if (isTypedTransientLookupError(error)) {
         await this.dependencies.repositories.appendOrderEvent({
@@ -1149,6 +1155,7 @@ export class ReconciliationService {
       });
       return issues;
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
       const message = error instanceof Error ? error.message : "Unknown local reconciliation persistence failure.";
       return [{
         code: "OPEN_ORDER_NEEDS_REVIEW",
@@ -1450,6 +1457,7 @@ function fenceAsyncBoundary<T extends object>(
             return settled;
           },
           (error: unknown) => {
+            if (isRuntimeOwnershipFailure(error)) throw error;
             runtimeOwnership.assertLocallyHeld();
             throw error;
           },

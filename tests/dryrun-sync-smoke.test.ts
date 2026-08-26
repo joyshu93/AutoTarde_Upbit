@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdir, rm } from "node:fs/promises";
+import path from "node:path";
 
 import type { AppConfig } from "../src/app/env.js";
 import {
   applyDryRunSyncSmokeSafetyEnv,
   buildDryRunSyncSmokeResult,
+  runDryRunSyncSmoke,
   validateDryRunSyncSmokeSafety,
 } from "../src/smoke/dryrun-sync.js";
 import { test } from "./harness.js";
@@ -153,6 +156,45 @@ test("dry-run sync smoke warns when post-sync readiness warns", async () => {
   ]);
 });
 
+test("dry-run sync one-shot runs under real scoped ownership and cleans up without an API call", async () => {
+  if (process.platform !== "win32") return;
+
+  const databasePath = await createTempDatabasePath("dryrun-sync-owned-smoke");
+  const previousDatabasePath = process.env.DATABASE_PATH;
+  const cleanupEvents: string[] = [];
+  let observedGeneration: number | null = null;
+  process.env.DATABASE_PATH = databasePath;
+
+  try {
+    const result = await runDryRunSyncSmoke({
+      createApplication(config, overrides) {
+        overrides.runtimeOwnershipAuthority.assertLocallyHeld();
+        observedGeneration = overrides.runtimeOwnershipAuthority.snapshot().generation;
+        return {
+          config,
+          exchangeBackedReadEnabled: true,
+          liveSendPath: "DRY_RUN_ADAPTER",
+          telegramRouter: {
+            async route(command: string) {
+              return { text: createRouteResponse(command, "PASS") };
+            },
+          },
+          telegramInboundPolling: { stop() { cleanupEvents.push("inbound:stop"); } },
+          strategyScheduler: { stop() { cleanupEvents.push("scheduler:stop"); } },
+          persistence: { close() { cleanupEvents.push("persistence:close"); } },
+        } as never;
+      },
+    });
+
+    assert.equal(result.status, "PASS");
+    assert.ok((observedGeneration ?? 0) > 0);
+    assert.deepEqual(cleanupEvents, ["inbound:stop", "scheduler:stop", "persistence:close"]);
+  } finally {
+    restoreOptionalEnv("DATABASE_PATH", previousDatabasePath);
+    await rm(path.dirname(databasePath), { recursive: true, force: true });
+  }
+});
+
 function createRouteResponse(command: string, readinessStatus: "PASS" | "WARN" | "BLOCK"): string {
   switch (command) {
     case "/config":
@@ -245,4 +287,18 @@ function createSafetyEnvReport(): ReturnType<typeof applyDryRunSyncSmokeSafetyEn
     databasePathDefaulted: false,
     databasePath: "./var/company-dryrun.sqlite",
   };
+}
+
+async function createTempDatabasePath(label: string): Promise<string> {
+  const directory = path.resolve("tmp", `${label}-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  await mkdir(directory, { recursive: true });
+  return path.join(directory, "runtime.sqlite");
+}
+
+function restoreOptionalEnv(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
 }

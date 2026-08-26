@@ -8,6 +8,7 @@ import {
   type RuntimeOwnershipContext,
   type VerifiedRuntimeDatabase,
 } from "./app/runtime-ownership-context.js";
+import { RuntimeOwnershipGuardError } from "./app/runtime-ownership-guard.js";
 import {
   acquireRuntimeProcessLock,
   type RuntimeProcessLock,
@@ -62,21 +63,22 @@ export interface RunMainOperations {
 
 export async function startTelegramRuntime(input: {
   strategyScheduler: {
-    start(): { readonly started: boolean };
+    start(onRuntimeOwnershipLost?: (error: unknown) => void): { readonly started: boolean };
     reportStartupBlockIfNeeded(): Promise<boolean>;
   };
   telegramInboundPolling: {
-    start(): { readonly running: boolean };
+    start(onRuntimeOwnershipLost?: (error: unknown) => void): { readonly running: boolean };
   };
+  onRuntimeOwnershipLost?: (error: unknown) => void;
   installRuntimeSignalHandlers(): void;
   telegramCommandMenuSetup: {
     setup(): Promise<TelegramCommandMenuSetupResult>;
   };
 }): Promise<TelegramRuntimeStartupResult> {
-  const strategySchedulerStatus = input.strategyScheduler.start();
+  const strategySchedulerStatus = input.strategyScheduler.start(input.onRuntimeOwnershipLost);
   const strategySchedulerStartupBlockNotified =
     await input.strategyScheduler.reportStartupBlockIfNeeded();
-  const telegramInboundPollingStatus = input.telegramInboundPolling.start();
+  const telegramInboundPollingStatus = input.telegramInboundPolling.start(input.onRuntimeOwnershipLost);
   if (hasBackgroundRuntime({
     strategyScheduler: strategySchedulerStatus,
     telegramInboundPolling: telegramInboundPollingStatus,
@@ -163,6 +165,7 @@ export async function runAppStartup(
   try {
     notificationDeliverySummary = await app.notificationDelivery.deliverPending("primary");
   } catch (error) {
+    if (isRuntimeOwnershipFailure(error)) throw error;
     notificationDeliverySummary = {
       attempted: 0,
       sent: 0,
@@ -193,6 +196,9 @@ export async function runAppStartup(
       app,
       shutdown: (reason) => runtimeShutdown(reason ?? "RUNTIME_SHUTDOWN"),
     }),
+    onRuntimeOwnershipLost: () => {
+      void runtimeShutdown("RUNTIME_OWNERSHIP_LOST").catch(() => undefined);
+    },
     telegramCommandMenuSetup: app.telegramCommandMenuSetup,
   });
   const {
@@ -260,6 +266,11 @@ export async function runAppStartup(
   }
     },
   });
+}
+
+function isRuntimeOwnershipFailure(error: unknown): boolean {
+  return error instanceof RuntimeOwnershipGuardError ||
+    (error instanceof Error && /^RUNTIME_OWNERSHIP_(?:LOST|NOT_HELD):/u.test(error.message));
 }
 
 function resolveOwnershipLossSource(

@@ -139,6 +139,7 @@ export class PortfolioSyncService {
         reconciliationRun: { ...reconciliationResult.reconciliationRun },
       };
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
       dependencies.runtimeOwnership!.assertLocallyHeld();
       const message = error instanceof Error ? error.message : "Unknown portfolio sync failure.";
       await updateReconciliationRun({
@@ -179,6 +180,7 @@ export class PortfolioSyncService {
           await getTickers(UPBIT_SPOT_MARKETS),
         );
       } catch (error) {
+        if (isRuntimeOwnershipFailure(error)) throw error;
         marketPriceError = error instanceof Error ? error.message : "Unknown public ticker failure.";
       }
     }
@@ -228,6 +230,11 @@ function throwRuntimeOwnershipNotHeld(): never {
     "RUNTIME_OWNERSHIP_NOT_HELD",
     "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
   );
+}
+
+function isRuntimeOwnershipFailure(error: unknown): boolean {
+  return error instanceof RuntimeOwnershipGuardError ||
+    (error instanceof Error && /^RUNTIME_OWNERSHIP_(?:LOST|NOT_HELD):/u.test(error.message));
 }
 
 function snapshotRunInput(input: {

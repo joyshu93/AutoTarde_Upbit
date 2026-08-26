@@ -1,7 +1,9 @@
 import { pathToFileURL } from "node:url";
 
 import { createApp, type AppServices } from "../app/create-app.js";
-import type { AppConfig } from "../app/env.js";
+import { loadAppConfig, type AppConfig } from "../app/env.js";
+import type { RuntimeOwnershipAuthority } from "../app/runtime-ownership-guard.js";
+import { runWithScopedRuntimeOwnership } from "../app/scoped-runtime-ownership.js";
 
 type DryRunSyncSmokeStatus = "PASS" | "WARN" | "BLOCK" | "SKIPPED";
 type DryRunSyncSmokeEnvKey = keyof typeof FORCED_DRY_RUN_SYNC_ENV;
@@ -117,6 +119,14 @@ export interface DryRunSyncSmokeResult {
   readonly commands: DryRunSyncSmokeCommandResult[];
 }
 
+export interface DryRunSyncSmokeOperations {
+  createApplication(
+    config: AppConfig,
+    overrides: { readonly runtimeOwnershipAuthority: RuntimeOwnershipAuthority },
+  ): AppServices;
+  runWithScopedRuntimeOwnership: typeof runWithScopedRuntimeOwnership;
+}
+
 export function applyDryRunSyncSmokeSafetyEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): DryRunSyncSmokeEnvReport {
@@ -177,17 +187,26 @@ export function validateDryRunSyncSmokeSafety(input: {
   return blockers;
 }
 
-export async function runDryRunSyncSmoke(): Promise<DryRunSyncSmokeResult> {
+export async function runDryRunSyncSmoke(
+  overrides: Partial<DryRunSyncSmokeOperations> = {},
+): Promise<DryRunSyncSmokeResult> {
   const safetyEnv = applyDryRunSyncSmokeSafetyEnv();
-  const app = createApp();
+  const config = loadAppConfig();
+  const createApplication = overrides.createApplication ?? ((appConfig, appOverrides) =>
+    createApp(appConfig, appOverrides));
+  const runOwned = overrides.runWithScopedRuntimeOwnership ?? runWithScopedRuntimeOwnership;
 
-  try {
-    return await buildDryRunSyncSmokeResult(app, safetyEnv);
-  } finally {
-    app.telegramInboundPolling.stop();
-    app.strategyScheduler.stop();
-    app.persistence.close();
-  }
+  return runOwned(config, async (runtimeOwnershipAuthority) => {
+    const app = createApplication(config, { runtimeOwnershipAuthority });
+
+    try {
+      return await buildDryRunSyncSmokeResult(app, safetyEnv);
+    } finally {
+      app.telegramInboundPolling.stop();
+      app.strategyScheduler.stop();
+      app.persistence.close();
+    }
+  });
 }
 
 export async function buildDryRunSyncSmokeResult(
