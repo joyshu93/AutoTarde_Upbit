@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import {
   InlineTelegramStrategyRunController,
   type CandidateBtcRunPreparation,
@@ -10,6 +11,63 @@ import type {
   PositionGuardRunResult,
 } from "../src/modules/strategy/position-guard-runner.js";
 import { test } from "./harness.js";
+
+function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "LOST",
+      generation: 1,
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 1,
+      heartbeatAtEpochMs: 1,
+      expiresAtEpochMs: 45_001,
+      takeover: false,
+      lossReason: "TEST_GENERATION_REPLACED",
+    }),
+    assertLocallyHeld() {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+    async assertCurrent(): Promise<never> {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+  };
+}
+
+test("strategy run controller rejects before preparation or runner work after ownership loss", async () => {
+  let preparationCalls = 0;
+  let runnerCalls = 0;
+  const controller = new InlineTelegramStrategyRunController({
+    runner: {
+      async runOnce(): Promise<PositionGuardRunResult> {
+        runnerCalls += 1;
+        throw new Error("runner must not run after ownership loss");
+      },
+      async previewOnce(): Promise<PositionGuardPreviewResult> {
+        throw new Error("preview is not used by requestRun");
+      },
+    },
+    candidateBtcRunPreparation: {
+      async prepare(): Promise<never> {
+        preparationCalls += 1;
+        throw new Error("preparation must not run after ownership loss");
+      },
+    },
+    runtimeOwnership: createLostRuntimeOwnershipAuthority(),
+  });
+
+  await assert.rejects(
+    () => controller.requestRun({
+      exchangeAccountId: "primary",
+      market: "KRW-BTC",
+      requestedBy: "TELEGRAM",
+      requestedCommand: "/run",
+    }),
+    /RUNTIME_OWNERSHIP_LOST/u,
+  );
+
+  assert.equal(preparationCalls, 0);
+  assert.equal(runnerCalls, 0);
+});
 
 test("manual strategy run preflight blocks before runner execution", async () => {
   let runOnceCalled = false;

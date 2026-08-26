@@ -46,8 +46,16 @@ import type {
   SubmitOrderFromDecisionResult,
 } from "./interfaces.js";
 import { parseCandidateEvidenceTimestamp } from "./candidate-evidence-decimals.js";
+import type { RuntimeOwnershipAuthority } from "../../app/runtime-ownership-guard.js";
 
 const CANDIDATE_FINAL_ORDER_SCAN_LIMIT = 100;
+
+class RuntimeOwnershipLostBeforeSendError extends Error {
+  constructor(readonly cause: unknown) {
+    super("RUNTIME_OWNERSHIP_LOST: Final persisted runtime ownership check failed before order transmission.");
+    this.name = "RuntimeOwnershipLostBeforeSendError";
+  }
+}
 
 const EXACT_ORDER_RECORD_FIELDS = Object.freeze([
   "id",
@@ -88,6 +96,7 @@ export class ExecutionService {
       accountExecutionLeases: AccountExecutionLeaseStore;
       accountExecutionLeaseMs: number;
       operatorState: OperatorStateStore;
+      runtimeOwnership?: RuntimeOwnershipAuthority;
       candidatePilots?: Pick<
         CandidatePilotRepository,
         "getDeployment" | "getExactState" | "getExecutionBindingForOrder" |
@@ -526,6 +535,7 @@ export class ExecutionService {
 
     let exchangeOrderPromise: ReturnType<ExecutionExchangeAdapter["createOrder"]> | undefined;
     let createOrderInvoked = false;
+    let finalRuntimeOwnershipCheckStarted = false;
     let synchronousSubmissionError: unknown = null;
     try {
       await this.assertFinalCandidatePreSendAuthority({
@@ -556,7 +566,7 @@ export class ExecutionService {
         input.exchangeAccountId,
         CANDIDATE_FINAL_ORDER_SCAN_LIMIT + 1,
       );
-      // This exact own-order read is the final await on the successful path.
+      // This is the final order-persistence read before the runtime generation fence.
       const finalPersistedOrder = await this.dependencies.repositories.findOrderById(
         input.exchangeAccountId,
         order.id,
@@ -567,6 +577,10 @@ export class ExecutionService {
         activeOrders: finalActiveOrders,
         persistedOrder: finalPersistedOrder,
       });
+      if (this.dependencies.runtimeOwnership) {
+        finalRuntimeOwnershipCheckStarted = true;
+        await this.dependencies.runtimeOwnership.assertCurrent(Date.now());
+      }
       createOrderInvoked = true;
       exchangeOrderPromise = this.dependencies.executionAdapter.createOrder({
         market,
@@ -583,6 +597,9 @@ export class ExecutionService {
         synchronousSubmissionError = error;
       } else {
         releaseLease = false;
+        if (finalRuntimeOwnershipCheckStarted) {
+          throw new RuntimeOwnershipLostBeforeSendError(error);
+        }
         if (candidateContext && candidateBinding) {
           await this.pauseCandidateIntentFault({
             authority: candidateContext.authority,

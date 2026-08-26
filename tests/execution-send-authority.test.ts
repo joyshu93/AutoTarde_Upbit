@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import type { ExecutionStateRecord } from "../src/domain/types.js";
 import { ExecutionService } from "../src/modules/execution/execution-service.js";
 import { ExchangeOrderSubmissionError } from "../src/modules/exchange/errors.js";
@@ -91,6 +92,47 @@ test("renewal loss after SUBMITTING retains recovery evidence and sends nothing"
   assert.equal(exchange.createOrderCalls, 0);
   assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING");
   assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
+});
+
+test("a replaced runtime generation after final order checks leaves immutable evidence and never sends", async () => {
+  const exchange = createCountingAdapter();
+  let persistedAuthorityChecks = 0;
+  const runtimeOwnership: RuntimeOwnershipAuthority = {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: 1,
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 1,
+      heartbeatAtEpochMs: 1,
+      expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent(atEpochMs): Promise<never> {
+      assert.equal(Number.isSafeInteger(atEpochMs), true);
+      persistedAuthorityChecks += 1;
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+  };
+  const leaseStore = new InMemoryAccountExecutionLeaseStore();
+  const { service, repositories, operatorState } = await createService({
+    exchangeAdapter: exchange,
+    accountExecutionLeases: leaseStore,
+    runtimeOwnership,
+  });
+
+  await assert.rejects(
+    () => service.submitOrderFromDecision(validInput()),
+    /RUNTIME_OWNERSHIP_LOST/u,
+  );
+
+  assert.equal(persistedAuthorityChecks, 1);
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING");
+  assert.equal((await repositories.listRiskEvents("primary")).length, 0);
+  assert.equal((await operatorState.getState()).systemStatus, "RUNNING");
+  assert.notEqual(await leaseStore.getLease("primary"), null);
 });
 
 test("slow validation expiry cannot turn into a concurrent send because pre-send renewal verifies ownership", async () => {
@@ -588,6 +630,12 @@ test("only ExecutionService has production createOrder authority", async () => {
     .map(({ filePath }) => path.relative(process.cwd(), filePath).replaceAll("\\", "/"));
 
   assert.deepEqual(createOrderCallers, ["src/modules/execution/execution-service.ts"]);
+
+  const cancelOrderCallers = callers
+    .filter(({ source }) => /\.cancelOrder\s*\(/u.test(source))
+    .map(({ filePath }) => path.relative(process.cwd(), filePath).replaceAll("\\", "/"));
+
+  assert.deepEqual(cancelOrderCallers, []);
 });
 
 async function createService(overrides: {
@@ -595,6 +643,7 @@ async function createService(overrides: {
   accountExecutionLeases?: AccountExecutionLeaseStore;
   repositories?: InMemoryExecutionRepository;
   operatorState?: InMemoryOperatorStateStore;
+  runtimeOwnership?: RuntimeOwnershipAuthority;
   accountExecutionLeaseMs?: number;
   now?: () => string;
 } = {}) {
@@ -613,6 +662,7 @@ async function createService(overrides: {
     accountExecutionLeases,
     accountExecutionLeaseMs: overrides.accountExecutionLeaseMs ?? 30_000,
     operatorState,
+    runtimeOwnership: overrides.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
     now: overrides.now ?? (() => "2026-04-20T00:00:20.000Z"),
   });
   await repositories.saveBalanceSnapshot({
@@ -713,6 +763,33 @@ function createRunningState(overrides: Partial<ExecutionStateRecord> = {}): Exec
     degradedAt: null,
     updatedAt: "2026-04-20T00:00:00.000Z",
     ...overrides,
+  };
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
   };
 }
 

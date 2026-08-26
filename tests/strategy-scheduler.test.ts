@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import { StrategyScheduler } from "../src/app/strategy-scheduler.js";
 import { InMemoryExecutionRepository } from "../src/modules/db/repositories/in-memory-repositories.js";
 import type {
@@ -10,6 +11,58 @@ import type {
 } from "../src/modules/telegram/interfaces.js";
 import type { OperatorNotificationReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
+
+function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "LOST",
+      generation: 1,
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 1,
+      heartbeatAtEpochMs: 1,
+      expiresAtEpochMs: 45_001,
+      takeover: false,
+      lossReason: "TEST_GENERATION_REPLACED",
+    }),
+    assertLocallyHeld() {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+    async assertCurrent(): Promise<never> {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+  };
+}
+
+test("strategy scheduler rejects a cycle after runtime ownership is lost", async () => {
+  let controllerCalls = 0;
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: {
+      async requestRun(): Promise<TelegramStrategyRunResult> {
+        controllerCalls += 1;
+        throw new Error("controller must not run after ownership loss");
+      },
+      async requestPreview(): Promise<TelegramStrategyPreviewResult> {
+        throw new Error("preview is not used by the scheduler");
+      },
+    },
+    runtimeOwnership: createLostRuntimeOwnershipAuthority(),
+  });
+  scheduler.stop();
+
+  await assert.rejects(
+    () => scheduler.runMarketNow("KRW-BTC"),
+    /RUNTIME_OWNERSHIP_LOST/u,
+  );
+
+  assert.equal(controllerCalls, 0);
+});
 
 test("strategy scheduler is disabled by default and does not schedule timers", () => {
   const scheduledDelays: number[] = [];

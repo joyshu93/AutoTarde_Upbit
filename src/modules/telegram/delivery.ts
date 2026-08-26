@@ -4,6 +4,7 @@ import type {
   OperatorNotificationFailureClass,
   OperatorNotificationRecord,
 } from "../../domain/types.js";
+import type { RuntimeOwnershipAuthority } from "../../app/runtime-ownership-guard.js";
 import { createId } from "../../shared/ids.js";
 import type { ExecutionRepository } from "../db/interfaces.js";
 import type {
@@ -219,6 +220,7 @@ export class OperatorNotificationDeliveryService {
       leaseDurationMs?: number;
       workerName?: string;
       locale?: TelegramLocale;
+      runtimeOwnership?: RuntimeOwnershipAuthority;
     },
   ) {}
 
@@ -241,6 +243,7 @@ export class OperatorNotificationDeliveryService {
     exchangeAccountId: string,
     limit = DEFAULT_PENDING_DELIVERY_LIMIT,
   ): Promise<OperatorNotificationDeliverySummary> {
+    this.dependencies.runtimeOwnership?.assertLocallyHeld();
     const inFlight = this.inFlightByExchangeAccount.get(exchangeAccountId);
     if (inFlight) {
       return inFlight;
@@ -277,6 +280,7 @@ export class OperatorNotificationDeliveryService {
     exchangeAccountId: string,
     limit: number,
   ): Promise<OperatorNotificationDeliverySummary> {
+    this.dependencies.runtimeOwnership?.assertLocallyHeld();
     const runId = createId("operator_notification_delivery_run");
     const startedAt = this.now();
 
@@ -326,6 +330,7 @@ export class OperatorNotificationDeliveryService {
       let staleLease = 0;
 
       for (const notification of claimedNotifications) {
+        this.dependencies.runtimeOwnership?.assertLocallyHeld();
         const delivered = await this.deliverRecord(notification);
         if (delivered.deliveryStatus === "SENT") {
           sent += 1;
@@ -380,6 +385,7 @@ export class OperatorNotificationDeliveryService {
       });
       return summary;
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
       const errorMessage = sanitizeOperatorNotificationError(error);
       const summary = {
         attempted: 0,
@@ -409,6 +415,7 @@ export class OperatorNotificationDeliveryService {
   }
 
   async deliverRecord(record: ClaimedOperatorNotificationRecord): Promise<OperatorNotificationRecord> {
+    this.dependencies.runtimeOwnership?.assertLocallyHeld();
     if (record.deliveryStatus !== "PENDING" || !this.isConfigured()) {
       return record;
     }
@@ -907,6 +914,10 @@ function sanitizeOperatorNotificationError(error: unknown): string {
   }
 
   return truncateText(String(error), MAX_DELIVERY_ERROR_LENGTH);
+}
+
+function isRuntimeOwnershipFailure(error: unknown): boolean {
+  return error instanceof Error && /^RUNTIME_OWNERSHIP_(?:LOST|NOT_HELD):/u.test(error.message);
 }
 
 function truncateText(input: string, maxLength: number): string {

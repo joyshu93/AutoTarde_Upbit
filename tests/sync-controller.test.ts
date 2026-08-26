@@ -1,11 +1,57 @@
 import assert from "node:assert/strict";
 
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import { InlineTelegramSyncController } from "../src/app/sync-controller.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { PortfolioSyncService } from "../src/modules/reconciliation/portfolio-sync-service.js";
 import { ReconciliationService } from "../src/modules/reconciliation/reconciliation-service.js";
 import { DurableTelegramReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
+
+function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "LOST",
+      generation: 1,
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 1,
+      heartbeatAtEpochMs: 1,
+      expiresAtEpochMs: 45_001,
+      takeover: false,
+      lossReason: "TEST_GENERATION_REPLACED",
+    }),
+    assertLocallyHeld() {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+    async assertCurrent(): Promise<never> {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+  };
+}
+
+test("inline telegram sync controller rejects before sync after runtime ownership is lost", async () => {
+  let syncCalls = 0;
+  const controller = new InlineTelegramSyncController({
+    portfolioSyncService: {
+      async run(): Promise<never> {
+        syncCalls += 1;
+        throw new Error("sync must not run after ownership loss");
+      },
+    },
+    runtimeOwnership: createLostRuntimeOwnershipAuthority(),
+  });
+
+  await assert.rejects(
+    () => controller.requestSync({
+      exchangeAccountId: "primary",
+      requestedBy: "TELEGRAM",
+      requestedCommand: "/sync",
+    }),
+    /RUNTIME_OWNERSHIP_LOST/u,
+  );
+
+  assert.equal(syncCalls, 0);
+});
 
 function createPortfolioSyncService(input: {
   exchangeAdapter: ConstructorParameters<typeof PortfolioSyncService>[0]["exchangeAdapter"];

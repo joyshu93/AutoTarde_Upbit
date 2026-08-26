@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import type { TelegramInboundOffsetRecord } from "../src/domain/types.js";
 import {
   splitTelegramReplyText,
@@ -8,6 +9,155 @@ import {
   type TelegramInboundUpdate,
 } from "../src/modules/telegram/inbound.js";
 import { test } from "./harness.js";
+
+test("telegram inbound rejects all routing and responses after runtime ownership is lost", async () => {
+  let pollCalls = 0;
+  let routeCalls = 0;
+  let sendCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        pollCalls += 1;
+        return [createUpdate(1, "123", "/status")];
+      },
+    },
+    messageClient: {
+      async sendMessage() {
+        sendCalls += 1;
+      },
+    },
+    router: {
+      async route() {
+        routeCalls += 1;
+        return { text: "read-only status" };
+      },
+    },
+    operatorChatId: "123",
+    runtimeOwnership: createLostRuntimeOwnershipAuthority(),
+  });
+  service.stop();
+
+  await assert.rejects(() => service.pollOnce(), /RUNTIME_OWNERSHIP_LOST/u);
+
+  assert.equal(pollCalls, 0);
+  assert.equal(routeCalls, 0);
+  assert.equal(sendCalls, 0);
+});
+
+test("telegram inbound propagates ownership loss while a read-only route is awaiting", async () => {
+  const runtimeOwnership = createControllableRuntimeOwnershipAuthority();
+  let sendCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        return [createUpdate(1, "123", "/status")];
+      },
+    },
+    messageClient: {
+      async sendMessage() {
+        sendCalls += 1;
+      },
+    },
+    router: {
+      async route() {
+        runtimeOwnership.lose();
+        return { text: "stale read-only status" };
+      },
+    },
+    operatorChatId: "123",
+    runtimeOwnership,
+  });
+
+  await assert.rejects(() => service.pollOnce(), /RUNTIME_OWNERSHIP_LOST/u);
+
+  assert.equal(sendCalls, 0);
+});
+
+test("telegram inbound persists no offset when ownership is lost during polling", async () => {
+  const runtimeOwnership = createControllableRuntimeOwnershipAuthority();
+  const savedOffsets: TelegramInboundOffsetRecord[] = [];
+  let routeCalls = 0;
+  let sendCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        runtimeOwnership.lose();
+        return [createUpdate(1, "123", "/pause")];
+      },
+    },
+    messageClient: {
+      async sendMessage() {
+        sendCalls += 1;
+      },
+    },
+    router: {
+      async route() {
+        routeCalls += 1;
+        return { text: "stale mutation result" };
+      },
+    },
+    operatorChatId: "123",
+    exchangeAccountId: "primary",
+    offsetStore: createOffsetStore({ savedOffsets }),
+    botTokenRef: "sha256:runtime-loss",
+    runtimeOwnership,
+  });
+
+  await assert.rejects(() => service.pollOnce(), /RUNTIME_OWNERSHIP_LOST/u);
+
+  assert.deepEqual(savedOffsets, []);
+  assert.equal(routeCalls, 0);
+  assert.equal(sendCalls, 0);
+});
+
+function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "LOST",
+      generation: 1,
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 1,
+      heartbeatAtEpochMs: 1,
+      expiresAtEpochMs: 45_001,
+      takeover: false,
+      lossReason: "TEST_GENERATION_REPLACED",
+    }),
+    assertLocallyHeld() {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+    async assertCurrent(): Promise<never> {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+  };
+}
+
+function createControllableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority & { lose(): void } {
+  let held = true;
+  return {
+    lose() {
+      held = false;
+    },
+    snapshot: () => ({
+      status: held ? "OWNED" : "LOST",
+      generation: 1,
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 1,
+      heartbeatAtEpochMs: 1,
+      expiresAtEpochMs: 45_001,
+      takeover: false,
+      lossReason: held ? null : "TEST_GENERATION_REPLACED",
+    }),
+    assertLocallyHeld() {
+      if (!held) throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+    async assertCurrent(): Promise<never> {
+      throw new Error("assertCurrent is not used by inbound routing");
+    },
+  };
+}
 
 test("telegram inbound polling stays skipped when disabled or not configured", async () => {
   const routed: string[] = [];

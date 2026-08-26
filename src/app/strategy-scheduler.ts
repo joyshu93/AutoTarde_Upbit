@@ -12,6 +12,7 @@ import type {
 } from "../modules/telegram/interfaces.js";
 import type { OperatorNotificationReporter } from "../modules/telegram/reporter.js";
 import { createId } from "../shared/ids.js";
+import type { RuntimeOwnershipAuthority } from "./runtime-ownership-guard.js";
 
 export interface StrategySchedulerMarketConfig {
   market: SupportedMarket;
@@ -51,6 +52,7 @@ type StrategySchedulerDependencies = {
   beforeRunAccountRefresh?: () => Promise<StrategySchedulerAccountRefreshResult | null>;
   beforeRunPreflight?: () => Promise<StrategySchedulerStartupPreflight | null>;
   resolveRunPreparationOwner?: StrategySchedulerRunPreparationOwnerResolver;
+  runtimeOwnership?: RuntimeOwnershipAuthority;
   now?: () => string;
   setTimer?: (callback: () => void, delayMs: number) => SchedulerTimer;
   clearTimer?: (timer: SchedulerTimer) => void;
@@ -191,6 +193,11 @@ export class StrategyScheduler {
   }
 
   runMarketNow(market: SupportedMarket): Promise<TelegramStrategyRunResult> {
+    try {
+      this.dependencies.runtimeOwnership?.assertLocallyHeld();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     if (this.stopBegun) {
       return Promise.reject(new Error("Strategy scheduler cannot run after stop has begun."));
     }
@@ -205,6 +212,7 @@ export class StrategyScheduler {
   }
 
   private async executeMarketNow(market: SupportedMarket): Promise<TelegramStrategyRunResult> {
+    this.dependencies.runtimeOwnership?.assertLocallyHeld();
     const config = this.dependencies.config.markets.find((candidate) => candidate.market === market);
     if (!config) {
       throw new Error(`Unsupported scheduled market: ${market}`);

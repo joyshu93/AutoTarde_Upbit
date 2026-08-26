@@ -1,3 +1,4 @@
+import type { RuntimeOwnershipAuthority } from "../../app/runtime-ownership-guard.js";
 import type { TelegramCommandRouter } from "./commands.js";
 import type {
   TelegramCallbackClient,
@@ -146,6 +147,7 @@ export class TelegramInboundPollingService {
       initialOffset?: number | null;
       offsetStore?: TelegramInboundOffsetStore | null;
       botTokenRef?: string | null;
+      runtimeOwnership?: RuntimeOwnershipAuthority;
       pollIntervalMs?: number;
       longPollTimeoutSeconds?: number;
       limit?: number;
@@ -217,6 +219,11 @@ export class TelegramInboundPollingService {
   }
 
   pollOnce(): Promise<TelegramInboundPollSummary> {
+    try {
+      this.dependencies.runtimeOwnership?.assertLocallyHeld();
+    } catch (error) {
+      return Promise.reject(error);
+    }
     if (this.stopBegun) {
       return Promise.reject(new Error("Telegram inbound polling cannot poll after stop has begun."));
     }
@@ -231,6 +238,7 @@ export class TelegramInboundPollingService {
   }
 
   private async executePollOnce(): Promise<TelegramInboundPollSummary> {
+    this.dependencies.runtimeOwnership?.assertLocallyHeld();
     this.lastPollAt = this.now();
 
     if (!this.isConfigured()) {
@@ -258,7 +266,9 @@ export class TelegramInboundPollingService {
       let failed = 0;
 
       for (const update of updates) {
+        this.dependencies.runtimeOwnership?.assertLocallyHeld();
         await this.advanceOffset(update.updateId);
+        this.dependencies.runtimeOwnership?.assertLocallyHeld();
 
         if (update.callbackQuery) {
           try {
@@ -269,6 +279,7 @@ export class TelegramInboundPollingService {
               ignored += 1;
             }
           } catch (error) {
+            if (isRuntimeOwnershipFailure(error)) throw error;
             failed += 1;
             this.lastError = sanitizeTelegramInboundError(error);
           }
@@ -291,7 +302,9 @@ export class TelegramInboundPollingService {
             text,
             this.dependencies.exchangeAccountId ?? "primary",
           );
+          this.dependencies.runtimeOwnership?.assertLocallyHeld();
           for (const [index, replyText] of splitTelegramReplyText(response.text).entries()) {
+            this.dependencies.runtimeOwnership?.assertLocallyHeld();
             await this.dependencies.messageClient?.sendMessage({
               chatId: this.dependencies.operatorChatId ?? "",
               text: replyText,
@@ -305,6 +318,7 @@ export class TelegramInboundPollingService {
           }
           processed += 1;
         } catch (error) {
+          if (isRuntimeOwnershipFailure(error)) throw error;
           failed += 1;
           this.lastError = sanitizeTelegramInboundError(error);
         }
@@ -325,6 +339,7 @@ export class TelegramInboundPollingService {
         errorMessage: failed > 0 ? this.lastError : null,
       };
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
       const errorMessage = sanitizeTelegramInboundError(error);
       this.failedCount += 1;
       this.lastError = errorMessage;
@@ -389,6 +404,7 @@ export class TelegramInboundPollingService {
       throw new Error(CALLBACK_ACK_CLIENT_UNAVAILABLE);
     }
     await callbackClient.answerCallbackQuery({ callbackQueryId: callbackQuery.callbackId });
+    this.dependencies.runtimeOwnership?.assertLocallyHeld();
 
     const routeReadOnlyCallback = this.dependencies.router.routeReadOnlyCallback;
     if (!routeReadOnlyCallback) {
@@ -404,6 +420,7 @@ export class TelegramInboundPollingService {
       action,
       this.dependencies.exchangeAccountId ?? "primary",
     );
+    this.dependencies.runtimeOwnership?.assertLocallyHeld();
     await editClient.editMessageText({
       chatId: callbackQuery.chatId,
       messageId: callbackQuery.messageId,
@@ -677,6 +694,10 @@ function sanitizeTelegramInboundError(error: unknown): string {
   }
 
   return `${normalized.slice(0, MAX_INBOUND_ERROR_LENGTH - 3)}...`;
+}
+
+function isRuntimeOwnershipFailure(error: unknown): boolean {
+  return error instanceof Error && /^RUNTIME_OWNERSHIP_(?:LOST|NOT_HELD):/u.test(error.message);
 }
 
 function redactSensitiveQueryValues(message: string): string {

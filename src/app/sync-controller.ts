@@ -5,6 +5,7 @@ import type {
   TelegramSyncRequest,
   TelegramSyncResult,
 } from "../modules/telegram/interfaces.js";
+import type { RuntimeOwnershipAuthority } from "./runtime-ownership-guard.js";
 
 export class InlineTelegramSyncController implements TelegramSyncController {
   private running = false;
@@ -13,11 +14,13 @@ export class InlineTelegramSyncController implements TelegramSyncController {
     private readonly dependencies: {
       portfolioSyncService: Pick<PortfolioSyncService, "run">;
       reporter?: OperatorNotificationReporter;
+      runtimeOwnership?: RuntimeOwnershipAuthority;
       now?: () => string;
     },
   ) {}
 
   async requestSync(request: TelegramSyncRequest): Promise<TelegramSyncResult> {
+    this.dependencies.runtimeOwnership?.assertLocallyHeld();
     const requestedAt = this.dependencies.now?.() ?? new Date().toISOString();
     if (this.running) {
       return {

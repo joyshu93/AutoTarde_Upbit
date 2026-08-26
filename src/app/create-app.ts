@@ -124,16 +124,16 @@ export function createApp(
     config.executionMode === "LIVE" &&
     config.liveExecutionGate === "ENABLED" &&
     exchangeBackedReadEnabled;
+  const runtimeOwnership = overrides.runtimeOwnershipAuthority;
   if (liveSendEnabled) {
-    const runtimeAuthority = overrides.runtimeOwnershipAuthority;
-    if (runtimeAuthority === undefined) {
+    if (runtimeOwnership === undefined) {
       throw new RuntimeOwnershipGuardError(
         "RUNTIME_OWNERSHIP_NOT_HELD",
         "RUNTIME_OWNERSHIP_NOT_HELD: LIVE application construction requires acquired runtime authority.",
       );
     }
-    runtimeAuthority.assertLocallyHeld();
-    const ownership = runtimeAuthority.snapshot();
+    runtimeOwnership.assertLocallyHeld();
+    const ownership = runtimeOwnership.snapshot();
     if (ownership.status !== "OWNED" || ownership.executionMode !== "LIVE") {
       throw new RuntimeOwnershipGuardError(
         "RUNTIME_OWNERSHIP_NOT_HELD",
@@ -211,6 +211,7 @@ export function createApp(
     maxBackoffMs: config.telegramDeliveryMaxBackoffMs,
     leaseDurationMs: config.telegramDeliveryLeaseMs,
     locale: telegramLocale,
+    ...(runtimeOwnership ? { runtimeOwnership } : {}),
   });
   const telegramCommandMenuSetup = new TelegramCommandMenuSetupService({
     client: telegramMessageClient,
@@ -229,6 +230,7 @@ export function createApp(
     accountExecutionLeases,
     accountExecutionLeaseMs: config.accountExecutionLeaseMs,
     operatorState,
+    runtimeOwnership: runtimeOwnership ?? createUnavailableRuntimeOwnershipAuthority(),
     reporter,
     ...(candidatePolicySelection ? { candidatePilots: persistence.candidatePilots } : {}),
   });
@@ -336,6 +338,7 @@ export function createApp(
         exchangeBackedReadEnabled,
         liveSendPath,
       }),
+    ...(runtimeOwnership ? { runtimeOwnership } : {}),
   });
   const strategyScheduler = new StrategyScheduler({
     config: createDefaultStrategySchedulerConfig({
@@ -389,6 +392,7 @@ export function createApp(
         exchangeBackedReadEnabled,
         liveSendPath,
       }),
+    ...(runtimeOwnership ? { runtimeOwnership } : {}),
   });
 
   let telegramInboundPolling: TelegramInboundPollingService | null = null;
@@ -435,6 +439,7 @@ export function createApp(
     syncController: new InlineTelegramSyncController({
       portfolioSyncService,
       reporter,
+      ...(runtimeOwnership ? { runtimeOwnership } : {}),
     }),
     strategyRunController,
     schedulerStatus: () => strategyScheduler.getStatus(),
@@ -462,6 +467,7 @@ export function createApp(
     exchangeAccountId: "primary",
     offsetStore: persistence.telegramInboundOffsets,
     botTokenRef: telegramBotTokenRef,
+    ...(runtimeOwnership ? { runtimeOwnership } : {}),
     pollIntervalMs: config.telegramInboundPollIntervalMs,
     longPollTimeoutSeconds: config.telegramInboundPollTimeoutSeconds,
     limit: config.telegramInboundPollLimit,
@@ -624,4 +630,31 @@ function assertExactOwnDataValues(
 
 function createTelegramBotTokenRef(botToken: string): string {
   return `sha256:${createHash("sha256").update(botToken).digest("hex").slice(0, 16)}`;
+}
+
+function createUnavailableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "UNOWNED",
+      generation: null,
+      executionMode: null,
+      acquiredAtEpochMs: null,
+      heartbeatAtEpochMs: null,
+      expiresAtEpochMs: null,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {
+      throw new RuntimeOwnershipGuardError(
+        "RUNTIME_OWNERSHIP_NOT_HELD",
+        "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
+      );
+    },
+    async assertCurrent(): Promise<never> {
+      throw new RuntimeOwnershipGuardError(
+        "RUNTIME_OWNERSHIP_NOT_HELD",
+        "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
+      );
+    },
+  };
 }

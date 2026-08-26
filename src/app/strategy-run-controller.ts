@@ -9,6 +9,7 @@ import type {
   TelegramStrategyRunRequest,
   TelegramStrategyRunResult,
 } from "../modules/telegram/interfaces.js";
+import type { RuntimeOwnershipAuthority } from "./runtime-ownership-guard.js";
 
 export type CandidateBtcRunPreparationResult =
   | Readonly<{
@@ -32,6 +33,7 @@ type InlineTelegramStrategyRunControllerDependencies = {
   runner: Pick<PositionGuardStrategyRunner, "runOnce" | "previewOnce">;
   candidateBtcRunPreparation?: CandidateBtcRunPreparation;
   beforeManualRunPreflight?: () => Promise<StrategySchedulerStartupPreflight | null>;
+  runtimeOwnership?: RuntimeOwnershipAuthority;
   now?: () => string;
 };
 
@@ -44,6 +46,7 @@ export class InlineTelegramStrategyRunController implements TelegramStrategyRunC
   }
 
   async requestRun(request: TelegramStrategyRunRequest): Promise<TelegramStrategyRunResult> {
+    this.dependencies.runtimeOwnership?.assertLocallyHeld();
     const requestSnapshot = snapshotRunRequest(request);
     const requestedAt = this.dependencies.now?.() ?? new Date().toISOString();
     if (this.running) {
@@ -222,6 +225,9 @@ function snapshotControllerDependencies(
     ...(dependencies.beforeManualRunPreflight === undefined
       ? {}
       : { beforeManualRunPreflight: dependencies.beforeManualRunPreflight }),
+    ...(dependencies.runtimeOwnership === undefined
+      ? {}
+      : { runtimeOwnership: dependencies.runtimeOwnership }),
     ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
   });
 }
