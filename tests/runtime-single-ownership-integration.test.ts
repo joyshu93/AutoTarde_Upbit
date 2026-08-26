@@ -58,7 +58,6 @@ interface OperationalSideEffects {
   schedulerStarts: number;
   telegramStarts: number;
   createOrderCalls: number;
-  cancelOrderCalls: number;
 }
 
 interface ChildFixtureMessage {
@@ -825,7 +824,6 @@ function createZeroSideEffects(): OperationalSideEffects {
     schedulerStarts: 0,
     telegramStarts: 0,
     createOrderCalls: 0,
-    cancelOrderCalls: 0,
   };
 }
 
