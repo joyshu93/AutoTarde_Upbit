@@ -16,12 +16,15 @@ import { verifyLiveDatabaseIdentity } from "./live-database-identity.js";
 import { createSqliteRuntimeOwnershipPersistence } from
   "../modules/db/repositories/sqlite-repositories.js";
 import { canonicalizeLocalDatabasePath } from "../modules/db/local-database-path.js";
+import type { SqliteDatabaseOpenVerification } from
+  "../modules/db/repositories/sqlite-database.js";
 
 const EXCHANGE_ACCOUNT_ID = "primary";
 
 export interface VerifiedRuntimeDatabase {
   readonly canonicalDatabasePath: string;
   readonly lockIdentity: RuntimeLockIdentity;
+  readonly databaseOpenVerification?: SqliteDatabaseOpenVerification;
 }
 
 export interface RuntimeOwnershipContext {
@@ -46,6 +49,7 @@ export interface RuntimeOwnershipContextDependencies {
   createOwnershipPersistence(
     databasePath: string,
     scopeKey: string,
+    databaseOpenVerification?: SqliteDatabaseOpenVerification,
   ): ReturnType<typeof createSqliteRuntimeOwnershipPersistence>;
   createOwnerToken(): string;
   nowEpochMs(): number;
@@ -64,6 +68,9 @@ export function verifyAndResolveRuntimeDatabase(config: AppConfig): VerifiedRunt
     : canonicalizeLocalDatabasePath(config.databasePath);
   return {
     canonicalDatabasePath,
+    ...(verification.status === "VERIFIED"
+      ? { databaseOpenVerification: verification.databaseOpenVerification }
+      : {}),
     lockIdentity: deriveRuntimeLockIdentity({
       canonicalDatabasePath,
       databaseInstanceId: null,
@@ -106,6 +113,7 @@ export async function createRuntimeOwnershipContext(
     ownershipPersistence = createOwnershipPersistence(
       input.verifiedDatabase.canonicalDatabasePath,
       input.verifiedDatabase.lockIdentity.scopeDigest,
+      input.verifiedDatabase.databaseOpenVerification,
     );
     const ownerToken = createOwnerToken();
     const store = ownershipPersistence.runtimeOwnership;
@@ -149,13 +157,19 @@ export async function createRuntimeOwnershipContext(
       releaseCurrentOwnership(releasedAtEpochMs) {
         releasePromise ??= (async () => {
           await heartbeat.stop();
+          if (!input.processLock.isHeld()) guard.markLost("PROCESS_LOCK_LOST");
           const snapshot = guard.snapshot();
           if (snapshot.generation === null) return false;
-          return store.release({
+          if (snapshot.lossReason && shouldRecordRuntimeOwnershipLoss(snapshot.lossReason)) {
+            return false;
+          }
+          const released = await store.release({
             ownerToken,
             generation: snapshot.generation,
             releasedAtEpochMs,
           });
+          if (!released) guard.markLost("PERSISTED_OWNERSHIP_MISMATCH");
+          return released;
         })();
         return releasePromise;
       },
@@ -234,5 +248,7 @@ function shouldRecordRuntimeOwnershipLoss(reason: string): boolean {
     reason === "OWNERSHIP_EXPIRED" ||
     reason === "HEARTBEAT_EXPIRED" ||
     reason === "HEARTBEAT_RENEWAL_MISMATCH" ||
-    reason === "HEARTBEAT_RENEWAL_FAILED";
+    reason === "HEARTBEAT_RENEWAL_FAILED" ||
+    reason === "RUNTIME_WORK_QUIESCENCE_FAILED" ||
+    reason === "SCOPED_WORK_QUIESCENCE_FAILED";
 }

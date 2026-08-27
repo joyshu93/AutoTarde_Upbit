@@ -1,14 +1,20 @@
 import assert from "node:assert/strict";
-import { link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import {
   fingerprintUpbitAccessKey,
+  LiveDatabaseIdentityError,
   provisionLiveDatabaseIdentity,
   verifyLiveDatabaseIdentity,
 } from "../src/app/live-database-identity.js";
+import type { RuntimeOwnershipContext } from "../src/app/runtime-ownership-context.js";
+import type {
+  RuntimeProcessLock,
+  RuntimeProcessLockLossReason,
+} from "../src/app/runtime-process-lock.js";
 import {
   canonicalizeLocalDatabasePath,
   LocalDatabasePathError,
@@ -18,24 +24,20 @@ import { runLiveReadinessSmoke } from "../src/smoke/live-readiness.js";
 import { runLiveSchedulerPreflightSmoke } from "../src/smoke/live-scheduler-preflight.js";
 import { test } from "./harness.js";
 import { loadAppConfig } from "../src/app/env.js";
-import { createVerifiedApplication } from "../src/index.js";
+import { createVerifiedApplication, runMain } from "../src/index.js";
 import { createApp as createProductionApp } from "../src/app/create-app.js";
 
 const INSTANCE_ID = "7d66cf9c-c739-4b39-a7ac-41a9a6f75e59";
+const REPLACEMENT_INSTANCE_ID = "cb5542a5-3a53-4c15-b82a-774be6f20b79";
 const ACCESS_KEY = "test-access-key";
 
-test("local database canonicalization rejects network, device, and short-path forms", () => {
+test("local database canonicalization rejects network and device path forms", () => {
   const rejected: Array<readonly [string, string]> = [
     [String.raw`\\server\share\runtime.sqlite`, "DATABASE_PATH_NETWORK"],
     [String.raw`\\?\C:\runtime\runtime.sqlite`, "DATABASE_PATH_DEVICE"],
     [String.raw`\\.\C:\runtime\runtime.sqlite`, "DATABASE_PATH_DEVICE"],
     [String.raw`\??\C:\runtime\runtime.sqlite`, "DATABASE_PATH_DEVICE"],
   ];
-  if (process.platform === "win32") {
-    rejected.push([String.raw`C:\RUNTIME~1\runtime.sqlite`, "DATABASE_PATH_SHORT_NAME"]);
-    rejected.push([String.raw`C:\runtime\RUNTIM~1.SQL`, "DATABASE_PATH_SHORT_NAME"]);
-  }
-
   for (const [databasePath, code] of rejected) {
     assert.throws(
       () => canonicalizeLocalDatabasePath(databasePath),
@@ -78,6 +80,17 @@ test("local database canonicalization resolves a missing DRY_RUN target beneath 
   const directory = await mkdtemp(join(tmpdir(), "autotrade-local-db-missing-"));
   try {
     const databasePath = join(directory, "nested", "runtime.sqlite");
+    assert.equal(canonicalizeLocalDatabasePath(databasePath), resolve(databasePath));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("local database canonicalization permits a legitimate tilde filename", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "autotrade-local-db-tilde-"));
+  try {
+    const databasePath = join(directory, "runtime~2026.sqlite");
+    await writeFile(databasePath, "sqlite-fixture");
     assert.equal(canonicalizeLocalDatabasePath(databasePath), resolve(databasePath));
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -190,6 +203,180 @@ test("explicit provisioning binds an existing migrated database and verification
     assert.equal(verified.status, "VERIFIED");
     assert.deepEqual(afterBytes, beforeBytes);
     assert.equal(afterStat.mtimeMs, beforeStat.mtimeMs);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("LIVE runtime rejects a database replaced after identity verification before ownership mutation", async () => {
+  const verifiedFixture = await createDatabaseFixture();
+  const replacementFixture = await createDatabaseFixture();
+  const verifiedBackupPath = `${verifiedFixture.databasePath}.verified`;
+  const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
+  let createAppCalls = 0;
+  let caught: unknown;
+
+  try {
+    provisionLiveDatabaseIdentity({
+      databasePath: verifiedFixture.databasePath,
+      databaseInstanceId: INSTANCE_ID,
+      exchangeAccountId: "primary",
+      upbitAccessKey: ACCESS_KEY,
+    });
+    provisionLiveDatabaseIdentity({
+      databasePath: replacementFixture.databasePath,
+      databaseInstanceId: REPLACEMENT_INSTANCE_ID,
+      exchangeAccountId: "primary",
+      upbitAccessKey: ACCESS_KEY,
+    });
+    process.env.UPBIT_ACCESS_KEY = ACCESS_KEY;
+    const config = loadAppConfig({
+      APP_EXECUTION_MODE: "LIVE",
+      ENABLE_LIVE_ORDERS: "true",
+      DATABASE_PATH: verifiedFixture.databasePath,
+      LIVE_DATABASE_INSTANCE_ID: INSTANCE_ID,
+    });
+
+    try {
+      await runMain({
+        loadAppConfig: () => config,
+        async acquireRuntimeProcessLock(identity) {
+          await rename(verifiedFixture.databasePath, verifiedBackupPath);
+          await rename(replacementFixture.databasePath, verifiedFixture.databasePath);
+          return new HeldRuntimeProcessLock(identity);
+        },
+        createApp(appConfig, overrides) {
+          createAppCalls += 1;
+          return createProductionApp(appConfig, overrides);
+        },
+        async runAppStartup() {
+          throw new Error("LIVE runtime startup must not follow a replaced database open.");
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    assert.ok(
+      caught instanceof LiveDatabaseIdentityError &&
+        caught.code === "DATABASE_FILE_IDENTITY_CHANGED",
+      `unexpected replacement failure: ${caught instanceof Error ? `${caught.name}:${caught.message}` : String(caught)}`,
+    );
+    assert.equal(createAppCalls, 0);
+
+    const replacement = new DatabaseSync(verifiedFixture.databasePath, { readOnly: true });
+    try {
+      const eventCount = replacement.prepare(
+        "SELECT COUNT(*) AS count FROM runtime_ownership_events",
+      ).get() as { count: number };
+      assert.equal(eventCount.count, 0);
+    } finally {
+      replacement.close();
+    }
+  } finally {
+    if (previousAccessKey === undefined) delete process.env.UPBIT_ACCESS_KEY;
+    else process.env.UPBIT_ACCESS_KEY = previousAccessKey;
+    await verifiedFixture.cleanup();
+    await replacementFixture.cleanup();
+  }
+});
+
+test("LIVE runtime keeps ownership and application opens bound to the initially verified file", async () => {
+  const verifiedFixture = await createDatabaseFixture();
+  const replacementFixture = await createDatabaseFixture();
+  const verifiedBackupPath = `${verifiedFixture.databasePath}.verified`;
+  const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
+  let createAppCalls = 0;
+  let caught: unknown;
+
+  try {
+    for (const databasePath of [verifiedFixture.databasePath, replacementFixture.databasePath]) {
+      provisionLiveDatabaseIdentity({
+        databasePath,
+        databaseInstanceId: INSTANCE_ID,
+        exchangeAccountId: "primary",
+        upbitAccessKey: ACCESS_KEY,
+      });
+    }
+    process.env.UPBIT_ACCESS_KEY = ACCESS_KEY;
+    const config = loadAppConfig({
+      APP_EXECUTION_MODE: "LIVE",
+      ENABLE_LIVE_ORDERS: "true",
+      DATABASE_PATH: verifiedFixture.databasePath,
+      LIVE_DATABASE_INSTANCE_ID: INSTANCE_ID,
+    });
+
+    try {
+      await runMain({
+        loadAppConfig: () => config,
+        async acquireRuntimeProcessLock(identity) {
+          return new HeldRuntimeProcessLock(identity);
+        },
+        async createRuntimeOwnershipContext(input) {
+          await rename(verifiedFixture.databasePath, verifiedBackupPath);
+          await rename(replacementFixture.databasePath, verifiedFixture.databasePath);
+          return createFakeRuntimeOwnershipContext(input.executionMode);
+        },
+        createApp(appConfig, overrides) {
+          createAppCalls += 1;
+          assert.ok(overrides.databaseOpenVerification);
+          overrides.databaseOpenVerification.assertBeforeOpen(appConfig.databasePath);
+          throw new Error("LIVE application open must use the initial database verifier.");
+        },
+        async runAppStartup() {
+          throw new Error("LIVE runtime startup must not follow a replaced application database.");
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    assert.ok(
+      caught instanceof LiveDatabaseIdentityError &&
+        caught.code === "DATABASE_FILE_IDENTITY_CHANGED",
+      `unexpected split-open failure: ${caught instanceof Error ? `${caught.name}:${caught.message}` : String(caught)}`,
+    );
+    assert.equal(createAppCalls, 1);
+
+    const replacement = new DatabaseSync(verifiedFixture.databasePath, { readOnly: true });
+    try {
+      const eventCount = replacement.prepare(
+        "SELECT COUNT(*) AS count FROM runtime_ownership_events",
+      ).get() as { count: number };
+      assert.equal(eventCount.count, 0);
+    } finally {
+      replacement.close();
+    }
+  } finally {
+    if (previousAccessKey === undefined) delete process.env.UPBIT_ACCESS_KEY;
+    else process.env.UPBIT_ACCESS_KEY = previousAccessKey;
+    await verifiedFixture.cleanup();
+    await replacementFixture.cleanup();
+  }
+});
+
+test("LIVE open verification reports a path-free identity error when the verified file disappears", async () => {
+  const fixture = await createDatabaseFixture();
+  try {
+    provisionLiveDatabaseIdentity({
+      databasePath: fixture.databasePath,
+      databaseInstanceId: INSTANCE_ID,
+      exchangeAccountId: "primary",
+      upbitAccessKey: ACCESS_KEY,
+    });
+    const verification = verify(fixture.databasePath);
+    assert.equal(verification.status, "VERIFIED");
+    await rm(fixture.databasePath, { force: true });
+
+    assert.throws(
+      () => verification.databaseOpenVerification.assertBeforeOpen(fixture.databasePath),
+      (error: unknown) => {
+        assert.ok(error instanceof LiveDatabaseIdentityError);
+        assert.equal(error.code, "DATABASE_FILE_IDENTITY_CHANGED");
+        assert.doesNotMatch(error.message, new RegExp(fixture.databasePath.replaceAll("\\", "\\\\"), "u"));
+        return true;
+      },
+    );
   } finally {
     await fixture.cleanup();
   }
@@ -361,4 +548,58 @@ function restoreEnv(previous: Record<string, string | undefined>): void {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+}
+
+class HeldRuntimeProcessLock implements RuntimeProcessLock {
+  private held = true;
+  private readonly listeners = new Set<(reason: RuntimeProcessLockLossReason) => void>();
+
+  constructor(readonly identity: RuntimeProcessLock["identity"]) {}
+
+  isHeld(): boolean {
+    return this.held;
+  }
+
+  onLost(listener: (reason: RuntimeProcessLockLossReason) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  async release(): Promise<void> {
+    this.held = false;
+  }
+}
+
+function createFakeRuntimeOwnershipContext(
+  executionMode: "DRY_RUN" | "LIVE",
+): RuntimeOwnershipContext {
+  const snapshot = {
+    status: "OWNED" as const,
+    generation: 1,
+    executionMode,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: 2,
+    takeover: false,
+    lossReason: null,
+  };
+  return {
+    guard: {
+      snapshot: () => snapshot,
+      assertLocallyHeld() {},
+      async assertCurrent() {
+        throw new Error("not used");
+      },
+    },
+    heartbeat: null,
+    snapshot: () => snapshot,
+    fence() {},
+    async releaseCurrentOwnership() {
+      return true;
+    },
+    async waitForLossRecording() {},
+    closeOwnershipDatabase() {},
+    async releaseProcessLock() {},
+    async shutdownAfterStartupFailure() {},
+  } as unknown as RuntimeOwnershipContext;
 }

@@ -76,8 +76,12 @@ export function canonicalizeLocalDatabasePath(
     rejectUnsafeLexicalForm(realExistingPath);
     if (!sameCanonicalPath(existingPath, realExistingPath)) {
       throw new LocalDatabasePathError(
-        "DATABASE_PATH_REPARSE_POINT",
-        "Database path resolves through an alias or reparse point.",
+        process.platform === "win32" && containsDosShortNameComponent(existingPath)
+          ? "DATABASE_PATH_SHORT_NAME"
+          : "DATABASE_PATH_REPARSE_POINT",
+        process.platform === "win32" && containsDosShortNameComponent(existingPath)
+          ? "Database path resolves through a Windows short-name alias."
+          : "Database path resolves through an alias or reparse point.",
       );
     }
 
@@ -144,21 +148,29 @@ function rejectUnsafeLexicalForm(databasePath: string): void {
       "Database path must not use UNC or network storage.",
     );
   }
-  if (
-    process.platform === "win32" &&
-    /(?:^|\\)[^\\]*~[0-9]+(?:\.[^\\]*)?(?:\\|$)/iu.test(windowsForm)
-  ) {
-    throw new LocalDatabasePathError(
-      "DATABASE_PATH_SHORT_NAME",
-      "Database path must not use an ambiguous Windows short name.",
-    );
-  }
   if (!isAbsolute(databasePath) && databasePath.startsWith("//")) {
     throw new LocalDatabasePathError(
       "DATABASE_PATH_NETWORK",
       "Database path must not use UNC or network storage.",
     );
   }
+}
+
+function containsDosShortNameComponent(databasePath: string): boolean {
+  return databasePath
+    .replaceAll("/", "\\")
+    .split("\\")
+    .some((component) => {
+      const match = /^([^.]*)~([1-9][0-9]*)(?:\.([^.]+))?$/iu.exec(component);
+      if (!match) return false;
+      const stemPrefix = match[1]!;
+      const numericTail = match[2]!;
+      const extension = match[3] ?? "";
+      return stemPrefix.length >= 1 &&
+        stemPrefix.length <= 6 &&
+        stemPrefix.length + 1 + numericTail.length <= 8 &&
+        extension.length <= 3;
+    });
 }
 
 function sameCanonicalPath(left: string, right: string): boolean {

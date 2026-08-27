@@ -3,12 +3,22 @@ import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 
 import { loadAppConfig } from "../src/app/env.js";
-import { RuntimeProcessLockError } from "../src/app/runtime-process-lock.js";
+import {
+  RuntimeProcessLockError,
+  type RuntimeProcessLock,
+  type RuntimeProcessLockLossReason,
+} from "../src/app/runtime-process-lock.js";
+import {
+  createRuntimeOwnershipContext,
+  type RuntimeOwnershipContext,
+} from "../src/app/runtime-ownership-context.js";
 import {
   runWithScopedRuntimeOwnership,
   stopScopedApplicationRuntime,
 } from "../src/app/scoped-runtime-ownership.js";
 import { createVerifiedApplication } from "../src/index.js";
+import { createSqliteRuntimeOwnershipPersistence } from
+  "../src/modules/db/repositories/sqlite-repositories.js";
 import { runDryRunCompletionSmoke } from "../src/smoke/dryrun-completion.js";
 import { runDryRunReadinessSmoke } from "../src/smoke/dryrun-readiness.js";
 import { test } from "./harness.js";
@@ -220,6 +230,96 @@ test("scoped application cleanup fences and quiesces delivery before database cl
   ]);
 });
 
+test("scoped cleanup preserves process-lock loss as LOST instead of RELEASED", async () => {
+  const databasePath = await createTempDatabasePath("scoped-process-lock-loss");
+  const config = createDryRunConfig(databasePath);
+  let processLock: ControllableRuntimeProcessLock | null = null;
+
+  try {
+    await assert.rejects(
+      () => runWithScopedRuntimeOwnership(config, async (_authority, _verifiedConfig, fenceApplication) => {
+        await stopScopedApplicationRuntime(createScopedRuntimeApp({
+          onDeliveryStop() {
+            processLock!.lose("LISTENER_CLOSED");
+          },
+        }), fenceApplication, 1_000);
+      }, {
+        async acquireRuntimeProcessLock(identity) {
+          processLock = new ControllableRuntimeProcessLock(identity);
+          return processLock;
+        },
+      }),
+      /release was not accepted|ownership loss/u,
+    );
+
+    const inspection = createSqliteRuntimeOwnershipPersistence(
+      databasePath,
+      processLock!.identity.scopeDigest,
+    );
+    try {
+      const events = await inspection.runtimeOwnership.listRecentEvents(10);
+      assert.deepEqual(events.map((event) => event.eventType), ["LOST", "ACQUIRED"]);
+      assert.equal(events[0]?.reasonCode, "PROCESS_LOCK_LOST");
+    } finally {
+      inspection.close();
+    }
+  } finally {
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("scoped delivery timeout records LOST and retains the unsafe scope until process exit", async () => {
+  const databasePath = await createTempDatabasePath("scoped-delivery-timeout");
+  const config = createDryRunConfig(databasePath);
+  const deliverySettlement = createDeferred<void>();
+  let processLock: ControllableRuntimeProcessLock | null = null;
+  let ownership: RuntimeOwnershipContext | null = null;
+  let applicationDatabaseCloseCalls = 0;
+
+  try {
+    await assert.rejects(
+      () => runWithScopedRuntimeOwnership(config, async (_authority, _verifiedConfig, fenceApplication) => {
+        await stopScopedApplicationRuntime(createScopedRuntimeApp({
+          deliverySettlement: deliverySettlement.promise,
+          onApplicationDatabaseClose() {
+            applicationDatabaseCloseCalls += 1;
+          },
+        }), fenceApplication, 0);
+      }, {
+        async acquireRuntimeProcessLock(identity) {
+          processLock = new ControllableRuntimeProcessLock(identity);
+          return processLock;
+        },
+        async createRuntimeOwnershipContext(input) {
+          ownership = await createRuntimeOwnershipContext(input);
+          return ownership;
+        },
+      }),
+      /quiescence/u,
+    );
+
+    assert.equal(applicationDatabaseCloseCalls, 0);
+    assert.equal(processLock!.releaseCalls, 0);
+    const inspection = createSqliteRuntimeOwnershipPersistence(
+      databasePath,
+      processLock!.identity.scopeDigest,
+    );
+    try {
+      const events = await inspection.runtimeOwnership.listRecentEvents(10);
+      assert.deepEqual(events.map((event) => event.eventType), ["LOST", "ACQUIRED"]);
+      assert.equal(events[0]?.reasonCode, "SCOPED_WORK_QUIESCENCE_FAILED");
+    } finally {
+      inspection.close();
+    }
+  } finally {
+    deliverySettlement.resolve();
+    const cleanupOwnership = ownership as RuntimeOwnershipContext | null;
+    cleanupOwnership?.closeOwnershipDatabase();
+    await cleanupOwnership?.releaseProcessLock();
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
 function createDryRunConfig(databasePath: string) {
   return loadAppConfig({
     APP_EXECUTION_MODE: "DRY_RUN",
@@ -260,4 +360,77 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 
 function isRuntimeContention(error: unknown): boolean {
   return error instanceof RuntimeProcessLockError && error.code === "RUNTIME_ALREADY_OWNED";
+}
+
+function createScopedRuntimeApp(input: Readonly<{
+  onDeliveryStop?: () => void;
+  deliverySettlement?: Promise<void>;
+  onApplicationDatabaseClose?: () => void;
+}> = {}) {
+  return {
+    notificationDelivery: {
+      stop() {
+        input.onDeliveryStop?.();
+        return {
+          stopped: true,
+          inFlightCount: input.deliverySettlement ? 1 : 0,
+          quiesced: input.deliverySettlement === undefined,
+        };
+      },
+      async stopAndWait() {
+        await input.deliverySettlement;
+        return { stopped: true, inFlightCount: 0, quiesced: true };
+      },
+    },
+    telegramInboundPolling: {
+      stop() {
+        return { running: false } as never;
+      },
+      async stopAndWait() {
+        return { running: false } as never;
+      },
+    },
+    strategyScheduler: {
+      stop() {
+        return { markets: [] } as never;
+      },
+      async stopAndWait() {
+        return { markets: [], quiesced: true } as never;
+      },
+    },
+    persistence: {
+      close() {
+        input.onApplicationDatabaseClose?.();
+      },
+    },
+  };
+}
+
+class ControllableRuntimeProcessLock implements RuntimeProcessLock {
+  releaseCalls = 0;
+  private held = true;
+  private readonly listeners = new Set<(reason: RuntimeProcessLockLossReason) => void>();
+
+  constructor(readonly identity: RuntimeProcessLock["identity"]) {}
+
+  isHeld(): boolean {
+    return this.held;
+  }
+
+  onLost(listener: (reason: RuntimeProcessLockLossReason) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  async release(): Promise<void> {
+    if (!this.held) return;
+    this.held = false;
+    this.releaseCalls += 1;
+  }
+
+  lose(reason: RuntimeProcessLockLossReason): void {
+    if (!this.held) return;
+    this.held = false;
+    for (const listener of this.listeners) listener(reason);
+  }
 }

@@ -6,6 +6,8 @@ Define one explicit lifecycle that works for both `DRY_RUN` and future `LIVE` ex
 
 LIVE database identity validation occurs before the order lifecycle exists. A path, migration, instance, account, or credential mismatch must stop composition before persistence bootstrap, recovery, scheduler, Telegram, strategy, or order services are constructed; it must not create an order event or risk record in an untrusted database. Readiness and scheduler-preflight smoke commands inspect the verified DB read-only and cannot transition an order.
 
+The verified LIVE file identity is reasserted around every later SQLite open, and the migration/account/instance/credential contract is validated on the actual opened handle before ownership, migration, or bootstrap mutation. Replacing the database after initial verification therefore fails before an order lifecycle or runtime-ownership event can be created in the replacement.
+
 The system must never treat “strategy said buy” as equivalent to “order exists.” Orders need explicit lifecycle records.
 
 A `DEFERRED_CONFIRMATION` strategy decision is persisted as `PENDING_CONFIRMATION` but does not create an order intent or `orders` row. A later matching `EXECUTED_AFTER_CONFIRMATION` decision must pass the full lifecycle independently.
@@ -158,6 +160,8 @@ Cancellation must preserve lifecycle evidence:
 There is no reachable production `cancelOrder` caller today, and runtime single-ownership work does not invent one. If a future reachable cancellation sender is introduced, it must perform the same final persisted runtime-generation check immediately before exchange cancellation, with no awaited local work between that check and starting the exchange call. This is a future requirement, not a claim that a current cancellation path exists.
 
 Runtime ownership is an outer process authority boundary, not an order lifecycle transition or replacement for `account_execution_leases`. One mutating `DRY_RUN` or `LIVE` runtime may own a canonical local database/account on the supported single Windows host. One fail-closed canonical path, with network/device/reparse/short-name/hardlink aliases rejected, binds the OS lock, every database open, and persisted `scope_key`; persisted generations then fence stale workers. Lock loss, heartbeat expiry, or a generation mismatch fences lifecycle-adjacent notification delivery, inbound polling, scheduler work, and heartbeat renewal before bounded shutdown quiescence. Exact-generation `LOST` evidence cannot touch a newer owner, and normal shutdown records exact-generation `RELEASED`. Multi-host and network-share deployments are unsupported.
+
+Runtime cleanup is a clean `RELEASED` handoff only when all lifecycle-adjacent workers have settled and the process lock remains held. Process-lock loss during cleanup is retained as `LOST`. A delivery or other worker timeout in either long-running or scoped shutdown also records `LOST` and retains the SQLite/process-lock scope until terminal process exit, so an already-started outbound side effect cannot overlap a newly admitted runtime.
 
 Migration `0024_add_runtime_ownership.sql` is applied only through a separately approved offline stop, backup, migration, and read-only verification sequence. It does not alter existing lifecycle, strategy, sizing, risk, or Telegram-truth semantics.
 

@@ -30,6 +30,7 @@ export async function runWithScopedRuntimeOwnership<T>(
     authority: RuntimeOwnershipAuthority,
     verifiedConfig: AppConfig,
     fenceApplication: (reason: string) => void,
+    verifiedDatabase: VerifiedRuntimeDatabase,
   ) => Promise<T>,
   overrides: Partial<ScopedRuntimeOwnershipOperations> = {},
 ): Promise<T> {
@@ -55,6 +56,7 @@ export async function runWithScopedRuntimeOwnership<T>(
       ownership.guard,
       verifiedConfig,
       (reason) => ownership.fence(reason),
+      verified,
     );
     workFailed = false;
     return result;
@@ -77,6 +79,7 @@ export async function stopScopedApplicationRuntime(
   const captureFailure = (error: unknown): void => {
     firstFailure ??= error;
   };
+  let workersQuiesced = true;
 
   let deliveryStatus = { stopped: true, inFlightCount: 0, quiesced: true };
   let inboundStatus: ReturnType<RuntimeStoppableApp["telegramInboundPolling"]["stop"]> | null = null;
@@ -85,21 +88,25 @@ export async function stopScopedApplicationRuntime(
   try {
     fenceApplication("SCOPED_WORK_COMPLETE");
   } catch (error) {
+    workersQuiesced = false;
     captureFailure(error);
   }
   try {
     deliveryStatus = app.notificationDelivery?.stop() ?? deliveryStatus;
   } catch (error) {
+    workersQuiesced = false;
     captureFailure(error);
   }
   try {
     inboundStatus = app.telegramInboundPolling.stop();
   } catch (error) {
+    workersQuiesced = false;
     captureFailure(error);
   }
   try {
     schedulerStatus = app.strategyScheduler.stop();
   } catch (error) {
+    workersQuiesced = false;
     captureFailure(error);
   }
 
@@ -119,7 +126,10 @@ export async function stopScopedApplicationRuntime(
     );
 
     for (const settlement of settlements) {
-      if (settlement.status === "rejected") captureFailure(settlement.reason);
+      if (settlement.status === "rejected") {
+        workersQuiesced = false;
+        captureFailure(settlement.reason);
+      }
     }
 
     const [delivery, inbound, scheduler] = settlements;
@@ -134,10 +144,21 @@ export async function stopScopedApplicationRuntime(
         scheduler.value.markets.some((market) => market.running)
       )
     ) {
+      workersQuiesced = false;
       captureFailure(new Error("Scoped runtime workers did not quiesce before database close."));
     }
   } catch (error) {
+    workersQuiesced = false;
     captureFailure(error);
+  }
+
+  if (!workersQuiesced) {
+    try {
+      fenceApplication("SCOPED_WORK_QUIESCENCE_FAILED");
+    } catch (error) {
+      captureFailure(error);
+    }
+    throw firstFailure ?? new Error("Scoped runtime workers did not quiesce before database close.");
   }
 
   try {
@@ -179,15 +200,19 @@ async function releaseScopedRuntimeOwnership(
   } catch (error) {
     captureFailure(error);
   }
-  try {
-    ownership.closeOwnershipDatabase();
-  } catch (error) {
-    captureFailure(error);
-  }
-  try {
-    await ownership.releaseProcessLock();
-  } catch (error) {
-    captureFailure(error);
+  const retainUnsafeScope = ownership.snapshot().lossReason ===
+    "SCOPED_WORK_QUIESCENCE_FAILED";
+  if (!retainUnsafeScope) {
+    try {
+      ownership.closeOwnershipDatabase();
+    } catch (error) {
+      captureFailure(error);
+    }
+    try {
+      await ownership.releaseProcessLock();
+    } catch (error) {
+      captureFailure(error);
+    }
   }
 
   if (firstFailure !== null) throw firstFailure;

@@ -77,7 +77,10 @@ import type {
   SqliteRuntimeOwnershipBundle,
 } from "./contracts.js";
 import { fromSqliteBoolean, parseJson, stringifyJson, toSqliteBoolean } from "./sqlite-shapes.js";
-import { openSqliteDatabase } from "./sqlite-database.js";
+import {
+  openSqliteDatabase,
+  type SqliteDatabaseOpenVerification,
+} from "./sqlite-database.js";
 import { createId } from "../../../shared/ids.js";
 import { SqliteAccountExecutionLeaseStore } from "./sqlite-account-execution-lease-store.js";
 import { SqliteCandidatePilotRepository } from "./sqlite-candidate-pilot-repository.js";
@@ -168,8 +171,11 @@ interface SqliteCandidateBindingAuthorityRow {
   created_at: string;
 }
 
-export function createSqlitePersistence(options: SqliteBootstrapOptions): SqlitePersistenceBundle {
-  const handle = openSqliteDatabase(options.databasePath);
+export function createSqlitePersistence(
+  options: SqliteBootstrapOptions,
+  databaseOpenVerification?: SqliteDatabaseOpenVerification,
+): SqlitePersistenceBundle {
+  const handle = openSqliteDatabase(options.databasePath, databaseOpenVerification);
   const repositories = new SqliteExecutionRepository(handle.db);
   const candidatePilots = new SqliteCandidatePilotRepository(handle.db);
   const accountExecutionLeases = new SqliteAccountExecutionLeaseStore(handle.db);
@@ -245,8 +251,9 @@ export function createSqlitePersistence(options: SqliteBootstrapOptions): Sqlite
 export function createSqliteRuntimeOwnershipPersistence(
   databasePath: string,
   scopeKey: string,
+  databaseOpenVerification?: SqliteDatabaseOpenVerification,
 ): SqliteRuntimeOwnershipBundle {
-  const handle = openSqliteDatabase(databasePath);
+  const handle = openSqliteDatabase(databasePath, databaseOpenVerification);
   return {
     runtimeOwnership: new SqliteRuntimeOwnershipStore(handle.db, scopeKey),
     close() {

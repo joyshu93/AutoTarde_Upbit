@@ -10,10 +10,19 @@ export interface SqliteDatabaseHandle {
   close(): void;
 }
 
-export function openSqliteDatabase(databasePath: string): SqliteDatabaseHandle {
+export interface SqliteDatabaseOpenVerification {
+  assertBeforeOpen(databasePath: string): void;
+  assertOpenedDatabase(db: DatabaseSync, databasePath: string): void;
+}
+
+export function openSqliteDatabase(
+  databasePath: string,
+  verification?: SqliteDatabaseOpenVerification,
+): SqliteDatabaseHandle {
   const openedPath = databasePath === ":memory:"
     ? databasePath
     : canonicalizeLocalDatabasePath(databasePath);
+  if (openedPath !== ":memory:") verification?.assertBeforeOpen(openedPath);
   if (openedPath !== ":memory:") mkdirSync(dirname(openedPath), { recursive: true });
 
   const db = new DatabaseSync(openedPath);
@@ -23,6 +32,7 @@ export function openSqliteDatabase(databasePath: string): SqliteDatabaseHandle {
       if (!sameDatabasePath(openedPath, canonicalOpenedPath)) {
         throw new Error("SQLite opened a different canonical database path than the accepted runtime path.");
       }
+      verification?.assertOpenedDatabase(db, openedPath);
     }
     db.exec("PRAGMA foreign_keys = ON;");
     db.exec("PRAGMA journal_mode = WAL;");
@@ -61,14 +71,19 @@ export function openSqliteDatabase(databasePath: string): SqliteDatabaseHandle {
   };
 }
 
-export function openReadOnlySqliteDatabase(databasePath: string): DatabaseSync {
+export function openReadOnlySqliteDatabase(
+  databasePath: string,
+  verification?: SqliteDatabaseOpenVerification,
+): DatabaseSync {
   const canonicalPath = canonicalizeLocalDatabasePath(databasePath, { mustExist: true });
+  verification?.assertBeforeOpen(canonicalPath);
   const db = new DatabaseSync(canonicalPath, { readOnly: true });
   try {
     const canonicalOpenedPath = canonicalizeLocalDatabasePath(canonicalPath, { mustExist: true });
     if (!sameDatabasePath(canonicalPath, canonicalOpenedPath)) {
       throw new Error("SQLite opened a different canonical database path than the accepted read-only path.");
     }
+    verification?.assertOpenedDatabase(db, canonicalPath);
     return db;
   } catch (error) {
     db.close();

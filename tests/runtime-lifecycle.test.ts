@@ -231,7 +231,7 @@ test("owned runtime waits for notification delivery settlement before closing da
   assert.equal(events.at(-1), "process-lock:release");
 });
 
-test("worker rejection still waits for notification delivery settlement before database close", async () => {
+test("worker rejection waits for delivery settlement and retains the unsafe runtime scope", async () => {
   const events: string[] = [];
   const deliverySettlement = createDeferred<void>();
   const inboundError = new Error("inbound_quiescence_failed");
@@ -265,8 +265,9 @@ test("worker rejection still waits for notification delivery settlement before d
     inboundError.message,
   );
   assert.equal(events.includes("ownership:release"), false);
-  assert.ok(events.indexOf("delivery:quiesce") < events.indexOf("app-db:close"));
-  assert.equal(events.at(-1), "process-lock:release");
+  assert.equal(events.includes("app-db:close"), false);
+  assert.equal(events.includes("ownership-db:close"), false);
+  assert.equal(events.includes("process-lock:release"), false);
 });
 
 test("owned runtime shutdown shares one promise and preserves the first reason", async () => {
@@ -365,10 +366,16 @@ test("release and database close failures produce partial shutdown", async () =>
   assert.equal(events.at(-1), "process-lock:release");
 });
 
-test("worker quiescence timeout prevents ownership release and still closes lock last", async () => {
+test("worker quiescence timeout records loss and retains databases plus process lock", async () => {
   const events: string[] = [];
+  const fenceReasons: string[] = [];
   const never = new Promise<void>(() => undefined);
-  const ownership = createOwnershipContext(events);
+  const ownership = createOwnershipContext(events, {
+    fence(reason) {
+      fenceReasons.push(reason);
+      events.push("ownership:fence");
+    },
+  });
   const app = createAsyncRuntimeApp(events, {
     async deliveryStopAndWait() {
       events.push("delivery:quiesce");
@@ -392,7 +399,10 @@ test("worker quiescence timeout prevents ownership release and still closes lock
     "SKIPPED",
   );
   assert.equal(events.includes("ownership:release"), false);
-  assert.equal(events.at(-1), "process-lock:release");
+  assert.deepEqual(fenceReasons, ["RUNTIME_SHUTDOWN", "RUNTIME_WORK_QUIESCENCE_FAILED"]);
+  assert.equal(events.includes("app-db:close"), false);
+  assert.equal(events.includes("ownership-db:close"), false);
+  assert.equal(events.includes("process-lock:release"), false);
 });
 
 test("scheduler final persistence timeout prevents ownership release after running clears", async () => {
@@ -477,7 +487,9 @@ test("scheduler final persistence timeout prevents ownership release after runni
   );
   assert.equal(releaseCalled, false);
   assert.equal(runSettled, false);
-  assert.equal(events.at(-1), "process-lock:release");
+  assert.equal(events.includes("app-db:close"), false);
+  assert.equal(events.includes("ownership-db:close"), false);
+  assert.equal(events.includes("process-lock:release"), false);
 
   finalPersistence.resolve();
   await currentRun;
@@ -712,6 +724,7 @@ function createOwnershipContext(
     lossReason?: string | null;
     releaseCurrentOwnership?: (releasedAtEpochMs: number) => Promise<boolean>;
     closeOwnershipDatabase?: () => void;
+    fence?: (reason: string) => void;
   } = {},
 ): RuntimeOwnershipContext {
   const status = overrides.status ?? "OWNED";
@@ -730,9 +743,9 @@ function createOwnershipContext(
       takeover: false,
       lossReason: overrides.lossReason ?? null,
     }),
-    fence() {
+    fence: overrides.fence ?? (() => {
       events.push("ownership:fence");
-    },
+    }),
     releaseCurrentOwnership: overrides.releaseCurrentOwnership ?? (async () => {
       events.push("ownership:release");
       return true;

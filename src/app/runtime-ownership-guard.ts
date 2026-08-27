@@ -207,9 +207,15 @@ export class RuntimeOwnershipGuard implements RuntimeOwnershipAuthority {
   }
 
   markLost(reason: string): boolean {
-    if (this.status === "LOST") return false;
     if (!/^[A-Z][A-Z0-9_]{0,63}$/u.test(reason)) {
       throw new Error("Runtime ownership loss reason must be a non-secret uppercase reason code.");
+    }
+
+    if (this.status === "LOST") {
+      if (!isCleanupFenceReason(this.lossReason) || isCleanupFenceReason(reason)) return false;
+      this.lossReason = reason;
+      for (const listener of this.lossListeners) listener(reason);
+      return true;
     }
 
     this.status = "LOST";
@@ -249,6 +255,12 @@ export class RuntimeOwnershipGuard implements RuntimeOwnershipAuthority {
       `RUNTIME_OWNERSHIP_LOST: ${this.lossReason ?? "UNKNOWN"}`,
     );
   }
+}
+
+function isCleanupFenceReason(reason: string | null): boolean {
+  return reason === "RUNTIME_SHUTDOWN" ||
+    reason === "SCOPED_WORK_COMPLETE" ||
+    reason === "STARTUP_FAILED";
 }
 
 function sameOwnership(

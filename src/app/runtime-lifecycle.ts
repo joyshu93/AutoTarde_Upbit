@@ -313,6 +313,18 @@ async function stopOwnedAppRuntime(input: {
   });
   steps.push(quiescenceStep);
 
+  const unsafeWorkerState = deliveryStopStep.status !== "STOPPED" ||
+    telegramStopStep.status !== "STOPPED" ||
+    schedulerStopStep.status !== "STOPPED" ||
+    quiescenceStep.status !== "STOPPED";
+  if (unsafeWorkerState) {
+    try {
+      input.runtimeOwnership.fence("RUNTIME_WORK_QUIESCENCE_FAILED");
+    } catch {
+      // The existing failed stop/quiescence step already preserves the blocking failure.
+    }
+  }
+
   const lossRecordingStep = await stopAsyncStep(
     "runtime_ownership_loss_recording",
     async () => {
@@ -344,15 +356,21 @@ async function stopOwnedAppRuntime(input: {
     }));
   }
 
-  steps.push(stopStep("sqlite_persistence", () => {
-    input.app.persistence.close();
-  }));
-  steps.push(stopStep("runtime_ownership_database", () => {
-    input.runtimeOwnership.closeOwnershipDatabase();
-  }));
-  steps.push(await stopAsyncStep("runtime_process_lock", async () => {
-    await input.runtimeOwnership.releaseProcessLock();
-  }));
+  if (unsafeWorkerState) {
+    steps.push(skippedStep("sqlite_persistence", "runtime_not_quiesced"));
+    steps.push(skippedStep("runtime_ownership_database", "runtime_not_quiesced"));
+    steps.push(skippedStep("runtime_process_lock", "runtime_not_quiesced"));
+  } else {
+    steps.push(stopStep("sqlite_persistence", () => {
+      input.app.persistence.close();
+    }));
+    steps.push(stopStep("runtime_ownership_database", () => {
+      input.runtimeOwnership.closeOwnershipDatabase();
+    }));
+    steps.push(await stopAsyncStep("runtime_process_lock", async () => {
+      await input.runtimeOwnership.releaseProcessLock();
+    }));
+  }
 
   return createStopSummary(input.reason, steps);
 }

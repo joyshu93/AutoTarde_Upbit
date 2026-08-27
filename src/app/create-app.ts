@@ -20,6 +20,8 @@ import { InlineTelegramSyncController } from "./sync-controller.js";
 import type { ExecutionRepository, OperatorStateStore } from "../modules/db/interfaces.js";
 import type { SqlitePersistenceBundle } from "../modules/db/repositories/contracts.js";
 import { createSqlitePersistence } from "../modules/db/repositories/sqlite-repositories.js";
+import type { SqliteDatabaseOpenVerification } from
+  "../modules/db/repositories/sqlite-database.js";
 import { canonicalizeLocalDatabasePath } from "../modules/db/local-database-path.js";
 import { CandidateExecutionEvidenceService } from "../modules/execution/candidate-evidence-service.js";
 import { ExecutionService } from "../modules/execution/execution-service.js";
@@ -94,6 +96,7 @@ export interface CreateAppOverrides {
   publicMarketDataReader?: PositionGuardPublicMarketDataReader;
   privateExchangeAdapter?: LiveExecutionAdapter;
   runtimeOwnershipAuthority?: RuntimeOwnershipAuthority;
+  databaseOpenVerification?: SqliteDatabaseOpenVerification;
   afterCandidatePilotAuthorityValidated?: (authority: PositionGuardPilotAbandonmentValidation) => void;
   candidatePilotInitializerClock?: PositionGuardPilotInitializerClock;
   candidatePilotInitializerRepository?: PositionGuardPilotInitializerRepository;
@@ -160,7 +163,11 @@ export function createApp(
     executionMode: config.executionMode,
     liveExecutionGate: config.liveExecutionGate,
     killSwitchActive: config.globalKillSwitch,
-  });
+  }, overrides.databaseOpenVerification ?? (
+    liveDatabaseVerification.status === "VERIFIED"
+      ? liveDatabaseVerification.databaseOpenVerification
+      : undefined
+  ));
   try {
   const { repositories, operatorState, accountExecutionLeases } = persistence;
   const candidatePilotInitializer = candidatePolicySelection

@@ -27,7 +27,7 @@ export function openLiveReadOnlyContext(
   }
   const accessKey = env.UPBIT_ACCESS_KEY?.trim() || null;
   const secretKey = env.UPBIT_SECRET_KEY?.trim() || null;
-  verifyLiveDatabaseIdentity({
+  const verification = verifyLiveDatabaseIdentity({
     executionMode: config.executionMode,
     databasePath: config.databasePath,
     expectedDatabaseInstanceId: config.liveDatabaseInstanceId ?? null,
@@ -35,7 +35,13 @@ export function openLiveReadOnlyContext(
     upbitAccessKey: accessKey,
   });
 
-  const db = openReadOnlySqliteDatabase(config.databasePath);
+  if (verification.status !== "VERIFIED") {
+    throw new Error("Read-only LIVE inspection requires verified LIVE database identity.");
+  }
+  const db = openReadOnlySqliteDatabase(
+    verification.canonicalDatabasePath,
+    verification.databaseOpenVerification,
+  );
   const exchangeBackedReadEnabled = Boolean(accessKey && secretKey);
   return {
     config,

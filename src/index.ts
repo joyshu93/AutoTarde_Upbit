@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 
-import { createApp, type AppServices } from "./app/create-app.js";
+import { createApp, type AppServices, type CreateAppOverrides } from "./app/create-app.js";
 import { loadAppConfig, type AppConfig } from "./app/env.js";
 import {
   createRuntimeOwnershipContext,
@@ -69,7 +69,9 @@ export interface RunMainOperations {
   }): Promise<RuntimeOwnershipContext>;
   createApp(
     config: AppConfig,
-    overrides: { readonly runtimeOwnershipAuthority: RuntimeOwnershipContext["guard"] },
+    overrides: CreateAppOverrides & {
+      readonly runtimeOwnershipAuthority: RuntimeOwnershipContext["guard"];
+    },
   ): AppServices;
   runAppStartup(app: AppServices, operations: AppStartupOperations): Promise<void>;
 }
@@ -78,7 +80,9 @@ export interface CreateVerifiedApplicationOperations {
   loadAppConfig(): AppConfig;
   createApp(
     config: AppConfig,
-    overrides: { readonly runtimeOwnershipAuthority: RuntimeOwnershipAuthority },
+    overrides: CreateAppOverrides & {
+      readonly runtimeOwnershipAuthority: RuntimeOwnershipAuthority;
+    },
   ): AppServices;
   runWithScopedRuntimeOwnership: typeof runWithScopedRuntimeOwnership;
 }
@@ -367,6 +371,9 @@ export async function runMain(
   try {
     const app = operations.createApp(verifiedConfig, {
       runtimeOwnershipAuthority: ownership.guard,
+      ...(verified.databaseOpenVerification
+        ? { databaseOpenVerification: verified.databaseOpenVerification }
+        : {}),
     });
     await operations.runAppStartup(app, { runtimeOwnership: ownership });
   } catch (error) {
@@ -387,8 +394,14 @@ export async function createVerifiedApplication<T>(
     runtimeOwnershipAuthority,
     verifiedConfig,
     fenceApplication,
+    verifiedDatabase,
   ) => {
-    const app = createApplication(verifiedConfig, { runtimeOwnershipAuthority });
+    const app = createApplication(verifiedConfig, {
+      runtimeOwnershipAuthority,
+      ...(verifiedDatabase.databaseOpenVerification
+        ? { databaseOpenVerification: verifiedDatabase.databaseOpenVerification }
+        : {}),
+    });
     try {
       return await useApplication(app);
     } finally {
