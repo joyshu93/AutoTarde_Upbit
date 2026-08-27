@@ -128,6 +128,7 @@ test("a replaced runtime generation after final order checks leaves immutable ev
     processLock: new HeldProcessLock(),
     store: ownershipStore,
     ownerToken: "owner-a".padEnd(64, "x"),
+    nowEpochMs: () => 2,
   });
   await runtimeOwnership.acquire({ executionMode: "DRY_RUN", acquiredAtEpochMs: 1 });
   const repositories = new ReplaceOwnershipOnFinalOrderReadRepository(async () => {
@@ -224,6 +225,7 @@ async function verifyInFlightGenerationReplacement(adapterError: Error | null): 
     processLock: new HeldProcessLock(),
     store: ownershipStore,
     ownerToken: "owner-a".padEnd(64, "x"),
+    nowEpochMs: Date.now,
   });
   const acquiredAtEpochMs = Date.now();
   await runtimeOwnership.acquire({ executionMode: "DRY_RUN", acquiredAtEpochMs });

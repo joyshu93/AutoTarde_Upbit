@@ -216,7 +216,12 @@ async function createHeartbeatFixture(
   const clock = new ManualClock(1_000);
   const timer = new ManualTimer();
   const processLock = new FakeProcessLock();
-  const guard = new RuntimeOwnershipGuard({ processLock, store, ownerToken: OWNER_A });
+  const guard = new RuntimeOwnershipGuard({
+    processLock,
+    store,
+    ownerToken: OWNER_A,
+    nowEpochMs: () => clock.nowEpochMs(),
+  });
   await guard.acquire({ executionMode: "LIVE", acquiredAtEpochMs: 1_000 });
   const losses: string[] = [];
   const heartbeat = new RuntimeHeartbeat({

@@ -94,6 +94,7 @@ export class StrategyScheduler {
   private readonly timers = new Map<SupportedMarket, SchedulerTimer>();
   private readonly statusByMarket = new Map<SupportedMarket, StrategySchedulerMarketStatus>();
   private readonly inFlightRuns = new Set<Promise<TelegramStrategyRunResult>>();
+  private readonly inFlightStartupBlockReports = new Set<Promise<void>>();
   private startupPreflight: StrategySchedulerStartupPreflight | null;
   private accountRefreshInFlight: Promise<StrategySchedulerAccountRefreshResult | null> | null = null;
   private scheduledRunQueue: Promise<void> = Promise.resolve();
@@ -154,8 +155,14 @@ export class StrategyScheduler {
     }
 
     this.startupBlockReported = true;
-    await this.reportSchedulerStartupBlock(this.startupPreflight);
-    return true;
+    const report = this.reportSchedulerStartupBlock(this.startupPreflight);
+    this.inFlightStartupBlockReports.add(report);
+    try {
+      await report;
+      return true;
+    } finally {
+      this.inFlightStartupBlockReports.delete(report);
+    }
   }
 
   stop(): StrategySchedulerStatus {
@@ -179,6 +186,7 @@ export class StrategyScheduler {
     this.stop();
     const pending = [
       ...this.inFlightRuns,
+      ...this.inFlightStartupBlockReports,
       this.scheduledRunQueue,
     ];
     const quiesced = await waitForWorkOrTimeout(Promise.allSettled(pending), timeoutMs);
@@ -821,6 +829,7 @@ export class StrategyScheduler {
     }
 
     try {
+      this.runtimeOwnership.assertLocallyHeld();
       await this.dependencies.reporter.report({
         exchangeAccountId: this.dependencies.config.exchangeAccountId,
         notificationType: "SCHEDULER_STARTUP_BLOCKED",
@@ -835,7 +844,10 @@ export class StrategyScheduler {
           checks: preflight.checks,
         },
       });
-    } catch {
+      this.runtimeOwnership.assertLocallyHeld();
+    } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
+      this.runtimeOwnership.assertLocallyHeld();
       // Startup safety decisions must not be changed by Telegram reporting failures.
     }
   }

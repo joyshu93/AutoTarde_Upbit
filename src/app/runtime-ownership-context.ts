@@ -121,6 +121,7 @@ export async function createRuntimeOwnershipContext(
       processLock: input.processLock,
       store,
       ownerToken,
+      nowEpochMs,
     });
     const heartbeat = new RuntimeHeartbeat({ guard, store, ownerToken });
     let lossRecordingPromise = Promise.resolve();

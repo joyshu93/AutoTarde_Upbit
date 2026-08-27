@@ -313,6 +313,7 @@ function registerIntegrationTests(): void {
       processLock: new FakeProcessLock([]),
       store: ownershipPersistence.runtimeOwnership,
       ownerToken: "a".repeat(64),
+      nowEpochMs: () => 1_001,
     });
     const expected = {
       atEpochMs: 1_001,
@@ -394,6 +395,7 @@ function registerIntegrationTests(): void {
       processLock: new FakeProcessLock([]),
       store,
       ownerToken: "a".repeat(64),
+      nowEpochMs: () => 1_001,
     });
 
     try {
@@ -534,6 +536,7 @@ async function createDeterministicOwnedRuntime(databasePath: string, events: str
     processLock,
     store: ownershipPersistence.runtimeOwnership,
     ownerToken,
+    nowEpochMs: () => 1_001,
   });
   await guard.acquire({ executionMode: "DRY_RUN", acquiredAtEpochMs: 1_000 });
   const clock = new ManualClock(1_001);

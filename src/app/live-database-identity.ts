@@ -253,9 +253,34 @@ function createLiveDatabaseOpenVerification(input: Readonly<{
     assertBeforeOpen: assertFileIdentity,
     assertOpenedDatabase(db: DatabaseSync, databasePath: string): void {
       assertFileIdentity(databasePath);
+      const openedDatabasePath = readOpenedDatabasePath(db);
+      if (!sameDatabasePath(openedDatabasePath, input.canonicalDatabasePath)) {
+        throw databaseFileIdentityChanged();
+      }
+      assertSameDatabaseFileIdentity(
+        input.fileIdentity,
+        readDatabaseFileIdentity(openedDatabasePath),
+      );
       validateLiveDatabaseContents(db, input);
     },
   });
+}
+
+function readOpenedDatabasePath(db: DatabaseSync): string {
+  try {
+    const locatedPath = typeof db.location === "function"
+      ? db.location("main")
+      : (db.prepare("PRAGMA database_list").all() as unknown as Array<{
+          name: string;
+          file: string;
+        }>).find((row) => row.name === "main")?.file ?? null;
+    if (locatedPath === null || !isAbsolute(locatedPath)) {
+      throw databaseFileIdentityChanged();
+    }
+    return canonicalizeLocalDatabasePath(locatedPath, { mustExist: true });
+  } catch {
+    throw databaseFileIdentityChanged();
+  }
 }
 
 function validateLiveDatabaseContents(
@@ -305,11 +330,15 @@ function readDatabaseFileIdentity(databasePath: string): LiveDatabaseFileIdentit
       birthtimeNs: stats.birthtimeNs.toString(),
     };
   } catch {
-    throw new LiveDatabaseIdentityError(
-      "DATABASE_FILE_IDENTITY_CHANGED",
-      "LIVE database file identity could not be reasserted after verification.",
-    );
+    throw databaseFileIdentityChanged();
   }
+}
+
+function databaseFileIdentityChanged(): LiveDatabaseIdentityError {
+  return new LiveDatabaseIdentityError(
+    "DATABASE_FILE_IDENTITY_CHANGED",
+    "LIVE database file identity could not be reasserted after verification.",
+  );
 }
 
 function assertSameDatabaseFileIdentity(

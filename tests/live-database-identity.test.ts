@@ -208,6 +208,39 @@ test("explicit provisioning binds an existing migrated database and verification
   }
 });
 
+test("LIVE open verification rejects a different actual SQLite handle at the verified path", async () => {
+  const verifiedFixture = await createDatabaseFixture();
+  const otherFixture = await createDatabaseFixture();
+  try {
+    for (const databasePath of [verifiedFixture.databasePath, otherFixture.databasePath]) {
+      provisionLiveDatabaseIdentity({
+        databasePath,
+        databaseInstanceId: INSTANCE_ID,
+        exchangeAccountId: "primary",
+        upbitAccessKey: ACCESS_KEY,
+      });
+    }
+    const verification = verify(verifiedFixture.databasePath);
+    assert.equal(verification.status, "VERIFIED");
+    const otherDatabase = new DatabaseSync(otherFixture.databasePath, { readOnly: true });
+    try {
+      assert.throws(
+        () => verification.databaseOpenVerification.assertOpenedDatabase(
+          otherDatabase,
+          verifiedFixture.databasePath,
+        ),
+        (error: unknown) => error instanceof LiveDatabaseIdentityError &&
+          error.code === "DATABASE_FILE_IDENTITY_CHANGED",
+      );
+    } finally {
+      otherDatabase.close();
+    }
+  } finally {
+    await verifiedFixture.cleanup();
+    await otherFixture.cleanup();
+  }
+});
+
 test("LIVE runtime rejects a database replaced after identity verification before ownership mutation", async () => {
   const verifiedFixture = await createDatabaseFixture();
   const replacementFixture = await createDatabaseFixture();

@@ -67,6 +67,7 @@ interface RuntimeOwnershipGuardDependencies {
   readonly processLock: RuntimeProcessLock;
   readonly store: RuntimeOwnershipStore;
   readonly ownerToken: string;
+  readonly nowEpochMs: () => number;
 }
 
 export class RuntimeOwnershipGuard implements RuntimeOwnershipAuthority {
@@ -137,6 +138,12 @@ export class RuntimeOwnershipGuard implements RuntimeOwnershipAuthority {
         "RUNTIME_OWNERSHIP_NOT_HELD",
         "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership has not been acquired.",
       );
+    }
+    const nowEpochMs = this.dependencies.nowEpochMs();
+    validateEpochMs(nowEpochMs);
+    if (nowEpochMs >= this.record.expiresAtEpochMs) {
+      this.markLost("OWNERSHIP_EXPIRED");
+      this.throwLost();
     }
   }
 

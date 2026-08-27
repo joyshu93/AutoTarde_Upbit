@@ -487,6 +487,57 @@ test("strategy scheduler does not start when live startup preflight blocks it", 
   assert.equal(notifications[0]?.payload?.liveSendPath, "LIVE_ADAPTER");
 });
 
+test("strategy scheduler tracks and fences an in-flight startup-block report during stop", async () => {
+  const ownership = createOwnedThenLostRuntimeOwnershipAuthority();
+  const report = createDeferred<void>();
+  let reportCalls = 0;
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      startupPreflight: {
+        checkedAt: "2026-04-20T00:00:00.000Z",
+        scope: "LIVE",
+        status: "BLOCK",
+        detail: "Live scheduler startup blocked by active_orders.",
+        checks: [{
+          name: "active_orders",
+          status: "BLOCK",
+          detail: "1 active order must be resolved first.",
+        }],
+      },
+      markets: [{ market: "KRW-BTC", intervalMs: 1_800_000 }],
+    },
+    controller: createController(),
+    reporter: {
+      async report() {
+        reportCalls += 1;
+        await report.promise;
+      },
+    },
+    runtimeOwnership: ownership.authority,
+  });
+
+  scheduler.start();
+  const reporting = scheduler.reportStartupBlockIfNeeded();
+  await waitForMicrotasks();
+
+  assert.equal(reportCalls, 1);
+  assert.equal((await scheduler.stopAndWait(0)).quiesced, false);
+
+  const rejected = assert.rejects(
+    () => reporting,
+    (error: unknown) => error === ownership.lossError,
+  );
+  ownership.lose();
+  report.resolve();
+  await rejected;
+
+  assert.equal((await scheduler.stopAndWait(1_000)).quiesced, true);
+});
+
 test("strategy scheduler records completed run outcomes through the shared run controller", async () => {
   const requests: TelegramStrategyRunRequest[] = [];
   const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];

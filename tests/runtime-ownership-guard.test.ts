@@ -25,7 +25,12 @@ const OWNER_B = "owner-b".padEnd(64, "x");
 test("runtime ownership guard transitions from UNOWNED to OWNED and forbids reacquisition", async () => {
   const processLock = new FakeProcessLock();
   const store = new InMemoryRuntimeOwnershipStore("0".repeat(64));
-  const guard = new RuntimeOwnershipGuard({ processLock, store, ownerToken: OWNER_A });
+  const guard = new RuntimeOwnershipGuard({
+    processLock,
+    store,
+    ownerToken: OWNER_A,
+    nowEpochMs: () => 1_001,
+  });
 
   assert.deepEqual(guard.snapshot(), {
     status: "UNOWNED",
@@ -75,6 +80,7 @@ test("runtime ownership guard reserves acquisition before awaiting persistence",
     processLock: new FakeProcessLock(),
     store,
     ownerToken: OWNER_A,
+    nowEpochMs: () => 1_001,
   });
 
   const firstAcquire = guard.acquire({ executionMode: "LIVE", acquiredAtEpochMs: 1_000 });
@@ -96,6 +102,7 @@ test("runtime ownership guard permanently fences synchronous process-lock loss",
     processLock,
     store: new InMemoryRuntimeOwnershipStore("0".repeat(64)),
     ownerToken: OWNER_A,
+    nowEpochMs: () => 1_001,
   });
   const losses: string[] = [];
   guard.onLost((reason) => losses.push(reason));
@@ -117,6 +124,7 @@ test("runtime ownership guard local assertion checks the process lock even witho
     processLock,
     store: new InMemoryRuntimeOwnershipStore("0".repeat(64)),
     ownerToken: OWNER_A,
+    nowEpochMs: () => 1_001,
   });
   await guard.acquire({ executionMode: "LIVE", acquiredAtEpochMs: 1_000 });
 
@@ -133,6 +141,7 @@ test("runtime ownership guard permanently fences a persisted generation mismatch
     processLock: new FakeProcessLock(),
     store,
     ownerToken: OWNER_A,
+    nowEpochMs: () => 2_001,
   });
   await guard.acquire({ executionMode: "LIVE", acquiredAtEpochMs: 1_000 });
   await store.acquireAfterProcessLock({
@@ -158,11 +167,34 @@ test("runtime ownership guard rejects expiry at the exact persisted deadline", a
     processLock: new FakeProcessLock(),
     store: new InMemoryRuntimeOwnershipStore("0".repeat(64)),
     ownerToken: OWNER_A,
+    nowEpochMs: () => 45_999,
   });
   await guard.acquire({ executionMode: "DRY_RUN", acquiredAtEpochMs: 1_000 });
 
   await assert.rejects(() => guard.assertCurrent(46_000), /RUNTIME_OWNERSHIP_LOST/u);
 
+  assert.equal(guard.snapshot().status, "LOST");
+  assert.equal(guard.snapshot().lossReason, "OWNERSHIP_EXPIRED");
+});
+
+test("runtime ownership guard local assertion fences ownership at the exact expiry deadline", async () => {
+  let nowEpochMs = 45_999;
+  const guard = new RuntimeOwnershipGuard({
+    processLock: new FakeProcessLock(),
+    store: new InMemoryRuntimeOwnershipStore("0".repeat(64)),
+    ownerToken: OWNER_A,
+    nowEpochMs: () => nowEpochMs,
+  });
+  await guard.acquire({ executionMode: "DRY_RUN", acquiredAtEpochMs: 1_000 });
+
+  guard.assertLocallyHeld();
+  nowEpochMs = 46_000;
+
+  assert.throws(
+    () => guard.assertLocallyHeld(),
+    (error: unknown) => error instanceof RuntimeOwnershipGuardError &&
+      error.code === "RUNTIME_OWNERSHIP_LOST",
+  );
   assert.equal(guard.snapshot().status, "LOST");
   assert.equal(guard.snapshot().lossReason, "OWNERSHIP_EXPIRED");
 });
