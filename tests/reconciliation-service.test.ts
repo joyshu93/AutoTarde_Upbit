@@ -2550,6 +2550,103 @@ test("submission recovery accepts canonical Upbit market-ask decimal normalizati
   assert.equal((await repositories.findOrderByReference("primary", order.id))?.status, "FILLED");
 });
 
+test("submission recovery accepts canonical Upbit market-ask volume truncation", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = pausedUncertainSubmissionState();
+  const order = uncertainSubmissionOrder({
+    id: "market-ask-volume-truncation",
+    side: "ask",
+    ordType: "market",
+    price: null,
+    volume: "0.00005151762",
+    identifier: "market-ask-volume-truncation-identifier",
+    upbitUuid: "market-ask-volume-truncation-uuid",
+  });
+  await repositories.saveOrder(order);
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: {
+      async getOrder() {
+        return {
+          uuid: order.upbitUuid!,
+          identifier: order.identifier,
+          market: order.market,
+          side: "ask" as const,
+          ordType: "market" as const,
+          state: "done",
+          price: null,
+          volume: "0.00005151",
+          remainingVolume: "0",
+          executedVolume: "0.00005151",
+          paidFee: "0",
+          createdAt: order.requestedAt,
+          fills: [],
+          raw: { state: "done" },
+        };
+      },
+    },
+    recoveryClock: {
+      now: () => ({ observedAt: "2026-08-27T07:57:18.229Z", observedAtEpochMs: 1_787_817_438_229 }),
+    },
+  });
+
+  const result = await reconciliation.recoverOrderByIdentifier(order);
+
+  assert.equal(result.outcome, "RECOVERED");
+  assert.equal((await repositories.findOrderByReference("primary", order.id))?.status, "FILLED");
+});
+
+test("submission recovery rejects a market-ask volume mismatch within Upbit precision", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = pausedUncertainSubmissionState();
+  const order = uncertainSubmissionOrder({
+    id: "market-ask-material-volume-mismatch",
+    side: "ask",
+    ordType: "market",
+    price: null,
+    volume: "0.00005151762",
+    identifier: "market-ask-material-volume-mismatch-identifier",
+    upbitUuid: "market-ask-material-volume-mismatch-uuid",
+  });
+  await repositories.saveOrder(order);
+  const reconciliation = new ReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: {
+      async getOrder() {
+        return {
+          uuid: order.upbitUuid!,
+          identifier: order.identifier,
+          market: order.market,
+          side: "ask" as const,
+          ordType: "market" as const,
+          state: "done",
+          price: null,
+          volume: "0.00005150",
+          remainingVolume: "0",
+          executedVolume: "0.00005150",
+          paidFee: "0",
+          createdAt: order.requestedAt,
+          fills: [],
+          raw: { state: "done" },
+        };
+      },
+    },
+    recoveryClock: {
+      now: () => ({ observedAt: "2026-08-27T07:57:18.230Z", observedAtEpochMs: 1_787_817_438_230 }),
+    },
+  });
+
+  const result = await reconciliation.recoverOrderByIdentifier(order);
+
+  assert.equal(result.outcome, "TRANSIENT_FAILURE");
+  assert.equal(
+    (await repositories.findOrderByReference("primary", order.id))?.status,
+    "RECONCILIATION_REQUIRED",
+  );
+});
+
 test("submission recovery accepts canonical Upbit market-bid quote truncation", async () => {
   const repositories = new InMemoryExecutionRepository();
   const operatorState = pausedUncertainSubmissionState();

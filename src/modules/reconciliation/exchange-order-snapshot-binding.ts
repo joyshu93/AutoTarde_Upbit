@@ -220,7 +220,8 @@ function sameOrderIntentDecimal(
 ): boolean {
   if (left === null || right === null) return left === right;
   const usesUpbitEightDecimalCanonicalization =
-    side === "bid" && ordType === "price" && field === "price";
+    (side === "bid" && ordType === "price" && field === "price") ||
+    (side === "ask" && ordType === "market" && field === "volume");
   if (!usesUpbitEightDecimalCanonicalization) {
     return sameNullableDecimal(left, right, label);
   }
