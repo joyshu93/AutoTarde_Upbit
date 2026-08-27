@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import type { CandidateExecutionBindingRecord } from "../src/domain/pilot-types.js";
 import type {
   ExecutionStateRecord,
@@ -53,7 +54,7 @@ type FinalMutation =
   | "REJECTED_COMPETING_ORDER"
   | "ORDER_ID_REFERENCE_COLLISION"
   | "ORDER_CANCELED_DURING_OPERATOR_STATE"
-  | "HELPER_RESOLUTION_PAUSE"
+  | "AUTHORITY_POST_SNAPSHOT_PAUSE"
   | "OPERATOR_STATE";
 
 test("bound candidate success rereads every final authority in strict order and sends exactly once", async () => {
@@ -72,6 +73,7 @@ test("bound candidate success rereads every final authority in strict order and 
     "operatorState",
     "activeOrders",
     "order",
+    "combinedAuthority",
     "createOrder",
   ]);
 });
@@ -118,22 +120,20 @@ test("candidate final order reread uses exact account and order id despite refer
   assert.equal(fixture.repositories.referenceLookupCalls, 0);
 });
 
-test("final exact order read and sole send have no helper-resolution microtask seam", async () => {
-  const fixture = await createFixture("HELPER_RESOLUTION_PAUSE");
+test("the final persisted authority callback sends before a queued post-snapshot pause", async () => {
+  const fixture = await createFixture("AUTHORITY_POST_SNAPSHOT_PAUSE");
 
   const result = await fixture.service.submitOrderFromDecision(candidateInput());
-  await Promise.resolve();
+  await fixture.waitForFinalPause();
 
   assert.equal(result.accepted, true);
   assert.equal(fixture.adapter.createOrderCalls, 1);
   assert.equal(fixture.adapter.systemStatusAtSend, "RUNNING");
-  assert.deepEqual(fixture.trace.slice(-5), [
-    "operatorState",
-    "activeOrders",
-    "order",
-    "createOrder",
-    "finalOrderMicrotaskPause",
-  ]);
+  assert.equal((await fixture.operatorState.getState()).systemStatus, "PAUSED");
+  const combinedRead = fixture.trace.indexOf("combinedAuthority");
+  const send = fixture.trace.indexOf("createOrder");
+  const pauseStarted = fixture.trace.indexOf("postSnapshotPause");
+  assert.ok(combinedRead >= 0 && send > combinedRead && pauseStarted > send);
 });
 
 test("a final operator-state race occurs after all candidate reads and sends zero", async () => {
@@ -226,18 +226,26 @@ test("candidate final authority keeps the exact account/order revalidation immed
     "this.assertFinalPersistedSubmissionAuthority",
     exactOrderRead,
   );
+  const combinedAuthorityCheck = submitMethod.indexOf(
+    "await this.runtimeOwnership.runWithCurrentExecutionAuthority",
+    persistedHelperCall,
+  );
   const sendSite = submitMethod.indexOf(
     "this.dependencies.executionAdapter.createOrder",
-    persistedHelperCall,
+    combinedAuthorityCheck,
   );
   assert.ok(
     candidateHelperCall >= 0 && finalStateRead > candidateHelperCall &&
     blockerRead > finalStateRead && exactOrderRead > blockerRead &&
-    persistedHelperCall > exactOrderRead && sendSite > persistedHelperCall,
+    persistedHelperCall > exactOrderRead &&
+    combinedAuthorityCheck > persistedHelperCall && sendSite > combinedAuthorityCheck,
   );
-  const afterFinalPersistedRead = submitMethod.slice(exactOrderRead, sendSite);
+  const afterFinalPersistedRead = submitMethod.slice(persistedHelperCall, sendSite);
   assert.equal((afterFinalPersistedRead.match(/\bawait\b/gu) ?? []).length, 1);
   assert.doesNotMatch(afterFinalPersistedRead, /operatorState\.getState|candidatePilots/u);
+  const callbackEnd = submitMethod.indexOf("return undefined;", sendSite);
+  assert.ok(callbackEnd > sendSite);
+  assert.doesNotMatch(submitMethod.slice(combinedAuthorityCheck, callbackEnd), /=>\s*async|async\s*\(/u);
 });
 
 async function assertFinalCandidateFault(mutation: FinalMutation): Promise<void> {
@@ -278,13 +286,11 @@ class FinalAuthorityRepository extends InMemoryExecutionRepository {
   finalReadsArmed = false;
   referenceLookupCalls = 0;
   cancellationMutations = 0;
-  private submittingOrder: OrderRecord | null = null;
 
   constructor(
     candidatePilots: InMemoryCandidatePilotRepository,
     private readonly mutation: FinalMutation,
     readonly trace: string[],
-    private readonly onFinalOrderResolved: () => void,
   ) {
     super(undefined, candidatePilots);
   }
@@ -293,7 +299,6 @@ class FinalAuthorityRepository extends InMemoryExecutionRepository {
     await super.updateOrder(record);
     if (record.status === "SUBMITTING") {
       this.finalReadsArmed = true;
-      this.submittingOrder = record;
     }
   }
 
@@ -342,24 +347,6 @@ class FinalAuthorityRepository extends InMemoryExecutionRepository {
   }
 
   findOrderById(exchangeAccountId: string, orderId: string): Promise<OrderRecord | null> {
-    if (
-      this.finalReadsArmed &&
-      this.mutation === "HELPER_RESOLUTION_PAUSE" &&
-      this.submittingOrder?.id === orderId &&
-      this.submittingOrder.exchangeAccountId === exchangeAccountId
-    ) {
-      const order = this.submittingOrder;
-      this.trace.push("order");
-      return {
-        then: (resolve: (value: OrderRecord) => unknown) => {
-          resolve(order);
-          queueMicrotask(() => {
-            this.onFinalOrderResolved();
-            this.trace.push("finalOrderMicrotaskPause");
-          });
-        },
-      } as unknown as Promise<OrderRecord>;
-    }
     return super.findOrderById(exchangeAccountId, orderId).then((order) => {
       if (!this.finalReadsArmed) return order;
     this.trace.push("order");
@@ -463,6 +450,7 @@ class TracingDryRunAdapter extends DryRunExchangeAdapter {
 async function createFixture(mutation: FinalMutation) {
   const trace: string[] = [];
   let repositories: FinalAuthorityRepository;
+  let finalPausePromise: Promise<void> = Promise.resolve();
   const operatorState = new TracingOperatorStateStore(
     executionState(),
     () => repositories?.finalReadsArmed ?? false,
@@ -471,9 +459,13 @@ async function createFixture(mutation: FinalMutation) {
     () => repositories.cancelSubmittingOrderDuringOperatorState(),
   );
   const candidatePilots = new InMemoryCandidatePilotRepository(operatorState);
-  repositories = new FinalAuthorityRepository(candidatePilots, mutation, trace, () => {
-    operatorState.visibleSystemStatus = "PAUSED";
-  });
+  const pauseAfterSnapshot = (): Promise<void> => {
+    finalPausePromise = operatorState.pause("final combined authority race").then(() => {
+      operatorState.visibleSystemStatus = "PAUSED";
+    });
+    return finalPausePromise;
+  };
+  repositories = new FinalAuthorityRepository(candidatePilots, mutation, trace);
   const leases = new InMemoryAccountExecutionLeaseStore();
   const adapter = new TracingDryRunAdapter(
     trace,
@@ -494,11 +486,83 @@ async function createFixture(mutation: FinalMutation) {
     accountExecutionLeases: leases,
     accountExecutionLeaseMs: 30_000,
     operatorState,
+    runtimeOwnership: createAlwaysOwnedRuntimeAuthority({
+      operatorState,
+      trace,
+      pauseAfterSnapshot,
+      postSnapshotPause: mutation === "AUTHORITY_POST_SNAPSHOT_PAUSE",
+    }),
     candidatePilots: finalCandidatePilotReads(candidatePilots, repositories, mutation, trace),
     now: () => ATTEMPT_AT,
   });
 
-  return { adapter, candidatePilots, leases, operatorState, repositories, service, trace };
+  return {
+    adapter,
+    candidatePilots,
+    leases,
+    operatorState,
+    repositories,
+    service,
+    trace,
+    waitForFinalPause: () => finalPausePromise,
+  };
+}
+
+function createAlwaysOwnedRuntimeAuthority(input: {
+  readonly operatorState: TracingOperatorStateStore;
+  readonly trace: string[];
+  readonly postSnapshotPause: boolean;
+  pauseAfterSnapshot(): Promise<void>;
+}): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "a"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  const authority = {
+    snapshot: () => ({
+      status: "OWNED" as const,
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+    runWithCurrentExecutionAuthority(
+      _authorityInput: Parameters<NonNullable<RuntimeOwnershipAuthority["runWithCurrentExecutionAuthority"]>>[0],
+      callback: () => undefined,
+    ) {
+      input.trace.push("combinedAuthority");
+      const executionAuthorityState = {
+        ...executionState(),
+        systemStatus: input.operatorState.visibleSystemStatus,
+      };
+      if (input.operatorState.visibleSystemStatus !== "RUNNING") {
+        return Promise.reject(new Error("final pre-send authority is blocked"));
+      }
+      if (input.postSnapshotPause) {
+        queueMicrotask(() => {
+          input.trace.push("postSnapshotPause");
+          void input.pauseAfterSnapshot();
+        });
+      }
+      callback();
+      return Promise.resolve({
+        runtimeOwnership: { ...record },
+        executionState: executionAuthorityState,
+      });
+    },
+  };
+  return authority;
 }
 
 function finalCandidatePilotReads(

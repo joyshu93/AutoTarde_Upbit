@@ -2,6 +2,15 @@ import assert from "node:assert/strict";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
+import {
+  RuntimeOwnershipGuard,
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../src/app/runtime-ownership-guard.js";
+import type {
+  RuntimeProcessLock,
+  RuntimeProcessLockLossReason,
+} from "../src/app/runtime-process-lock.js";
 import type { ExecutionStateRecord } from "../src/domain/types.js";
 import { ExecutionService } from "../src/modules/execution/execution-service.js";
 import { ExchangeOrderSubmissionError } from "../src/modules/exchange/errors.js";
@@ -12,8 +21,27 @@ import {
 } from "../src/modules/exchange/interfaces.js";
 import { InMemoryAccountExecutionLeaseStore } from "../src/modules/db/repositories/in-memory-account-execution-lease-store.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
+import { InMemoryRuntimeOwnershipStore } from "../src/modules/db/repositories/in-memory-runtime-ownership-store.js";
 import type { AccountExecutionLeaseStore } from "../src/modules/db/pilot-interfaces.js";
+import type { OperatorNotificationReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
+
+test("execution service fails closed before persistence when runtime authority is omitted", async () => {
+  const exchange = createCountingAdapter();
+  const { service, repositories } = await createService({
+    exchangeAdapter: exchange,
+    runtimeOwnership: null,
+  });
+
+  await assert.rejects(
+    () => service.submitOrderFromDecision(validInput()),
+    /RUNTIME_OWNERSHIP_NOT_HELD/u,
+  );
+
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await repositories.listOrders("primary")).length, 0);
+  assert.equal((await repositories.listRiskEvents("primary")).length, 0);
+});
 
 test("a lease conflict creates no order row and calls createOrder zero times", async () => {
   const exchange = createCountingAdapter();
@@ -92,6 +120,185 @@ test("renewal loss after SUBMITTING retains recovery evidence and sends nothing"
   assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING");
   assert.equal((await operatorState.getState()).systemStatus, "PAUSED");
 });
+
+test("a replaced runtime generation after final order checks leaves immutable evidence and never sends", async () => {
+  const exchange = createCountingAdapter();
+  const ownershipStore = new InMemoryRuntimeOwnershipStore("0".repeat(64));
+  const runtimeOwnership = new RuntimeOwnershipGuard({
+    processLock: new HeldProcessLock(),
+    store: ownershipStore,
+    ownerToken: "owner-a".padEnd(64, "x"),
+    nowEpochMs: () => 2,
+  });
+  await runtimeOwnership.acquire({ executionMode: "DRY_RUN", acquiredAtEpochMs: 1 });
+  const repositories = new ReplaceOwnershipOnFinalOrderReadRepository(async () => {
+    await ownershipStore.acquireAfterProcessLock({
+      ownerToken: "owner-b".padEnd(64, "x"),
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 2,
+      expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+    });
+  });
+  const leaseStore = new InMemoryAccountExecutionLeaseStore();
+  const { service, operatorState } = await createService({
+    exchangeAdapter: exchange,
+    accountExecutionLeases: leaseStore,
+    repositories,
+    runtimeOwnership,
+  });
+
+  await assert.rejects(
+    () => service.submitOrderFromDecision(validInput()),
+    (error) => error instanceof RuntimeOwnershipGuardError &&
+      error.code === "RUNTIME_OWNERSHIP_LOST",
+  );
+
+  assert.equal(repositories.replacementCalls, 1);
+  assert.equal(exchange.createOrderCalls, 0);
+  assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING");
+  assert.equal((await repositories.listRiskEvents("primary")).length, 0);
+  assert.equal((await operatorState.getState()).systemStatus, "RUNNING");
+  assert.notEqual(await leaseStore.getLease("primary"), null);
+});
+
+test("generation replacement while createOrder fulfills leaves finalization to the new owner", async () => {
+  await verifyInFlightGenerationReplacement(null);
+});
+
+test("generation replacement while createOrder rejects preserves ownership loss over adapter rejection", async () => {
+  await verifyInFlightGenerationReplacement(new ExchangeOrderSubmissionError({
+    kind: "DEFINITIVE_REJECTION",
+    status: 400,
+    exchangeCode: "validation_error",
+    exchangeName: "validation_error",
+    responseReceived: true,
+  }));
+});
+
+test("post-adapter ownership read failure cannot trigger stale recovery finalization", async () => {
+  const sentinel = new Error("post_adapter_ownership_read_failed");
+  const operatorState = new InMemoryOperatorStateStore(createRunningState());
+  const baseAuthority = createAlwaysOwnedRuntimeOwnershipAuthority(operatorState);
+  const leaseStore = new CountingLeaseStore();
+  let notificationCalls = 0;
+  const { service, repositories } = await createService({
+    operatorState,
+    accountExecutionLeases: leaseStore,
+    runtimeOwnership: {
+      ...baseAuthority,
+      async assertCurrent() {
+        throw sentinel;
+      },
+    },
+    reporter: {
+      async report() {
+        notificationCalls += 1;
+      },
+    },
+  });
+
+  await assert.rejects(() => service.submitOrderFromDecision(validInput()), (error) => error === sentinel);
+  assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING");
+  assert.equal((await repositories.listRiskEvents("primary")).length, 0);
+  assert.notEqual(await leaseStore.getLease("primary"), null);
+  assert.equal(leaseStore.releaseCalls, 0);
+  assert.equal(notificationCalls, 0);
+});
+
+async function verifyInFlightGenerationReplacement(adapterError: Error | null): Promise<void> {
+  const scopeKey = "0".repeat(64);
+  const ownershipStore = new InMemoryRuntimeOwnershipStore(scopeKey);
+  let combinedOwnership = null as Awaited<ReturnType<typeof ownershipStore.getCurrent>>;
+  ownershipStore.getCurrentExecutionAuthority = () => combinedOwnership === null
+    ? null
+    : {
+        runtimeOwnership: { ...combinedOwnership },
+        executionState: {
+          exchangeAccountId: "primary",
+          executionMode: "DRY_RUN",
+          liveExecutionGate: "DISABLED",
+          systemStatus: "RUNNING",
+          killSwitchActive: false,
+        },
+      };
+  const runtimeOwnership = new RuntimeOwnershipGuard({
+    processLock: new HeldProcessLock(),
+    store: ownershipStore,
+    ownerToken: "owner-a".padEnd(64, "x"),
+    nowEpochMs: Date.now,
+  });
+  const acquiredAtEpochMs = Date.now();
+  await runtimeOwnership.acquire({ executionMode: "DRY_RUN", acquiredAtEpochMs });
+  combinedOwnership = await ownershipStore.getCurrent();
+  const deferredAdapter = createDeferredAdapter(adapterError);
+  const leaseStore = new CountingLeaseStore();
+  let notificationCalls = 0;
+  const reporter: OperatorNotificationReporter = {
+    async report() {
+      notificationCalls += 1;
+    },
+  };
+  const { service, repositories, operatorState } = await createService({
+    exchangeAdapter: deferredAdapter.adapter,
+    accountExecutionLeases: leaseStore,
+    runtimeOwnership,
+    reporter,
+  });
+
+  const submission = service.submitOrderFromDecision(validInput());
+  void submission.catch(() => undefined);
+  await waitFor(() => deferredAdapter.createOrderCalls === 1);
+  const replacement = await ownershipStore.acquireAfterProcessLock({
+    ownerToken: "owner-b".padEnd(64, "x"),
+    executionMode: "DRY_RUN",
+    acquiredAtEpochMs: acquiredAtEpochMs + 1,
+    expiresAtEpochMs: acquiredAtEpochMs + 60_000,
+  });
+  combinedOwnership = replacement.record;
+  deferredAdapter.settle();
+
+  await assert.rejects(
+    () => submission,
+    (error) => error instanceof RuntimeOwnershipGuardError &&
+      error.code === "RUNTIME_OWNERSHIP_LOST" &&
+      error.message === "RUNTIME_OWNERSHIP_LOST: PERSISTED_OWNERSHIP_MISMATCH",
+  );
+  assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING");
+  assert.equal((await repositories.listRiskEvents("primary")).length, 0);
+  assert.equal((await operatorState.getState()).systemStatus, "RUNNING");
+  assert.notEqual(await leaseStore.getLease("primary"), null);
+  assert.equal(leaseStore.releaseCalls, 0);
+  assert.equal(notificationCalls, 0);
+}
+
+class ReplaceOwnershipOnFinalOrderReadRepository extends InMemoryExecutionRepository {
+  replacementCalls = 0;
+
+  constructor(private readonly replaceOwnership: () => Promise<void>) {
+    super();
+  }
+
+  override async findOrderById(exchangeAccountId: string, orderId: string) {
+    const order = await super.findOrderById(exchangeAccountId, orderId);
+    this.replacementCalls += 1;
+    await this.replaceOwnership();
+    return order;
+  }
+}
+
+class HeldProcessLock implements RuntimeProcessLock {
+  readonly identity = { scopeDigest: "f".repeat(64) };
+
+  isHeld(): boolean {
+    return true;
+  }
+
+  onLost(_listener: (reason: RuntimeProcessLockLossReason) => void): () => void {
+    return () => undefined;
+  }
+
+  async release(): Promise<void> {}
+}
 
 test("slow validation expiry cannot turn into a concurrent send because pre-send renewal verifies ownership", async () => {
   const base = new InMemoryAccountExecutionLeaseStore();
@@ -588,6 +795,12 @@ test("only ExecutionService has production createOrder authority", async () => {
     .map(({ filePath }) => path.relative(process.cwd(), filePath).replaceAll("\\", "/"));
 
   assert.deepEqual(createOrderCallers, ["src/modules/execution/execution-service.ts"]);
+
+  const cancelOrderCallers = callers
+    .filter(({ source }) => /\.cancelOrder\s*\(/u.test(source))
+    .map(({ filePath }) => path.relative(process.cwd(), filePath).replaceAll("\\", "/"));
+
+  assert.deepEqual(cancelOrderCallers, []);
 });
 
 async function createService(overrides: {
@@ -595,8 +808,10 @@ async function createService(overrides: {
   accountExecutionLeases?: AccountExecutionLeaseStore;
   repositories?: InMemoryExecutionRepository;
   operatorState?: InMemoryOperatorStateStore;
+  runtimeOwnership?: RuntimeOwnershipAuthority | null;
   accountExecutionLeaseMs?: number;
   now?: () => string;
+  reporter?: OperatorNotificationReporter;
 } = {}) {
   const repositories = overrides.repositories ?? new InMemoryExecutionRepository();
   const operatorState = overrides.operatorState ?? new InMemoryOperatorStateStore(createRunningState());
@@ -613,6 +828,13 @@ async function createService(overrides: {
     accountExecutionLeases,
     accountExecutionLeaseMs: overrides.accountExecutionLeaseMs ?? 30_000,
     operatorState,
+    ...(overrides.reporter === undefined ? {} : { reporter: overrides.reporter }),
+    ...(overrides.runtimeOwnership === null
+      ? {}
+      : {
+          runtimeOwnership: overrides.runtimeOwnership ??
+            createAlwaysOwnedRuntimeOwnershipAuthority(operatorState),
+        }),
     now: overrides.now ?? (() => "2026-04-20T00:00:20.000Z"),
   });
   await repositories.saveBalanceSnapshot({
@@ -716,6 +938,57 @@ function createRunningState(overrides: Partial<ExecutionStateRecord> = {}): Exec
   };
 }
 
+class CountingLeaseStore extends InMemoryAccountExecutionLeaseStore {
+  releaseCalls = 0;
+
+  override async releaseLease(exchangeAccountId: string, ownerToken: string): Promise<boolean> {
+    this.releaseCalls += 1;
+    return super.releaseLease(exchangeAccountId, ownerToken);
+  }
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(
+  operatorState: InMemoryOperatorStateStore,
+): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+    runWithCurrentExecutionAuthority(_input, callback) {
+      callback();
+      return operatorState.getState().then((executionState) => ({
+        runtimeOwnership: { ...record },
+        executionState: {
+          exchangeAccountId: executionState.exchangeAccountId,
+          executionMode: executionState.executionMode,
+          liveExecutionGate: executionState.liveExecutionGate,
+          systemStatus: executionState.systemStatus,
+          killSwitchActive: executionState.killSwitchActive,
+        },
+      }));
+    },
+  };
+}
+
 function validInput() {
   return {
     exchangeAccountId: "primary",
@@ -789,6 +1062,56 @@ function createCountingAdapter(options: {
       return createOrderCalls;
     },
   };
+}
+
+function createDeferredAdapter(error: Error | null): {
+  readonly adapter: ExecutionExchangeAdapter;
+  readonly createOrderCalls: number;
+  settle(): void;
+} {
+  const baseAdapter = new DryRunExchangeAdapter();
+  const deferred = createDeferred<void>();
+  let createOrderCalls = 0;
+  return {
+    adapter: {
+      sendPath: "DRY_RUN_ADAPTER",
+      getBalances: baseAdapter.getBalances.bind(baseAdapter),
+      getOrderChance: baseAdapter.getOrderChance.bind(baseAdapter),
+      testOrder: baseAdapter.testOrder.bind(baseAdapter),
+      cancelOrder: baseAdapter.cancelOrder.bind(baseAdapter),
+      getOrder: baseAdapter.getOrder.bind(baseAdapter),
+      listOpenOrders: baseAdapter.listOpenOrders.bind(baseAdapter),
+      listClosedOrders: baseAdapter.listClosedOrders.bind(baseAdapter),
+      async createOrder(request) {
+        createOrderCalls += 1;
+        await deferred.promise;
+        if (error !== null) throw error;
+        return baseAdapter.createOrder(request);
+      },
+    },
+    get createOrderCalls() {
+      return createOrderCalls;
+    },
+    settle() {
+      deferred.resolve();
+    },
+  };
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.fail("Timed out waiting for deferred createOrder invocation.");
 }
 
 async function listTypeScriptFiles(directory: string): Promise<string[]> {

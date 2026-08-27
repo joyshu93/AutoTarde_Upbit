@@ -46,6 +46,10 @@ import type {
   SubmitOrderFromDecisionResult,
 } from "./interfaces.js";
 import { parseCandidateEvidenceTimestamp } from "./candidate-evidence-decimals.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../../app/runtime-ownership-guard.js";
 
 const CANDIDATE_FINAL_ORDER_SCAN_LIMIT = 100;
 
@@ -79,6 +83,8 @@ function sameOrderRecord(left: OrderRecord, right: OrderRecord): boolean {
 }
 
 export class ExecutionService {
+  private readonly runtimeOwnership: RuntimeOwnershipAuthority;
+
   constructor(
     private readonly dependencies: {
       riskLimits: ExecutionRiskLimits;
@@ -88,6 +94,7 @@ export class ExecutionService {
       accountExecutionLeases: AccountExecutionLeaseStore;
       accountExecutionLeaseMs: number;
       operatorState: OperatorStateStore;
+      runtimeOwnership?: RuntimeOwnershipAuthority;
       candidatePilots?: Pick<
         CandidatePilotRepository,
         "getDeployment" | "getExactState" | "getExecutionBindingForOrder" |
@@ -96,9 +103,12 @@ export class ExecutionService {
       reporter?: OperatorNotificationReporter;
       now?: () => string;
     },
-  ) {}
+  ) {
+    this.runtimeOwnership = dependencies.runtimeOwnership ?? createUnavailableRuntimeOwnershipAuthority();
+  }
 
   async submitOrderFromDecision(input: SubmitOrderFromDecisionInput): Promise<SubmitOrderFromDecisionResult> {
+    this.runtimeOwnership.assertLocallyHeld();
     assertCanonicalUpbitMarketBuyQuote(input);
     const attemptStartedAt = this.dependencies.now?.() ?? new Date().toISOString();
     const decision = input.decision;
@@ -526,6 +536,7 @@ export class ExecutionService {
 
     let exchangeOrderPromise: ReturnType<ExecutionExchangeAdapter["createOrder"]> | undefined;
     let createOrderInvoked = false;
+    let finalRuntimeExecutionAuthorityCheckStarted = false;
     let synchronousSubmissionError: unknown = null;
     try {
       await this.assertFinalCandidatePreSendAuthority({
@@ -556,7 +567,7 @@ export class ExecutionService {
         input.exchangeAccountId,
         CANDIDATE_FINAL_ORDER_SCAN_LIMIT + 1,
       );
-      // This exact own-order read is the final await on the successful path.
+      // This is the final order-persistence read before the runtime generation fence.
       const finalPersistedOrder = await this.dependencies.repositories.findOrderById(
         input.exchangeAccountId,
         order.id,
@@ -567,22 +578,40 @@ export class ExecutionService {
         activeOrders: finalActiveOrders,
         persistedOrder: finalPersistedOrder,
       });
-      createOrderInvoked = true;
-      exchangeOrderPromise = this.dependencies.executionAdapter.createOrder({
-        market,
-        side: input.side,
-        ordType: input.ordType,
-        volume: input.volume,
-        price: input.price,
-        identifier: order.identifier,
-        timeInForce: null,
-        smpType: null,
+      finalRuntimeExecutionAuthorityCheckStarted = true;
+      if (this.runtimeOwnership.runWithCurrentExecutionAuthority === undefined) {
+        throw new RuntimeOwnershipGuardError(
+          "RUNTIME_OWNERSHIP_NOT_HELD",
+          "RUNTIME_OWNERSHIP_NOT_HELD: Persisted combined execution authority is unavailable.",
+        );
+      }
+      await this.runtimeOwnership.runWithCurrentExecutionAuthority({
+        atEpochMs: Date.now(),
+        exchangeAccountId: input.exchangeAccountId,
+        expectedExecutionMode: initialAuthority.executionMode,
+        expectedLiveExecutionGate: initialAuthority.liveExecutionGate,
+      }, () => {
+        createOrderInvoked = true;
+        exchangeOrderPromise = this.dependencies.executionAdapter.createOrder({
+          market,
+          side: input.side,
+          ordType: input.ordType,
+          volume: input.volume,
+          price: input.price,
+          identifier: order.identifier,
+          timeInForce: null,
+          smpType: null,
+        });
+        return undefined;
       });
     } catch (error) {
       if (createOrderInvoked) {
         synchronousSubmissionError = error;
       } else {
         releaseLease = false;
+        if (finalRuntimeExecutionAuthorityCheckStarted) {
+          throw error;
+        }
         if (candidateContext && candidateBinding) {
           await this.pauseCandidateIntentFault({
             authority: candidateContext.authority,
@@ -610,10 +639,28 @@ export class ExecutionService {
       }
     }
 
+    let postAdapterOwnershipAssertionFailed = false;
     try {
       if (synchronousSubmissionError !== null) throw synchronousSubmissionError;
       if (!exchangeOrderPromise) throw new Error("Exchange order submission did not start.");
-      const exchangeOrder = await exchangeOrderPromise;
+      let exchangeOrder: Awaited<typeof exchangeOrderPromise>;
+      try {
+        exchangeOrder = await exchangeOrderPromise;
+      } catch (error) {
+        try {
+          await this.runtimeOwnership.assertCurrent(Date.now());
+        } catch (ownershipError) {
+          postAdapterOwnershipAssertionFailed = true;
+          throw ownershipError;
+        }
+        throw error;
+      }
+      try {
+        await this.runtimeOwnership.assertCurrent(Date.now());
+      } catch (ownershipError) {
+        postAdapterOwnershipAssertionFailed = true;
+        throw ownershipError;
+      }
 
       const submittedAt = this.currentTimestamp();
       let updatedOrder: OrderRecord = {
@@ -726,6 +773,10 @@ export class ExecutionService {
         reason: null,
       };
     } catch (error) {
+      if (postAdapterOwnershipAssertionFailed || error instanceof RuntimeOwnershipGuardError) {
+        releaseLease = false;
+        throw error;
+      }
       if (error instanceof PostSendPersistenceSafetyError) {
         throw error;
       }
@@ -1426,7 +1477,9 @@ function hasExecutedVolume(executedVolume: string | null): boolean {
 
 type ExecutionAuthorityTuple = Pick<ExecutionStateRecord, "executionMode" | "liveExecutionGate">;
 
-function selectExecutionAuthority(state: ExecutionStateRecord): ExecutionAuthorityTuple {
+function selectExecutionAuthority(
+  state: Pick<ExecutionStateRecord, "executionMode" | "liveExecutionGate">,
+): ExecutionAuthorityTuple {
   return {
     executionMode: state.executionMode,
     liveExecutionGate: state.liveExecutionGate,
@@ -1531,6 +1584,24 @@ export class LeaseBlockPersistenceSafetyError extends Error {
     super(message);
     this.name = "LeaseBlockPersistenceSafetyError";
   }
+}
+
+function createUnavailableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "UNOWNED", generation: null, executionMode: null, acquiredAtEpochMs: null,
+      heartbeatAtEpochMs: null, expiresAtEpochMs: null, takeover: false, lossReason: null,
+    }),
+    assertLocallyHeld: throwRuntimeOwnershipNotHeld,
+    async assertCurrent(): Promise<never> { return throwRuntimeOwnershipNotHeld(); },
+  };
+}
+
+function throwRuntimeOwnershipNotHeld(): never {
+  throw new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_NOT_HELD",
+    "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
+  );
 }
 
 function createDryRunSyntheticFill(input: {

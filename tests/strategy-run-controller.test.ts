@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 
 import {
-  InlineTelegramStrategyRunController,
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../src/app/runtime-ownership-guard.js";
+import {
+  InlineTelegramStrategyRunController as ProductionInlineTelegramStrategyRunController,
   type CandidateBtcRunPreparation,
 } from "../src/app/strategy-run-controller.js";
 import type { PositionGuardPilotRefreshReceipt } from "../src/domain/pilot-types.js";
@@ -10,6 +14,195 @@ import type {
   PositionGuardRunResult,
 } from "../src/modules/strategy/position-guard-runner.js";
 import { test } from "./harness.js";
+
+class InlineTelegramStrategyRunController extends ProductionInlineTelegramStrategyRunController {
+  constructor(dependencies: ConstructorParameters<typeof ProductionInlineTelegramStrategyRunController>[0]) {
+    super({
+      ...dependencies,
+      runtimeOwnership: dependencies.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    });
+  }
+}
+
+test("strategy run controller fails closed when runtime authority is omitted", async () => {
+  let runnerCalls = 0;
+  const controller = new ProductionInlineTelegramStrategyRunController({
+    runner: {
+      async runOnce(): Promise<never> {
+        runnerCalls += 1;
+        throw new Error("runner must not run without ownership authority");
+      },
+      async previewOnce(): Promise<never> {
+        throw new Error("preview is not used by requestRun");
+      },
+    },
+  });
+
+  await assert.rejects(
+    () => controller.requestRun({
+      exchangeAccountId: "primary",
+      market: "KRW-BTC",
+      requestedBy: "TELEGRAM",
+      requestedCommand: "/run",
+    }),
+    /RUNTIME_OWNERSHIP_NOT_HELD/u,
+  );
+  assert.equal(runnerCalls, 0);
+});
+
+function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "LOST",
+      generation: 1,
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 1,
+      heartbeatAtEpochMs: 1,
+      expiresAtEpochMs: 45_001,
+      takeover: false,
+      lossReason: "TEST_GENERATION_REPLACED",
+    }),
+    assertLocallyHeld() {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+    async assertCurrent(): Promise<never> {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+  };
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+  };
+}
+
+test("strategy run controller rejects before preparation or runner work after ownership loss", async () => {
+  let preparationCalls = 0;
+  let runnerCalls = 0;
+  const controller = new InlineTelegramStrategyRunController({
+    runner: {
+      async runOnce(): Promise<PositionGuardRunResult> {
+        runnerCalls += 1;
+        throw new Error("runner must not run after ownership loss");
+      },
+      async previewOnce(): Promise<PositionGuardPreviewResult> {
+        throw new Error("preview is not used by requestRun");
+      },
+    },
+    candidateBtcRunPreparation: {
+      async prepare(): Promise<never> {
+        preparationCalls += 1;
+        throw new Error("preparation must not run after ownership loss");
+      },
+    },
+    runtimeOwnership: createLostRuntimeOwnershipAuthority(),
+  });
+
+  await assert.rejects(
+    () => controller.requestRun({
+      exchangeAccountId: "primary",
+      market: "KRW-BTC",
+      requestedBy: "TELEGRAM",
+      requestedCommand: "/run",
+    }),
+    /RUNTIME_OWNERSHIP_LOST/u,
+  );
+
+  assert.equal(preparationCalls, 0);
+  assert.equal(runnerCalls, 0);
+});
+
+test("strategy run controller rethrows ownership loss from an active runner", async () => {
+  const ownership = createOwnedThenLostRuntimeOwnershipAuthority();
+  const controller = new InlineTelegramStrategyRunController({
+    runner: {
+      async runOnce(): Promise<never> {
+        ownership.lose();
+        throw ownership.lossError;
+      },
+      async previewOnce(): Promise<never> {
+        throw new Error("preview is not used by requestRun");
+      },
+    },
+    runtimeOwnership: ownership.authority,
+  });
+
+  await assert.rejects(
+    () => controller.requestRun({
+      exchangeAccountId: "primary",
+      market: "KRW-ETH",
+      requestedBy: "TELEGRAM",
+      requestedCommand: "/run",
+    }),
+    (error) => error === ownership.lossError,
+  );
+});
+
+function createOwnedThenLostRuntimeOwnershipAuthority(): {
+  authority: RuntimeOwnershipAuthority;
+  lose(): void;
+  lossError: RuntimeOwnershipGuardError;
+} {
+  let held = true;
+  const lossError = new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_LOST",
+    "RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED",
+  );
+  return {
+    lossError,
+    lose() {
+      held = false;
+    },
+    authority: {
+      snapshot: () => ({
+        status: held ? "OWNED" : "LOST",
+        generation: 1,
+        executionMode: "DRY_RUN",
+        acquiredAtEpochMs: 1,
+        heartbeatAtEpochMs: 1,
+        expiresAtEpochMs: 45_001,
+        takeover: false,
+        lossReason: held ? null : "TEST_GENERATION_REPLACED",
+      }),
+      assertLocallyHeld() {
+        if (!held) throw lossError;
+      },
+      async assertCurrent() {
+        if (!held) throw lossError;
+        return {
+          ownerToken: "owner".padEnd(64, "x"),
+          generation: 1,
+          executionMode: "DRY_RUN",
+          acquiredAtEpochMs: 1,
+          heartbeatAtEpochMs: 1,
+          expiresAtEpochMs: 45_001,
+        };
+      },
+    },
+  };
+}
 
 test("manual strategy run preflight blocks before runner execution", async () => {
   let runOnceCalled = false;

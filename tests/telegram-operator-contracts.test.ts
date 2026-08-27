@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+
+import { buildRuntimeOwnershipBanner } from "../src/index.js";
+import type { RuntimeOwnershipSnapshot } from "../src/app/runtime-ownership-guard.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -42,6 +45,132 @@ import type {
   TelegramSyncResult,
 } from "../src/modules/telegram/interfaces.js";
 import { test } from "./harness.js";
+
+test("startup banner exposes runtime ownership health without secret scope identifiers", () => {
+  const snapshot = {
+    status: "OWNED",
+    generation: 4,
+    executionMode: "LIVE",
+    acquiredAtEpochMs: 1_785_000_000_000,
+    heartbeatAtEpochMs: 1_785_000_010_000,
+    expiresAtEpochMs: 1_785_000_055_000,
+    takeover: false,
+    lossReason: null,
+    ownerToken: "owner-token-must-not-render",
+    canonicalDatabasePath: "C:\\secrets\\runtime.sqlite",
+    scopeDigest: "scope-digest-must-not-render",
+    namedPipeName: "\\\\.\\pipe\\autotrade-upbit-runtime-secret",
+    keyFingerprint: "key-fingerprint-must-not-render",
+  } as RuntimeOwnershipSnapshot;
+
+  const banner = buildRuntimeOwnershipBanner(snapshot, 1_785_000_015_000);
+  const rendered = JSON.stringify(banner);
+
+  assert.deepEqual(banner, {
+    status: "OWNED",
+    generation: 4,
+    executionMode: "LIVE",
+    heartbeatAtEpochMs: 1_785_000_010_000,
+    heartbeatAgeMs: 5_000,
+    heartbeatIntervalMs: 10_000,
+    ttlMs: 45_000,
+    takeover: false,
+    lossReason: null,
+  });
+  assert.doesNotMatch(rendered, /owner-token-must-not-render|runtime\.sqlite|scope-digest-must-not-render|autotrade-upbit-runtime-secret|key-fingerprint-must-not-render/u);
+});
+
+test("startup banner covers owned lost and unavailable ownership without secret scope identifiers", () => {
+  const cases = [
+    {
+      status: "OWNED",
+      snapshotStatus: "OWNED",
+      generation: 4,
+      executionMode: "LIVE",
+      heartbeatAtEpochMs: 1_785_000_010_000,
+      heartbeatAgeMs: 5_000,
+      takeover: false,
+      reason: null,
+    },
+    {
+      status: "LOST",
+      snapshotStatus: "LOST",
+      generation: 5,
+      executionMode: "DRY_RUN",
+      heartbeatAtEpochMs: 1_785_000_010_000,
+      heartbeatAgeMs: 5_000,
+      takeover: true,
+      reason: "PERSISTED_OWNERSHIP_MISMATCH",
+    },
+    {
+      status: "UNAVAILABLE",
+      snapshotStatus: "UNOWNED",
+      generation: null,
+      executionMode: null,
+      heartbeatAtEpochMs: null,
+      heartbeatAgeMs: null,
+      takeover: false,
+      reason: null,
+    },
+  ] as const;
+
+  for (const ownership of cases) {
+    const snapshot = {
+      status: ownership.snapshotStatus,
+      generation: ownership.generation,
+      executionMode: ownership.executionMode,
+      acquiredAtEpochMs: ownership.generation === null ? null : 1_785_000_000_000,
+      heartbeatAtEpochMs: ownership.heartbeatAtEpochMs,
+      expiresAtEpochMs: ownership.generation === null ? null : 1_785_000_055_000,
+      takeover: ownership.takeover,
+      lossReason: ownership.reason,
+      ownerToken: `${ownership.status}-banner-owner-token-canary`,
+      canonicalDatabasePath: `C:\\${ownership.status}\\runtime.sqlite`,
+      scopeDigest: `${ownership.status}-banner-scope-digest-canary`,
+      namedPipeName: `\\\\.\\pipe\\${ownership.status}-banner-runtime-canary`,
+      keyFingerprint: `${ownership.status}-banner-key-fingerprint-canary`,
+    } as RuntimeOwnershipSnapshot;
+    const banner = buildRuntimeOwnershipBanner(snapshot, 1_785_000_015_000);
+
+    assert.equal(banner.status, ownership.status);
+    assert.equal(banner.generation, ownership.generation);
+    assert.equal(banner.executionMode, ownership.executionMode);
+    assert.equal(banner.heartbeatAtEpochMs, ownership.heartbeatAtEpochMs);
+    assert.equal(banner.heartbeatAgeMs, ownership.heartbeatAgeMs);
+    assert.equal(banner.takeover, ownership.takeover);
+    assert.equal(banner.lossReason, ownership.reason);
+    assert.doesNotMatch(JSON.stringify(banner), /banner-owner-token-canary|runtime\.sqlite|banner-scope-digest-canary|banner-runtime-canary|banner-key-fingerprint-canary/u);
+  }
+});
+
+test("runtime ownership documentation distinguishes scoped mutable smokes from provably read-only tools", () => {
+  const root = process.cwd();
+  const readme = readFileSync(join(root, "README.md"), "utf8");
+  const design = readFileSync(
+    join(root, "docs", "superpowers", "specs", "2026-08-26-runtime-single-ownership-design.md"),
+    "utf8",
+  );
+
+  for (const document of [readme, design]) {
+    assert.match(document, /mutable or composed smoke.*process.*persisted runtime(?:-control)? ownership/isu);
+    assert.match(document, /contend with an existing owner/iu);
+  }
+  assert.doesNotMatch(design, /read-only report and smoke commands do not acquire ownership/iu);
+});
+
+test("mandatory docs distinguish dry-run smoke business safety from runtime-control ownership", () => {
+  const root = process.cwd();
+  const documents = ["README.md", "ARCHITECTURE.md", "RISK_POLICY.md"].map((path) =>
+    readFileSync(join(root, path), "utf8"),
+  );
+
+  for (const document of documents) {
+    assert.match(
+      document,
+      /DRY_RUN readiness and completion smokes make no trading or business-state mutation while acquiring and releasing process plus persisted runtime-control ownership evidence; each contends with an existing owner/iu,
+    );
+  }
+});
 
 test("formatter remains a re-export-only compatibility facade", () => {
   const formatterSource = readFileSync(

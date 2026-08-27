@@ -1,7 +1,12 @@
 import { pathToFileURL } from "node:url";
 
 import { createApp } from "../app/create-app.js";
-import type { AppConfig } from "../app/env.js";
+import { loadAppConfig, type AppConfig } from "../app/env.js";
+import type { RuntimeOwnershipAuthority } from "../app/runtime-ownership-guard.js";
+import {
+  runWithScopedRuntimeOwnership,
+  stopScopedApplicationRuntime,
+} from "../app/scoped-runtime-ownership.js";
 import {
   SUPPORTED_MARKETS,
   type ExecutionStateRecord,
@@ -161,6 +166,15 @@ export interface DryRunCompletionSmokeResult {
   readonly checks: DryRunCompletionSmokeCheck[];
 }
 
+export interface DryRunCompletionSmokeOperations {
+  loadAppConfig(): AppConfig;
+  createApplication(
+    config: AppConfig,
+    overrides: { readonly runtimeOwnershipAuthority: RuntimeOwnershipAuthority },
+  ): ReturnType<typeof createApp>;
+  runWithScopedRuntimeOwnership: typeof runWithScopedRuntimeOwnership;
+}
+
 export function applyDryRunCompletionSmokeSafetyEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): DryRunCompletionSmokeEnvReport {
@@ -221,17 +235,27 @@ export function validateDryRunCompletionSmokeSafety(input: {
   return blockers;
 }
 
-export async function runDryRunCompletionSmoke(): Promise<DryRunCompletionSmokeResult> {
+export async function runDryRunCompletionSmoke(
+  overrides: Partial<DryRunCompletionSmokeOperations> = {},
+): Promise<DryRunCompletionSmokeResult> {
   const safetyEnv = applyDryRunCompletionSmokeSafetyEnv();
-  const app = createApp();
+  const config = (overrides.loadAppConfig ?? loadAppConfig)();
+  const createApplication = overrides.createApplication ?? ((appConfig, appOverrides) =>
+    createApp(appConfig, appOverrides));
+  const runOwned = overrides.runWithScopedRuntimeOwnership ?? runWithScopedRuntimeOwnership;
 
-  try {
-    return await buildDryRunCompletionSmokeResult(app, safetyEnv);
-  } finally {
-    app.telegramInboundPolling.stop();
-    app.strategyScheduler.stop();
-    app.persistence.close();
-  }
+  return runOwned(config, async (
+    runtimeOwnershipAuthority,
+    verifiedConfig,
+    fenceApplication,
+  ) => {
+    const app = createApplication(verifiedConfig, { runtimeOwnershipAuthority });
+    try {
+      return await buildDryRunCompletionSmokeResult(app, safetyEnv);
+    } finally {
+      await stopScopedApplicationRuntime(app, fenceApplication);
+    }
+  });
 }
 
 export async function buildDryRunCompletionSmokeResult(

@@ -71,12 +71,20 @@ import type {
   PersistUncertainSubmissionInput,
   TelegramInboundOffsetStore,
 } from "../interfaces.js";
-import type { SqliteBootstrapOptions, SqlitePersistenceBundle } from "./contracts.js";
+import type {
+  SqliteBootstrapOptions,
+  SqlitePersistenceBundle,
+  SqliteRuntimeOwnershipBundle,
+} from "./contracts.js";
 import { fromSqliteBoolean, parseJson, stringifyJson, toSqliteBoolean } from "./sqlite-shapes.js";
-import { openSqliteDatabase } from "./sqlite-database.js";
+import {
+  openSqliteDatabase,
+  type SqliteDatabaseOpenVerification,
+} from "./sqlite-database.js";
 import { createId } from "../../../shared/ids.js";
 import { SqliteAccountExecutionLeaseStore } from "./sqlite-account-execution-lease-store.js";
 import { SqliteCandidatePilotRepository } from "./sqlite-candidate-pilot-repository.js";
+import { SqliteRuntimeOwnershipStore } from "./sqlite-runtime-ownership-store.js";
 import { withImmediateTransaction } from "./sqlite-transaction.js";
 import {
   validateCandidateBoundOrderIntent,
@@ -163,8 +171,11 @@ interface SqliteCandidateBindingAuthorityRow {
   created_at: string;
 }
 
-export function createSqlitePersistence(options: SqliteBootstrapOptions): SqlitePersistenceBundle {
-  const handle = openSqliteDatabase(options.databasePath);
+export function createSqlitePersistence(
+  options: SqliteBootstrapOptions,
+  databaseOpenVerification?: SqliteDatabaseOpenVerification,
+): SqlitePersistenceBundle {
+  const handle = openSqliteDatabase(options.databasePath, databaseOpenVerification);
   const repositories = new SqliteExecutionRepository(handle.db);
   const candidatePilots = new SqliteCandidatePilotRepository(handle.db);
   const accountExecutionLeases = new SqliteAccountExecutionLeaseStore(handle.db);
@@ -231,6 +242,20 @@ export function createSqlitePersistence(options: SqliteBootstrapOptions): Sqlite
     accountExecutionLeases,
     operatorState: new SqliteOperatorStateStore(handle.db, options.exchangeAccountId),
     telegramInboundOffsets,
+    close() {
+      handle.close();
+    },
+  };
+}
+
+export function createSqliteRuntimeOwnershipPersistence(
+  databasePath: string,
+  scopeKey: string,
+  databaseOpenVerification?: SqliteDatabaseOpenVerification,
+): SqliteRuntimeOwnershipBundle {
+  const handle = openSqliteDatabase(databasePath, databaseOpenVerification);
+  return {
+    runtimeOwnership: new SqliteRuntimeOwnershipStore(handle.db, scopeKey),
     close() {
       handle.close();
     },

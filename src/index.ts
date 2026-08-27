@@ -1,15 +1,40 @@
 import { fileURLToPath } from "node:url";
 
-import { createApp, type AppServices } from "./app/create-app.js";
-import { loadAppConfig } from "./app/env.js";
-import { verifyLiveDatabaseIdentity } from "./app/live-database-identity.js";
+import { createApp, type AppServices, type CreateAppOverrides } from "./app/create-app.js";
+import { loadAppConfig, type AppConfig } from "./app/env.js";
+import {
+  createRuntimeOwnershipContext,
+  verifyAndResolveRuntimeDatabase,
+  type RuntimeOwnershipContext,
+  type VerifiedRuntimeDatabase,
+} from "./app/runtime-ownership-context.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+  type RuntimeOwnershipSnapshot,
+} from "./app/runtime-ownership-guard.js";
+import {
+  RUNTIME_HEARTBEAT_INTERVAL_MS,
+  RUNTIME_OWNERSHIP_TTL_MS,
+} from "./app/runtime-heartbeat.js";
+import {
+  acquireRuntimeProcessLock,
+  type RuntimeProcessLock,
+} from "./app/runtime-process-lock.js";
 import {
   hasBackgroundRuntime,
   createRuntimeShutdown,
+  installRuntimeOwnershipLossHandler,
   installRuntimeSignalHandlers,
   runRuntimeStartupGate,
+  type RuntimeOwnershipLossSource,
+  type RuntimeShutdown,
 } from "./app/runtime-lifecycle.js";
 import { buildStrategySchedulerStartupPreflight } from "./app/scheduler-preflight.js";
+import {
+  runWithScopedRuntimeOwnership,
+  stopScopedApplicationRuntime,
+} from "./app/scoped-runtime-ownership.js";
 import { applyStartupRecoveryPolicy, runStartupRecovery } from "./app/startup-recovery.js";
 import { detectExecutionStateSeedMismatches } from "./modules/db/interfaces.js";
 import type { TelegramCommandMenuSetupResult } from "./modules/telegram/setup.js";
@@ -28,25 +53,89 @@ export interface AppStartupOperations {
   readonly installRuntimeSignalHandlers?: typeof installRuntimeSignalHandlers;
   readonly startTelegramRuntime?: typeof startTelegramRuntime;
   readonly writeBanner?: (banner: unknown) => void;
+  readonly runtimeOwnership?: RuntimeOwnershipContext;
+}
+
+export interface RunMainOperations {
+  loadAppConfig(): AppConfig;
+  verifyAndResolveRuntimeDatabase(config: AppConfig): VerifiedRuntimeDatabase;
+  acquireRuntimeProcessLock(
+    identity: VerifiedRuntimeDatabase["lockIdentity"],
+  ): Promise<RuntimeProcessLock>;
+  createRuntimeOwnershipContext(input: {
+    readonly executionMode: AppConfig["executionMode"];
+    readonly verifiedDatabase: VerifiedRuntimeDatabase;
+    readonly processLock: RuntimeProcessLock;
+  }): Promise<RuntimeOwnershipContext>;
+  createApp(
+    config: AppConfig,
+    overrides: CreateAppOverrides & {
+      readonly runtimeOwnershipAuthority: RuntimeOwnershipContext["guard"];
+    },
+  ): AppServices;
+  runAppStartup(app: AppServices, operations: AppStartupOperations): Promise<void>;
+}
+
+export interface CreateVerifiedApplicationOperations {
+  loadAppConfig(): AppConfig;
+  createApp(
+    config: AppConfig,
+    overrides: CreateAppOverrides & {
+      readonly runtimeOwnershipAuthority: RuntimeOwnershipAuthority;
+    },
+  ): AppServices;
+  runWithScopedRuntimeOwnership: typeof runWithScopedRuntimeOwnership;
+}
+
+export function buildRuntimeOwnershipBanner(
+  snapshot: RuntimeOwnershipSnapshot | null | undefined,
+  nowEpochMs: number,
+): Readonly<{
+  status: "OWNED" | "LOST" | "UNAVAILABLE";
+  generation: number | null;
+  executionMode: RuntimeOwnershipSnapshot["executionMode"];
+  heartbeatAtEpochMs: number | null;
+  heartbeatAgeMs: number | null;
+  heartbeatIntervalMs: number;
+  ttlMs: number;
+  takeover: boolean;
+  lossReason: string | null;
+}> {
+  const heartbeatAtEpochMs = snapshot?.heartbeatAtEpochMs ?? null;
+  const heartbeatAgeMs = heartbeatAtEpochMs === null || !Number.isSafeInteger(nowEpochMs)
+    ? null
+    : Math.max(0, nowEpochMs - heartbeatAtEpochMs);
+  return {
+    status: snapshot?.status === "OWNED" ? "OWNED" : snapshot?.status === "LOST" ? "LOST" : "UNAVAILABLE",
+    generation: snapshot?.generation ?? null,
+    executionMode: snapshot?.executionMode ?? null,
+    heartbeatAtEpochMs,
+    heartbeatAgeMs,
+    heartbeatIntervalMs: RUNTIME_HEARTBEAT_INTERVAL_MS,
+    ttlMs: RUNTIME_OWNERSHIP_TTL_MS,
+    takeover: snapshot?.takeover ?? false,
+    lossReason: snapshot?.lossReason ?? null,
+  };
 }
 
 export async function startTelegramRuntime(input: {
   strategyScheduler: {
-    start(): { readonly started: boolean };
+    start(onRuntimeOwnershipLost?: (error: unknown) => void): { readonly started: boolean };
     reportStartupBlockIfNeeded(): Promise<boolean>;
   };
   telegramInboundPolling: {
-    start(): { readonly running: boolean };
+    start(onRuntimeOwnershipLost?: (error: unknown) => void): { readonly running: boolean };
   };
+  onRuntimeOwnershipLost?: (error: unknown) => void;
   installRuntimeSignalHandlers(): void;
   telegramCommandMenuSetup: {
     setup(): Promise<TelegramCommandMenuSetupResult>;
   };
 }): Promise<TelegramRuntimeStartupResult> {
-  const strategySchedulerStatus = input.strategyScheduler.start();
+  const strategySchedulerStatus = input.strategyScheduler.start(input.onRuntimeOwnershipLost);
   const strategySchedulerStartupBlockNotified =
     await input.strategyScheduler.reportStartupBlockIfNeeded();
-  const telegramInboundPollingStatus = input.telegramInboundPolling.start();
+  const telegramInboundPollingStatus = input.telegramInboundPolling.start(input.onRuntimeOwnershipLost);
   if (hasBackgroundRuntime({
     strategyScheduler: strategySchedulerStatus,
     telegramInboundPolling: telegramInboundPollingStatus,
@@ -78,11 +167,26 @@ export async function runAppStartup(
   const writeBanner = operations.writeBanner ?? ((banner: unknown) => {
     console.log(JSON.stringify(banner, null, 2));
   });
-  const runtimeShutdown = createRuntimeShutdown(app);
+  const appOnlyShutdown = operations.runtimeOwnership
+    ? null
+    : createRuntimeShutdown(app);
+  const runtimeShutdown: RuntimeShutdown = operations.runtimeOwnership
+    ? createRuntimeShutdown(app, operations.runtimeOwnership)
+    : async () => appOnlyShutdown!();
+  const ownershipLossSource = resolveOwnershipLossSource(operations.runtimeOwnership);
+  if (operations.runtimeOwnership) {
+    app.telegramRouter.setRuntimeOwnershipSnapshotProvider(() => operations.runtimeOwnership!.snapshot());
+  }
+  if (ownershipLossSource) {
+    installRuntimeOwnershipLossHandler({
+      shutdown: runtimeShutdown,
+      ownershipLossSource,
+    });
+  }
 
   await runRuntimeStartupGate({
     initializer: app.candidatePilotStartupAuthority,
-    shutdown: runtimeShutdown,
+    shutdown: () => runtimeShutdown("STARTUP_FAILED"),
     continueStartup: async () => {
   await app.candidatePilotStartupRecovery?.prepareAndRecover();
   const startupRecovery = await runStartupRecoveryOperation({
@@ -121,6 +225,7 @@ export async function runAppStartup(
   try {
     notificationDeliverySummary = await app.notificationDelivery.deliverPending("primary");
   } catch (error) {
+    if (isRuntimeOwnershipFailure(error)) throw error;
     notificationDeliverySummary = {
       attempted: 0,
       sent: 0,
@@ -149,8 +254,11 @@ export async function runAppStartup(
     telegramInboundPolling: app.telegramInboundPolling,
     installRuntimeSignalHandlers: () => installRuntimeSignalHandlersOperation({
       app,
-      shutdown: runtimeShutdown,
+      shutdown: (reason) => runtimeShutdown(reason ?? "RUNTIME_SHUTDOWN"),
     }),
+    onRuntimeOwnershipLost: () => {
+      void runtimeShutdown("RUNTIME_OWNERSHIP_LOST").catch(() => undefined);
+    },
     telegramCommandMenuSetup: app.telegramCommandMenuSetup,
   });
   const {
@@ -182,7 +290,10 @@ export async function runAppStartup(
     liveSendPath: app.liveSendPath,
     seedMismatches,
     upbitBaseUrl: app.config.upbitBaseUrl,
-    databasePath: app.config.databasePath,
+    runtimeOwnership: buildRuntimeOwnershipBanner(
+      operations.runtimeOwnership?.snapshot(),
+      Date.now(),
+    ),
     recoveryReader: app.exchangeBackedReadEnabled ? "UPBIT_PRIVATE_READER" : "DISABLED",
     reconciliationMaxOrderLookupsPerRun: app.config.reconciliationMaxOrderLookupsPerRun,
     reconciliationHistoryMaxPagesPerMarket: app.config.reconciliationHistoryMaxPagesPerMarket,
@@ -214,29 +325,89 @@ export async function runAppStartup(
   writeBanner(banner);
 
   if (!runtimeHasBackgroundWork) {
-    runtimeShutdown();
+    await runtimeShutdown("NO_BACKGROUND_RUNTIME");
   }
     },
   });
 }
 
-export async function runMain(
-  createApplication: () => AppServices = createVerifiedApplication,
-): Promise<void> {
-  const app = createApplication();
-  await runAppStartup(app);
+function isRuntimeOwnershipFailure(error: unknown): boolean {
+  return error instanceof RuntimeOwnershipGuardError ||
+    (error instanceof Error && /^RUNTIME_OWNERSHIP_(?:LOST|NOT_HELD):/u.test(error.message));
 }
 
-export function createVerifiedApplication(): AppServices {
-  const config = loadAppConfig();
-  verifyLiveDatabaseIdentity({
-    executionMode: config.executionMode,
-    databasePath: config.databasePath,
-    expectedDatabaseInstanceId: config.liveDatabaseInstanceId ?? null,
-    exchangeAccountId: "primary",
-    upbitAccessKey: process.env.UPBIT_ACCESS_KEY?.trim() || null,
+function resolveOwnershipLossSource(
+  runtimeOwnership: RuntimeOwnershipContext | undefined,
+): RuntimeOwnershipLossSource | undefined {
+  if (!runtimeOwnership) return undefined;
+  const guard = runtimeOwnership.guard as RuntimeOwnershipContext["guard"] &
+    Partial<RuntimeOwnershipLossSource>;
+  return typeof guard.onLost === "function"
+    ? guard as RuntimeOwnershipContext["guard"] & RuntimeOwnershipLossSource
+    : undefined;
+}
+
+export async function runMain(
+  overrides: Partial<RunMainOperations> = {},
+): Promise<void> {
+  const operations: RunMainOperations = {
+    loadAppConfig,
+    verifyAndResolveRuntimeDatabase,
+    acquireRuntimeProcessLock,
+    createRuntimeOwnershipContext,
+    createApp,
+    runAppStartup,
+    ...overrides,
+  };
+  const config = operations.loadAppConfig();
+  const verified = operations.verifyAndResolveRuntimeDatabase(config);
+  const verifiedConfig = { ...config, databasePath: verified.canonicalDatabasePath };
+  const processLock = await operations.acquireRuntimeProcessLock(verified.lockIdentity);
+  const ownership = await operations.createRuntimeOwnershipContext({
+    executionMode: verifiedConfig.executionMode,
+    verifiedDatabase: verified,
+    processLock,
   });
-  return createApp(config);
+  try {
+    const app = operations.createApp(verifiedConfig, {
+      runtimeOwnershipAuthority: ownership.guard,
+      ...(verified.databaseOpenVerification
+        ? { databaseOpenVerification: verified.databaseOpenVerification }
+        : {}),
+    });
+    await operations.runAppStartup(app, { runtimeOwnership: ownership });
+  } catch (error) {
+    await ownership.shutdownAfterStartupFailure();
+    throw error;
+  }
+}
+
+export async function createVerifiedApplication<T>(
+  useApplication: (app: AppServices) => Promise<T>,
+  overrides: Partial<CreateVerifiedApplicationOperations> = {},
+): Promise<T> {
+  const config = (overrides.loadAppConfig ?? loadAppConfig)();
+  const createApplication = overrides.createApp ?? createApp;
+  const runOwned = overrides.runWithScopedRuntimeOwnership ?? runWithScopedRuntimeOwnership;
+
+  return runOwned(config, async (
+    runtimeOwnershipAuthority,
+    verifiedConfig,
+    fenceApplication,
+    verifiedDatabase,
+  ) => {
+    const app = createApplication(verifiedConfig, {
+      runtimeOwnershipAuthority,
+      ...(verifiedDatabase.databaseOpenVerification
+        ? { databaseOpenVerification: verifiedDatabase.databaseOpenVerification }
+        : {}),
+    });
+    try {
+      return await useApplication(app);
+    } finally {
+      await stopScopedApplicationRuntime(app, fenceApplication);
+    }
+  });
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

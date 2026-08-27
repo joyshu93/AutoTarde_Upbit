@@ -1,5 +1,3 @@
-import { DatabaseSync } from "node:sqlite";
-
 import type { AppConfig } from "../app/env.js";
 import { loadAppConfig } from "../app/env.js";
 import { verifyLiveDatabaseIdentity } from "../app/live-database-identity.js";
@@ -7,6 +5,7 @@ import {
   SqliteExecutionRepository,
   SqliteOperatorStateStore,
 } from "../modules/db/repositories/sqlite-repositories.js";
+import { openReadOnlySqliteDatabase } from "../modules/db/repositories/sqlite-database.js";
 
 export interface LiveReadOnlyContext {
   config: AppConfig;
@@ -28,7 +27,7 @@ export function openLiveReadOnlyContext(
   }
   const accessKey = env.UPBIT_ACCESS_KEY?.trim() || null;
   const secretKey = env.UPBIT_SECRET_KEY?.trim() || null;
-  verifyLiveDatabaseIdentity({
+  const verification = verifyLiveDatabaseIdentity({
     executionMode: config.executionMode,
     databasePath: config.databasePath,
     expectedDatabaseInstanceId: config.liveDatabaseInstanceId ?? null,
@@ -36,7 +35,13 @@ export function openLiveReadOnlyContext(
     upbitAccessKey: accessKey,
   });
 
-  const db = new DatabaseSync(config.databasePath, { readOnly: true });
+  if (verification.status !== "VERIFIED") {
+    throw new Error("Read-only LIVE inspection requires verified LIVE database identity.");
+  }
+  const db = openReadOnlySqliteDatabase(
+    verification.canonicalDatabasePath,
+    verification.databaseOpenVerification,
+  );
   const exchangeBackedReadEnabled = Boolean(accessKey && secretKey);
   return {
     config,

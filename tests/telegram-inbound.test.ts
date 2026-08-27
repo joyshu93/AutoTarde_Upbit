@@ -1,13 +1,586 @@
 import assert from "node:assert/strict";
 
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../src/app/runtime-ownership-guard.js";
 import type { TelegramInboundOffsetRecord } from "../src/domain/types.js";
 import {
   splitTelegramReplyText,
   TelegramBotUpdateClient,
-  TelegramInboundPollingService,
+  TelegramInboundPollingService as ProductionTelegramInboundPollingService,
   type TelegramInboundUpdate,
 } from "../src/modules/telegram/inbound.js";
 import { test } from "./harness.js";
+
+class TelegramInboundPollingService extends ProductionTelegramInboundPollingService {
+  constructor(dependencies: ConstructorParameters<typeof ProductionTelegramInboundPollingService>[0]) {
+    super({
+      ...dependencies,
+      runtimeOwnership: dependencies.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    });
+  }
+}
+
+test("telegram inbound fails closed when runtime authority is omitted", async () => {
+  let pollCalls = 0;
+  const service = new ProductionTelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        pollCalls += 1;
+        return [];
+      },
+    },
+    messageClient: { async sendMessage() {} },
+    router: { async route() { return { text: "unused" }; } },
+    operatorChatId: "123",
+  });
+
+  await assert.rejects(() => service.pollOnce(), /RUNTIME_OWNERSHIP_NOT_HELD/u);
+  assert.equal(pollCalls, 0);
+});
+
+test("telegram inbound start fails closed before installing a timer", () => {
+  let timerCalls = 0;
+  const service = new ProductionTelegramInboundPollingService({
+    enabled: true,
+    updateClient: { async getUpdates() { return []; } },
+    messageClient: { async sendMessage() {} },
+    router: { async route() { return { text: "unused" }; } },
+    operatorChatId: "123",
+    setTimer: () => {
+      timerCalls += 1;
+      return setTimeout(() => undefined, 60_000);
+    },
+  });
+
+  assert.throws(() => service.start(), /RUNTIME_OWNERSHIP_NOT_HELD/u);
+  assert.equal(timerCalls, 0);
+});
+
+test("scheduled inbound ownership loss routes once without unhandled rejection or repeat timer", async () => {
+  const ownership = createFreshLossRuntimeOwnershipAuthority();
+  const callbacks: Array<() => void> = [];
+  const routedErrors: unknown[] = [];
+  const unhandled: unknown[] = [];
+  let timerCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        ownership.lose();
+        return [];
+      },
+    },
+    messageClient: { async sendMessage() {} },
+    router: { async route() { return { text: "unused" }; } },
+    operatorChatId: "123",
+    runtimeOwnership: ownership.authority,
+    setTimer: (callback: () => void) => {
+      timerCalls += 1;
+      callbacks.push(callback);
+      const timer = setTimeout(() => undefined, 60_000);
+      clearTimeout(timer);
+      return timer;
+    },
+  });
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+
+  try {
+    (service.start as unknown as (onOwnershipLost: (error: unknown) => void) => unknown)(
+      (error) => routedErrors.push(error),
+    );
+    callbacks[0]?.();
+    await waitForUnhandledTurn();
+
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(routedErrors, [ownership.errors[0]]);
+    assert.equal(timerCalls, 1);
+    assert.equal(service.getStatus().running, false);
+    assert.equal(service.getStatus().failedCount, 0);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    service.stop();
+  }
+});
+
+test("scheduled reply rejection after ownership loss routes the exact loss once without retry", async () => {
+  const ownership = createFreshLossRuntimeOwnershipAuthority();
+  const callbacks: Array<() => void> = [];
+  const routedErrors: unknown[] = [];
+  const unhandled: unknown[] = [];
+  let timerCalls = 0;
+  let sendCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        return [createUpdate(1, "123", "/status")];
+      },
+    },
+    messageClient: {
+      async sendMessage() {
+        sendCalls += 1;
+        ownership.lose();
+        throw new Error("ordinary_send_rejection");
+      },
+    },
+    router: { async route() { return { text: "single reply" }; } },
+    operatorChatId: "123",
+    runtimeOwnership: ownership.authority,
+    setTimer: (callback: () => void) => {
+      timerCalls += 1;
+      callbacks.push(callback);
+      const timer = setTimeout(() => undefined, 60_000);
+      clearTimeout(timer);
+      return timer;
+    },
+  });
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+
+  try {
+    service.start((error) => routedErrors.push(error));
+    callbacks[0]?.();
+    await waitForUnhandledTurn();
+
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(routedErrors, [ownership.errors[0]]);
+    assert.equal(sendCalls, 1);
+    assert.equal(timerCalls, 1);
+    assert.equal(service.getStatus().running, false);
+    assert.equal(service.getStatus().failedCount, 0);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    service.stop();
+  }
+});
+
+test("scheduled callback edit rejection after ownership loss routes the exact loss once without retry", async () => {
+  const ownership = createFreshLossRuntimeOwnershipAuthority();
+  const callbacks: Array<() => void> = [];
+  const routedErrors: unknown[] = [];
+  const unhandled: unknown[] = [];
+  let timerCalls = 0;
+  let acknowledgementCalls = 0;
+  let editCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        return [createCallbackUpdate(1, {
+          callbackId: "callback-edit-rejection-loss",
+          senderId: "123",
+          chatId: "123",
+          messageId: 10,
+          data: "status:refresh",
+        })];
+      },
+    },
+    messageClient: {
+      async sendMessage() {},
+      async answerCallbackQuery() {
+        acknowledgementCalls += 1;
+      },
+      async editMessageText() {
+        editCalls += 1;
+        ownership.lose();
+        throw new Error("ordinary_edit_rejection");
+      },
+    },
+    router: {
+      async route() { return { text: "unused" }; },
+      async routeReadOnlyCallback() { return { text: "read-only callback" }; },
+    },
+    operatorChatId: "123",
+    runtimeOwnership: ownership.authority,
+    setTimer: (callback: () => void) => {
+      timerCalls += 1;
+      callbacks.push(callback);
+      const timer = setTimeout(() => undefined, 60_000);
+      clearTimeout(timer);
+      return timer;
+    },
+  } as unknown as ConstructorParameters<typeof TelegramInboundPollingService>[0]);
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+
+  try {
+    service.start((error) => routedErrors.push(error));
+    callbacks[0]?.();
+    await waitForUnhandledTurn();
+
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(routedErrors, [ownership.errors[0]]);
+    assert.equal(acknowledgementCalls, 1);
+    assert.equal(editCalls, 1);
+    assert.equal(timerCalls, 1);
+    assert.equal(service.getStatus().running, false);
+    assert.equal(service.getStatus().failedCount, 0);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    service.stop();
+  }
+});
+
+test("telegram inbound rejects all routing and responses after runtime ownership is lost", async () => {
+  let pollCalls = 0;
+  let routeCalls = 0;
+  let sendCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        pollCalls += 1;
+        return [createUpdate(1, "123", "/status")];
+      },
+    },
+    messageClient: {
+      async sendMessage() {
+        sendCalls += 1;
+      },
+    },
+    router: {
+      async route() {
+        routeCalls += 1;
+        return { text: "read-only status" };
+      },
+    },
+    operatorChatId: "123",
+    runtimeOwnership: createLostRuntimeOwnershipAuthority(),
+  });
+  service.stop();
+
+  await assert.rejects(() => service.pollOnce(), /RUNTIME_OWNERSHIP_LOST/u);
+
+  assert.equal(pollCalls, 0);
+  assert.equal(routeCalls, 0);
+  assert.equal(sendCalls, 0);
+});
+
+test("telegram inbound propagates ownership loss while a read-only route is awaiting", async () => {
+  const runtimeOwnership = createControllableRuntimeOwnershipAuthority();
+  let sendCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        return [createUpdate(1, "123", "/status")];
+      },
+    },
+    messageClient: {
+      async sendMessage() {
+        sendCalls += 1;
+      },
+    },
+    router: {
+      async route() {
+        runtimeOwnership.lose();
+        return { text: "stale read-only status" };
+      },
+    },
+    operatorChatId: "123",
+    runtimeOwnership,
+  });
+
+  await assert.rejects(() => service.pollOnce(), /RUNTIME_OWNERSHIP_LOST/u);
+
+  assert.equal(sendCalls, 0);
+});
+
+test("telegram inbound persists no offset when ownership is lost during polling", async () => {
+  const runtimeOwnership = createControllableRuntimeOwnershipAuthority();
+  const savedOffsets: TelegramInboundOffsetRecord[] = [];
+  let routeCalls = 0;
+  let sendCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        runtimeOwnership.lose();
+        return [createUpdate(1, "123", "/pause")];
+      },
+    },
+    messageClient: {
+      async sendMessage() {
+        sendCalls += 1;
+      },
+    },
+    router: {
+      async route() {
+        routeCalls += 1;
+        return { text: "stale mutation result" };
+      },
+    },
+    operatorChatId: "123",
+    exchangeAccountId: "primary",
+    offsetStore: createOffsetStore({ savedOffsets }),
+    botTokenRef: "sha256:runtime-loss",
+    runtimeOwnership,
+  });
+
+  await assert.rejects(() => service.pollOnce(), /RUNTIME_OWNERSHIP_LOST/u);
+
+  assert.deepEqual(savedOffsets, []);
+  assert.equal(routeCalls, 0);
+  assert.equal(sendCalls, 0);
+});
+
+test("telegram inbound rejects before getUpdates when ownership is lost during durable offset loading", async () => {
+  const ownership = createFreshLossRuntimeOwnershipAuthority();
+  let getUpdatesCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        getUpdatesCalls += 1;
+        return [];
+      },
+    },
+    messageClient: { async sendMessage() {} },
+    router: { async route() { return { text: "unused" }; } },
+    operatorChatId: "123",
+    exchangeAccountId: "primary",
+    offsetStore: {
+      async getTelegramInboundOffset() {
+        ownership.lose();
+        return null;
+      },
+      async saveTelegramInboundOffset() {
+        throw new Error("offset save must not run");
+      },
+    },
+    botTokenRef: "sha256:offset-load-loss",
+    runtimeOwnership: ownership.authority,
+  });
+
+  await assert.rejects(() => service.pollOnce(), (error) => error === ownership.errors[0]);
+  assert.equal(getUpdatesCalls, 0);
+});
+
+test("telegram inbound rejects an empty getUpdates result when ownership is lost while polling", async () => {
+  const ownership = createFreshLossRuntimeOwnershipAuthority();
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        ownership.lose();
+        return [];
+      },
+    },
+    messageClient: { async sendMessage() {} },
+    router: { async route() { return { text: "unused" }; } },
+    operatorChatId: "123",
+    runtimeOwnership: ownership.authority,
+  });
+
+  await assert.rejects(() => service.pollOnce(), (error) => error === ownership.errors[0]);
+  assert.equal(service.getStatus().failedCount, 0);
+});
+
+test("telegram inbound replaces a transport rejection with the exact ownership error after mid-poll loss", async () => {
+  const ownership = createFreshLossRuntimeOwnershipAuthority();
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        ownership.lose();
+        throw new Error("telegram_transport_failed");
+      },
+    },
+    messageClient: { async sendMessage() {} },
+    router: { async route() { return { text: "unused" }; } },
+    operatorChatId: "123",
+    runtimeOwnership: ownership.authority,
+  });
+
+  await assert.rejects(() => service.pollOnce(), (error) => error === ownership.errors[0]);
+  assert.equal(service.getStatus().failedCount, 0);
+});
+
+test("telegram inbound rejects when ownership is lost while a reply send settles", async () => {
+  const ownership = createFreshLossRuntimeOwnershipAuthority();
+  let sendCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        return [createUpdate(1, "123", "/status")];
+      },
+    },
+    messageClient: {
+      async sendMessage() {
+        sendCalls += 1;
+        ownership.lose();
+      },
+    },
+    router: {
+      async route() {
+        return { text: "single reply" };
+      },
+    },
+    operatorChatId: "123",
+    runtimeOwnership: ownership.authority,
+  } as unknown as ConstructorParameters<typeof TelegramInboundPollingService>[0]);
+
+  await assert.rejects(() => service.pollOnce(), (error) => error === ownership.errors[0]);
+  assert.equal(sendCalls, 1);
+  assert.equal(service.getStatus().processedCount, 0);
+  assert.equal(service.getStatus().failedCount, 0);
+});
+
+test("telegram inbound rejects the exact ownership error when loss occurs while callback edit settles", async () => {
+  const ownership = createFreshLossRuntimeOwnershipAuthority();
+  let editCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        return [createCallbackUpdate(1, {
+          callbackId: "callback-runtime-loss",
+          senderId: "123",
+          chatId: "123",
+          messageId: 10,
+          data: "status:refresh",
+        })];
+      },
+    },
+    messageClient: {
+      async sendMessage() {},
+      async answerCallbackQuery() {},
+      async editMessageText() {
+        editCalls += 1;
+        ownership.lose();
+      },
+    },
+    router: {
+      async route() { return { text: "unused" }; },
+      async routeReadOnlyCallback() { return { text: "read-only callback" }; },
+    },
+    operatorChatId: "123",
+    runtimeOwnership: ownership.authority,
+  } as unknown as ConstructorParameters<typeof TelegramInboundPollingService>[0]);
+
+  await assert.rejects(() => service.pollOnce(), (error) => error === ownership.errors[0]);
+  assert.equal(editCalls, 1);
+  assert.equal(service.getStatus().processedCount, 0);
+  assert.equal(service.getStatus().failedCount, 0);
+});
+
+function createFreshLossRuntimeOwnershipAuthority(): {
+  authority: RuntimeOwnershipAuthority;
+  errors: RuntimeOwnershipGuardError[];
+  lose(): void;
+} {
+  let held = true;
+  const errors: RuntimeOwnershipGuardError[] = [];
+  return {
+    errors,
+    lose() {
+      held = false;
+    },
+    authority: {
+      snapshot: () => ({
+        status: held ? "OWNED" : "LOST",
+        generation: 1,
+        executionMode: "DRY_RUN",
+        acquiredAtEpochMs: 1,
+        heartbeatAtEpochMs: 1,
+        expiresAtEpochMs: 45_001,
+        takeover: false,
+        lossReason: held ? null : "TEST_GENERATION_REPLACED",
+      }),
+      assertLocallyHeld() {
+        if (!held) {
+          const error = new RuntimeOwnershipGuardError(
+            "RUNTIME_OWNERSHIP_LOST",
+            "RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED",
+          );
+          errors.push(error);
+          throw error;
+        }
+      },
+      async assertCurrent(): Promise<never> {
+        throw new Error("assertCurrent is not used by inbound routing");
+      },
+    },
+  };
+}
+
+function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "LOST",
+      generation: 1,
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 1,
+      heartbeatAtEpochMs: 1,
+      expiresAtEpochMs: 45_001,
+      takeover: false,
+      lossReason: "TEST_GENERATION_REPLACED",
+    }),
+    assertLocallyHeld() {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+    async assertCurrent(): Promise<never> {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+  };
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+  };
+}
+
+function createControllableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority & { lose(): void } {
+  let held = true;
+  return {
+    lose() {
+      held = false;
+    },
+    snapshot: () => ({
+      status: held ? "OWNED" : "LOST",
+      generation: 1,
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 1,
+      heartbeatAtEpochMs: 1,
+      expiresAtEpochMs: 45_001,
+      takeover: false,
+      lossReason: held ? null : "TEST_GENERATION_REPLACED",
+    }),
+    assertLocallyHeld() {
+      if (!held) throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+    async assertCurrent(): Promise<never> {
+      throw new Error("assertCurrent is not used by inbound routing");
+    },
+  };
+}
 
 test("telegram inbound polling stays skipped when disabled or not configured", async () => {
   const routed: string[] = [];
@@ -1006,6 +1579,87 @@ test("telegram inbound polling starts from a durable offset scoped by bot token 
   assert.equal(service.getStatus().offsetLoaded, true);
 });
 
+test("telegram inbound stopAndWait clears timers, rejects new work, and waits for the active poll", async () => {
+  const activePoll = createDeferred<TelegramInboundUpdate[]>();
+  let getUpdatesCalls = 0;
+  let clearTimerCalls = 0;
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        getUpdatesCalls += 1;
+        return activePoll.promise;
+      },
+    },
+    messageClient: {
+      async sendMessage() {},
+    },
+    router: {
+      async route() {
+        return { text: "unused" };
+      },
+    },
+    operatorChatId: "123",
+    pollIntervalMs: 60_000,
+    setTimer: () => setTimeout(() => undefined, 60_000),
+    clearTimer: (timer) => {
+      clearTimerCalls += 1;
+      clearTimeout(timer);
+    },
+  });
+
+  service.start();
+  const currentPoll = service.pollOnce();
+  await waitForMicrotasks();
+  let stopResolved = false;
+  const stopping = service.stopAndWait(1_000).then((status) => {
+    stopResolved = true;
+    return status;
+  });
+
+  assert.equal(clearTimerCalls, 1);
+  assert.equal(service.getStatus().running, true);
+  assert.throws(() => service.start(), /cannot start after stop/i);
+  await assert.rejects(() => service.pollOnce(), /cannot poll after stop/i);
+  assert.equal(getUpdatesCalls, 1);
+  assert.equal(stopResolved, false);
+
+  activePoll.resolve([]);
+  await currentPoll;
+  const status = await stopping;
+  assert.equal(status.running, false);
+});
+
+test("telegram inbound stopAndWait returns at its bound while the active poll remains visible", async () => {
+  const activePoll = createDeferred<TelegramInboundUpdate[]>();
+  const service = new TelegramInboundPollingService({
+    enabled: true,
+    updateClient: {
+      async getUpdates() {
+        return activePoll.promise;
+      },
+    },
+    messageClient: {
+      async sendMessage() {},
+    },
+    router: {
+      async route() {
+        return { text: "unused" };
+      },
+    },
+    operatorChatId: "123",
+  });
+
+  const currentPoll = service.pollOnce();
+  await waitForMicrotasks();
+  const status = await service.stopAndWait(0);
+
+  assert.equal(status.running, true);
+
+  activePoll.resolve([]);
+  await currentPoll;
+});
+
 test("telegram bot update client posts getUpdates payload and normalizes messages", async () => {
   const requests: Array<{ url: string; body: string }> = [];
   const client = new TelegramBotUpdateClient({
@@ -1166,4 +1820,21 @@ function createOffsetStore(input: {
       input.savedOffsets.push(record);
     },
   };
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+async function waitForMicrotasks(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function waitForUnhandledTurn(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
 }

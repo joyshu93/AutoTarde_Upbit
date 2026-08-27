@@ -72,11 +72,11 @@ Current remaining gaps:
 - Telegram delivery now coalesces kicks received while an inline worker is already running into a follow-up pass, so notifications created during an in-flight pass are delivered without waiting for an unrelated future alert
 - `/alerts` now exposes delivery-worker queue metrics such as pending totals, due/scheduled counts, active/expired leases, abandoned-lease candidates, recent worker-run summaries, recent attempt outcome counts, and latest/oldest timestamps
 - Telegram inbound polling is now available behind `ENABLE_TELEGRAM_INBOUND_POLLING=false` by default, uses the existing command router, accepts text commands only from the private chat whose source chat ID and sender ID both match `TELEGRAM_OPERATOR_CHAT_ID`, persists `getUpdates` offset progress in `telegram_inbound_offsets`, exposes locale-aware `/inbound` inspection with canonical `/inbound detail`, and splits long command replies into bounded Telegram messages
-- `npm run smoke:dryrun:readiness` now provides a non-mutating local DRY_RUN preflight over runtime config and persisted readiness evidence before the local runtime starts
+- `npm run smoke:dryrun:readiness` now provides a local DRY_RUN preflight over runtime config and persisted readiness evidence before the local runtime starts; it makes no trading or business-state mutation but participates in runtime-control ownership
 - `npm run smoke:dryrun:sync` now provides an exchange-backed DRY_RUN `/sync` rehearsal that persists snapshots/reconciliation evidence but does not run strategy, Telegram transport, scheduler, or order transmission
 - `npm run smoke:dryrun:operator` now provides an offline, fixture-backed DRY_RUN operator rehearsal for `/config`, `/status`, `/readiness`, `/sync`, `/balances`, `/positions`, `/run BTC|ETH`, `/orders`, `/scheduler`, and `/alerts`
 - `scripts/start-company-dryrun-scheduler.example.ps1` now provides a local DRY_RUN scheduler launcher that keeps live orders disabled, runs DRY_RUN sync/readiness smokes, then starts the runtime with scheduler `RUN_ON_START=true`
-- `npm run smoke:dryrun:completion` now provides a persisted-evidence gate for marking the DRY_RUN automatic scheduler rehearsal complete without running sync, strategy, Telegram transport, scheduler timers, Upbit calls, or order transmission
+- `npm run smoke:dryrun:completion` now provides a persisted-evidence gate for marking the DRY_RUN automatic scheduler rehearsal complete without running sync, strategy, Telegram transport, scheduler timers, Upbit calls, or order transmission; it makes no trading or business-state mutation but participates in runtime-control ownership
 - startup recovery can now mark persisted operator state `DEGRADED` when unresolved portfolio drift remains after exchange-backed bootstrap checks
 - scheduler-triggered strategy cycles now persist `strategy_scheduler_runs` so scheduled run starts, completions, failures, and skips remain inspectable after process restart, including through `/scheduler`
 - `/scheduler` now shows current in-memory scheduler status and startup preflight summary before the persisted scheduler-run history
@@ -118,6 +118,24 @@ Current risk-policy framing is budget-first rather than asset-count-first:
 - future strategy sizing should be derived from total equity / exposure budgets, not from a simplistic “two assets means split in half” rule
 
 ## Runtime Shape
+
+### Runtime Single Ownership
+
+One mutating runtime may own each canonical local SQLite database and exchange account across both `DRY_RUN` and `LIVE`. One fail-closed canonicalizer runs before lock derivation and every database open; it rejects UNC/network and device paths, Windows short names, symlink/junction/reparse aliases, and hardlink ambiguity. The accepted path/account digest drives the Windows named-pipe lock, the exact SQLite path opened by both modes, and persisted `scope_key` binding on every current-owner operation and audit event. This design supports one Windows host with local storage only: network shares and multi-host deployments are not supported.
+
+LIVE identity verification binds the native local file identity in addition to migration, account, instance UUID, and access-key fingerprint evidence. Ownership, application, and LIVE read-only SQLite opens derive the main-database location from the opened connection, canonicalize it, and verify the captured file identity plus persisted evidence on that actual handle before any mutable initialization. Replacing the file or opening a different actual handle after verification fails without migrating, bootstrapping, or writing ownership state to the replacement. A canonical filename such as `runtime~2026.sqlite` is valid; only native resolution proving an actual Windows short-name alias is blocked.
+
+The owner renews every 10 seconds and expires after 45 seconds. Every local side-effect admission samples the runtime clock, so the exact expiry deadline fences work without waiting for the next heartbeat. On lock loss, expired heartbeat, or persisted-generation mismatch, it fences future work; stops notification delivery, Telegram polling, scheduler timers, and heartbeat renewal; waits up to 30 seconds for settlement, including any scheduler startup-block report already in flight; records exact-generation `LOST` evidence best-effort; then closes SQLite and the process lock. Startup-block reporting itself asserts ownership before and after Telegram persistence/transport. The stale owner cannot touch a newer generation, while normal shutdown records `RELEASED` and releases only its exact generation. The sole reachable order send still starts synchronously inside the final persisted-authority callback. After adapter fulfillment or rejection, ownership is checked again before any finalization, pause, notification, or lease release; a stale owner leaves `SUBMITTING` and its lease for recovery. Existing order-lease semantics, strategy behavior, sizing, risk controls, and Telegram's operator-only truth boundary otherwise do not change.
+
+Runtime work records `RELEASED` only after delivery, inbound polling, and scheduler work are observably quiescent and the process lock is still held. Process-lock loss during cleanup remains `LOST`. If bounded quiescence fails or times out, both long-running and scoped shutdown fail closed and retain application persistence, ownership persistence, and the process lock until terminal process exit instead of admitting another runtime while old work may still settle. This is a fatal outcome, not a same-process restart condition.
+
+The startup banner plus Korean-first `/status` and `/readiness` summaries show secret-free ownership health: owned/lost/unavailable, generation, mode, heartbeat time/age, takeover, and reason. Their `detail` forms retain canonical fields. They never show an owner token, canonical/raw database path, scope digest, named-pipe name, key fingerprint, or another secret. A second launch prints `RUNTIME_ALREADY_OWNED` only in that duplicate process's console; it cannot write the database or Telegram.
+
+`0024_add_runtime_ownership.sql`, including its canonical `scope_key` primary-key and audit binding, must be deployed later through an explicit offline procedure: stop the runtime, back up the database and sidecars, apply the existing approved migration/identity operation, run read-only readiness verification, start one runtime, then separately confirm a duplicate launch has zero side effects. This repository change does not migrate, restart, deploy, or push anything.
+
+A mutable or composed smoke acquires and releases process plus persisted runtime-control ownership evidence even when it is non-trading and makes no business-state mutation; it must contend with an existing owner exactly like the long-running runtime. DRY_RUN readiness and completion smokes make no trading or business-state mutation while acquiring and releasing process plus persisted runtime-control ownership evidence; each contends with an existing owner. Only a provably read-only report, inspection, or smoke command that does not construct a mutable runtime composition remains ownership-free.
+
+The confirmed `npm run probe:live:duplicate-owner` command is the dedicated no-side-effect duplicate check. It verifies LIVE database identity through a read-only SQLite handle and attempts only the same Windows named-pipe lock used by startup. `PASS/DUPLICATE_BLOCKED` means an owner rejected the duplicate; `BLOCK/NO_ACTIVE_OWNER` means the probe unexpectedly acquired and immediately released the lock. Its JSON omits database paths, scope digests, key fingerprints, and credentials, and it never constructs the application, runs migrations, starts workers, calls Upbit or Telegram, or transmits orders. Copy `scripts/probe-live-duplicate-owner.example.ps1` to its ignored `.local.ps1` form and set the exact confirmation before an approved operational exercise; do not use a normal second LIVE launcher as a probe.
 
 ### BTC Candidate Pilot Is Available, Not Activated
 
@@ -217,7 +235,7 @@ Use Node.js `22.13.0` or newer so the built-in `node:sqlite` runtime module is a
 3. Run `npm run test`.
 4. Start the scaffold with `npm run start`.
 
-At startup the app prints the effective execution mode, live gate, configured `databasePath`, and supported Telegram operator commands.
+At startup the app prints the effective execution mode, live gate, secret-free runtime ownership health, and supported Telegram operator commands.
 
 ## Configuration
 
@@ -545,7 +563,7 @@ For repeated checks with the same DRY_RUN environment, copy `scripts/smoke-dryru
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke-dryrun-readiness.local.ps1
 ```
 
-This smoke forces `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, `STRATEGY_SCHEDULER_ENABLED=false`, and `STRATEGY_SCHEDULER_RUN_ON_START=false`. It reads local runtime configuration, persisted execution state, latest snapshots, latest reconciliation, active orders, recent risk blocks, and pending notifications. It does not run `/sync`, run strategy, start the scheduler, poll Telegram, call Upbit, deliver notifications, or send orders. A `WARN` is expected on a fresh DB before `/sync`; a `BLOCK` must be resolved before continuing.
+This smoke forces `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, `STRATEGY_SCHEDULER_ENABLED=false`, and `STRATEGY_SCHEDULER_RUN_ON_START=false`. It reads local runtime configuration, persisted execution state, latest snapshots, latest reconciliation, active orders, recent risk blocks, and pending notifications. It does not run `/sync`, run strategy, start the scheduler, poll Telegram, call Upbit, deliver notifications, or send orders. It does acquire and release process plus persisted runtime-control ownership evidence and contends with an existing owner, without a trading or business-state mutation. A `WARN` is expected on a fresh DB before `/sync`; a `BLOCK` must be resolved before continuing.
 
 After readiness is clean enough to proceed and Upbit read credentials are configured, run one exchange-backed DRY_RUN sync rehearsal:
 
@@ -614,7 +632,7 @@ For repeated checks with the same DRY_RUN scheduler database, copy `scripts/smok
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke-dryrun-completion.local.ps1
 ```
 
-This smoke forces `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, disables Telegram delivery and inbound polling, disables scheduler startup, and reads only persisted local evidence: latest balance snapshot, latest position snapshot, latest reconciliation, active orders, recent risk blocks, pending operator notifications, and latest `strategy_scheduler_runs` for `KRW-BTC` and `KRW-ETH`. It does not run `/sync`, run strategy, start the scheduler, poll Telegram, call Upbit, deliver notifications, create orders, or transmit orders.
+This smoke forces `APP_EXECUTION_MODE=DRY_RUN`, `ENABLE_LIVE_ORDERS=false`, disables Telegram delivery and inbound polling, disables scheduler startup, and reads persisted local evidence: latest balance snapshot, latest position snapshot, latest reconciliation, active orders, recent risk blocks, pending operator notifications, and latest `strategy_scheduler_runs` for `KRW-BTC` and `KRW-ETH`. It does not run `/sync`, run strategy, start the scheduler, poll Telegram, call Upbit, deliver notifications, create orders, or transmit orders. It does acquire and release process plus persisted runtime-control ownership evidence and contends with an existing owner, without a trading or business-state mutation.
 
 ## Local LIVE Script
 
@@ -622,7 +640,7 @@ LIVE startup now fails closed unless `DATABASE_PATH` is an explicit absolute pat
 
 Existing databases are never bound automatically. Stop LIVE, back up `var/company-live.sqlite`, copy `scripts/provision-live-database-identity.example.ps1` to its ignored `.local.ps1` form, create a UUID with `[guid]::NewGuid().ToString()`, fill the existing absolute DB path and current Upbit access key, then run the script once. Keep the resulting UUID in every local LIVE startup/readiness script as `LIVE_DATABASE_INSTANCE_ID`; it is not a secret. Provisioning applies pending migrations and inserts the singleton binding, so it must never run while LIVE is active. Key rotation intentionally requires a separately reviewed rebind procedure; startup never rewrites a fingerprint.
 
-Both LIVE smoke commands open the verified database with `readOnly: true` and do not construct the runtime application, run migrations, bootstrap records, initialize the candidate pilot, or start operational workers. They may read persisted state only.
+Both LIVE smoke commands open the verified database with `readOnly: true` and do not construct the runtime application, run migrations, bootstrap records, initialize the candidate pilot, or start operational workers. They may read persisted state only. LIVE readiness additionally requires an explicit positive-safe-integer `LIVE_READINESS_MAX_EVIDENCE_AGE_MS`; the checked-in examples use one hour. Evidence exactly at the limit passes, older or missing account-health evidence warns and requires an approved `/sync` before `/run`, while a missing policy or malformed, future, or uncomparable timestamp blocks.
 
 For an explicit live validation run, copy `scripts/start-company-live.example.ps1` to `scripts/start-company-live.local.ps1`, fill in secrets, set:
 
@@ -658,6 +676,14 @@ powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke-live-readiness.loca
 This smoke only checks local configuration, persisted execution state, adapter wiring, recent local snapshots, and local active-order visibility. It does not send orders, run strategy, start the scheduler, start Telegram polling, run `/sync`, or call Upbit.
 The example live startup script runs this smoke before `npm run start`; if it returns `BLOCK`, the live process is not started.
 The output includes `blockingCheckNames`, `warningCheckNames`, and `nextActions` so the operator can fix the local script, persisted execution state, or required `/sync` step without guessing.
+
+After exactly one approved LIVE runtime is already healthy, the dedicated duplicate-owner probe can test only the startup process-lock boundary:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\probe-live-duplicate-owner.local.ps1
+```
+
+Create that ignored local file from `scripts/probe-live-duplicate-owner.example.ps1`. Exit 0 with `PASS/DUPLICATE_BLOCKED` is the expected contention result. `BLOCK/NO_ACTIVE_OWNER` means no active process-lock owner was found; the probe immediately released the lock and must not be treated as readiness. Any other failure is also fail-closed. The command performs no runtime start, database write, migration, API call, worker start, or order transmission.
 
 After the manual LIVE process is healthy and `/sync` has produced fresh snapshots, check whether the automatic scheduler would pass its startup preflight without actually starting timers:
 

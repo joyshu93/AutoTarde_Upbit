@@ -1,13 +1,19 @@
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { statSync } from "node:fs";
+import { isAbsolute } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 
 import type { ExecutionMode } from "../domain/types.js";
 import {
   listCanonicalMigrationFilenames,
+  openReadOnlySqliteDatabase,
   openSqliteDatabase,
+  type SqliteDatabaseOpenVerification,
 } from "../modules/db/repositories/sqlite-database.js";
+import {
+  canonicalizeLocalDatabasePath,
+  LocalDatabasePathError,
+} from "../modules/db/local-database-path.js";
 
 const FINGERPRINT_DOMAIN = "AUTOTRADE_UPBIT_LIVE_ACCOUNT_V1\0";
 const RETIRED_MIGRATIONS = new Set(["0013_add_max_live_order_value_risk_code.sql"]);
@@ -28,7 +34,14 @@ export type LiveDatabaseIdentityVerification =
       canonicalDatabasePath: string;
       databaseInstanceId: string;
       exchangeAccountId: string;
+      databaseOpenVerification: SqliteDatabaseOpenVerification;
     }>;
+
+interface LiveDatabaseFileIdentity {
+  readonly device: string;
+  readonly inode: string;
+  readonly birthtimeNs: string;
+}
 
 export interface LiveDatabaseIdentityProvisioningInput {
   databasePath: string;
@@ -83,40 +96,28 @@ export function verifyLiveDatabaseIdentity(
   const expectedInstanceId = validateInstanceId(input.expectedDatabaseInstanceId);
   const accessKeyFingerprint = fingerprintUpbitAccessKey(input.upbitAccessKey ?? "");
   const exchangeAccountId = requireNonEmpty(input.exchangeAccountId, "exchange_account_id");
-  const db = new DatabaseSync(databasePath, { readOnly: true });
+  const fileIdentityBeforeOpen = readDatabaseFileIdentity(databasePath);
+  const db = openReadOnlySqliteDatabase(databasePath);
   try {
-    validateMigrationLedger(db);
-    validateExchangeAccount(db, exchangeAccountId);
-    const identity = readIdentity(db);
-    if (identity === null) {
-      throw new LiveDatabaseIdentityError(
-        "IDENTITY_MISSING",
-        "LIVE database identity is missing; run the explicit offline provisioning command first.",
-      );
-    }
-    if (identity.database_instance_id !== expectedInstanceId) {
-      throw new LiveDatabaseIdentityError(
-        "DATABASE_INSTANCE_MISMATCH",
-        "LIVE database instance identity does not match the configured expectation.",
-      );
-    }
-    if (identity.exchange_account_id !== exchangeAccountId) {
-      throw new LiveDatabaseIdentityError(
-        "EXCHANGE_ACCOUNT_MISMATCH",
-        "LIVE database exchange account identity does not match the configured account.",
-      );
-    }
-    if (identity.upbit_access_key_sha256 !== accessKeyFingerprint) {
-      throw new LiveDatabaseIdentityError(
-        "CREDENTIAL_MISMATCH",
-        "LIVE database credential identity does not match the configured Upbit access key.",
-      );
-    }
+    const fileIdentityAfterOpen = readDatabaseFileIdentity(databasePath);
+    assertSameDatabaseFileIdentity(fileIdentityBeforeOpen, fileIdentityAfterOpen);
+    const identity = validateLiveDatabaseContents(db, {
+      expectedInstanceId,
+      exchangeAccountId,
+      accessKeyFingerprint,
+    });
     return {
       status: "VERIFIED",
       canonicalDatabasePath: databasePath,
       databaseInstanceId: identity.database_instance_id,
       exchangeAccountId: identity.exchange_account_id,
+      databaseOpenVerification: createLiveDatabaseOpenVerification({
+        canonicalDatabasePath: databasePath,
+        fileIdentity: fileIdentityAfterOpen,
+        expectedInstanceId,
+        exchangeAccountId,
+        accessKeyFingerprint,
+      }),
     };
   } finally {
     db.close();
@@ -188,7 +189,7 @@ function inspectExistingBindingBeforeProvision(input: Readonly<{
   exchangeAccountId: string;
   upbitAccessKeyFingerprint: string;
 }>): void {
-  const db = new DatabaseSync(input.databasePath, { readOnly: true });
+  const db = openReadOnlySqliteDatabase(input.databasePath);
   try {
     validateExchangeAccount(db, input.exchangeAccountId);
     const existing = readIdentity(db);
@@ -216,38 +217,150 @@ function validateExistingAbsoluteDatabasePath(rawPath: string): string {
       "LIVE DATABASE_PATH must be an explicit absolute path to an existing SQLite file.",
     );
   }
-  const canonicalPath = resolve(databasePath);
-  if (!existsSync(canonicalPath)) {
+  try {
+    return canonicalizeLocalDatabasePath(databasePath, { mustExist: true });
+  } catch (error) {
+    if (!(error instanceof LocalDatabasePathError)) throw error;
+    const code = error.code === "DATABASE_PATH_NOT_FOUND"
+      ? "DATABASE_NOT_FOUND"
+      : error.code === "DATABASE_PATH_NOT_REGULAR_FILE"
+        ? "DATABASE_NOT_REGULAR_FILE"
+        : error.code;
+    const message = error.code === "DATABASE_PATH_NOT_FOUND"
+      ? "LIVE database does not exist; no file or directory was created."
+      : `LIVE ${error.message}`;
+    throw new LiveDatabaseIdentityError(code, message);
+  }
+}
+
+function createLiveDatabaseOpenVerification(input: Readonly<{
+  canonicalDatabasePath: string;
+  fileIdentity: LiveDatabaseFileIdentity;
+  expectedInstanceId: string;
+  exchangeAccountId: string;
+  accessKeyFingerprint: string;
+}>): SqliteDatabaseOpenVerification {
+  const assertFileIdentity = (databasePath: string): void => {
+    if (!sameDatabasePath(databasePath, input.canonicalDatabasePath)) {
+      throw new LiveDatabaseIdentityError(
+        "DATABASE_FILE_IDENTITY_CHANGED",
+        "LIVE database path changed after identity verification.",
+      );
+    }
+    assertSameDatabaseFileIdentity(input.fileIdentity, readDatabaseFileIdentity(databasePath));
+  };
+  return Object.freeze({
+    assertBeforeOpen: assertFileIdentity,
+    assertOpenedDatabase(db: DatabaseSync, databasePath: string): void {
+      assertFileIdentity(databasePath);
+      const openedDatabasePath = readOpenedDatabasePath(db);
+      if (!sameDatabasePath(openedDatabasePath, input.canonicalDatabasePath)) {
+        throw databaseFileIdentityChanged();
+      }
+      assertSameDatabaseFileIdentity(
+        input.fileIdentity,
+        readDatabaseFileIdentity(openedDatabasePath),
+      );
+      validateLiveDatabaseContents(db, input);
+    },
+  });
+}
+
+function readOpenedDatabasePath(db: DatabaseSync): string {
+  try {
+    const locatedPath = typeof db.location === "function"
+      ? db.location("main")
+      : (db.prepare("PRAGMA database_list").all() as unknown as Array<{
+          name: string;
+          file: string;
+        }>).find((row) => row.name === "main")?.file ?? null;
+    if (locatedPath === null || !isAbsolute(locatedPath)) {
+      throw databaseFileIdentityChanged();
+    }
+    return canonicalizeLocalDatabasePath(locatedPath, { mustExist: true });
+  } catch {
+    throw databaseFileIdentityChanged();
+  }
+}
+
+function validateLiveDatabaseContents(
+  db: DatabaseSync,
+  expected: Readonly<{
+    expectedInstanceId: string;
+    exchangeAccountId: string;
+    accessKeyFingerprint: string;
+  }>,
+): LiveDatabaseIdentityRow {
+  validateMigrationLedger(db);
+  validateExchangeAccount(db, expected.exchangeAccountId);
+  const identity = readIdentity(db);
+  if (identity === null) {
     throw new LiveDatabaseIdentityError(
-      "DATABASE_NOT_FOUND",
-      "LIVE database does not exist; no file or directory was created.",
+      "IDENTITY_MISSING",
+      "LIVE database identity is missing; run the explicit offline provisioning command first.",
     );
   }
-
-  let component = canonicalPath;
-  let final = true;
-  while (true) {
-    const stats = lstatSync(component);
-    if (stats.isSymbolicLink()) {
-      throw new LiveDatabaseIdentityError(
-        "DATABASE_PATH_REPARSE_POINT",
-        final
-          ? "LIVE database path must identify a regular non-symlink file."
-          : "LIVE database path has a symlink, junction, or reparse-point ancestor.",
-      );
-    }
-    if (final && !stats.isFile()) {
-      throw new LiveDatabaseIdentityError(
-        "DATABASE_NOT_REGULAR_FILE",
-        "LIVE database path must identify an existing regular file.",
-      );
-    }
-    const parent = resolve(component, "..");
-    if (parent === component) break;
-    component = parent;
-    final = false;
+  if (identity.database_instance_id !== expected.expectedInstanceId) {
+    throw new LiveDatabaseIdentityError(
+      "DATABASE_INSTANCE_MISMATCH",
+      "LIVE database instance identity does not match the configured expectation.",
+    );
   }
-  return canonicalPath;
+  if (identity.exchange_account_id !== expected.exchangeAccountId) {
+    throw new LiveDatabaseIdentityError(
+      "EXCHANGE_ACCOUNT_MISMATCH",
+      "LIVE database exchange account identity does not match the configured account.",
+    );
+  }
+  if (identity.upbit_access_key_sha256 !== expected.accessKeyFingerprint) {
+    throw new LiveDatabaseIdentityError(
+      "CREDENTIAL_MISMATCH",
+      "LIVE database credential identity does not match the configured Upbit access key.",
+    );
+  }
+  return identity;
+}
+
+function readDatabaseFileIdentity(databasePath: string): LiveDatabaseFileIdentity {
+  try {
+    const stats = statSync(databasePath, { bigint: true });
+    return {
+      device: stats.dev.toString(),
+      inode: stats.ino.toString(),
+      birthtimeNs: stats.birthtimeNs.toString(),
+    };
+  } catch {
+    throw databaseFileIdentityChanged();
+  }
+}
+
+function databaseFileIdentityChanged(): LiveDatabaseIdentityError {
+  return new LiveDatabaseIdentityError(
+    "DATABASE_FILE_IDENTITY_CHANGED",
+    "LIVE database file identity could not be reasserted after verification.",
+  );
+}
+
+function assertSameDatabaseFileIdentity(
+  expected: LiveDatabaseFileIdentity,
+  actual: LiveDatabaseFileIdentity,
+): void {
+  if (
+    expected.device !== actual.device ||
+    expected.inode !== actual.inode ||
+    expected.birthtimeNs !== actual.birthtimeNs
+  ) {
+    throw new LiveDatabaseIdentityError(
+      "DATABASE_FILE_IDENTITY_CHANGED",
+      "LIVE database file identity changed after verification.",
+    );
+  }
+}
+
+function sameDatabasePath(left: string, right: string): boolean {
+  return process.platform === "win32"
+    ? left.toUpperCase() === right.toUpperCase()
+    : left === right;
 }
 
 function validateMigrationLedger(db: DatabaseSync): void {

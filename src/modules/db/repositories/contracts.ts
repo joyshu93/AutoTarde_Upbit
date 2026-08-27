@@ -1,5 +1,11 @@
 import type { ExecutionRepository, OperatorStateStore, TelegramInboundOffsetStore } from "../interfaces.js";
 import type { AccountExecutionLeaseStore, CandidatePilotRepository } from "../pilot-interfaces.js";
+import type { RuntimeOwnershipStore } from "../runtime-ownership-interfaces.js";
+
+export interface SqliteRuntimeOwnershipBundle {
+  runtimeOwnership: RuntimeOwnershipStore;
+  close(): void;
+}
 
 export interface SqlitePersistenceBundle {
   repositories: ExecutionRepository;

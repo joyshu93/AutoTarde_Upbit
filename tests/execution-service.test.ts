@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import type { ExecutionStateRecord, OrderRecord } from "../src/domain/types.js";
 import { ExecutionService } from "../src/modules/execution/execution-service.js";
 import type { SubmissionOutcome, SubmitOrderFromDecisionResult } from "../src/modules/execution/interfaces.js";
@@ -17,6 +18,7 @@ function createExecutionService(overrides?: {
   exchangeAdapter?: ExecutionExchangeAdapter;
   validationAdapter?: Pick<ExchangeAdapter, "getOrderChance" | "testOrder">;
   reporter?: OperatorNotificationReporter;
+  runtimeOwnership?: RuntimeOwnershipAuthority;
   initialState?: Partial<ExecutionStateRecord>;
 }) {
   const repositories = new InMemoryExecutionRepository();
@@ -49,6 +51,10 @@ function createExecutionService(overrides?: {
     accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
     accountExecutionLeaseMs: 30_000,
     operatorState,
+    runtimeOwnership: overrides?.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(
+      operatorState,
+      overrides?.initialState?.executionMode ?? "DRY_RUN",
+    ),
     now: () => "2026-04-20T00:00:20.000Z",
     ...(overrides?.validationAdapter ? { validationAdapter: overrides.validationAdapter } : {}),
     ...(overrides?.reporter ? { reporter: overrides.reporter } : {}),
@@ -211,6 +217,7 @@ test("baseline final send requires its own exact persisted SUBMITTING intent", a
       accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
       accountExecutionLeaseMs: 30_000,
       operatorState,
+      runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(operatorState, "LIVE"),
       now: () => "2026-04-20T00:00:20.000Z",
     });
 
@@ -242,6 +249,95 @@ test("baseline final send requires its own exact persisted SUBMITTING intent", a
     assert.equal((await operatorState.getState()).systemStatus, "PAUSED", mutation);
     assert.equal((await repositories.listOrders("primary"))[0]?.status, "SUBMITTING", mutation);
   }
+});
+
+test("execution service checks persisted ownership before send and after adapter settlement", async () => {
+  const checkedAt: number[] = [];
+  const runtimeOwnership: RuntimeOwnershipAuthority = {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: 7,
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 1,
+      heartbeatAtEpochMs: 1,
+      expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent(atEpochMs) {
+      checkedAt.push(atEpochMs);
+      return {
+        ownerToken: "owner".padEnd(64, "x"),
+        generation: 7,
+        executionMode: "DRY_RUN",
+        acquiredAtEpochMs: 1,
+        heartbeatAtEpochMs: 1,
+        expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+      };
+    },
+    runWithCurrentExecutionAuthority(input, callback) {
+      checkedAt.push(input.atEpochMs);
+      callback();
+      return Promise.resolve({
+        runtimeOwnership: {
+          ownerToken: "owner".padEnd(64, "x"),
+          generation: 7,
+          executionMode: "DRY_RUN",
+          acquiredAtEpochMs: 1,
+          heartbeatAtEpochMs: 1,
+          expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+        },
+        executionState: {
+          exchangeAccountId: input.exchangeAccountId,
+          executionMode: "DRY_RUN",
+          liveExecutionGate: "DISABLED",
+          systemStatus: "RUNNING",
+          killSwitchActive: false,
+        },
+      });
+    },
+  };
+  const { service, repositories } = createExecutionService({ runtimeOwnership });
+  await repositories.saveBalanceSnapshot({
+    id: "runtime-authority-balance",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:00:00.000Z",
+    source: "EXCHANGE_POLL",
+    totalKrwValue: "10000000",
+    balancesJson: "[]",
+  });
+  await repositories.savePositionSnapshot({
+    id: "runtime-authority-position",
+    exchangeAccountId: "primary",
+    capturedAt: "2026-04-20T00:00:00.000Z",
+    source: "EXCHANGE_POLL",
+    positionsJson: "[]",
+  });
+
+  const result = await service.submitOrderFromDecision({
+    exchangeAccountId: "primary",
+    strategyDecisionId: "runtime-authority-decision",
+    referencePriceCapturedAt: "2026-04-20T00:00:10.000Z",
+    decision: {
+      strategyKey: "deterministic.stub.v1",
+      market: "KRW-BTC",
+      action: "ENTER",
+      reasonCodes: ["RUNTIME_AUTHORITY_TEST"],
+      referencePrice: 100_000_000,
+      requestedNotionalKrw: 100_000,
+      requestedQuantity: 0.001,
+      metadata: {},
+    },
+    side: "bid",
+    ordType: "limit",
+    price: "100000000",
+    volume: "0.001",
+  });
+
+  assert.equal(result.outcome, "SIMULATED_FILLED");
+  assert.equal(checkedAt.length, 2);
+  assert.equal(checkedAt.every(Number.isSafeInteger), true);
 });
 
 test("execution service persists a dry-run order and blocks duplicate idempotent submissions", async () => {
@@ -756,6 +852,7 @@ test("execution service queues an operator notification when an order is rejecte
     accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
     accountExecutionLeaseMs: 30_000,
     operatorState,
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(operatorState),
     reporter,
     now: () => "2026-04-20T00:00:20.000Z",
   });
@@ -1036,6 +1133,7 @@ test("execution service records lifecycle evidence from the live execution adapt
     accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
     accountExecutionLeaseMs: 30_000,
     operatorState,
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(operatorState, "LIVE"),
     now: () => "2026-04-20T00:00:20.000Z",
   });
 
@@ -1142,6 +1240,49 @@ function countingLiveAdapter(): Readonly<{
       listClosedOrders: baseAdapter.listClosedOrders.bind(baseAdapter),
     },
     createOrderCalls: () => calls,
+  };
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(
+  operatorState: InMemoryOperatorStateStore,
+  executionMode: "DRY_RUN" | "LIVE" = "DRY_RUN",
+): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+    runWithCurrentExecutionAuthority(_input, callback) {
+      callback();
+      return operatorState.getState().then((executionState) => ({
+        runtimeOwnership: { ...record },
+        executionState: {
+          exchangeAccountId: executionState.exchangeAccountId,
+          executionMode: executionState.executionMode,
+          liveExecutionGate: executionState.liveExecutionGate,
+          systemStatus: executionState.systemStatus,
+          killSwitchActive: executionState.killSwitchActive,
+        },
+      }));
+    },
   };
 }
 

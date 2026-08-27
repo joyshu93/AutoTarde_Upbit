@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 
-import { StrategyScheduler } from "../src/app/strategy-scheduler.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../src/app/runtime-ownership-guard.js";
+import { StrategyScheduler as ProductionStrategyScheduler } from "../src/app/strategy-scheduler.js";
 import { InMemoryExecutionRepository } from "../src/modules/db/repositories/in-memory-repositories.js";
 import type {
   TelegramStrategyPreviewResult,
@@ -10,6 +14,274 @@ import type {
 } from "../src/modules/telegram/interfaces.js";
 import type { OperatorNotificationReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
+
+class StrategyScheduler extends ProductionStrategyScheduler {
+  constructor(dependencies: ConstructorParameters<typeof ProductionStrategyScheduler>[0]) {
+    if (!Object.hasOwn(dependencies, "runtimeOwnership")) {
+      Object.defineProperty(dependencies, "runtimeOwnership", {
+        value: createAlwaysOwnedRuntimeOwnershipAuthority(),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+    super(dependencies);
+  }
+}
+
+test("strategy scheduler fails closed when runtime authority is omitted", async () => {
+  let controllerCalls = 0;
+  const scheduler = new ProductionStrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(): Promise<never> {
+        controllerCalls += 1;
+        throw new Error("controller must not run without ownership authority");
+      },
+    }),
+  });
+
+  await assert.rejects(
+    () => scheduler.runMarketNow("KRW-BTC"),
+    /RUNTIME_OWNERSHIP_NOT_HELD/u,
+  );
+  assert.equal(controllerCalls, 0);
+});
+
+test("strategy scheduler start fails closed before installing a timer", () => {
+  let timerCalls = 0;
+  const scheduler = new ProductionStrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController(),
+    setTimer: () => {
+      timerCalls += 1;
+      return setTimeout(() => undefined, 60_000);
+    },
+  });
+
+  assert.throws(() => scheduler.start(), /RUNTIME_OWNERSHIP_NOT_HELD/u);
+  assert.equal(timerCalls, 0);
+});
+
+test("scheduled scheduler ownership loss routes once without unhandled rejection or repeat timer", async () => {
+  const ownership = createOwnedThenLostRuntimeOwnershipAuthority();
+  const callbacks: Array<() => void> = [];
+  const routedErrors: unknown[] = [];
+  const unhandled: unknown[] = [];
+  let timerCalls = 0;
+  let reportCalls = 0;
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController(),
+    reporter: {
+      async report() {
+        reportCalls += 1;
+      },
+    },
+    runtimeOwnership: ownership.authority,
+    setTimer: (callback) => {
+      timerCalls += 1;
+      callbacks.push(callback);
+      const timer = setTimeout(() => undefined, 60_000);
+      clearTimeout(timer);
+      return timer;
+    },
+  });
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+
+  try {
+    (scheduler.start as unknown as (onOwnershipLost: (error: unknown) => void) => unknown)(
+      (error) => routedErrors.push(error),
+    );
+    ownership.lose();
+    callbacks[0]?.();
+    await waitForUnhandledTurn();
+
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(routedErrors, [ownership.lossError]);
+    assert.equal(timerCalls, 1);
+    assert.equal(reportCalls, 0);
+    assert.equal(scheduler.getStatus().started, false);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    scheduler.stop();
+  }
+});
+
+function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "LOST",
+      generation: 1,
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 1,
+      heartbeatAtEpochMs: 1,
+      expiresAtEpochMs: 45_001,
+      takeover: false,
+      lossReason: "TEST_GENERATION_REPLACED",
+    }),
+    assertLocallyHeld() {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+    async assertCurrent(): Promise<never> {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+  };
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+  };
+}
+
+test("strategy scheduler rejects a cycle after runtime ownership is lost", async () => {
+  let controllerCalls = 0;
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: {
+      async requestRun(): Promise<TelegramStrategyRunResult> {
+        controllerCalls += 1;
+        throw new Error("controller must not run after ownership loss");
+      },
+      async requestPreview(): Promise<TelegramStrategyPreviewResult> {
+        throw new Error("preview is not used by the scheduler");
+      },
+    },
+    runtimeOwnership: createLostRuntimeOwnershipAuthority(),
+  });
+  scheduler.stop();
+
+  await assert.rejects(
+    () => scheduler.runMarketNow("KRW-BTC"),
+    /RUNTIME_OWNERSHIP_LOST/u,
+  );
+
+  assert.equal(controllerCalls, 0);
+});
+
+test("strategy scheduler rethrows ownership loss during account refresh without stale failure evidence", async () => {
+  const ownership = createOwnedThenLostRuntimeOwnershipAuthority();
+  const notifications: Parameters<OperatorNotificationReporter["report"]>[0][] = [];
+  const repositories = new InMemoryExecutionRepository();
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController(),
+    repositories,
+    reporter: createReporter(notifications),
+    beforeRunAccountRefresh: async () => {
+      ownership.lose();
+      throw ownership.lossError;
+    },
+    runtimeOwnership: ownership.authority,
+    now: () => "2026-04-20T00:00:00.000Z",
+  });
+
+  await assert.rejects(
+    () => scheduler.runMarketNow("KRW-BTC"),
+    (error) => error === ownership.lossError,
+  );
+
+  assert.equal((await repositories.listStrategySchedulerRuns("primary", 10)).length, 0);
+  assert.equal(notifications.length, 0);
+  assert.equal(scheduler.getStatus().markets[0]?.failureCount, 0);
+});
+
+function createOwnedThenLostRuntimeOwnershipAuthority(): {
+  authority: RuntimeOwnershipAuthority;
+  lose(): void;
+  lossError: RuntimeOwnershipGuardError;
+} {
+  let held = true;
+  const lossError = new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_LOST",
+    "RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED",
+  );
+  return {
+    lossError,
+    lose() {
+      held = false;
+    },
+    authority: {
+      snapshot: () => ({
+        status: held ? "OWNED" : "LOST",
+        generation: 1,
+        executionMode: "DRY_RUN",
+        acquiredAtEpochMs: 1,
+        heartbeatAtEpochMs: 1,
+        expiresAtEpochMs: 45_001,
+        takeover: false,
+        lossReason: held ? null : "TEST_GENERATION_REPLACED",
+      }),
+      assertLocallyHeld() {
+        if (!held) throw lossError;
+      },
+      async assertCurrent() {
+        if (!held) throw lossError;
+        return {
+          ownerToken: "owner".padEnd(64, "x"),
+          generation: 1,
+          executionMode: "DRY_RUN",
+          acquiredAtEpochMs: 1,
+          heartbeatAtEpochMs: 1,
+          expiresAtEpochMs: 45_001,
+        };
+      },
+    },
+  };
+}
 
 test("strategy scheduler is disabled by default and does not schedule timers", () => {
   const scheduledDelays: number[] = [];
@@ -213,6 +485,57 @@ test("strategy scheduler does not start when live startup preflight blocks it", 
   assert.match(notifications[0]?.message ?? "", /active_orders/);
   assert.equal(notifications[0]?.payload?.scope, "LIVE");
   assert.equal(notifications[0]?.payload?.liveSendPath, "LIVE_ADAPTER");
+});
+
+test("strategy scheduler tracks and fences an in-flight startup-block report during stop", async () => {
+  const ownership = createOwnedThenLostRuntimeOwnershipAuthority();
+  const report = createDeferred<void>();
+  let reportCalls = 0;
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "LIVE_ADAPTER",
+      startupPreflight: {
+        checkedAt: "2026-04-20T00:00:00.000Z",
+        scope: "LIVE",
+        status: "BLOCK",
+        detail: "Live scheduler startup blocked by active_orders.",
+        checks: [{
+          name: "active_orders",
+          status: "BLOCK",
+          detail: "1 active order must be resolved first.",
+        }],
+      },
+      markets: [{ market: "KRW-BTC", intervalMs: 1_800_000 }],
+    },
+    controller: createController(),
+    reporter: {
+      async report() {
+        reportCalls += 1;
+        await report.promise;
+      },
+    },
+    runtimeOwnership: ownership.authority,
+  });
+
+  scheduler.start();
+  const reporting = scheduler.reportStartupBlockIfNeeded();
+  await waitForMicrotasks();
+
+  assert.equal(reportCalls, 1);
+  assert.equal((await scheduler.stopAndWait(0)).quiesced, false);
+
+  const rejected = assert.rejects(
+    () => reporting,
+    (error: unknown) => error === ownership.lossError,
+  );
+  ownership.lose();
+  report.resolve();
+  await rejected;
+
+  assert.equal((await scheduler.stopAndWait(1_000)).quiesced, true);
 });
 
 test("strategy scheduler records completed run outcomes through the shared run controller", async () => {
@@ -1594,6 +1917,100 @@ test("run-on-start resolves ownership per market sequentially before later timer
   assert.deepEqual(scheduledDelays, [1_800_000, 2_700_000]);
 });
 
+test("strategy scheduler stopAndWait clears timers, rejects new work, and waits for the active run", async () => {
+  const activeRun = createDeferred<void>();
+  const scheduledCallbacks: Array<() => void> = [];
+  let clearTimerCalls = 0;
+  let requestRunCalls = 0;
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(request) {
+        requestRunCalls += 1;
+        await activeRun.promise;
+        return createController().requestRun(request);
+      },
+    }),
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:01.000Z",
+      "2026-04-20T00:00:02.000Z",
+    ]),
+    setTimer: (callback) => {
+      scheduledCallbacks.push(callback);
+      return setTimeout(() => undefined, 60_000);
+    },
+    clearTimer: (timer) => {
+      clearTimerCalls += 1;
+      clearTimeout(timer);
+    },
+  });
+
+  scheduler.start();
+  const currentRun = scheduler.runMarketNow("KRW-BTC");
+  await waitForMicrotasks();
+  let stopResolved = false;
+  const stopping = scheduler.stopAndWait(1_000).then((status) => {
+    stopResolved = true;
+    return status;
+  });
+
+  assert.equal(clearTimerCalls, 1);
+  assert.throws(() => scheduler.start(), /cannot start after stop/i);
+  await assert.rejects(() => scheduler.runMarketNow("KRW-BTC"), /cannot run after stop/i);
+  scheduledCallbacks[0]?.();
+  await waitForMicrotasks();
+  assert.equal(requestRunCalls, 1);
+  assert.equal(stopResolved, false);
+
+  activeRun.resolve();
+  await currentRun;
+  const status = await stopping;
+  assert.equal(status.started, false);
+  assert.equal(status.quiesced, true);
+  assert.equal(status.markets[0]?.running, false);
+});
+
+test("strategy scheduler stopAndWait returns at its bound while active work remains visible", async () => {
+  const activeRun = createDeferred<void>();
+  const scheduler = new StrategyScheduler({
+    config: {
+      enabled: true,
+      runOnStart: false,
+      exchangeAccountId: "primary",
+      liveSendPath: "DRY_RUN_ADAPTER",
+      markets: [{ market: "KRW-BTC", intervalMs: 3_600_000 }],
+    },
+    controller: createController({
+      async requestRun(request) {
+        await activeRun.promise;
+        return createController().requestRun(request);
+      },
+    }),
+    now: createNowSequence([
+      "2026-04-20T00:00:00.000Z",
+      "2026-04-20T00:00:01.000Z",
+    ]),
+  });
+
+  const currentRun = scheduler.runMarketNow("KRW-BTC");
+  await waitForMicrotasks();
+  const status = await scheduler.stopAndWait(0);
+
+  assert.equal(status.started, false);
+  assert.equal(status.quiesced, false);
+  assert.equal(status.markets[0]?.running, true);
+
+  activeRun.resolve();
+  await currentRun;
+});
+
 function createController(
   overrides: Partial<TelegramStrategyRunController> = {},
 ): TelegramStrategyRunController {
@@ -1653,4 +2070,17 @@ function createNowSequence(values: string[]): () => string {
 
 async function waitForMicrotasks(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function waitForUnhandledTurn(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }

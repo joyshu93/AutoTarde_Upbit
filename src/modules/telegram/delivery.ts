@@ -4,6 +4,10 @@ import type {
   OperatorNotificationFailureClass,
   OperatorNotificationRecord,
 } from "../../domain/types.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../../app/runtime-ownership-guard.js";
 import { createId } from "../../shared/ids.js";
 import type { ExecutionRepository } from "../db/interfaces.js";
 import type {
@@ -195,9 +199,17 @@ export class TelegramBotApiClient implements TelegramMessageClient, TelegramMess
   }
 }
 
+export interface OperatorNotificationDeliveryStopStatus {
+  readonly stopped: boolean;
+  readonly inFlightCount: number;
+  readonly quiesced: boolean;
+}
+
 export class OperatorNotificationDeliveryService {
   private readonly inFlightByExchangeAccount = new Map<string, Promise<OperatorNotificationDeliverySummary>>();
   private readonly rerunRequestedByExchangeAccount = new Set<string>();
+  private readonly runtimeOwnership: RuntimeOwnershipAuthority;
+  private stopped = false;
 
   constructor(
     private readonly dependencies: {
@@ -219,14 +231,18 @@ export class OperatorNotificationDeliveryService {
       leaseDurationMs?: number;
       workerName?: string;
       locale?: TelegramLocale;
+      runtimeOwnership?: RuntimeOwnershipAuthority;
     },
-  ) {}
+  ) {
+    this.runtimeOwnership = dependencies.runtimeOwnership ?? createUnavailableRuntimeOwnershipAuthority();
+  }
 
   isConfigured(): boolean {
     return Boolean(this.dependencies.client && this.dependencies.operatorChatId);
   }
 
   kick(exchangeAccountId: string, limit = DEFAULT_PENDING_DELIVERY_LIMIT): void {
+    if (this.stopped) return;
     if (this.inFlightByExchangeAccount.has(exchangeAccountId)) {
       this.rerunRequestedByExchangeAccount.add(exchangeAccountId);
       return;
@@ -241,6 +257,10 @@ export class OperatorNotificationDeliveryService {
     exchangeAccountId: string,
     limit = DEFAULT_PENDING_DELIVERY_LIMIT,
   ): Promise<OperatorNotificationDeliverySummary> {
+    this.runtimeOwnership.assertLocallyHeld();
+    if (this.stopped) {
+      throw new Error("Operator notification delivery is stopped.");
+    }
     const inFlight = this.inFlightByExchangeAccount.get(exchangeAccountId);
     if (inFlight) {
       return inFlight;
@@ -249,7 +269,7 @@ export class OperatorNotificationDeliveryService {
     const deliveryRun = this.runDeliveryUntilIdle(exchangeAccountId, limit).finally(() => {
       if (this.inFlightByExchangeAccount.get(exchangeAccountId) === deliveryRun) {
         this.inFlightByExchangeAccount.delete(exchangeAccountId);
-        if (this.rerunRequestedByExchangeAccount.delete(exchangeAccountId)) {
+        if (!this.stopped && this.rerunRequestedByExchangeAccount.delete(exchangeAccountId)) {
           this.kick(exchangeAccountId, limit);
         }
       }
@@ -259,13 +279,35 @@ export class OperatorNotificationDeliveryService {
     return deliveryRun;
   }
 
+  stop(): OperatorNotificationDeliveryStopStatus {
+    this.stopped = true;
+    this.rerunRequestedByExchangeAccount.clear();
+    const inFlightCount = this.inFlightByExchangeAccount.size;
+    return {
+      stopped: true,
+      inFlightCount,
+      quiesced: inFlightCount === 0,
+    };
+  }
+
+  async stopAndWait(timeoutMs: number): Promise<OperatorNotificationDeliveryStopStatus> {
+    this.stop();
+    const pending = [...this.inFlightByExchangeAccount.values()];
+    await waitForDeliverySettlement(Promise.allSettled(pending), timeoutMs);
+    return {
+      stopped: true,
+      inFlightCount: this.inFlightByExchangeAccount.size,
+      quiesced: this.inFlightByExchangeAccount.size === 0,
+    };
+  }
+
   private async runDeliveryUntilIdle(
     exchangeAccountId: string,
     limit: number,
   ): Promise<OperatorNotificationDeliverySummary> {
     let summary = await this.runDelivery(exchangeAccountId, limit);
 
-    while (this.rerunRequestedByExchangeAccount.delete(exchangeAccountId)) {
+    while (!this.stopped && this.rerunRequestedByExchangeAccount.delete(exchangeAccountId)) {
       const followUpSummary = await this.runDelivery(exchangeAccountId, limit);
       summary = mergeDeliverySummaries(summary, followUpSummary);
     }
@@ -277,6 +319,7 @@ export class OperatorNotificationDeliveryService {
     exchangeAccountId: string,
     limit: number,
   ): Promise<OperatorNotificationDeliverySummary> {
+    this.runtimeOwnership.assertLocallyHeld();
     const runId = createId("operator_notification_delivery_run");
     const startedAt = this.now();
 
@@ -319,6 +362,7 @@ export class OperatorNotificationDeliveryService {
           leaseExpiresAt: addMillisecondsToIso(claimedAt, this.leaseDurationMs()),
         },
       );
+      this.runtimeOwnership.assertLocallyHeld();
 
       let sent = 0;
       let retryScheduled = 0;
@@ -326,7 +370,9 @@ export class OperatorNotificationDeliveryService {
       let staleLease = 0;
 
       for (const notification of claimedNotifications) {
+        this.runtimeOwnership.assertLocallyHeld();
         const delivered = await this.deliverRecord(notification);
+        this.runtimeOwnership.assertLocallyHeld();
         if (delivered.deliveryStatus === "SENT") {
           sent += 1;
           continue;
@@ -355,6 +401,7 @@ export class OperatorNotificationDeliveryService {
       }
 
       const queueState = await this.summarizeQueueState(exchangeAccountId, claimedAt);
+      this.runtimeOwnership.assertLocallyHeld();
       const summary = {
         attempted: claimedNotifications.length,
         sent,
@@ -380,6 +427,7 @@ export class OperatorNotificationDeliveryService {
       });
       return summary;
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
       const errorMessage = sanitizeOperatorNotificationError(error);
       const summary = {
         attempted: 0,
@@ -409,6 +457,7 @@ export class OperatorNotificationDeliveryService {
   }
 
   async deliverRecord(record: ClaimedOperatorNotificationRecord): Promise<OperatorNotificationRecord> {
+    this.runtimeOwnership.assertLocallyHeld();
     if (record.deliveryStatus !== "PENDING" || !this.isConfigured()) {
       return record;
     }
@@ -421,6 +470,7 @@ export class OperatorNotificationDeliveryService {
         chatId: this.dependencies.operatorChatId ?? "",
         text: formatOperatorNotificationDeliveryText(record, this.dependencies.locale),
       });
+      this.runtimeOwnership.assertLocallyHeld();
 
       const deliveredRecord: OperatorNotificationRecord = {
         ...record,
@@ -457,6 +507,8 @@ export class OperatorNotificationDeliveryService {
       });
       return finalized ? deliveredRecord : record;
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
+      this.runtimeOwnership.assertLocallyHeld();
       const classifiedError = classifyTelegramDeliveryError(error);
       const shouldRetry =
         classifiedError.failureClass === "RETRYABLE" && attemptCount < this.maxAttempts();
@@ -580,6 +632,7 @@ export class OperatorNotificationDeliveryService {
     summary: OperatorNotificationDeliverySummary;
     errorMessage: string | null;
   }): Promise<void> {
+    this.runtimeOwnership.assertLocallyHeld();
     await this.dependencies.repositories.saveOperatorNotificationDeliveryRun({
       id: input.runId,
       exchangeAccountId: input.exchangeAccountId,
@@ -602,6 +655,7 @@ export class OperatorNotificationDeliveryService {
       errorMessage: input.errorMessage,
       summaryJson: JSON.stringify(input.summary),
     });
+    this.runtimeOwnership.assertLocallyHeld();
   }
 
   private async finalizeTransition(transition: {
@@ -615,7 +669,10 @@ export class OperatorNotificationDeliveryService {
     deliveredAt: string | null;
     lastError: string | null;
   }): Promise<boolean> {
-    return this.dependencies.repositories.compareAndSetOperatorNotificationDeliveryStatus(transition);
+    this.runtimeOwnership.assertLocallyHeld();
+    const finalized = await this.dependencies.repositories.compareAndSetOperatorNotificationDeliveryStatus(transition);
+    this.runtimeOwnership.assertLocallyHeld();
+    return finalized;
   }
 
   private async saveAttemptRecord(input: {
@@ -645,7 +702,9 @@ export class OperatorNotificationDeliveryService {
       createdAt: input.attemptedAt,
     };
 
+    this.runtimeOwnership.assertLocallyHeld();
     await this.dependencies.repositories.saveOperatorNotificationDeliveryAttempt(record);
+    this.runtimeOwnership.assertLocallyHeld();
   }
 
   private async summarizeQueueState(
@@ -899,6 +958,48 @@ function clampBackoff(delayMs: number, minimumMs: number, maximumMs: number): nu
 
 function addMillisecondsToIso(isoTimestamp: string, delayMs: number): string {
   return new Date(Date.parse(isoTimestamp) + delayMs).toISOString();
+}
+
+function createUnavailableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "UNOWNED", generation: null, executionMode: null, acquiredAtEpochMs: null,
+      heartbeatAtEpochMs: null, expiresAtEpochMs: null, takeover: false, lossReason: null,
+    }),
+    assertLocallyHeld: throwRuntimeOwnershipNotHeld,
+    async assertCurrent(): Promise<never> { return throwRuntimeOwnershipNotHeld(); },
+  };
+}
+
+function waitForDeliverySettlement<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  const boundedTimeoutMs = Number.isSafeInteger(timeoutMs) && timeoutMs >= 0 ? timeoutMs : 0;
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error("Operator notification delivery did not quiesce before the shutdown timeout."));
+    }, boundedTimeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+}
+
+function throwRuntimeOwnershipNotHeld(): never {
+  throw new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_NOT_HELD",
+    "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
+  );
+}
+
+function isRuntimeOwnershipFailure(error: unknown): boolean {
+  return error instanceof RuntimeOwnershipGuardError ||
+    (error instanceof Error && /^RUNTIME_OWNERSHIP_(?:LOST|NOT_HELD):/u.test(error.message));
 }
 
 function sanitizeOperatorNotificationError(error: unknown): string {

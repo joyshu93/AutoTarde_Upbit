@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import type { PositionGuardPolicySelection } from "../src/domain/pilot-types.js";
 import type { ExchangeBalance, ExecutionStateRecord } from "../src/domain/types.js";
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import {
   derivePositionGuardPilotDeploymentId,
   PositionGuardPilotInitializer,
@@ -17,7 +18,7 @@ import {
 } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { CandidateExecutionEvidenceService } from
   "../src/modules/execution/candidate-evidence-service.js";
-import { ExecutionService } from "../src/modules/execution/execution-service.js";
+import { ExecutionService as ProductionExecutionService } from "../src/modules/execution/execution-service.js";
 import type { CandidateExecutionAuthority } from "../src/modules/execution/interfaces.js";
 import type {
   CancelOrderResult,
@@ -28,12 +29,13 @@ import type {
   UpbitOrderRequest,
 } from "../src/modules/exchange/interfaces.js";
 import { ExchangeOrderSubmissionError } from "../src/modules/exchange/errors.js";
-import { ReconciliationService } from "../src/modules/reconciliation/reconciliation-service.js";
+import { ReconciliationService as ProductionReconciliationService } from
+  "../src/modules/reconciliation/reconciliation-service.js";
 import { createEmptyPositionGuardCandidateState } from
   "../src/modules/strategy/position-guard-candidate-state.js";
 import {
   createDefaultPositionGuardRunnerConfig,
-  PositionGuardStrategyRunner,
+  PositionGuardStrategyRunner as ProductionPositionGuardStrategyRunner,
 } from "../src/modules/strategy/position-guard-runner.js";
 import {
   toStrategyDecision,
@@ -45,6 +47,34 @@ import type {
   PositionGuardStructureAnalysis,
 } from "../src/modules/strategy/position-guard-core.js";
 import { test } from "./harness.js";
+
+class ExecutionService extends ProductionExecutionService {
+  constructor(dependencies: ConstructorParameters<typeof ProductionExecutionService>[0]) {
+    super({
+      ...dependencies,
+      runtimeOwnership: dependencies.runtimeOwnership ??
+        createAlwaysOwnedRuntimeOwnershipAuthority(dependencies.operatorState),
+    });
+  }
+}
+
+class ReconciliationService extends ProductionReconciliationService {
+  constructor(dependencies: ConstructorParameters<typeof ProductionReconciliationService>[0]) {
+    super({
+      ...dependencies,
+      runtimeOwnership: dependencies.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    });
+  }
+}
+
+class PositionGuardStrategyRunner extends ProductionPositionGuardStrategyRunner {
+  constructor(dependencies: ConstructorParameters<typeof ProductionPositionGuardStrategyRunner>[0]) {
+    super({
+      ...dependencies,
+      runtimeOwnership: dependencies.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    });
+  }
+}
 
 const ACCOUNT_ID = "primary";
 const PILOT_IDENTITY = {
@@ -59,6 +89,57 @@ const CREATED_AT = "2026-08-21T00:00:00.000Z";
 const SNAPSHOT_AT = "2026-08-21T00:00:30.000Z";
 const RECONCILIATION_COMPLETED_AT = "2026-08-21T00:00:31.000Z";
 const NOW = "2026-08-21T00:00:40.000Z";
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(
+  operatorState?: Pick<InMemoryOperatorStateStore, "getState">,
+): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+    runWithCurrentExecutionAuthority(input, callback) {
+      const statePromise = operatorState === undefined
+        ? {
+            exchangeAccountId: input.exchangeAccountId,
+            executionMode: input.expectedExecutionMode,
+            liveExecutionGate: input.expectedLiveExecutionGate,
+            systemStatus: "RUNNING" as const,
+            killSwitchActive: false,
+          }
+        : operatorState.getState();
+      callback();
+      return Promise.resolve(statePromise).then((state) => ({
+        runtimeOwnership: { ...record },
+        executionState: {
+          exchangeAccountId: state.exchangeAccountId,
+          executionMode: state.executionMode,
+          liveExecutionGate: state.liveExecutionGate,
+          systemStatus: state.systemStatus,
+          killSwitchActive: state.killSwitchActive,
+        },
+      }));
+    },
+  };
+}
 
 test("pending-flat suppresses new BTC risk until fake exchange-backed flat recovery activates", async () => {
   const operatorState = new InMemoryOperatorStateStore(executionState());

@@ -4,6 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Worker } from "node:worker_threads";
 
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import type { PositionGuardPilotDeploymentRecord } from "../src/domain/pilot-types.js";
 import type { ExecutionStateRecord } from "../src/domain/types.js";
 import type {
@@ -677,6 +678,7 @@ test("malformed persisted candidate activation epoch is swept into an atomic fau
       },
     });
     const reconciliation = new ReconciliationService({
+      runtimeOwnership: createAlwaysOwnedRuntimeAuthority(),
       repositories: bundle.repositories,
       operatorState: bundle.operatorState,
       candidateEvidenceService,
@@ -698,6 +700,33 @@ test("malformed persisted candidate activation epoch is swept into an atomic fau
     assert.equal(transition?.createdAt, faultAt);
   });
 });
+
+function createAlwaysOwnedRuntimeAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "a"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+  };
+}
 
 test("migration 0019 preserves legacy mirrors and writes authoritative canonical decimals separately", async () => {
   await withFreshBundle("candidate-exact-decimals", async (bundle, _databasePath, db) => {

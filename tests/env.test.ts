@@ -23,6 +23,11 @@ test("loadAppConfig defaults to DRY_RUN with live gate disabled", () => {
   assert.equal(config.strategySchedulerRunOnStart, false);
   assert.equal(config.strategySchedulerBtcIntervalMs, 3_600_000);
   assert.equal(config.strategySchedulerEthIntervalMs, 3_600_000);
+  assert.equal(
+    (config as typeof config & { liveReadinessMaxEvidenceAgeMs: number | null })
+      .liveReadinessMaxEvidenceAgeMs,
+    null,
+  );
   assert.equal(config.reconciliationMaxOrderLookupsPerRun, 10);
   assert.equal(config.reconciliationHistoryMaxPagesPerMarket, 3);
   assert.equal(config.reconciliationClosedOrderLookbackDays, 7);
@@ -119,4 +124,17 @@ test("loadAppConfig requires a positive account execution lease duration", () =>
   assert.equal(loadAppConfig({ ACCOUNT_EXECUTION_LEASE_MS: "9007199254740992" }).accountExecutionLeaseMs, 30_000);
   assert.equal(loadAppConfig({ ACCOUNT_EXECUTION_LEASE_MS: "not-a-number" }).accountExecutionLeaseMs, 30_000);
   assert.equal(loadAppConfig({ ACCOUNT_EXECUTION_LEASE_MS: "12000" }).accountExecutionLeaseMs, 12_000);
+});
+
+test("loadAppConfig accepts only an explicit positive safe LIVE readiness evidence age", () => {
+  const configured = loadAppConfig({ LIVE_READINESS_MAX_EVIDENCE_AGE_MS: "3600000" }) as
+    ReturnType<typeof loadAppConfig> & { liveReadinessMaxEvidenceAgeMs: number | null };
+  assert.equal(configured.liveReadinessMaxEvidenceAgeMs, 3_600_000);
+
+  for (const value of ["0", "-1", "1.5", "9007199254740992", "not-a-number"]) {
+    assert.throws(
+      () => loadAppConfig({ LIVE_READINESS_MAX_EVIDENCE_AGE_MS: value }),
+      /LIVE_READINESS_MAX_EVIDENCE_AGE_MS must be a positive safe integer/iu,
+    );
+  }
 });

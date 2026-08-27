@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 
 import type { AppServices } from "../src/app/create-app.js";
-import type { AppStartupOperations } from "../src/index.js";
+import type { AppConfig } from "../src/app/env.js";
+import { RuntimeOwnershipGuardError } from "../src/app/runtime-ownership-guard.js";
+import { RuntimeProcessLockError, type RuntimeProcessLock } from "../src/app/runtime-process-lock.js";
+import type { RuntimeOwnershipContext, VerifiedRuntimeDatabase } from
+  "../src/app/runtime-ownership-context.js";
+import type { AppStartupOperations, RunMainOperations } from "../src/index.js";
 import { test } from "./harness.js";
 
 type IndexModule = typeof import("../src/index.js") & {
-  runMain(createApplication?: () => AppServices): Promise<void>;
+  runMain(operations?: Partial<RunMainOperations>): Promise<void>;
 };
 
 let indexModulePromise: Promise<IndexModule> | null = null;
@@ -159,33 +164,159 @@ test("application startup shares one shutdown owner after banner failure followi
   assert.equal(events.filter((event) => event === "persistence:close").length, 1);
 });
 
-test("runMain leaves createApp failure cleanup with the factory and preserves error identity", async () => {
+test("runMain preserves createApp failure identity while releasing acquired ownership", async () => {
   const events: string[] = [];
   const { runMain } = await loadFreshIndexModule();
   const originalError = new Error("create_app_failed");
-  const app = createAppFixture(events, {
-    async initialize() {
-      events.push("initializer");
-    },
-  }, true);
+  const runtime = createRunMainFixture(events);
 
   await assert.rejects(
-    () => runMain(() => {
-      events.push("factory");
-      app.telegramInboundPolling.stop();
-      app.strategyScheduler.stop();
-      app.persistence.close();
-      throw originalError;
+    () => runMain({
+      ...runtime.operations,
+      createApp() {
+        events.push("app:create");
+        throw originalError;
+      },
     }),
     (error) => error === originalError,
   );
 
   assert.deepEqual(events, [
-    "factory",
+    "config:load",
+    "identity:verify",
+    "process-lock:acquire",
+    "ownership-db:open",
+    "ownership:acquire",
+    "heartbeat:start",
+    "app:create",
+    "ownership:startup-failure",
+  ]);
+});
+
+test("runAppStartup preserves notification delivery ownership loss and starts no worker", async () => {
+  const events: string[] = [];
+  const { runAppStartup } = await loadFreshIndexModule();
+  const originalError = new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_LOST",
+    "RUNTIME_OWNERSHIP_LOST: STARTUP_DELIVERY_LOST",
+  );
+  const app = createAppFixture(events, null, true);
+  Object.defineProperty(app.notificationDelivery, "deliverPending", {
+    configurable: true,
+    value: async () => {
+      events.push("delivery");
+      throw originalError;
+    },
+  });
+
+  await assert.rejects(
+    () => runAppStartup(app, createOperations(events)),
+    (error) => error === originalError,
+  );
+
+  assert.deepEqual(events, [
+    "recovery",
+    "policy",
+    "delivery",
     "telegram:stop",
     "scheduler:stop",
     "persistence:close",
   ]);
+});
+
+test("runAppStartup routes scheduled ownership loss through the shared shutdown owner", async () => {
+  const events: string[] = [];
+  const { runAppStartup } = await loadFreshIndexModule();
+  const app = createAppFixture(events, null, true);
+  let onRuntimeOwnershipLost: ((error: unknown) => void) | undefined;
+  Object.defineProperty(app.strategyScheduler, "start", {
+    configurable: true,
+    value(handler?: (error: unknown) => void) {
+      events.push("scheduler:start");
+      onRuntimeOwnershipLost = handler;
+      return { started: true };
+    },
+  });
+
+  await runAppStartup(app, createOperations(events));
+  events.length = 0;
+
+  assert.ok(onRuntimeOwnershipLost);
+  onRuntimeOwnershipLost(new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_LOST",
+    "RUNTIME_OWNERSHIP_LOST: SCHEDULED_CALLBACK_LOST",
+  ));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(events, [
+    "telegram:stop",
+    "scheduler:stop",
+    "persistence:close",
+  ]);
+});
+
+test("runMain acquires both ownership layers before application construction and candidate authority", async () => {
+  const events: string[] = [];
+  const { runMain } = await loadFreshIndexModule();
+  const runtime = createRunMainFixture(events);
+
+  await runMain(runtime.operations);
+
+  assert.deepEqual(events.slice(0, 8), [
+    "config:load",
+    "identity:verify",
+    "process-lock:acquire",
+    "ownership-db:open",
+    "ownership:acquire",
+    "heartbeat:start",
+    "app:create",
+    "candidate-authority",
+  ]);
+});
+
+test("contended process lock causes zero mutable runtime side effects", async () => {
+  const events: string[] = [];
+  const sideEffects: string[] = [];
+  const { runMain } = await loadFreshIndexModule();
+  const originalError = new RuntimeProcessLockError(
+    "RUNTIME_ALREADY_OWNED",
+    "Another runtime already owns this scope.",
+  );
+  const runtime = createRunMainFixture(events);
+
+  await assert.rejects(
+    () => runMain({
+      ...runtime.operations,
+      async acquireRuntimeProcessLock() {
+        events.push("process-lock:acquire");
+        throw originalError;
+      },
+      async createRuntimeOwnershipContext() {
+        sideEffects.push("mutable-sqlite-open", "ownership-acquire", "heartbeat-start");
+        return runtime.ownership;
+      },
+      createApp() {
+        sideEffects.push("app-construction", "bootstrap");
+        return runtime.app;
+      },
+      async runAppStartup() {
+        sideEffects.push(
+          "candidate-initialization",
+          "candidate-recovery",
+          "upbit-read",
+          "telegram-delivery",
+          "telegram-menu",
+          "telegram-polling",
+          "scheduler",
+          "order-send",
+        );
+      },
+    }),
+    (error) => error === originalError,
+  );
+
+  assert.deepEqual(events, ["config:load", "identity:verify", "process-lock:acquire"]);
+  assert.deepEqual(sideEffects, []);
 });
 
 function loadFreshIndexModule(): Promise<IndexModule> {
@@ -321,4 +452,70 @@ function createAppFixture(
       },
     } as never,
   } as unknown as AppServices;
+}
+
+function createRunMainFixture(events: string[]): {
+  readonly app: AppServices;
+  readonly ownership: RuntimeOwnershipContext;
+  readonly operations: RunMainOperations;
+} {
+  const config = {} as AppConfig;
+  const verified = {
+    canonicalDatabasePath: "C:\\runtime-test\\autotrade.sqlite",
+    lockIdentity: { scopeDigest: "a".repeat(64) },
+  } satisfies VerifiedRuntimeDatabase;
+  const processLock = {
+    identity: verified.lockIdentity,
+    isHeld: () => true,
+    onLost: () => () => undefined,
+    async release() {
+      events.push("process-lock:release");
+    },
+  } satisfies RuntimeProcessLock;
+  const ownership = {
+    guard: {} as never,
+    heartbeat: {} as never,
+    snapshot: () => ({ status: "OWNED" }) as never,
+    fence() {},
+    async releaseCurrentOwnership() {
+      return true;
+    },
+    async waitForLossRecording() {},
+    closeOwnershipDatabase() {},
+    async releaseProcessLock() {},
+    async shutdownAfterStartupFailure() {
+      events.push("ownership:startup-failure");
+    },
+  } satisfies RuntimeOwnershipContext;
+  const app = createAppFixture(events, {
+    async initialize() {
+      events.push("candidate-authority");
+    },
+  }, false);
+  const operations: RunMainOperations = {
+    loadAppConfig() {
+      events.push("config:load");
+      return config;
+    },
+    verifyAndResolveRuntimeDatabase() {
+      events.push("identity:verify");
+      return verified;
+    },
+    async acquireRuntimeProcessLock() {
+      events.push("process-lock:acquire");
+      return processLock;
+    },
+    async createRuntimeOwnershipContext() {
+      events.push("ownership-db:open", "ownership:acquire", "heartbeat:start");
+      return ownership;
+    },
+    createApp() {
+      events.push("app:create");
+      return app;
+    },
+    async runAppStartup(startedApp) {
+      await startedApp.candidatePilotStartupAuthority.initialize();
+    },
+  };
+  return { app, ownership, operations };
 }

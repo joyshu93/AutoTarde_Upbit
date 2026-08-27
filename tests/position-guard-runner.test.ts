@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../src/app/runtime-ownership-guard.js";
 import type { ExecutionStateRecord, StrategyDecision } from "../src/domain/types.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { ExecutionService } from "../src/modules/execution/execution-service.js";
@@ -19,11 +23,177 @@ import type {
 import {
   createDefaultPositionGuardRunnerConfig,
   createStrategyDecisionRecord,
-  PositionGuardStrategyRunner,
+  PositionGuardStrategyRunner as ProductionPositionGuardStrategyRunner,
   toOrderSubmissionInput,
 } from "../src/modules/strategy/position-guard-runner.js";
 import type { PositionGuardEngineDecision, PositionGuardStrategyContext } from "../src/modules/strategy/position-guard-core.js";
 import { test } from "./harness.js";
+
+class PositionGuardStrategyRunner extends ProductionPositionGuardStrategyRunner {
+  constructor(dependencies: ConstructorParameters<typeof ProductionPositionGuardStrategyRunner>[0]) {
+    super({
+      ...dependencies,
+      runtimeOwnership: dependencies.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    });
+  }
+}
+
+test("position guard run fails closed when runtime authority is omitted", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  let marketReads = 0;
+  const reader = createFlatMarketReader();
+  const runner = new ProductionPositionGuardStrategyRunner({
+    repositories,
+    executionService: createExecutionService(repositories),
+    marketDataReader: {
+      async getTickers(markets) {
+        marketReads += 1;
+        return reader.getTickers(markets);
+      },
+      getMinuteCandles: reader.getMinuteCandles,
+      getDayCandles: reader.getDayCandles,
+    },
+    config: createDefaultPositionGuardRunnerConfig("primary"),
+  });
+
+  await assert.rejects(
+    () => runner.runOnce({ market: "KRW-BTC", generatedAt: "2026-04-20T01:05:00.000Z" }),
+    /RUNTIME_OWNERSHIP_NOT_HELD/u,
+  );
+  assert.equal(marketReads, 0);
+});
+
+test("position guard discards market data when ownership is lost before decision persistence", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const ownership = createOwnedThenLostRuntimeOwnershipAuthority();
+  const executionService = createExecutionService(repositories);
+  await seedEmptyPortfolio(repositories);
+  const marketDataReader = createFlatMarketReader();
+  const runner = new PositionGuardStrategyRunner({
+    repositories,
+    executionService,
+    marketDataReader: {
+      getTickers: marketDataReader.getTickers,
+      getMinuteCandles: marketDataReader.getMinuteCandles,
+      async getDayCandles(request) {
+        const candles = await marketDataReader.getDayCandles(request);
+        ownership.lose();
+        return candles;
+      },
+    },
+    config: createDefaultPositionGuardRunnerConfig("primary"),
+    runtimeOwnership: ownership.authority,
+  });
+
+  await assert.rejects(
+    () => runner.runOnce({
+      market: "KRW-BTC",
+      generatedAt: "2026-04-20T01:05:00.000Z",
+    }),
+    (error) => error === ownership.lossError,
+  );
+
+  assert.equal(
+    await repositories.getLatestStrategyDecision("primary", "KRW-BTC", "position_guard.paper_core.v1"),
+    null,
+  );
+  assert.equal((await repositories.listOrders("primary")).length, 0);
+});
+
+function createOwnedThenLostRuntimeOwnershipAuthority(): {
+  authority: RuntimeOwnershipAuthority;
+  lose(): void;
+  lossError: RuntimeOwnershipGuardError;
+} {
+  let held = true;
+  const lossError = new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_LOST",
+    "RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED",
+  );
+  return {
+    lossError,
+    lose() {
+      held = false;
+    },
+    authority: {
+      snapshot: () => ({
+        status: held ? "OWNED" : "LOST",
+        generation: 1,
+        executionMode: "DRY_RUN",
+        acquiredAtEpochMs: 1,
+        heartbeatAtEpochMs: 1,
+        expiresAtEpochMs: 45_001,
+        takeover: false,
+        lossReason: held ? null : "TEST_GENERATION_REPLACED",
+      }),
+      assertLocallyHeld() {
+        if (!held) throw lossError;
+      },
+      async assertCurrent() {
+        if (!held) throw lossError;
+        return {
+          ownerToken: "owner".padEnd(64, "x"),
+          generation: 1,
+          executionMode: "DRY_RUN",
+          acquiredAtEpochMs: 1,
+          heartbeatAtEpochMs: 1,
+          expiresAtEpochMs: 45_001,
+        };
+      },
+    },
+  };
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(
+  operatorState?: Pick<InMemoryOperatorStateStore, "getState">,
+): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+    runWithCurrentExecutionAuthority(input, callback) {
+      const statePromise = operatorState === undefined
+        ? {
+            exchangeAccountId: input.exchangeAccountId,
+            executionMode: input.expectedExecutionMode,
+            liveExecutionGate: input.expectedLiveExecutionGate,
+            systemStatus: "RUNNING" as const,
+            killSwitchActive: false,
+          }
+        : operatorState.getState();
+      callback();
+      return Promise.resolve(statePromise).then((state) => ({
+        runtimeOwnership: { ...record },
+        executionState: {
+          exchangeAccountId: state.exchangeAccountId,
+          executionMode: state.executionMode,
+          liveExecutionGate: state.liveExecutionGate,
+          systemStatus: state.systemStatus,
+          killSwitchActive: state.killSwitchActive,
+        },
+      }));
+    },
+  };
+}
 
 test("position guard runner persists a strategy decision without submitting when the action is HOLD", async () => {
   let createOrderCallCount = 0;
@@ -446,6 +616,7 @@ function createExecutionService(
     listClosedOrders: exchangeAdapterOverrides.listClosedOrders ?? baseAdapter.listClosedOrders.bind(baseAdapter),
   };
 
+  const operatorState = new InMemoryOperatorStateStore(createExecutionState());
   return new ExecutionService({
     riskLimits: {
       maxAllocationByAsset: {
@@ -461,7 +632,8 @@ function createExecutionService(
     repositories,
     accountExecutionLeases: new InMemoryAccountExecutionLeaseStore(),
     accountExecutionLeaseMs: 30_000,
-    operatorState: new InMemoryOperatorStateStore(createExecutionState()),
+    operatorState,
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(operatorState),
     now: () => "2026-04-20T01:05:10.000Z",
   });
 }

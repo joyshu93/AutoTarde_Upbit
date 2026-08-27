@@ -198,6 +198,7 @@ test("live readiness smoke checks block default dry-run wiring", () => {
     latestReconciliationRun: null,
     latestReconciliationIssueCodes: [],
     latestReconciliationBlockingIssueCodes: [],
+    checkedAt: "2026-05-11T00:00:01.000Z",
   });
 
   assert.equal(summarizeLiveReadinessSmokeStatus(checks), "BLOCK");
@@ -234,6 +235,7 @@ test("live readiness smoke checks pass only for explicitly gated live wiring", (
     latestReconciliationRun: createReconciliationRun({ status: "SUCCESS" }),
     latestReconciliationIssueCodes: [],
     latestReconciliationBlockingIssueCodes: [],
+    checkedAt: "2026-05-11T00:00:01.000Z",
   });
 
   assert.equal(summarizeLiveReadinessSmokeStatus(checks), "PASS");
@@ -266,6 +268,7 @@ test("live readiness smoke blocks automatic scheduler startup during validation"
     latestReconciliationRun: createReconciliationRun({ status: "SUCCESS" }),
     latestReconciliationIssueCodes: [],
     latestReconciliationBlockingIssueCodes: [],
+    checkedAt: "2026-05-11T00:00:01.000Z",
   });
 
   assert.equal(summarizeLiveReadinessSmokeStatus(checks), "BLOCK");
@@ -298,6 +301,7 @@ test("live readiness smoke next actions guide snapshot warnings without blocking
     latestReconciliationRun: null,
     latestReconciliationIssueCodes: [],
     latestReconciliationBlockingIssueCodes: [],
+    checkedAt: "2026-05-11T00:00:01.000Z",
   });
 
   assert.equal(summarizeLiveReadinessSmokeStatus(checks), "WARN");
@@ -327,11 +331,116 @@ test("live readiness smoke blocks reconciliation drift issue codes", () => {
     latestReconciliationRun: createReconciliationRun({ status: "DRIFT_DETECTED" }),
     latestReconciliationIssueCodes: ["BALANCE_DRIFT_DETECTED"],
     latestReconciliationBlockingIssueCodes: ["BALANCE_DRIFT_DETECTED"],
+    checkedAt: "2026-05-11T00:00:01.000Z",
   });
 
   assert.equal(summarizeLiveReadinessSmokeStatus(checks), "BLOCK");
   assert.equal(checks.find((check) => check.name === "latest_reconciliation")?.status, "BLOCK");
 });
+
+test("live readiness smoke blocks LIVE when the explicit evidence freshness policy is missing", () => {
+  const checks = buildLiveReadinessSmokeChecks({
+    app: {
+      config: createConfig({
+        executionMode: "LIVE",
+        liveExecutionGate: "ENABLED",
+        liveReadinessMaxEvidenceAgeMs: null,
+      }),
+      exchangeBackedReadEnabled: true,
+      liveSendPath: "LIVE_ADAPTER",
+    },
+    executionState: createExecutionState({
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+    }),
+    seedMismatches: [],
+    activeOrderCount: 0,
+    latestBalanceSnapshotAt: "2026-05-11T00:00:00.000Z",
+    latestPositionSnapshotAt: "2026-05-11T00:00:00.000Z",
+    latestReconciliationRun: createReconciliationRun(),
+    latestReconciliationIssueCodes: [],
+    latestReconciliationBlockingIssueCodes: [],
+    checkedAt: "2026-05-11T00:00:01.000Z",
+  } as Parameters<typeof buildLiveReadinessSmokeChecks>[0]);
+
+  assert.equal(checks.find((check) => check.name === "evidence_freshness_policy")?.status, "BLOCK");
+  assert.deepEqual(buildLiveReadinessNextActions(checks), [
+    "Set LIVE_READINESS_MAX_EVIDENCE_AGE_MS to an explicit positive safe integer before LIVE readiness.",
+  ]);
+});
+
+test("live readiness smoke passes exact freshness boundaries and warns one millisecond beyond them", () => {
+  const exactBoundary = buildFreshnessChecks({
+    checkedAt: "2026-05-11T00:01:00.000Z",
+    balanceAt: "2026-05-11T00:00:00.000Z",
+    positionAt: "2026-05-11T00:00:00.000Z",
+    reconciliationAt: "2026-05-11T00:00:00.000Z",
+  });
+  assert.equal(summarizeLiveReadinessSmokeStatus(exactBoundary), "PASS");
+  for (const name of ["balance_snapshot", "position_snapshot", "latest_reconciliation"]) {
+    assert.equal(exactBoundary.find((check) => check.name === name)?.status, "PASS");
+    assert.match(exactBoundary.find((check) => check.name === name)?.detail ?? "", /fresh_age_ms=60000/iu);
+  }
+
+  const stale = buildFreshnessChecks({
+    checkedAt: "2026-05-11T00:01:00.001Z",
+    balanceAt: "2026-05-11T00:00:00.000Z",
+    positionAt: "2026-05-11T00:00:00.000Z",
+    reconciliationAt: "2026-05-11T00:00:00.000Z",
+  });
+  assert.equal(summarizeLiveReadinessSmokeStatus(stale), "WARN");
+  for (const name of ["balance_snapshot", "position_snapshot", "latest_reconciliation"]) {
+    assert.equal(stale.find((check) => check.name === name)?.status, "WARN");
+    assert.match(stale.find((check) => check.name === name)?.detail ?? "", /stale_age_ms=60001/iu);
+  }
+});
+
+test("live readiness smoke blocks future and malformed persisted health timestamps", () => {
+  const future = buildFreshnessChecks({
+    checkedAt: "2026-05-11T00:01:00.000Z",
+    balanceAt: "2026-05-11T00:01:00.001Z",
+    positionAt: "not-a-timestamp",
+    reconciliationAt: "2026-05-11T00:01:00.001Z",
+  });
+
+  assert.equal(summarizeLiveReadinessSmokeStatus(future), "BLOCK");
+  assert.equal(future.find((check) => check.name === "balance_snapshot")?.status, "BLOCK");
+  assert.equal(future.find((check) => check.name === "position_snapshot")?.status, "BLOCK");
+  assert.equal(future.find((check) => check.name === "latest_reconciliation")?.status, "BLOCK");
+  assert.match(future.find((check) => check.name === "balance_snapshot")?.detail ?? "", /uncomparable/iu);
+  assert.match(future.find((check) => check.name === "position_snapshot")?.detail ?? "", /uncomparable/iu);
+  assert.match(future.find((check) => check.name === "latest_reconciliation")?.detail ?? "", /uncomparable/iu);
+  assert.deepEqual(buildLiveReadinessNextActions(future), [
+    "Investigate system clock and persisted health timestamps before LIVE startup.",
+  ]);
+});
+
+function buildFreshnessChecks(input: {
+  checkedAt: string;
+  balanceAt: string;
+  positionAt: string;
+  reconciliationAt: string;
+}): ReturnType<typeof buildLiveReadinessSmokeChecks> {
+  const config = {
+    ...createConfig({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    liveReadinessMaxEvidenceAgeMs: 60_000,
+  } as AppConfig;
+  return buildLiveReadinessSmokeChecks({
+    app: { config, exchangeBackedReadEnabled: true, liveSendPath: "LIVE_ADAPTER" },
+    executionState: createExecutionState({ executionMode: "LIVE", liveExecutionGate: "ENABLED" }),
+    seedMismatches: [],
+    activeOrderCount: 0,
+    latestBalanceSnapshotAt: input.balanceAt,
+    latestPositionSnapshotAt: input.positionAt,
+    latestReconciliationRun: createReconciliationRun({
+      startedAt: input.reconciliationAt,
+      completedAt: input.reconciliationAt,
+    }),
+    latestReconciliationIssueCodes: [],
+    latestReconciliationBlockingIssueCodes: [],
+    checkedAt: input.checkedAt,
+  } as Parameters<typeof buildLiveReadinessSmokeChecks>[0]);
+}
 
 function createConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   return {
@@ -360,6 +469,7 @@ function createConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     strategySchedulerRunOnStart: false,
     strategySchedulerBtcIntervalMs: 3_600_000,
     strategySchedulerEthIntervalMs: 3_600_000,
+    liveReadinessMaxEvidenceAgeMs: 3_600_000,
     reconciliationMaxOrderLookupsPerRun: 10,
     reconciliationHistoryMaxPagesPerMarket: 3,
     reconciliationClosedOrderLookbackDays: 7,
@@ -471,6 +581,9 @@ function createSmokeApp(
     notificationDelivery: {
       isConfigured() {
         return false;
+      },
+      stop() {
+        return { stopped: true, inFlightCount: 0, quiesced: true };
       },
     } as never,
     persistence: {

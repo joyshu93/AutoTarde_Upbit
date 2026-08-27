@@ -1,12 +1,27 @@
 import assert from "node:assert/strict";
 
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../src/app/runtime-ownership-guard.js";
 import type { OrderRecord, ReconciliationRunRecord } from "../src/domain/types.js";
 import { InMemoryExecutionRepository, InMemoryOperatorStateStore } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { ExchangeOrderLookupError } from "../src/modules/exchange/errors.js";
 import { parseCandidateEvidenceTimestamp } from "../src/modules/execution/candidate-evidence-decimals.js";
-import { ReconciliationService } from "../src/modules/reconciliation/reconciliation-service.js";
+import {
+  ReconciliationService as ProductionReconciliationService,
+} from "../src/modules/reconciliation/reconciliation-service.js";
 import { DurableTelegramReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
+
+class ReconciliationService extends ProductionReconciliationService {
+  constructor(dependencies: ConstructorParameters<typeof ProductionReconciliationService>[0]) {
+    super({
+      ...dependencies,
+      runtimeOwnership: dependencies.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    });
+  }
+}
 
 function uncertainSubmissionOrder(overrides: Partial<OrderRecord> = {}): OrderRecord {
   return {
@@ -92,6 +107,193 @@ function activeReconciliationRaceState() {
     degradedAt: null,
     updatedAt: "2026-08-24T00:00:00.000Z",
   });
+}
+
+test("reconciliation discards an exchange order result after ownership loss without stale persistence", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = activeReconciliationRaceState();
+  const order = activeReconciliationRaceOrder();
+  const ownership = createOwnedThenLostRuntimeOwnershipAuthority();
+  await repositories.saveOrder(order);
+  const service = new ProductionReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: {
+      async getOrder() {
+        ownership.lose();
+        return {
+          uuid: order.upbitUuid!,
+          identifier: order.identifier,
+          market: order.market,
+          side: order.side,
+          ordType: "limit" as const,
+          state: "done" as const,
+          price: order.price,
+          volume: order.volume,
+          remainingVolume: "0",
+          executedVolume: order.volume!,
+          paidFee: "500",
+          createdAt: order.createdAt,
+          fills: [],
+          raw: { state: "done" },
+        };
+      },
+    },
+    runtimeOwnership: ownership.authority,
+  });
+
+  await assert.rejects(
+    () => service.runWithRecord("primary"),
+    (error) => error === ownership.lossError,
+  );
+
+  assert.deepEqual(await repositories.findOrderById("primary", order.id), order);
+  assert.equal((await repositories.listOrderEvents(order.id)).length, 0);
+  assert.equal((await repositories.listFills(order.id)).length, 0);
+  assert.equal((await repositories.listRiskEvents("primary")).length, 0);
+  assert.equal((await repositories.listReconciliationRuns("primary")).length, 0);
+  assert.equal((await operatorState.getState()).systemStatus, "RUNNING");
+});
+
+test("reconciliation broad catches preserve the exact ownership error before any second assertion", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const operatorState = activeReconciliationRaceState();
+  const order = activeReconciliationRaceOrder();
+  const ownership = createFreshAssertionRuntimeOwnershipAuthority();
+  const originalError = new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_LOST",
+    "RUNTIME_OWNERSHIP_LOST: ORDER_READ_DETECTED_LOSS",
+  );
+  await repositories.saveOrder(order);
+  const service = new ProductionReconciliationService({
+    repositories,
+    operatorState,
+    orderReader: {
+      async getOrder(): Promise<never> {
+        ownership.lose();
+        throw originalError;
+      },
+    },
+    runtimeOwnership: ownership.authority,
+  });
+
+  await assert.rejects(() => service.runWithRecord("primary"), (error) => error === originalError);
+
+  assert.equal(ownership.assertionErrors.length, 0);
+  assert.deepEqual(await repositories.findOrderById("primary", order.id), order);
+  assert.equal((await repositories.listOrderEvents(order.id)).length, 0);
+  assert.equal((await repositories.listReconciliationRuns("primary")).length, 0);
+});
+
+function createFreshAssertionRuntimeOwnershipAuthority(): {
+  authority: RuntimeOwnershipAuthority;
+  assertionErrors: RuntimeOwnershipGuardError[];
+  lose(): void;
+} {
+  let held = true;
+  const assertionErrors: RuntimeOwnershipGuardError[] = [];
+  return {
+    assertionErrors,
+    lose() {
+      held = false;
+    },
+    authority: {
+      snapshot: () => ({
+        status: held ? "OWNED" : "LOST",
+        generation: 1,
+        executionMode: "DRY_RUN",
+        acquiredAtEpochMs: 1,
+        heartbeatAtEpochMs: 1,
+        expiresAtEpochMs: 45_001,
+        takeover: false,
+        lossReason: held ? null : "TEST_GENERATION_REPLACED",
+      }),
+      assertLocallyHeld() {
+        if (!held) {
+          const error = new RuntimeOwnershipGuardError(
+            "RUNTIME_OWNERSHIP_LOST",
+            `RUNTIME_OWNERSHIP_LOST: ASSERTION_${assertionErrors.length + 1}`,
+          );
+          assertionErrors.push(error);
+          throw error;
+        }
+      },
+      async assertCurrent(): Promise<never> {
+        throw new Error("assertCurrent is not used by reconciliation");
+      },
+    },
+  };
+}
+
+function createOwnedThenLostRuntimeOwnershipAuthority(): {
+  authority: RuntimeOwnershipAuthority;
+  lose(): void;
+  lossError: RuntimeOwnershipGuardError;
+} {
+  let held = true;
+  const lossError = new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_LOST",
+    "RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED",
+  );
+  return {
+    lossError,
+    lose() {
+      held = false;
+    },
+    authority: {
+      snapshot: () => ({
+        status: held ? "OWNED" : "LOST",
+        generation: 1,
+        executionMode: "DRY_RUN",
+        acquiredAtEpochMs: 1,
+        heartbeatAtEpochMs: 1,
+        expiresAtEpochMs: 45_001,
+        takeover: false,
+        lossReason: held ? null : "TEST_GENERATION_REPLACED",
+      }),
+      assertLocallyHeld() {
+        if (!held) throw lossError;
+      },
+      async assertCurrent() {
+        if (!held) throw lossError;
+        return {
+          ownerToken: "owner".padEnd(64, "x"),
+          generation: 1,
+          executionMode: "DRY_RUN",
+          acquiredAtEpochMs: 1,
+          heartbeatAtEpochMs: 1,
+          expiresAtEpochMs: 45_001,
+        };
+      },
+    },
+  };
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+  };
 }
 
 test("active reconciliation CAS conflict preserves a concurrent terminal aggregate without stale projection", async () => {

@@ -10,6 +10,7 @@ import {
 } from "../src/app/create-app.js";
 import type { AppConfig } from "../src/app/env.js";
 import { provisionLiveDatabaseIdentity } from "../src/app/live-database-identity.js";
+import type { RuntimeOwnershipAuthority } from "../src/app/runtime-ownership-guard.js";
 import { runAppStartup, startTelegramRuntime, type AppStartupOperations } from "../src/index.js";
 import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
 import {
@@ -27,7 +28,10 @@ const TEST_LIVE_ACCESS_KEY = "create-app-test-access-key";
 
 function createApp(config?: AppConfig, overrides: CreateAppOverrides = {}) {
   if (!config || config.executionMode !== "LIVE") {
-    return createProductionApp(config, overrides);
+    return createProductionApp(config, {
+      runtimeOwnershipAuthority: createAlwaysOwnedRuntimeAuthority(),
+      ...overrides,
+    });
   }
 
   const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
@@ -58,11 +62,83 @@ function createApp(config?: AppConfig, overrides: CreateAppOverrides = {}) {
       exchangeAccountId: "primary",
       upbitAccessKey: accessKey,
     });
-    return createProductionApp(guardedConfig, overrides);
+    return createProductionApp(guardedConfig, {
+      runtimeOwnershipAuthority: createAlwaysOwnedRuntimeAuthority(),
+      ...overrides,
+    });
   } finally {
     restoreOptionalEnv("UPBIT_ACCESS_KEY", previousAccessKey);
   }
 }
+
+test("createApp rejects a fully enabled LIVE send path without runtime authority", async () => {
+  const databasePath = await createTempDatabasePath("live-runtime-authority-required");
+  const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
+  const previousSecretKey = process.env.UPBIT_SECRET_KEY;
+  process.env.UPBIT_ACCESS_KEY = TEST_LIVE_ACCESS_KEY;
+  process.env.UPBIT_SECRET_KEY = "create-app-test-secret-key";
+
+  try {
+    const setup = createSqlitePersistence({
+      databasePath,
+      exchangeAccountId: "primary",
+      userId: "system_operator",
+      userTelegramId: "system_operator",
+      userDisplayName: "System Operator",
+      accessKeyRef: "TEST:UPBIT_ACCESS_KEY",
+      secretKeyRef: "TEST:UPBIT_SECRET_KEY",
+      executionMode: "LIVE",
+      liveExecutionGate: "ENABLED",
+      killSwitchActive: false,
+    });
+    setup.close();
+    provisionLiveDatabaseIdentity({
+      databasePath,
+      databaseInstanceId: TEST_LIVE_DATABASE_INSTANCE_ID,
+      exchangeAccountId: "primary",
+      upbitAccessKey: TEST_LIVE_ACCESS_KEY,
+    });
+
+    assert.throws(
+      () => createProductionApp(createConfig({
+        databasePath,
+        executionMode: "LIVE",
+        liveExecutionGate: "ENABLED",
+        liveDatabaseInstanceId: TEST_LIVE_DATABASE_INSTANCE_ID,
+      })),
+      /RUNTIME_OWNERSHIP_NOT_HELD/u,
+    );
+  } finally {
+    restoreOptionalEnv("UPBIT_ACCESS_KEY", previousAccessKey);
+    restoreOptionalEnv("UPBIT_SECRET_KEY", previousSecretKey);
+    await cleanupTempDatabase(databasePath);
+  }
+});
+
+test("explicit DRY_RUN composition needs no runtime authority and cannot select a live adapter", async () => {
+  const databasePath = await createTempDatabasePath("dryrun-runtime-authority-exemption");
+  const previousAccessKey = process.env.UPBIT_ACCESS_KEY;
+  const previousSecretKey = process.env.UPBIT_SECRET_KEY;
+  process.env.UPBIT_ACCESS_KEY = TEST_LIVE_ACCESS_KEY;
+  process.env.UPBIT_SECRET_KEY = "create-app-test-secret-key";
+
+  try {
+    const app = createProductionApp(createConfig({
+      databasePath,
+      executionMode: "DRY_RUN",
+      liveExecutionGate: "ENABLED",
+    }), {
+      privateExchangeAdapter: createLiveExecutionAdapterFake(),
+    });
+
+    assert.equal(app.liveSendPath, "DRY_RUN_ADAPTER");
+    app.persistence.close();
+  } finally {
+    restoreOptionalEnv("UPBIT_ACCESS_KEY", previousAccessKey);
+    restoreOptionalEnv("UPBIT_SECRET_KEY", previousSecretKey);
+    await cleanupTempDatabase(databasePath);
+  }
+});
 
 test("createApp keeps dry-run adapter as the default live send path", async () => {
   const databasePath = await createTempDatabasePath("dryrun");
@@ -1072,6 +1148,34 @@ function restoreOptionalEnv(name: string, value: string | undefined): void {
   }
 
   delete process.env[name];
+}
+
+function createAlwaysOwnedRuntimeAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot() {
+      return {
+        status: "OWNED",
+        generation: 1,
+        executionMode: "LIVE",
+        acquiredAtEpochMs: 1,
+        heartbeatAtEpochMs: 1,
+        expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+        takeover: false,
+        lossReason: null,
+      };
+    },
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return {
+        ownerToken: "test-owner-token-not-exposed-by-authority",
+        generation: 1,
+        executionMode: "LIVE",
+        acquiredAtEpochMs: 1,
+        heartbeatAtEpochMs: 1,
+        expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+      };
+    },
+  };
 }
 
 function candidatePolicySelection(): AppConfig["positionGuardPolicySelection"] {

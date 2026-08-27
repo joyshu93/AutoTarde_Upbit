@@ -2,17 +2,410 @@ import assert from "node:assert/strict";
 import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../src/app/runtime-ownership-guard.js";
 import type { OperatorNotificationRecord } from "../src/domain/types.js";
 import { InMemoryExecutionRepository } from "../src/modules/db/repositories/in-memory-repositories.js";
 import { createSqlitePersistence } from "../src/modules/db/repositories/sqlite-repositories.js";
 import {
-  OperatorNotificationDeliveryService,
+  OperatorNotificationDeliveryService as ProductionOperatorNotificationDeliveryService,
   TelegramBotApiClient,
   type TelegramMessageEditClient,
 } from "../src/modules/telegram/delivery.js";
 import { TelegramCommandMenuSetupService } from "../src/modules/telegram/setup.js";
 import { DurableTelegramReporter } from "../src/modules/telegram/reporter.js";
 import { test } from "./harness.js";
+
+class OperatorNotificationDeliveryService extends ProductionOperatorNotificationDeliveryService {
+  constructor(dependencies: ConstructorParameters<typeof ProductionOperatorNotificationDeliveryService>[0]) {
+    super({
+      ...dependencies,
+      runtimeOwnership: dependencies.runtimeOwnership ?? createAlwaysOwnedRuntimeOwnershipAuthority(),
+    });
+  }
+}
+
+test("notification delivery fails closed when runtime authority is omitted", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  let claimCalls = 0;
+  const service = new ProductionOperatorNotificationDeliveryService({
+    repositories: {
+      claimPendingOperatorNotifications: async (...args) => {
+        claimCalls += 1;
+        return repositories.claimPendingOperatorNotifications(...args);
+      },
+      compareAndSetOperatorNotificationDeliveryStatus:
+        repositories.compareAndSetOperatorNotificationDeliveryStatus.bind(repositories),
+      listOperatorNotifications: repositories.listOperatorNotifications.bind(repositories),
+      listPendingOperatorNotifications: repositories.listPendingOperatorNotifications.bind(repositories),
+      saveOperatorNotificationDeliveryAttempt:
+        repositories.saveOperatorNotificationDeliveryAttempt.bind(repositories),
+      saveOperatorNotificationDeliveryRun:
+        repositories.saveOperatorNotificationDeliveryRun.bind(repositories),
+    },
+    client: null,
+    operatorChatId: null,
+  });
+
+  await assert.rejects(() => service.deliverPending("primary"), /RUNTIME_OWNERSHIP_NOT_HELD/u);
+  assert.equal(claimCalls, 0);
+});
+
+test("notification delivery rejects before claim or send after runtime ownership is lost", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  let claimCalls = 0;
+  let sendCalls = 0;
+  const deliveryService = new OperatorNotificationDeliveryService({
+    repositories: {
+      claimPendingOperatorNotifications: async (...args) => {
+        claimCalls += 1;
+        return repositories.claimPendingOperatorNotifications(...args);
+      },
+      compareAndSetOperatorNotificationDeliveryStatus:
+        repositories.compareAndSetOperatorNotificationDeliveryStatus.bind(repositories),
+      listOperatorNotifications: repositories.listOperatorNotifications.bind(repositories),
+      listPendingOperatorNotifications: repositories.listPendingOperatorNotifications.bind(repositories),
+      saveOperatorNotificationDeliveryAttempt:
+        repositories.saveOperatorNotificationDeliveryAttempt.bind(repositories),
+      saveOperatorNotificationDeliveryRun:
+        repositories.saveOperatorNotificationDeliveryRun.bind(repositories),
+    },
+    client: {
+      async sendMessage() {
+        sendCalls += 1;
+      },
+    },
+    operatorChatId: "123",
+    runtimeOwnership: createLostRuntimeOwnershipAuthority(),
+  });
+
+  await assert.rejects(
+    () => deliveryService.deliverPending("primary"),
+    /RUNTIME_OWNERSHIP_LOST/u,
+  );
+
+  assert.equal(claimCalls, 0);
+  assert.equal(sendCalls, 0);
+});
+
+test("notification delivery stops after claim when runtime ownership is replaced", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const runtimeOwnership = createControllableRuntimeOwnershipAuthority();
+  let sendCalls = 0;
+  let saveRunCalls = 0;
+  await repositories.saveOperatorNotification(createNotification({
+    id: "runtime-loss-after-claim",
+    createdAt: "2026-04-20T00:00:00.000Z",
+  }));
+  const deliveryService = new OperatorNotificationDeliveryService({
+    repositories: {
+      claimPendingOperatorNotifications: async (...args) => {
+        const claimed = await repositories.claimPendingOperatorNotifications(...args);
+        runtimeOwnership.lose();
+        return claimed;
+      },
+      compareAndSetOperatorNotificationDeliveryStatus:
+        repositories.compareAndSetOperatorNotificationDeliveryStatus.bind(repositories),
+      listOperatorNotifications: repositories.listOperatorNotifications.bind(repositories),
+      listPendingOperatorNotifications: repositories.listPendingOperatorNotifications.bind(repositories),
+      saveOperatorNotificationDeliveryAttempt:
+        repositories.saveOperatorNotificationDeliveryAttempt.bind(repositories),
+      async saveOperatorNotificationDeliveryRun(record) {
+        saveRunCalls += 1;
+        await repositories.saveOperatorNotificationDeliveryRun(record);
+      },
+    },
+    client: {
+      async sendMessage() {
+        sendCalls += 1;
+      },
+    },
+    operatorChatId: "123",
+    runtimeOwnership,
+    now: () => "2026-04-20T00:00:00.000Z",
+  });
+
+  await assert.rejects(
+    () => deliveryService.deliverPending("primary"),
+    /RUNTIME_OWNERSHIP_LOST/u,
+  );
+
+  assert.equal(sendCalls, 0);
+  assert.equal(saveRunCalls, 0);
+});
+
+test("notification delivery leaves claimed evidence unchanged when ownership is lost during send", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const runtimeOwnership = createControllableRuntimeOwnershipAuthority();
+  let finalizeCalls = 0;
+  let attemptWrites = 0;
+  let runWrites = 0;
+  await repositories.saveOperatorNotification(createNotification({
+    id: "runtime-loss-during-send",
+    createdAt: "2026-04-20T00:00:00.000Z",
+  }));
+  const deliveryService = new OperatorNotificationDeliveryService({
+    repositories: {
+      claimPendingOperatorNotifications:
+        repositories.claimPendingOperatorNotifications.bind(repositories),
+      async compareAndSetOperatorNotificationDeliveryStatus(input) {
+        finalizeCalls += 1;
+        return repositories.compareAndSetOperatorNotificationDeliveryStatus(input);
+      },
+      listOperatorNotifications: repositories.listOperatorNotifications.bind(repositories),
+      listPendingOperatorNotifications: repositories.listPendingOperatorNotifications.bind(repositories),
+      async saveOperatorNotificationDeliveryAttempt(record) {
+        attemptWrites += 1;
+        await repositories.saveOperatorNotificationDeliveryAttempt(record);
+      },
+      async saveOperatorNotificationDeliveryRun(record) {
+        runWrites += 1;
+        await repositories.saveOperatorNotificationDeliveryRun(record);
+      },
+    },
+    client: {
+      async sendMessage() {
+        runtimeOwnership.lose();
+      },
+    },
+    operatorChatId: "123",
+    runtimeOwnership,
+    now: () => "2026-04-20T00:00:00.000Z",
+  });
+
+  await assert.rejects(
+    () => deliveryService.deliverPending("primary"),
+    /RUNTIME_OWNERSHIP_LOST/u,
+  );
+
+  const [notification] = await repositories.listOperatorNotifications("primary", 10);
+  assert.equal(finalizeCalls, 0);
+  assert.equal(attemptWrites, 0);
+  assert.equal(runWrites, 0);
+  assert.equal(notification?.deliveryStatus, "PENDING");
+  assert.notEqual(notification?.leaseToken, null);
+});
+
+test("notification delivery writes no retry or failure state when ownership is lost as send rejects", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const runtimeOwnership = createControllableRuntimeOwnershipAuthority();
+  let finalizeCalls = 0;
+  let attemptWrites = 0;
+  let runWrites = 0;
+  await repositories.saveOperatorNotification(createNotification({
+    id: "runtime-loss-during-send-error",
+    createdAt: "2026-04-20T00:00:00.000Z",
+  }));
+  const deliveryService = new OperatorNotificationDeliveryService({
+    repositories: {
+      claimPendingOperatorNotifications:
+        repositories.claimPendingOperatorNotifications.bind(repositories),
+      async compareAndSetOperatorNotificationDeliveryStatus(input) {
+        finalizeCalls += 1;
+        return repositories.compareAndSetOperatorNotificationDeliveryStatus(input);
+      },
+      listOperatorNotifications: repositories.listOperatorNotifications.bind(repositories),
+      listPendingOperatorNotifications: repositories.listPendingOperatorNotifications.bind(repositories),
+      async saveOperatorNotificationDeliveryAttempt(record) {
+        attemptWrites += 1;
+        await repositories.saveOperatorNotificationDeliveryAttempt(record);
+      },
+      async saveOperatorNotificationDeliveryRun(record) {
+        runWrites += 1;
+        await repositories.saveOperatorNotificationDeliveryRun(record);
+      },
+    },
+    client: {
+      async sendMessage() {
+        runtimeOwnership.lose();
+        throw new Error("telegram transport rejected after ownership loss");
+      },
+    },
+    operatorChatId: "123",
+    runtimeOwnership,
+    now: () => "2026-04-20T00:00:00.000Z",
+  });
+
+  await assert.rejects(
+    () => deliveryService.deliverPending("primary"),
+    /RUNTIME_OWNERSHIP_LOST/u,
+  );
+
+  const [notification] = await repositories.listOperatorNotifications("primary", 10);
+  assert.equal(finalizeCalls, 0);
+  assert.equal(attemptWrites, 0);
+  assert.equal(runWrites, 0);
+  assert.equal(notification?.deliveryStatus, "PENDING");
+  assert.notEqual(notification?.leaseToken, null);
+});
+
+test("notification delivery stopAndWait settles in-flight transport and prevents new kicks", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const transportStarted = createDeferred<void>();
+  const releaseTransport = createDeferred<void>();
+  let sendCalls = 0;
+  await repositories.saveOperatorNotification(createNotification({
+    id: "delivery-stop-and-wait",
+    createdAt: "2026-04-20T00:00:00.000Z",
+  }));
+  const deliveryService = new OperatorNotificationDeliveryService({
+    repositories,
+    client: {
+      async sendMessage() {
+        sendCalls += 1;
+        transportStarted.resolve();
+        await releaseTransport.promise;
+      },
+    },
+    operatorChatId: "123",
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(),
+    now: () => "2026-04-20T00:00:00.000Z",
+  });
+
+  const delivery = deliveryService.deliverPending("primary");
+  await transportStarted.promise;
+  assert.deepEqual(deliveryService.stop(), {
+    stopped: true,
+    inFlightCount: 1,
+    quiesced: false,
+  });
+  let waitSettled = false;
+  const wait = deliveryService.stopAndWait(1_000).then((status) => {
+    waitSettled = true;
+    return status;
+  });
+  await Promise.resolve();
+  assert.equal(waitSettled, false);
+
+  releaseTransport.resolve();
+  await delivery;
+  assert.deepEqual(await wait, {
+    stopped: true,
+    inFlightCount: 0,
+    quiesced: true,
+  });
+  deliveryService.kick("primary");
+  await Promise.resolve();
+  assert.equal(sendCalls, 1);
+});
+
+test("notification delivery stopAndWait emits explicit timeout evidence", async () => {
+  const repositories = new InMemoryExecutionRepository();
+  const transportStarted = createDeferred<void>();
+  const releaseTransport = createDeferred<void>();
+  await repositories.saveOperatorNotification(createNotification({
+    id: "delivery-stop-timeout",
+    createdAt: "2026-04-20T00:00:00.000Z",
+  }));
+  const deliveryService = new OperatorNotificationDeliveryService({
+    repositories,
+    client: {
+      async sendMessage() {
+        transportStarted.resolve();
+        await releaseTransport.promise;
+      },
+    },
+    operatorChatId: "123",
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(),
+    now: () => "2026-04-20T00:00:00.000Z",
+  });
+  const delivery = deliveryService.deliverPending("primary");
+  void delivery.catch(() => undefined);
+  await transportStarted.promise;
+
+  deliveryService.stop();
+  await assert.rejects(
+    () => deliveryService.stopAndWait(0),
+    /notification delivery did not quiesce before the shutdown timeout/iu,
+  );
+
+  releaseTransport.resolve();
+  await delivery;
+  assert.equal((await deliveryService.stopAndWait(1_000)).quiesced, true);
+});
+
+function createLostRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "LOST",
+      generation: 1,
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 1,
+      heartbeatAtEpochMs: 1,
+      expiresAtEpochMs: 45_001,
+      takeover: false,
+      lossReason: "TEST_GENERATION_REPLACED",
+    }),
+    assertLocallyHeld() {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+    async assertCurrent(): Promise<never> {
+      throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+  };
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+function createAlwaysOwnedRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  const record = {
+    ownerToken: "owner".padEnd(64, "x"),
+    generation: 1,
+    executionMode: "DRY_RUN" as const,
+    acquiredAtEpochMs: 1,
+    heartbeatAtEpochMs: 1,
+    expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+  };
+  return {
+    snapshot: () => ({
+      status: "OWNED",
+      generation: record.generation,
+      executionMode: record.executionMode,
+      acquiredAtEpochMs: record.acquiredAtEpochMs,
+      heartbeatAtEpochMs: record.heartbeatAtEpochMs,
+      expiresAtEpochMs: record.expiresAtEpochMs,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {},
+    async assertCurrent() {
+      return { ...record };
+    },
+  };
+}
+
+function createControllableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority & { lose(): void } {
+  let held = true;
+  return {
+    lose() {
+      held = false;
+    },
+    snapshot: () => ({
+      status: held ? "OWNED" : "LOST",
+      generation: 1,
+      executionMode: "DRY_RUN",
+      acquiredAtEpochMs: 1,
+      heartbeatAtEpochMs: 1,
+      expiresAtEpochMs: 45_001,
+      takeover: false,
+      lossReason: held ? null : "TEST_GENERATION_REPLACED",
+    }),
+    assertLocallyHeld() {
+      if (!held) throw new Error("RUNTIME_OWNERSHIP_LOST: TEST_GENERATION_REPLACED");
+    },
+    async assertCurrent(): Promise<never> {
+      throw new Error("assertCurrent is not used by notification delivery");
+    },
+  };
+}
 
 test("telegram bot api client sends typed HTML messages and returns Telegram message ids", async () => {
   const requests: Array<{
@@ -170,6 +563,7 @@ test("telegram bot api client acknowledges callbacks without navigation side eff
 test("telegram command-menu setup registers Korean fallback and English operator-chat menus", async () => {
   const requests: Array<{ input: RequestInfo | URL; init: RequestInit | undefined }> = [];
   const setupService = new TelegramCommandMenuSetupService({
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(),
     client: new TelegramBotApiClient({
       botToken: "token-1",
       fetchImpl: async (input, init) => {
@@ -207,6 +601,7 @@ test("telegram command-menu setup registers Korean fallback and English operator
 test("telegram command-menu setup repeats the same replacement requests without other side effects", async () => {
   const requests: Array<Record<string, unknown>> = [];
   const setupService = new TelegramCommandMenuSetupService({
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(),
     client: {
       async setMyCommands(input) {
         requests.push(JSON.parse(JSON.stringify(input)) as Record<string, unknown>);
@@ -227,6 +622,7 @@ test("telegram command-menu setup repeats the same replacement requests without 
 test("telegram command-menu setup skips without configuration and never calls the transport", async () => {
   let calls = 0;
   const setupService = new TelegramCommandMenuSetupService({
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(),
     client: {
       async setMyCommands() {
         calls += 1;
@@ -252,6 +648,7 @@ test("telegram command-menu setup captures first and second registration failure
   const token = "token-that-must-not-leak";
   const tokenBearingUrl = `https://api.telegram.org/bot${token}/setMyCommands`;
   const firstFailure = new TelegramCommandMenuSetupService({
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(),
     client: new TelegramBotApiClient({
       botToken: token,
       fetchImpl: async () => {
@@ -262,6 +659,7 @@ test("telegram command-menu setup captures first and second registration failure
   });
   let secondRequest = 0;
   const secondFailure = new TelegramCommandMenuSetupService({
+    runtimeOwnership: createAlwaysOwnedRuntimeOwnershipAuthority(),
     client: new TelegramBotApiClient({
       botToken: token,
       fetchImpl: async () => {
@@ -301,6 +699,59 @@ test("telegram command-menu setup captures first and second registration failure
     assert.equal(serialized.includes(token), false);
     assert.equal(serialized.includes(tokenBearingUrl), false);
     assert.equal(serialized.includes("transport secret"), false);
+  }
+});
+
+test("telegram command-menu setup fences before and after both transmissions", async () => {
+  const trace: string[] = [];
+  const baseAuthority = createAlwaysOwnedRuntimeOwnershipAuthority();
+  const setupService = new TelegramCommandMenuSetupService({
+    runtimeOwnership: {
+      ...baseAuthority,
+      assertLocallyHeld() {
+        trace.push("ownership");
+      },
+    },
+    client: {
+      async setMyCommands() {
+        trace.push("transmit");
+      },
+    },
+    operatorChatId: "operator-chat-1",
+  });
+
+  assert.equal((await setupService.setup()).status, "COMPLETED");
+  assert.deepEqual(trace, [
+    "ownership", "transmit", "ownership",
+    "ownership", "transmit", "ownership",
+  ]);
+});
+
+test("telegram command-menu setup preserves ownership loss after fulfillment and rejection", async () => {
+  for (const transmission of ["FULFILL", "REJECT"] as const) {
+    const ownershipError = new RuntimeOwnershipGuardError(
+      "RUNTIME_OWNERSHIP_LOST",
+      "RUNTIME_OWNERSHIP_LOST: TEST_SETUP_LOSS",
+    );
+    let held = true;
+    const baseAuthority = createAlwaysOwnedRuntimeOwnershipAuthority();
+    const setupService = new TelegramCommandMenuSetupService({
+      runtimeOwnership: {
+        ...baseAuthority,
+        assertLocallyHeld() {
+          if (!held) throw ownershipError;
+        },
+      },
+      client: {
+        async setMyCommands() {
+          held = false;
+          if (transmission === "REJECT") throw new Error("ordinary setup rejection");
+        },
+      },
+      operatorChatId: "operator-chat-1",
+    });
+
+    await assert.rejects(() => setupService.setup(), (error) => error === ownershipError);
   }
 });
 

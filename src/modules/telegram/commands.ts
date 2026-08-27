@@ -77,6 +77,7 @@ import { formatStrategyRunPresentation } from "./presentation/run.js";
 import { formatStrategyPreviewPresentation } from "./presentation/preview.js";
 import type { StrategyDecisionRecord } from "../../domain/types.js";
 import type { PositionGuardPilotRefreshReceipt } from "../../domain/pilot-types.js";
+import type { RuntimeOwnershipSnapshot } from "../../app/runtime-ownership-guard.js";
 import {
   isExactCandidateStateRollbackFlat,
   parseCandidatePilotTimestamp,
@@ -95,7 +96,13 @@ type TelegramCommandRouterDependencies = TelegramRouterDependencies & Readonly<{
 }>;
 
 export class TelegramCommandRouter {
+  private runtimeOwnershipSnapshotProvider: (() => RuntimeOwnershipSnapshot) | null = null;
+
   constructor(private readonly dependencies: TelegramCommandRouterDependencies) {}
+
+  setRuntimeOwnershipSnapshotProvider(provider: () => RuntimeOwnershipSnapshot): void {
+    this.runtimeOwnershipSnapshotProvider = provider;
+  }
 
   getSupportedCommands(): SupportedTelegramCommand[] {
     return listSupportedTelegramCommands();
@@ -602,10 +609,17 @@ export class TelegramCommandRouter {
       runs[0] ?? null,
       schedulerRuns,
     );
+    const runtimeOwnership = this.captureRuntimeOwnershipSnapshot();
+    const runtimeOwnershipNowEpochMs = this.runtimeOwnershipNowEpochMs();
+    const technicalOptions = {
+      ...options,
+      runtimeOwnership,
+      runtimeOwnershipNowEpochMs,
+    };
 
     return detail
       ? {
-          text: appendPilotTechnicalVisibility(formatStatusMessage(state, options), btcPilot),
+          text: appendPilotTechnicalVisibility(formatStatusMessage(state, technicalOptions), btcPilot),
         }
       : {
           text: formatStatusPresentation(
@@ -615,6 +629,8 @@ export class TelegramCommandRouter {
               latestReconciliationRun: options?.latestReconciliationRun ?? null,
               schedulerStatus: options?.schedulerStatus ?? null,
               btcPilot,
+              runtimeOwnership,
+              runtimeOwnershipNowEpochMs,
             },
             normalizeTelegramLocale(this.dependencies.locale),
           ),
@@ -657,6 +673,8 @@ export class TelegramCommandRouter {
       schedulerStatus: this.dependencies.schedulerStatus?.() ?? null,
       inboundStatus: this.dependencies.telegramInboundStatus?.() ?? null,
       now: this.dependencies.now?.() ?? new Date().toISOString(),
+      runtimeOwnership: this.captureRuntimeOwnershipSnapshot(),
+      runtimeOwnershipNowEpochMs: this.runtimeOwnershipNowEpochMs(),
     };
 
     return {
@@ -671,6 +689,17 @@ export class TelegramCommandRouter {
             normalizeTelegramLocale(this.dependencies.locale),
           ),
     };
+  }
+
+  private captureRuntimeOwnershipSnapshot(): RuntimeOwnershipSnapshot | null {
+    const snapshot = this.runtimeOwnershipSnapshotProvider?.() ?? null;
+    return snapshot === null ? null : Object.freeze({ ...snapshot });
+  }
+
+  private runtimeOwnershipNowEpochMs(): number {
+    const now = this.dependencies.now?.() ?? new Date().toISOString();
+    const parsed = Date.parse(now);
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : Date.now();
   }
 
   private async readBtcPilotVisibility(

@@ -54,6 +54,7 @@ import { formatRiskEventsPresentation } from "./risks.js";
 import { formatTelegramInboundPresentation } from "./inbound.js";
 import {
   describeLiveOrderBlockers,
+  formatRuntimeOwnershipTechnicalVisibility,
   formatStatusPresentation,
   type LiveSendPath,
 } from "./status.js";
@@ -68,6 +69,7 @@ import {
   type HistoryRecoveryPresentationSummary,
 } from "./history.js";
 import { formatRecoveryPresentation } from "./recovery.js";
+import type { RuntimeOwnershipSnapshot } from "../../../app/runtime-ownership-guard.js";
 
 const MANUAL_INPUT_NOTE = "Telegram does not accept manual cash or position input.";
 
@@ -113,7 +115,6 @@ function formatRuntimeConfigTechnicalMessage(config: TelegramRuntimeConfigSnapsh
     `config_live_blockers: ${liveBlockers.length === 0 ? "none" : liveBlockers.join(",")}`,
     `exchange_backed_read_enabled: ${config.exchangeBackedReadEnabled}`,
     `upbit_base_url: ${config.upbitBaseUrl}`,
-    `database_path: ${config.databasePath}`,
     `telegram_delivery_enabled: ${config.telegramDeliveryEnabled}`,
     `telegram_bot_token_configured: ${config.telegramBotTokenConfigured}`,
     `telegram_operator_chat_id_configured: ${config.telegramOperatorChatIdConfigured}`,
@@ -160,6 +161,8 @@ export interface ReadinessMessageInput {
   pendingNotifications: OperatorNotificationRecord[];
   schedulerStatus: StrategySchedulerStatus | null;
   inboundStatus: TelegramInboundPollingStatus | null;
+  runtimeOwnership?: RuntimeOwnershipSnapshot | null;
+  runtimeOwnershipNowEpochMs?: number | null;
   now?: string;
 }
 
@@ -184,10 +187,15 @@ export function formatReadinessMessage(input: ReadinessMessageInput): string {
     `active_order_count: ${input.activeOrders.length}`,
     `recent_risk_block_count: ${countRiskBlocks(input.recentRiskEvents)}`,
     `pending_notification_count: ${input.pendingNotifications.length}`,
+    ...formatRuntimeOwnershipTechnicalVisibility(
+      input.runtimeOwnership ?? null,
+      input.runtimeOwnershipNowEpochMs,
+    ).split("\n"),
     "checks:",
     ...checks.map((check) => `- ${check.name}: ${check.status} | ${check.detail}`),
     "read_only_boundary: /readiness never triggers sync, Telegram polling, strategy runs, scheduler ticks, exchange reads, order mutation, or live order transmission.",
     "secret_boundary: secret values are never rendered; only configured/not_configured readiness is shown.",
+    "database_location_boundary: database location identifiers are never rendered.",
     `operator_boundary: ${MANUAL_INPUT_NOTE}`,
   ].join("\n");
 }
@@ -201,6 +209,8 @@ export function formatStatusMessage(
     latestReconciliationRun?: ReconciliationRunRecord | null;
     schedulerStatus?: StrategySchedulerStatus;
     schedulerRuns?: StrategySchedulerRunRecord[];
+    runtimeOwnership?: RuntimeOwnershipSnapshot | null;
+    runtimeOwnershipNowEpochMs?: number | null;
   },
 ): string {
   const liveSendPath = options?.liveSendPath ?? "DRY_RUN_ADAPTER";
@@ -226,6 +236,10 @@ export function formatStatusMessage(
     `live_orders_allowed: ${blockers.length === 0 ? "true" : "false"}`,
     `blocked_by: ${blockers.length === 0 ? "none" : blockers.join(",")}`,
     `seed_mismatches: ${seedMismatches.length === 0 ? "none" : seedMismatches.join(",")}`,
+    ...formatRuntimeOwnershipTechnicalVisibility(
+      options?.runtimeOwnership ?? null,
+      options?.runtimeOwnershipNowEpochMs,
+    ).split("\n"),
     ...formatStrategySchedulerStatusLines(options?.schedulerStatus ?? null),
     ...formatStrategySchedulerRunLines(options?.schedulerRuns ?? []),
     ...formatLatestReconciliationLines(latestReconciliationRun),
@@ -250,6 +264,8 @@ export function formatReadinessSummaryMessage(
     recentRiskBlockCount: countRiskBlocks(input.recentRiskEvents),
     pendingNotificationCount: input.pendingNotifications.length,
     checks,
+    runtimeOwnership: input.runtimeOwnership ?? null,
+    runtimeOwnershipNowEpochMs: input.runtimeOwnershipNowEpochMs ?? null,
   }, locale);
 }
 

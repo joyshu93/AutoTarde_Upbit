@@ -7,8 +7,10 @@ import type {
 } from "../../../domain/types.js";
 import { formatTelegramTimestamp } from "./common.js";
 import type { TelegramLocale } from "./locale.js";
+import type { RuntimeOwnershipSnapshot } from "../../../app/runtime-ownership-guard.js";
 import {
   describePilot,
+  formatRuntimeOwnershipTechnicalVisibility,
   type BtcCandidatePilotVisibility,
 } from "./status.js";
 
@@ -32,6 +34,8 @@ export interface ReadinessPresentationInput {
   pendingNotificationCount: number;
   checks: readonly ReadinessPresentationCheck[];
   btcPilot?: BtcCandidatePilotVisibility | null;
+  runtimeOwnership?: RuntimeOwnershipSnapshot | null;
+  runtimeOwnershipNowEpochMs?: number | null;
 }
 
 export function formatReadinessPresentation(
@@ -55,6 +59,7 @@ function buildKoreanReadinessLines(input: ReadinessPresentationInput): string[] 
     `실행 모드: ${input.executionState.executionMode === "LIVE" ? "실거래" : "모의 실행"} (${input.executionState.executionMode})`,
     `시스템 상태: ${describeSystemStatus(input.executionState.systemStatus, "ko-KR")} (${input.executionState.systemStatus})`,
     `킬 스위치: ${input.executionState.killSwitchActive ? "켜짐" : "꺼짐"}`,
+    ...formatRuntimeOwnershipReadinessSummary(input.runtimeOwnership ?? null, input.runtimeOwnershipNowEpochMs, "ko-KR"),
     ...(input.executionState.degradedReason
       ? [`성능 저하 사유: ${input.executionState.degradedReason}`]
       : []),
@@ -91,6 +96,7 @@ function buildEnglishReadinessLines(input: ReadinessPresentationInput): string[]
     `Execution mode: ${input.executionState.executionMode === "LIVE" ? "live" : "dry run"} (${input.executionState.executionMode})`,
     `System status: ${describeSystemStatus(input.executionState.systemStatus, "en-US")} (${input.executionState.systemStatus})`,
     `Kill switch: ${input.executionState.killSwitchActive ? "on" : "off"}`,
+    ...formatRuntimeOwnershipReadinessSummary(input.runtimeOwnership ?? null, input.runtimeOwnershipNowEpochMs, "en-US"),
     ...(input.executionState.degradedReason
       ? [`Degraded reason: ${input.executionState.degradedReason}`]
       : []),
@@ -113,6 +119,41 @@ function buildEnglishReadinessLines(input: ReadinessPresentationInput): string[]
         ]),
     "Technical details: /readiness detail",
   ];
+}
+
+function formatRuntimeOwnershipReadinessSummary(
+  snapshot: RuntimeOwnershipSnapshot | null,
+  nowEpochMs: number | null | undefined,
+  locale: TelegramLocale,
+): string[] {
+  const technical = formatRuntimeOwnershipTechnicalVisibility(snapshot, nowEpochMs)
+    .split("\n")
+    .reduce<Record<string, string>>((values, line) => {
+      const [key, value] = line.split(": ", 2);
+      if (key !== undefined && value !== undefined) values[key] = value;
+      return values;
+    }, {});
+  const status = technical.runtime_ownership_status ?? "UNAVAILABLE";
+  const heartbeat = technical.runtime_ownership_heartbeat_at ?? "none";
+  const age = technical.runtime_ownership_heartbeat_age_ms ?? "none";
+
+  return locale === "ko-KR"
+    ? [
+        `런타임 소유권: ${status === "OWNED" ? "보유" : status === "LOST" ? "상실" : "확인 불가"} (${status})`,
+        `소유권 세대: ${technical.runtime_ownership_generation === "none" ? "없음" : technical.runtime_ownership_generation}`,
+        `소유권 모드: ${technical.runtime_ownership_execution_mode === "LIVE" ? "실거래" : technical.runtime_ownership_execution_mode === "DRY_RUN" ? "모의 실행" : "없음"} (${technical.runtime_ownership_execution_mode})`,
+        `마지막 하트비트: ${heartbeat === "none" ? "없음" : formatTelegramTimestamp(heartbeat, locale)} (age: ${age === "none" ? "없음" : `${age}ms`})`,
+        `시작 인계: ${technical.runtime_ownership_takeover === "true" ? "예" : "아니오"}`,
+        `소유권 사유: ${technical.runtime_ownership_reason === "none" ? "없음" : technical.runtime_ownership_reason}`,
+      ]
+    : [
+        `Runtime ownership: ${status === "OWNED" ? "owned" : status === "LOST" ? "lost" : "unavailable"} (${status})`,
+        `Ownership generation: ${technical.runtime_ownership_generation}`,
+        `Ownership mode: ${technical.runtime_ownership_execution_mode === "LIVE" ? "live" : technical.runtime_ownership_execution_mode === "DRY_RUN" ? "dry run" : "none"} (${technical.runtime_ownership_execution_mode})`,
+        `Last heartbeat: ${heartbeat === "none" ? "none" : formatTelegramTimestamp(heartbeat, locale)} (age: ${age === "none" ? "none" : `${age}ms`})`,
+        `Startup takeover: ${technical.runtime_ownership_takeover === "true" ? "yes" : "no"}`,
+        `Ownership reason: ${technical.runtime_ownership_reason}`,
+      ];
 }
 
 function describeOverallStatus(

@@ -4,6 +4,10 @@ import type {
   ReconciliationRunRecord,
   SupportedAsset,
 } from "../../domain/types.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "../../app/runtime-ownership-guard.js";
 import type { ExecutionRepository } from "../db/interfaces.js";
 import { parseCandidatePilotTimestamp } from "../db/pilot-interfaces.js";
 import type { ExchangeAdapter } from "../exchange/interfaces.js";
@@ -35,6 +39,7 @@ export class PortfolioSyncService {
     marketPriceReader?: Pick<UpbitPublicQuotationClient, "getTickers">;
     repositories: ExecutionRepository;
     reconciliationService: Pick<ReconciliationService, "runWithRecord">;
+    runtimeOwnership?: RuntimeOwnershipAuthority;
     now?: () => string;
   }>;
 
@@ -44,6 +49,7 @@ export class PortfolioSyncService {
       marketPriceReader?: Pick<UpbitPublicQuotationClient, "getTickers">;
       repositories: ExecutionRepository;
       reconciliationService: Pick<ReconciliationService, "runWithRecord">;
+      runtimeOwnership?: RuntimeOwnershipAuthority;
       now?: () => string;
     },
   ) {
@@ -52,6 +58,7 @@ export class PortfolioSyncService {
       ...(dependencies.marketPriceReader === undefined ? {} : { marketPriceReader: dependencies.marketPriceReader }),
       repositories: dependencies.repositories,
       reconciliationService: dependencies.reconciliationService,
+      runtimeOwnership: dependencies.runtimeOwnership ?? createUnavailableRuntimeOwnershipAuthority(),
       ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
     });
   }
@@ -63,6 +70,7 @@ export class PortfolioSyncService {
   }): Promise<PortfolioSyncRunResult> {
     const runInput = snapshotRunInput(input);
     const dependencies = this.dependencies;
+    dependencies.runtimeOwnership!.assertLocallyHeld();
     const requestedAt = runInput.requestedAt ?? dependencies.now?.() ?? new Date().toISOString();
     parseCandidatePilotTimestamp(requestedAt, "portfolio sync requestedAt");
     const repositories = dependencies.repositories;
@@ -81,9 +89,13 @@ export class PortfolioSyncService {
 
     try {
       const previousBalanceSnapshot = await getLatestBalanceSnapshot(runInput.exchangeAccountId);
+      dependencies.runtimeOwnership!.assertLocallyHeld();
       const previousPositionSnapshot = await getLatestPositionSnapshot(runInput.exchangeAccountId);
+      dependencies.runtimeOwnership!.assertLocallyHeld();
       const balances = await getBalances();
+      dependencies.runtimeOwnership!.assertLocallyHeld();
       const valuation = await this.resolveValuationPrices(balances, getTickers);
+      dependencies.runtimeOwnership!.assertLocallyHeld();
       const balanceSnapshot = buildBalanceSnapshotRecord({
         exchangeAccountId: runInput.exchangeAccountId,
         balances,
@@ -100,7 +112,9 @@ export class PortfolioSyncService {
       });
 
       await saveBalanceSnapshot(balanceSnapshot);
+      dependencies.runtimeOwnership!.assertLocallyHeld();
       await savePositionSnapshot(positionSnapshot);
+      dependencies.runtimeOwnership!.assertLocallyHeld();
 
       const reconciliationResult = await runWithRecord(runInput.exchangeAccountId, {
         source: runInput.source,
@@ -112,6 +126,7 @@ export class PortfolioSyncService {
           currentPositionSnapshot: positionSnapshot,
         },
       });
+      dependencies.runtimeOwnership!.assertLocallyHeld();
 
       return {
         requestedAt,
@@ -124,6 +139,8 @@ export class PortfolioSyncService {
         reconciliationRun: { ...reconciliationResult.reconciliationRun },
       };
     } catch (error) {
+      if (isRuntimeOwnershipFailure(error)) throw error;
+      dependencies.runtimeOwnership!.assertLocallyHeld();
       const message = error instanceof Error ? error.message : "Unknown portfolio sync failure.";
       await updateReconciliationRun({
         id: reconciliationRunIdentity.id,
@@ -163,6 +180,7 @@ export class PortfolioSyncService {
           await getTickers(UPBIT_SPOT_MARKETS),
         );
       } catch (error) {
+        if (isRuntimeOwnershipFailure(error)) throw error;
         marketPriceError = error instanceof Error ? error.message : "Unknown public ticker failure.";
       }
     }
@@ -194,6 +212,29 @@ export class PortfolioSyncService {
 
     return { priceByAsset, source: "avg_buy_price_fallback" };
   }
+}
+
+function createUnavailableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "UNOWNED", generation: null, executionMode: null, acquiredAtEpochMs: null,
+      heartbeatAtEpochMs: null, expiresAtEpochMs: null, takeover: false, lossReason: null,
+    }),
+    assertLocallyHeld: throwRuntimeOwnershipNotHeld,
+    async assertCurrent(): Promise<never> { return throwRuntimeOwnershipNotHeld(); },
+  };
+}
+
+function throwRuntimeOwnershipNotHeld(): never {
+  throw new RuntimeOwnershipGuardError(
+    "RUNTIME_OWNERSHIP_NOT_HELD",
+    "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
+  );
+}
+
+function isRuntimeOwnershipFailure(error: unknown): boolean {
+  return error instanceof RuntimeOwnershipGuardError ||
+    (error instanceof Error && /^RUNTIME_OWNERSHIP_(?:LOST|NOT_HELD):/u.test(error.message));
 }
 
 function snapshotRunInput(input: {

@@ -20,6 +20,9 @@ import { InlineTelegramSyncController } from "./sync-controller.js";
 import type { ExecutionRepository, OperatorStateStore } from "../modules/db/interfaces.js";
 import type { SqlitePersistenceBundle } from "../modules/db/repositories/contracts.js";
 import { createSqlitePersistence } from "../modules/db/repositories/sqlite-repositories.js";
+import type { SqliteDatabaseOpenVerification } from
+  "../modules/db/repositories/sqlite-database.js";
+import { canonicalizeLocalDatabasePath } from "../modules/db/local-database-path.js";
 import { CandidateExecutionEvidenceService } from "../modules/execution/candidate-evidence-service.js";
 import { ExecutionService } from "../modules/execution/execution-service.js";
 import {
@@ -59,6 +62,10 @@ import type {
 import {
   verifyLiveDatabaseIdentity,
 } from "./live-database-identity.js";
+import {
+  RuntimeOwnershipGuardError,
+  type RuntimeOwnershipAuthority,
+} from "./runtime-ownership-guard.js";
 
 export interface AppServices {
   config: AppConfig;
@@ -88,6 +95,8 @@ export interface AppServices {
 export interface CreateAppOverrides {
   publicMarketDataReader?: PositionGuardPublicMarketDataReader;
   privateExchangeAdapter?: LiveExecutionAdapter;
+  runtimeOwnershipAuthority?: RuntimeOwnershipAuthority;
+  databaseOpenVerification?: SqliteDatabaseOpenVerification;
   afterCandidatePilotAuthorityValidated?: (authority: PositionGuardPilotAbandonmentValidation) => void;
   candidatePilotInitializerClock?: PositionGuardPilotInitializerClock;
   candidatePilotInitializerRepository?: PositionGuardPilotInitializerRepository;
@@ -105,13 +114,44 @@ export function createApp(
     );
     overrides.afterCandidatePilotAuthorityValidated?.(authority);
   }
-  verifyLiveDatabaseIdentity({
+  const liveDatabaseVerification = verifyLiveDatabaseIdentity({
     executionMode: config.executionMode,
     databasePath: config.databasePath,
     expectedDatabaseInstanceId: config.liveDatabaseInstanceId ?? null,
     exchangeAccountId: "primary",
     upbitAccessKey: process.env.UPBIT_ACCESS_KEY?.trim() || null,
   });
+  config = {
+    ...config,
+    databasePath: liveDatabaseVerification.status === "VERIFIED"
+      ? liveDatabaseVerification.canonicalDatabasePath
+      : canonicalizeLocalDatabasePath(config.databasePath),
+  };
+  const exchangeBackedReadEnabled = Boolean(
+    process.env.UPBIT_ACCESS_KEY && process.env.UPBIT_SECRET_KEY,
+  );
+  const liveSendEnabled =
+    config.executionMode === "LIVE" &&
+    config.liveExecutionGate === "ENABLED" &&
+    exchangeBackedReadEnabled;
+  const suppliedRuntimeOwnership = overrides.runtimeOwnershipAuthority;
+  if (liveSendEnabled) {
+    if (suppliedRuntimeOwnership === undefined) {
+      throw new RuntimeOwnershipGuardError(
+        "RUNTIME_OWNERSHIP_NOT_HELD",
+        "RUNTIME_OWNERSHIP_NOT_HELD: LIVE application construction requires acquired runtime authority.",
+      );
+    }
+    suppliedRuntimeOwnership.assertLocallyHeld();
+    const ownership = suppliedRuntimeOwnership.snapshot();
+    if (ownership.status !== "OWNED" || ownership.executionMode !== "LIVE") {
+      throw new RuntimeOwnershipGuardError(
+        "RUNTIME_OWNERSHIP_NOT_HELD",
+        "RUNTIME_OWNERSHIP_NOT_HELD: LIVE application construction requires matching LIVE runtime authority.",
+      );
+    }
+  }
+  const runtimeOwnership = suppliedRuntimeOwnership ?? createUnavailableRuntimeOwnershipAuthority();
   const persistence = createSqlitePersistence({
     databasePath: config.databasePath,
     exchangeAccountId: "primary",
@@ -123,7 +163,11 @@ export function createApp(
     executionMode: config.executionMode,
     liveExecutionGate: config.liveExecutionGate,
     killSwitchActive: config.globalKillSwitch,
-  });
+  }, overrides.databaseOpenVerification ?? (
+    liveDatabaseVerification.status === "VERIFIED"
+      ? liveDatabaseVerification.databaseOpenVerification
+      : undefined
+  ));
   try {
   const { repositories, operatorState, accountExecutionLeases } = persistence;
   const candidatePilotInitializer = candidatePolicySelection
@@ -164,12 +208,7 @@ export function createApp(
     baseUrl: config.upbitBaseUrl,
   });
   const dryRunExchangeAdapter = new DryRunExchangeAdapter();
-  const exchangeBackedReadEnabled = Boolean(process.env.UPBIT_ACCESS_KEY && process.env.UPBIT_SECRET_KEY);
   const syncExchangeAdapter = exchangeBackedReadEnabled ? privateExchangeAdapter : dryRunExchangeAdapter;
-  const liveSendEnabled =
-    config.executionMode === "LIVE" &&
-    config.liveExecutionGate === "ENABLED" &&
-    exchangeBackedReadEnabled;
   const executionAdapter: ExecutionExchangeAdapter = liveSendEnabled ? privateExchangeAdapter : dryRunExchangeAdapter;
   const liveSendPath = executionAdapter.sendPath;
   const telegramMessageClient = config.telegramBotToken
@@ -187,10 +226,12 @@ export function createApp(
     maxBackoffMs: config.telegramDeliveryMaxBackoffMs,
     leaseDurationMs: config.telegramDeliveryLeaseMs,
     locale: telegramLocale,
+    runtimeOwnership,
   });
   const telegramCommandMenuSetup = new TelegramCommandMenuSetupService({
     client: telegramMessageClient,
     operatorChatId: config.telegramOperatorChatId,
+    runtimeOwnership,
   });
   const reporter = new DurableTelegramReporter({
     repositories,
@@ -205,6 +246,7 @@ export function createApp(
     accountExecutionLeases,
     accountExecutionLeaseMs: config.accountExecutionLeaseMs,
     operatorState,
+    runtimeOwnership,
     reporter,
     ...(candidatePolicySelection ? { candidatePilots: persistence.candidatePilots } : {}),
   });
@@ -246,6 +288,7 @@ export function createApp(
     executionService,
     marketDataReader: publicMarketDataReader,
     config: createDefaultPositionGuardRunnerConfig("primary"),
+    runtimeOwnership,
     ...(candidatePolicySelection && candidatePilotRecovery
       ? {
           policySelection: candidatePolicySelection,
@@ -264,6 +307,7 @@ export function createApp(
     historyRetentionAssumptionDays: config.reconciliationHistoryRetentionAssumptionDays,
     identifierRecovery: DEFAULT_IDENTIFIER_RECOVERY_POLICY,
     recoveryClock,
+    runtimeOwnership,
     ...(candidateEvidenceService ? { candidateEvidenceService } : {}),
     ...(exchangeBackedReadEnabled ? {
       orderReader: privateExchangeAdapter,
@@ -276,6 +320,7 @@ export function createApp(
     marketPriceReader: publicMarketDataReader,
     repositories,
     reconciliationService,
+    runtimeOwnership,
   });
   const candidateBtcRunPreparation = candidatePolicySelection
     ? new CandidateBtcRunPreparationService({
@@ -312,6 +357,7 @@ export function createApp(
         exchangeBackedReadEnabled,
         liveSendPath,
       }),
+    runtimeOwnership,
   });
   const strategyScheduler = new StrategyScheduler({
     config: createDefaultStrategySchedulerConfig({
@@ -365,6 +411,7 @@ export function createApp(
         exchangeBackedReadEnabled,
         liveSendPath,
       }),
+    runtimeOwnership,
   });
 
   let telegramInboundPolling: TelegramInboundPollingService | null = null;
@@ -411,6 +458,7 @@ export function createApp(
     syncController: new InlineTelegramSyncController({
       portfolioSyncService,
       reporter,
+      runtimeOwnership,
     }),
     strategyRunController,
     schedulerStatus: () => strategyScheduler.getStatus(),
@@ -438,6 +486,7 @@ export function createApp(
     exchangeAccountId: "primary",
     offsetStore: persistence.telegramInboundOffsets,
     botTokenRef: telegramBotTokenRef,
+    runtimeOwnership,
     pollIntervalMs: config.telegramInboundPollIntervalMs,
     longPollTimeoutSeconds: config.telegramInboundPollTimeoutSeconds,
     limit: config.telegramInboundPollLimit,
@@ -600,4 +649,31 @@ function assertExactOwnDataValues(
 
 function createTelegramBotTokenRef(botToken: string): string {
   return `sha256:${createHash("sha256").update(botToken).digest("hex").slice(0, 16)}`;
+}
+
+function createUnavailableRuntimeOwnershipAuthority(): RuntimeOwnershipAuthority {
+  return {
+    snapshot: () => ({
+      status: "UNOWNED",
+      generation: null,
+      executionMode: null,
+      acquiredAtEpochMs: null,
+      heartbeatAtEpochMs: null,
+      expiresAtEpochMs: null,
+      takeover: false,
+      lossReason: null,
+    }),
+    assertLocallyHeld() {
+      throw new RuntimeOwnershipGuardError(
+        "RUNTIME_OWNERSHIP_NOT_HELD",
+        "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
+      );
+    },
+    async assertCurrent(): Promise<never> {
+      throw new RuntimeOwnershipGuardError(
+        "RUNTIME_OWNERSHIP_NOT_HELD",
+        "RUNTIME_OWNERSHIP_NOT_HELD: Runtime ownership is unavailable in this composition.",
+      );
+    },
+  };
 }

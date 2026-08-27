@@ -1,4 +1,3 @@
-import { existsSync, lstatSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
@@ -31,6 +30,10 @@ import {
 } from "../modules/db/pilot-interfaces.js";
 import type { PositionGuardCandidateExecutionEvidence } from "../modules/strategy/position-guard-candidate-state.js";
 import type { OrderLifecycleStatus } from "../domain/types.js";
+import {
+  canonicalizeLocalDatabasePath,
+  LocalDatabasePathError,
+} from "../modules/db/local-database-path.js";
 
 export type PositionGuardPilotReadinessFormat = "TEXT" | "JSON";
 export type PositionGuardPilotReadinessStatus = "PASS" | "WARN" | "BLOCK";
@@ -330,36 +333,35 @@ export function inspectPositionGuardPilotReadiness(
     detail: "KRW-ETH remains on the baseline policy; this inspection cannot activate a candidate policy.",
   });
 
-  const databasePath = resolve(options.databasePath);
-  if (!existsSync(databasePath)) {
+  let databasePath = resolve(options.databasePath);
+  try {
+    databasePath = canonicalizeLocalDatabasePath(options.databasePath, { mustExist: true });
+  } catch (error) {
+    const detail = error instanceof LocalDatabasePathError && error.code === "DATABASE_PATH_NOT_FOUND"
+      ? "The explicitly selected SQLite database does not exist; no file was created."
+      : `The explicitly selected SQLite database path is unsafe: ${formatError(error)}`;
     mutable.checks.unshift({
       name: "database_file",
       status: "BLOCK",
-      detail: "The explicitly selected SQLite database does not exist; no file was created.",
+      detail,
     });
-    addUnavailableChecks(mutable, "database file is unavailable");
-    return buildReport(options, databasePath, selection, authority, mutable);
-  }
-  const databasePathFailure = validateRegularNonReparseDatabasePath(databasePath);
-  if (databasePathFailure !== null) {
-    mutable.checks.unshift({
-      name: "database_file",
-      status: "BLOCK",
-      detail: databasePathFailure,
-    });
-    addUnavailableChecks(mutable, "database path is not a regular file");
+    addUnavailableChecks(mutable, "database file is unavailable or not canonical local storage");
     return buildReport(options, databasePath, selection, authority, mutable);
   }
 
   mutable.checks.unshift({
     name: "database_file",
     status: "PASS",
-    detail: "Existing regular non-symlink SQLite file was selected explicitly.",
+    detail: "Existing uniquely named canonical local SQLite file was selected explicitly.",
   });
 
   let db: DatabaseSync | null = null;
   try {
     db = new DatabaseSync(databasePath, { readOnly: true });
+    const recheckedDatabasePath = canonicalizeLocalDatabasePath(databasePath, { mustExist: true });
+    if (!sameDatabasePath(databasePath, recheckedDatabasePath)) {
+      throw new Error("SQLite inspection path changed after its canonical read-only open.");
+    }
     const sqliteSnapshotCheck = inspectSqliteSnapshotReadSafety(db, mutable);
     mutable.checks.push(sqliteSnapshotCheck);
     if (sqliteSnapshotCheck.status === "BLOCK") {
@@ -402,25 +404,10 @@ export function inspectPositionGuardPilotReadiness(
   return buildReport(options, databasePath, selection, authority, mutable);
 }
 
-function validateRegularNonReparseDatabasePath(databasePath: string): string | null {
-  let component = databasePath;
-  let final = true;
-  while (true) {
-    const stats = lstatSync(component);
-    if (stats.isSymbolicLink()) {
-      return final
-        ? "The explicitly selected database path must identify an existing regular non-symlink file."
-        : "The explicitly selected database path has a symlink, junction, or reparse-point ancestor and is rejected.";
-    }
-    if (final && !stats.isFile()) {
-      return "The explicitly selected database path must identify an existing regular non-symlink file.";
-    }
-    const parent = resolve(component, "..");
-    if (parent === component) break;
-    component = parent;
-    final = false;
-  }
-  return null;
+function sameDatabasePath(left: string, right: string): boolean {
+  return process.platform === "win32"
+    ? left.toUpperCase() === right.toUpperCase()
+    : left === right;
 }
 
 export function formatPositionGuardPilotReadiness(

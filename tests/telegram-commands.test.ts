@@ -23,6 +23,7 @@ import {
   InMemoryTelegramInboundOffsetStore,
 } from "../src/modules/db/repositories/in-memory-repositories.js";
 import type { OperatorStateStore } from "../src/modules/db/interfaces.js";
+import type { RuntimeOwnershipSnapshot } from "../src/app/runtime-ownership-guard.js";
 import { TelegramCommandRouter } from "../src/modules/telegram/commands.js";
 import { listTelegramCommandContracts } from "../src/modules/telegram/contracts.js";
 import {
@@ -3013,6 +3014,223 @@ test("telegram router preserves canonical technical status behind /status detail
   assert.match(status.text, /recent_transitions: 1/);
   assert.match(status.text, /\| BOOTSTRAP \| none -> RUNNING \| mode none -> DRY_RUN \| gate none -> DISABLED \|/);
 });
+
+test("telegram router captures one immutable runtime ownership snapshot for status and readiness", async () => {
+  const router = createRouter();
+  const snapshot = {
+    status: "LOST",
+    generation: 9,
+    executionMode: "DRY_RUN",
+    acquiredAtEpochMs: 1_785_000_000_000,
+    heartbeatAtEpochMs: 1_785_000_010_000,
+    expiresAtEpochMs: 1_785_000_055_000,
+    takeover: true,
+    lossReason: "PERSISTED_OWNERSHIP_MISMATCH",
+  } as const;
+  let snapshotCalls = 0;
+  router.setRuntimeOwnershipSnapshotProvider(() => {
+    snapshotCalls += 1;
+    return snapshot;
+  });
+
+  const status = await router.route("/status detail");
+  const readiness = await router.route("/readiness detail");
+
+  assert.equal(snapshotCalls, 2);
+  for (const message of [status.text, readiness.text]) {
+    assert.match(message, /runtime_ownership_status: LOST/u);
+    assert.match(message, /runtime_ownership_generation: 9/u);
+    assert.match(message, /runtime_ownership_execution_mode: DRY_RUN/u);
+    assert.match(message, /runtime_ownership_heartbeat_age_ms:/u);
+    assert.match(message, /runtime_ownership_takeover: true/u);
+    assert.match(message, /runtime_ownership_reason: PERSISTED_OWNERSHIP_MISMATCH/u);
+  }
+});
+
+test("telegram routes and callbacks retain the complete runtime ownership matrix without secret scope data", async () => {
+  const cases = [
+    {
+      expected: {
+        status: "OWNED",
+        generation: "4",
+        executionMode: "LIVE",
+        heartbeatAt: "2026-07-25T17:20:10.000Z",
+        heartbeatAgeMs: "5_000",
+        takeover: false,
+        reason: "none",
+      },
+      snapshot: {
+        status: "OWNED",
+        generation: 4,
+        executionMode: "LIVE",
+        acquiredAtEpochMs: 1_785_000_000_000,
+        heartbeatAtEpochMs: 1_785_000_010_000,
+        expiresAtEpochMs: 1_785_000_055_000,
+        takeover: false,
+        lossReason: null,
+        ownerToken: "owned-route-owner-token-canary",
+        canonicalDatabasePath: "C:\\owned-route\\runtime.sqlite",
+        scopeDigest: "owned-route-scope-digest-canary",
+        namedPipeName: "\\\\.\\pipe\\owned-route-runtime-canary",
+        keyFingerprint: "owned-route-key-fingerprint-canary",
+      } as RuntimeOwnershipSnapshot,
+    },
+    {
+      expected: {
+        status: "LOST",
+        generation: "5",
+        executionMode: "DRY_RUN",
+        heartbeatAt: "2026-07-25T17:20:10.000Z",
+        heartbeatAgeMs: "5_000",
+        takeover: true,
+        reason: "PERSISTED_OWNERSHIP_MISMATCH",
+      },
+      snapshot: {
+        status: "LOST",
+        generation: 5,
+        executionMode: "DRY_RUN",
+        acquiredAtEpochMs: 1_785_000_000_000,
+        heartbeatAtEpochMs: 1_785_000_010_000,
+        expiresAtEpochMs: 1_785_000_055_000,
+        takeover: true,
+        lossReason: "PERSISTED_OWNERSHIP_MISMATCH",
+        ownerToken: "lost-route-owner-token-canary",
+        canonicalDatabasePath: "C:\\lost-route\\runtime.sqlite",
+        scopeDigest: "lost-route-scope-digest-canary",
+        namedPipeName: "\\\\.\\pipe\\lost-route-runtime-canary",
+        keyFingerprint: "lost-route-key-fingerprint-canary",
+      } as RuntimeOwnershipSnapshot,
+    },
+    {
+      expected: {
+        status: "UNAVAILABLE",
+        generation: "none",
+        executionMode: "none",
+        heartbeatAt: "none",
+        heartbeatAgeMs: "none",
+        takeover: false,
+        reason: "none",
+      },
+      snapshot: {
+        status: "UNOWNED",
+        generation: null,
+        executionMode: null,
+        acquiredAtEpochMs: null,
+        heartbeatAtEpochMs: null,
+        expiresAtEpochMs: null,
+        takeover: false,
+        lossReason: null,
+        ownerToken: "unavailable-route-owner-token-canary",
+        canonicalDatabasePath: "C:\\unavailable-route\\runtime.sqlite",
+        scopeDigest: "unavailable-route-scope-digest-canary",
+        namedPipeName: "\\\\.\\pipe\\unavailable-route-runtime-canary",
+        keyFingerprint: "unavailable-route-key-fingerprint-canary",
+      } as RuntimeOwnershipSnapshot,
+    },
+  ] as const;
+
+  for (const locale of ["ko-KR", "en-US"] as const) {
+    for (const ownership of cases) {
+      const router = new TelegramCommandRouter({
+        repositories: new InMemoryExecutionRepository(),
+        operatorState: createRouterState(),
+        locale,
+        now: () => "2026-07-25T17:20:15.000Z",
+      });
+      router.setRuntimeOwnershipSnapshotProvider(() => ownership.snapshot);
+      const conciseResponses = await Promise.all([
+        router.route("/status"),
+        router.route("/readiness"),
+        router.routeReadOnlyCallback({ type: "STATUS" }),
+        router.routeReadOnlyCallback({ type: "READINESS" }),
+      ]);
+      const detailResponses = await Promise.all([
+        router.route("/status detail"),
+        router.route("/readiness detail"),
+        router.routeReadOnlyCallback({ type: "STATUS_DETAIL" }),
+        router.routeReadOnlyCallback({ type: "READINESS_DETAIL" }),
+      ]);
+
+      for (const response of conciseResponses) {
+        assertRuntimeOwnershipConciseContract(response.text, locale, ownership.expected);
+        assertRuntimeOwnershipSecretsAreRedacted(response.text);
+      }
+      for (const response of detailResponses) {
+        assertRuntimeOwnershipDetailContract(response.text, ownership.expected);
+        assertRuntimeOwnershipSecretsAreRedacted(response.text);
+      }
+    }
+  }
+});
+
+function assertRuntimeOwnershipConciseContract(
+  text: string,
+  locale: "ko-KR" | "en-US",
+  expected: {
+    readonly status: "OWNED" | "LOST" | "UNAVAILABLE";
+    readonly generation: string;
+    readonly executionMode: "LIVE" | "DRY_RUN" | "none";
+    readonly heartbeatAt: string;
+    readonly heartbeatAgeMs: string;
+    readonly takeover: boolean;
+    readonly reason: string;
+  },
+): void {
+  const localized = locale === "ko-KR"
+    ? {
+        status: expected.status === "OWNED" ? "보유" : expected.status === "LOST" ? "상실" : "확인 불가",
+        generation: expected.generation === "none" ? "없음" : expected.generation,
+        mode: expected.executionMode === "LIVE" ? "실거래" : expected.executionMode === "DRY_RUN" ? "모의 실행" : "없음",
+        heartbeat: expected.heartbeatAt === "none" ? "없음" : "2026-07-26",
+        age: expected.heartbeatAgeMs === "none" ? "없음" : "5000ms",
+        takeover: expected.takeover ? "예" : "아니오",
+        reason: expected.reason === "none" ? "없음" : expected.reason,
+      }
+    : {
+        status: expected.status.toLowerCase(),
+        generation: expected.generation,
+        mode: expected.executionMode === "LIVE" ? "live" : expected.executionMode === "DRY_RUN" ? "dry run" : "none",
+        heartbeat: expected.heartbeatAt === "none" ? "none" : "2026-07-26",
+        age: expected.heartbeatAgeMs === "none" ? "none" : "5000ms",
+        takeover: expected.takeover ? "yes" : "no",
+        reason: expected.reason,
+      };
+  const labels = locale === "ko-KR"
+    ? ["런타임 소유권", "소유권 세대", "소유권 모드", "마지막 하트비트", "시작 인계", "소유권 사유"]
+    : ["Runtime ownership", "Ownership generation", "Ownership mode", "Last heartbeat", "Startup takeover", "Ownership reason"];
+
+  assert.match(text, new RegExp(`${labels[0]}: ${localized.status} \\(${expected.status}\\)`, "u"));
+  assert.match(text, new RegExp(`${labels[1]}: ${localized.generation}`, "u"));
+  assert.match(text, new RegExp(`${labels[2]}: ${localized.mode} \\(${expected.executionMode}\\)`, "u"));
+  assert.match(text, new RegExp(`${labels[3]}: ${localized.heartbeat}.*age: ${localized.age}`, "u"));
+  assert.match(text, new RegExp(`${labels[4]}: ${localized.takeover}`, "u"));
+  assert.match(text, new RegExp(`${labels[5]}: ${localized.reason}`, "u"));
+}
+
+function assertRuntimeOwnershipDetailContract(
+  text: string,
+  expected: {
+    readonly status: "OWNED" | "LOST" | "UNAVAILABLE";
+    readonly generation: string;
+    readonly executionMode: "LIVE" | "DRY_RUN" | "none";
+    readonly heartbeatAt: string;
+    readonly heartbeatAgeMs: string;
+    readonly takeover: boolean;
+    readonly reason: string;
+  },
+): void {
+  assert.match(text, new RegExp(`runtime_ownership_status: ${expected.status}`, "u"));
+  assert.match(text, new RegExp(`runtime_ownership_generation: ${expected.generation}`, "u"));
+  assert.match(text, new RegExp(`runtime_ownership_execution_mode: ${expected.executionMode}`, "u"));
+  assert.match(text, new RegExp(`runtime_ownership_heartbeat_at: ${expected.heartbeatAt}`, "u"));
+  assert.match(text, new RegExp(`runtime_ownership_heartbeat_age_ms: ${expected.heartbeatAgeMs.replace("_", "")}`, "u"));
+  assert.match(text, new RegExp(`runtime_ownership_takeover: ${expected.takeover}`, "u"));
+  assert.match(text, new RegExp(`runtime_ownership_reason: ${expected.reason}`, "u"));
+}
+
+function assertRuntimeOwnershipSecretsAreRedacted(text: string): void {
+  assert.doesNotMatch(text, /route-owner-token-canary|runtime\.sqlite|route-scope-digest-canary|route-runtime-canary|route-key-fingerprint-canary/u);
+}
 
 test("/status detail exactly equals the canonical formatStatusMessage output", async () => {
   const repository = new InMemoryExecutionRepository();

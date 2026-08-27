@@ -20,6 +20,7 @@
     "smoke:telegram:inbound": "npm run build && node dist/src/smoke/telegram-inbound-once.js",
     "smoke:live:readiness": "npm run build && node dist/src/smoke/live-readiness.js",
     "smoke:live:scheduler-preflight": "npm run build && node dist/src/smoke/live-scheduler-preflight.js",
+    "probe:live:duplicate-owner": "npm run build && node dist/src/operations/runtime-duplicate-owner-probe.js",
     "provision:live-db-identity": "npm run build && node dist/src/operations/provision-live-database-identity.js",
     "backtest:positionguard": "npm run build && node dist/src/research/position-guard-public-backtest.js",
     "report:performance": "npm run build && node dist/src/research/performance-report.js",
