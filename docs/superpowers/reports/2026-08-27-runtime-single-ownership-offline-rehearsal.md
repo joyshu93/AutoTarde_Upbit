@@ -42,6 +42,35 @@ evidence below was captured; no rehearsal-only production path remains.
 
 Node printed its expected experimental SQLite warning. No assertion failed.
 
+## Current Source Revalidation
+
+The migration, backup, identity, and read-only readiness portion was repeated
+after the final runtime-ownership safety fixes at source commit
+`c9990a2e80aed65411f851ef7afc14ee0535a99a`. The one-time command was
+`node .tmp-runtime-ownership-offline-rehearsal-current.mjs`; it exited 0 and
+the harness plus its OS-temporary fixture were deleted after the run.
+
+- production migration runner applied `0024_add_runtime_ownership.sql` exactly
+  once to a synthetic pre-0024 fixture
+- all seven runtime-ownership tables, indexes, and triggers were present
+- the closed pre-migration database was copied and verified independently
+- first identity provisioning returned `CREATED`; an exact retry returned
+  `ALREADY_MATCHED`
+- LIVE identity verification returned `VERIFIED`
+- `LIVE_READINESS_MAX_EVIDENCE_AGE_MS=3600000` was explicitly supplied
+- read-only readiness returned `WARN` with no blockers; the warnings were the
+  intentionally absent `balance_snapshot`, `position_snapshot`, and
+  `latest_reconciliation` evidence
+- the database SHA-256 was unchanged across readiness
+- runtime startup, scheduler, strategy, sync, Telegram polling/delivery,
+  Upbit/Telegram APIs, and order operations were not invoked
+
+The full `npm.cmd test` suite also exited 0 on the same source tree immediately
+before it was committed, including the runtime ownership integration and
+Windows duplicate-owner probe tests. The current revalidation did not operate
+on the operational database and does not replace the operational hold points
+below.
+
 ## Migration And Backup Evidence
 
 ### Pre-migration fixture
