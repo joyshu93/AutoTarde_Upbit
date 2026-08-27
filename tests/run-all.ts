@@ -33,6 +33,7 @@ await import("./candidate-btc-run-preparation.test.js");
 await import("./history-recovery-validation.test.js");
 await import("./startup-recovery.test.js");
 await import("./runtime-process-lock.test.js");
+await import("./runtime-duplicate-owner-probe.test.js");
 await import("./runtime-lifecycle.test.js");
 await import("./runtime-startup-gate.test.js");
 await import("./scoped-runtime-ownership.test.js");

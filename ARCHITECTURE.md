@@ -32,6 +32,8 @@ The verification result carries an in-memory, non-rendered file-identity/open ve
 
 `live-readonly-context` is the separate composition root for LIVE readiness and scheduler-preflight smoke commands. It uses the same canonical local-path guard before a read-only SQLite open, creates only read-capable repository facades, and never constructs `createApp`, candidate initialization, runtime workers, exchange clients, or Telegram transports. The explicit provisioning CLI is the only path that may apply migration `0023` and insert the singleton identity, and it requires an operator confirmation while LIVE is stopped.
 
+LIVE readiness captures one `checkedAt` instant after its persisted reads and compares balance, position, and reconciliation timestamps against the explicitly configured positive-safe-integer `LIVE_READINESS_MAX_EVIDENCE_AGE_MS`. Exact-boundary evidence is fresh; stale evidence is a warning that directs a scheduler-disabled owner to `/sync`; missing policy plus malformed, future, or uncomparable timestamps fail closed. The duplicate-owner probe is a smaller composition root still: it performs the same read-only LIVE identity verification, derives the mode-invariant startup lock identity, and attempts only the Windows named-pipe lock. It treats contention as proof that duplicate admission was blocked, releases an unexpectedly acquired lock before returning a blocking result, and has no mutable SQLite, application, worker, exchange, Telegram, or order dependency.
+
 ## Module Map
 
 ### `domain`

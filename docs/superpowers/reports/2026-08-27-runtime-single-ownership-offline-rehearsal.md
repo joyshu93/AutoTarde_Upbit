@@ -108,6 +108,11 @@ manually reimplemented for the migration step.
 - Order transmission attempted: false
 - Exchange probe attempted: false
 
+This captured result predates the later explicit readiness-freshness contract.
+Current code requires `LIVE_READINESS_MAX_EVIDENCE_AGE_MS`; the historical
+fixture result above is retained as rehearsal evidence rather than rewritten as
+though the new policy had been exercised.
+
 `WARN` is the correct result for this intentionally network-free fixture: no
 synthetic exchange snapshot or reconciliation success was invented. The absence
 of blockers proves identity, LIVE mode/gate, execution state, scheduler-off
@@ -172,21 +177,22 @@ LIVE configuration; do not copy synthetic values from this report.
 6. **Run only the read-only LIVE readiness smoke.** Keep scheduler and
    run-on-start disabled. Treat any identity, ledger, integrity, active-order,
    execution-state, or reconciliation blocker as a stop condition. The current
-   LIVE readiness smoke checks whether snapshots and reconciliation evidence
-   exist and reports their timestamps, but it does not enforce a freshness
-   threshold. Operators must compare those timestamps with a separately approved
-   freshness limit. Missing or manually stale evidence requires a separately
-   approved `/sync`; this migration procedure itself must not call it.
+   Set an explicitly approved positive-safe-integer
+   `LIVE_READINESS_MAX_EVIDENCE_AGE_MS`. The smoke blocks a missing policy and
+   malformed, future, or uncomparable timestamps; evidence exactly at the limit
+   passes. Missing or stale evidence warns and requires a separately approved
+   `/sync` before `/run`; this migration procedure itself must not call it.
 7. **Start exactly one runtime after separate approval.** Confirm ownership is
    `OWNED`, generation is present, heartbeat is fresh, and takeover status is
    expected. Keep the scheduler disabled until the normal operator checklist is
    complete.
-8. **Keep the operational duplicate exercise on hold.** There is no dedicated
-   checked-in no-side-effect duplicate-probe command. The automated Windows
-   integration suite and this synthetic rehearsal prove the lock contract, but
-   this runbook does not authorize using a normal second LIVE launcher as an
-   operational probe. Require a separately reviewed and approved probe or
-   procedure before attempting this step on the real host.
+8. **Run the dedicated probe only after separate operational approval.** Use
+   the ignored local copy of `scripts/probe-live-duplicate-owner.example.ps1`,
+   never a normal second LIVE launcher. The checked-in command verifies identity
+   read-only and attempts only the production named-pipe lock. Require exit 0
+   with `PASS/DUPLICATE_BLOCKED`; `BLOCK/NO_ACTIVE_OWNER` means it acquired and
+   immediately released the lock and the exercise must stop. This source task
+   did not execute that command on the real host.
 9. **Rollback only while fully offline.** If migration or verification fails,
    do not attempt an ad-hoc down migration. Stop every process, quarantine the
    failed database set, and restore the verified database plus matching sidecars

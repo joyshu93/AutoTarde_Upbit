@@ -38,6 +38,7 @@ export interface AppConfig {
   strategySchedulerRunOnStart: boolean;
   strategySchedulerBtcIntervalMs: number;
   strategySchedulerEthIntervalMs: number;
+  liveReadinessMaxEvidenceAgeMs?: number | null;
   reconciliationMaxOrderLookupsPerRun: number;
   reconciliationHistoryMaxPagesPerMarket: number;
   reconciliationClosedOrderLookbackDays: number;
@@ -136,6 +137,10 @@ export function loadAppConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       env.STRATEGY_SCHEDULER_ETH_INTERVAL_MS,
       DEFAULT_STRATEGY_SCHEDULER_INTERVAL_MS,
     ),
+    liveReadinessMaxEvidenceAgeMs: parseOptionalPositiveSafeInteger(
+      env.LIVE_READINESS_MAX_EVIDENCE_AGE_MS,
+      "LIVE_READINESS_MAX_EVIDENCE_AGE_MS",
+    ),
     reconciliationMaxOrderLookupsPerRun: parseNumber(
       env.RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN,
       DEFAULT_RECONCILIATION_MAX_ORDER_LOOKUPS_PER_RUN,
@@ -200,6 +205,15 @@ function parsePositiveNumber(input: string | undefined, fallback: number): numbe
 function parsePositiveSafeInteger(input: string | undefined, fallback: number): number {
   const parsed = Number(input);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseOptionalPositiveSafeInteger(input: string | undefined, name: string): number | null {
+  if (input === undefined || input.trim().length === 0) return null;
+  const parsed = Number(input);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive safe integer.`);
+  }
+  return parsed;
 }
 
 function listDeprecatedIgnoredEnvVars(env: NodeJS.ProcessEnv): readonly string[] {

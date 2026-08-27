@@ -135,6 +135,8 @@ The startup banner plus Korean-first `/status` and `/readiness` summaries show s
 
 A mutable or composed smoke acquires and releases process plus persisted runtime-control ownership evidence even when it is non-trading and makes no business-state mutation; it must contend with an existing owner exactly like the long-running runtime. DRY_RUN readiness and completion smokes make no trading or business-state mutation while acquiring and releasing process plus persisted runtime-control ownership evidence; each contends with an existing owner. Only a provably read-only report, inspection, or smoke command that does not construct a mutable runtime composition remains ownership-free.
 
+The confirmed `npm run probe:live:duplicate-owner` command is the dedicated no-side-effect duplicate check. It verifies LIVE database identity through a read-only SQLite handle and attempts only the same Windows named-pipe lock used by startup. `PASS/DUPLICATE_BLOCKED` means an owner rejected the duplicate; `BLOCK/NO_ACTIVE_OWNER` means the probe unexpectedly acquired and immediately released the lock. Its JSON omits database paths, scope digests, key fingerprints, and credentials, and it never constructs the application, runs migrations, starts workers, calls Upbit or Telegram, or transmits orders. Copy `scripts/probe-live-duplicate-owner.example.ps1` to its ignored `.local.ps1` form and set the exact confirmation before an approved operational exercise; do not use a normal second LIVE launcher as a probe.
+
 ### BTC Candidate Pilot Is Available, Not Activated
 
 Baseline remains the default policy and `DRY_RUN` remains the default execution mode. Candidate code availability does not approve or activate the pilot. The exact pilot identity is `BTC_COMBINED_CONSERVATIVE_PILOT_V1`, market `KRW-BTC`, policy `COMBINED_CONSERVATIVE`, version `PCS-2026-001.DEPLOYMENT_READINESS_V1`; ETH always remains baseline during this pilot.
@@ -638,7 +640,7 @@ LIVE startup now fails closed unless `DATABASE_PATH` is an explicit absolute pat
 
 Existing databases are never bound automatically. Stop LIVE, back up `var/company-live.sqlite`, copy `scripts/provision-live-database-identity.example.ps1` to its ignored `.local.ps1` form, create a UUID with `[guid]::NewGuid().ToString()`, fill the existing absolute DB path and current Upbit access key, then run the script once. Keep the resulting UUID in every local LIVE startup/readiness script as `LIVE_DATABASE_INSTANCE_ID`; it is not a secret. Provisioning applies pending migrations and inserts the singleton binding, so it must never run while LIVE is active. Key rotation intentionally requires a separately reviewed rebind procedure; startup never rewrites a fingerprint.
 
-Both LIVE smoke commands open the verified database with `readOnly: true` and do not construct the runtime application, run migrations, bootstrap records, initialize the candidate pilot, or start operational workers. They may read persisted state only.
+Both LIVE smoke commands open the verified database with `readOnly: true` and do not construct the runtime application, run migrations, bootstrap records, initialize the candidate pilot, or start operational workers. They may read persisted state only. LIVE readiness additionally requires an explicit positive-safe-integer `LIVE_READINESS_MAX_EVIDENCE_AGE_MS`; the checked-in examples use one hour. Evidence exactly at the limit passes, older or missing account-health evidence warns and requires an approved `/sync` before `/run`, while a missing policy or malformed, future, or uncomparable timestamp blocks.
 
 For an explicit live validation run, copy `scripts/start-company-live.example.ps1` to `scripts/start-company-live.local.ps1`, fill in secrets, set:
 
@@ -674,6 +676,14 @@ powershell.exe -ExecutionPolicy Bypass -File .\scripts\smoke-live-readiness.loca
 This smoke only checks local configuration, persisted execution state, adapter wiring, recent local snapshots, and local active-order visibility. It does not send orders, run strategy, start the scheduler, start Telegram polling, run `/sync`, or call Upbit.
 The example live startup script runs this smoke before `npm run start`; if it returns `BLOCK`, the live process is not started.
 The output includes `blockingCheckNames`, `warningCheckNames`, and `nextActions` so the operator can fix the local script, persisted execution state, or required `/sync` step without guessing.
+
+After exactly one approved LIVE runtime is already healthy, the dedicated duplicate-owner probe can test only the startup process-lock boundary:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\probe-live-duplicate-owner.local.ps1
+```
+
+Create that ignored local file from `scripts/probe-live-duplicate-owner.example.ps1`. Exit 0 with `PASS/DUPLICATE_BLOCKED` is the expected contention result. `BLOCK/NO_ACTIVE_OWNER` means no active process-lock owner was found; the probe immediately released the lock and must not be treated as readiness. Any other failure is also fail-closed. The command performs no runtime start, database write, migration, API call, worker start, or order transmission.
 
 After the manual LIVE process is healthy and `/sync` has produced fresh snapshots, check whether the automatic scheduler would pass its startup preflight without actually starting timers:
 

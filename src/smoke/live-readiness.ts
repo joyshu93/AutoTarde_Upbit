@@ -9,6 +9,7 @@ import {
 } from "../app/runtime-lifecycle.js";
 import type { ExecutionStateRecord, ReconciliationRunRecord } from "../domain/types.js";
 import { detectExecutionStateSeedMismatches } from "../modules/db/interfaces.js";
+import { parseCandidatePilotTimestamp } from "../modules/db/pilot-interfaces.js";
 import { openLiveReadOnlyContext } from "./live-readonly-context.js";
 
 type LiveReadinessSmokeStatus = "PASS" | "WARN" | "BLOCK";
@@ -116,6 +117,7 @@ async function runReadOnlyLiveReadinessSmoke(): Promise<LiveReadinessSmokeResult
     const latestReconciliationBlockingIssueCodes = latestReconciliationIssueCodes.filter((code) =>
       BLOCKING_RECONCILIATION_ISSUE_CODES.has(code)
     );
+    const checkedAt = new Date().toISOString();
     const seedMismatches = detectExecutionStateSeedMismatches(executionState, {
       executionMode: context.config.executionMode,
       liveExecutionGate: context.config.liveExecutionGate,
@@ -131,6 +133,7 @@ async function runReadOnlyLiveReadinessSmoke(): Promise<LiveReadinessSmokeResult
       latestReconciliationRun,
       latestReconciliationIssueCodes,
       latestReconciliationBlockingIssueCodes,
+      checkedAt,
     });
     return {
       service: context.config.serviceName,
@@ -206,6 +209,7 @@ export async function runLiveReadinessSmokeWithApplicationForTest(
         const latestReconciliationBlockingIssueCodes = latestReconciliationIssueCodes.filter((code) =>
           BLOCKING_RECONCILIATION_ISSUE_CODES.has(code)
         );
+        const checkedAt = new Date().toISOString();
         const seedMismatches = detectExecutionStateSeedMismatches(executionState, {
           executionMode: app.config.executionMode,
           liveExecutionGate: app.config.liveExecutionGate,
@@ -221,6 +225,7 @@ export async function runLiveReadinessSmokeWithApplicationForTest(
           latestReconciliationRun,
           latestReconciliationIssueCodes,
           latestReconciliationBlockingIssueCodes,
+          checkedAt,
         });
 
         return {
@@ -295,7 +300,9 @@ export function buildLiveReadinessSmokeChecks(input: {
   latestReconciliationRun: Pick<ReconciliationRunRecord, "status" | "completedAt"> | null;
   latestReconciliationIssueCodes: string[];
   latestReconciliationBlockingIssueCodes: string[];
+  checkedAt: string;
 }): LiveReadinessSmokeCheck[] {
+  const freshnessThresholdMs = getLiveReadinessFreshnessThresholdMs(input.app.config);
   return [
     {
       name: "non_mutation_boundary",
@@ -358,23 +365,35 @@ export function buildLiveReadinessSmokeChecks(input: {
         : `Persisted execution_state differs from startup seed: ${input.seedMismatches.join(",")}.`,
     },
     {
+      name: "evidence_freshness_policy",
+      status: input.app.config.executionMode !== "LIVE" || freshnessThresholdMs !== null ? "PASS" : "BLOCK",
+      detail: input.app.config.executionMode !== "LIVE"
+        ? "LIVE evidence freshness policy is not required outside LIVE readiness."
+        : freshnessThresholdMs === null
+          ? "LIVE_READINESS_MAX_EVIDENCE_AGE_MS must be an explicit positive safe integer."
+          : `LIVE evidence freshness max_age_ms=${freshnessThresholdMs}.`,
+    },
+    {
       name: "balance_snapshot",
-      status: input.latestBalanceSnapshotAt ? "PASS" : "WARN",
-      detail: input.latestBalanceSnapshotAt
-        ? `latest balance snapshot captured_at=${input.latestBalanceSnapshotAt}`
-        : "No balance snapshot is stored yet; run /sync before any live strategy run.",
+      ...describeHealthEvidenceFreshness(
+        "balance snapshot",
+        input.latestBalanceSnapshotAt,
+        input.checkedAt,
+        freshnessThresholdMs,
+      ),
     },
     {
       name: "position_snapshot",
-      status: input.latestPositionSnapshotAt ? "PASS" : "WARN",
-      detail: input.latestPositionSnapshotAt
-        ? `latest position snapshot captured_at=${input.latestPositionSnapshotAt}`
-        : "No position snapshot is stored yet; run /sync before any live strategy run.",
+      ...describeHealthEvidenceFreshness(
+        "position snapshot",
+        input.latestPositionSnapshotAt,
+        input.checkedAt,
+        freshnessThresholdMs,
+      ),
     },
     {
       name: "latest_reconciliation",
-      status: classifyLatestReconciliation(input),
-      detail: describeLatestReconciliation(input),
+      ...describeLatestReconciliation(input, freshnessThresholdMs),
     },
     {
       name: "active_orders",
@@ -386,46 +405,95 @@ export function buildLiveReadinessSmokeChecks(input: {
   ];
 }
 
-function classifyLatestReconciliation(input: {
-  latestReconciliationRun: Pick<ReconciliationRunRecord, "status" | "completedAt"> | null;
-  latestReconciliationIssueCodes: string[];
-  latestReconciliationBlockingIssueCodes: string[];
-}): LiveReadinessSmokeStatus {
-  if (!input.latestReconciliationRun) {
-    return "WARN";
-  }
-
-  if (input.latestReconciliationBlockingIssueCodes.length > 0) {
-    return "BLOCK";
-  }
-
-  return input.latestReconciliationRun.status === "SUCCESS" ? "PASS" : "WARN";
-}
-
 function describeLatestReconciliation(input: {
   latestReconciliationRun: Pick<ReconciliationRunRecord, "status" | "completedAt"> | null;
   latestReconciliationIssueCodes: string[];
   latestReconciliationBlockingIssueCodes: string[];
-}): string {
+  checkedAt: string;
+}, freshnessThresholdMs: number | null): Pick<LiveReadinessSmokeCheck, "status" | "detail"> {
   if (!input.latestReconciliationRun) {
-    return "No reconciliation run is stored yet; run /sync before any live strategy run.";
+    return {
+      status: "WARN",
+      detail: "No reconciliation run is stored yet; run /sync before any live strategy run.",
+    };
   }
 
   const issueCodes = formatIssueCodes(input.latestReconciliationIssueCodes);
+  const freshness = describeHealthEvidenceFreshness(
+    "reconciliation",
+    input.latestReconciliationRun.completedAt,
+    input.checkedAt,
+    freshnessThresholdMs,
+  );
   if (input.latestReconciliationBlockingIssueCodes.length > 0) {
-    return `latest reconciliation status=${input.latestReconciliationRun.status} ` +
-      `completed_at=${input.latestReconciliationRun.completedAt ?? "none"} ` +
-      `blocking_issue_codes=${input.latestReconciliationBlockingIssueCodes.join(",")} issue_codes=${issueCodes}`;
+    return {
+      status: "BLOCK",
+      detail: `${freshness.detail} status=${input.latestReconciliationRun.status} ` +
+        `blocking_issue_codes=${input.latestReconciliationBlockingIssueCodes.join(",")} issue_codes=${issueCodes}`,
+    };
   }
 
+  if (freshness.status === "BLOCK") return freshness;
   if (input.latestReconciliationRun.status !== "SUCCESS") {
-    return `latest reconciliation status=${input.latestReconciliationRun.status} ` +
-      `completed_at=${input.latestReconciliationRun.completedAt ?? "none"} ` +
-      `non_blocking_issue_codes=${issueCodes}`;
+    return {
+      status: "WARN",
+      detail: `${freshness.detail} status=${input.latestReconciliationRun.status} ` +
+        `non_blocking_issue_codes=${issueCodes}`,
+    };
   }
 
-  return `latest reconciliation status=${input.latestReconciliationRun.status} ` +
-    `completed_at=${input.latestReconciliationRun.completedAt ?? "none"}`;
+  return freshness;
+}
+
+function getLiveReadinessFreshnessThresholdMs(config: AppConfig): number | null {
+  const value = config.liveReadinessMaxEvidenceAgeMs;
+  return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value! : null;
+}
+
+function describeHealthEvidenceFreshness(
+  label: string,
+  timestamp: string | null,
+  checkedAt: string,
+  maxAgeMs: number | null,
+): Pick<LiveReadinessSmokeCheck, "status" | "detail"> {
+  if (timestamp === null) {
+    return {
+      status: "WARN",
+      detail: `No ${label} is stored yet; run /sync before any live strategy run.`,
+    };
+  }
+  if (maxAgeMs === null) {
+    return { status: "PASS", detail: `latest ${label} captured_at=${timestamp}` };
+  }
+
+  let ageNs: bigint;
+  try {
+    ageNs = parseCandidatePilotTimestamp(checkedAt, "LIVE readiness checkedAt") -
+      parseCandidatePilotTimestamp(timestamp, `LIVE readiness ${label} timestamp`);
+  } catch {
+    return {
+      status: "BLOCK",
+      detail: `latest ${label} captured_at=${timestamp} freshness_check=uncomparable`,
+    };
+  }
+  if (ageNs < 0n) {
+    return {
+      status: "BLOCK",
+      detail: `latest ${label} captured_at=${timestamp} freshness_check=uncomparable`,
+    };
+  }
+
+  const ageMs = ageNs / 1_000_000n;
+  const maxAgeNs = BigInt(maxAgeMs) * 1_000_000n;
+  return ageNs <= maxAgeNs
+    ? {
+        status: "PASS",
+        detail: `latest ${label} captured_at=${timestamp} fresh_age_ms=${ageMs} max_age_ms=${maxAgeMs}`,
+      }
+    : {
+        status: "WARN",
+        detail: `latest ${label} captured_at=${timestamp} stale_age_ms=${ageMs} max_age_ms=${maxAgeMs}`,
+      };
 }
 
 function formatIssueCodes(issueCodes: readonly string[]): string {
@@ -520,7 +588,28 @@ export function buildLiveReadinessNextActions(checks: readonly LiveReadinessSmok
     actions.push("Use the intended LIVE DATABASE_PATH or align persisted execution_state with the current startup seed.");
   }
 
-  if (checkNames.has("balance_snapshot") || checkNames.has("position_snapshot") || checkNames.has("latest_reconciliation")) {
+  if (checkNames.has("evidence_freshness_policy")) {
+    actions.push(
+      "Set LIVE_READINESS_MAX_EVIDENCE_AGE_MS to an explicit positive safe integer before LIVE readiness.",
+    );
+  }
+
+  const healthEvidenceChecks = checks.filter((check) =>
+    check.name === "balance_snapshot" ||
+    check.name === "position_snapshot" ||
+    check.name === "latest_reconciliation"
+  );
+  const uncomparableEvidenceBlocks = healthEvidenceChecks.filter((check) =>
+    check.status === "BLOCK" && check.detail.includes("freshness_check=uncomparable")
+  );
+  if (uncomparableEvidenceBlocks.length > 0) {
+    actions.push("Investigate system clock and persisted health timestamps before LIVE startup.");
+  }
+
+  if (healthEvidenceChecks.some((check) =>
+    check.status === "WARN" ||
+    (check.status === "BLOCK" && !uncomparableEvidenceBlocks.includes(check))
+  )) {
     actions.push("After the live process starts with scheduler disabled, run /sync and re-check /readiness before /run.");
   }
 
